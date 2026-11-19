@@ -4,14 +4,13 @@ its ledger event and any outgoing command in a single transaction."""
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import asdict
 
 from psycopg.types.json import Jsonb
 
 from relay.domain.behaviour import Behaviour, BehaviourState
-from relay.domain.evidence import RedExpectation, RedVerdict, TestObservation
+from relay.domain.evidence import ProcessContract, ProcessObservation, RedVerdict
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
 from relay.persistence.outbox import enqueue
@@ -59,28 +58,26 @@ class Behaviours:
             )
 
     async def register_acceptance_test(
-        self,
-        project_id: str,
-        behaviour_id: str,
-        expectation: RedExpectation,
-        contract_digest: str,
+        self, project_id: str, behaviour_id: str, contract: ProcessContract
     ) -> None:
         async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
-            behaviour.register_acceptance_test(expectation, contract_digest)
+            behaviour.register_acceptance_test(contract)
             await append_event(
                 connection,
                 project_id,
                 "behaviour.acceptance_test_registered",
                 subject_id=behaviour_id,
-                payload={"expectation": asdict(expectation), "contract_digest": contract_digest},
+                payload={"contract": contract.to_dict(), "contract_digest": contract.digest},
                 correlation_id=correlation,
             )
 
     async def record_red_run(
-        self, project_id: str, behaviour_id: str, observations: Sequence[TestObservation]
+        self, project_id: str, behaviour_id: str, observation: ProcessObservation
     ) -> RedVerdict:
         async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
-            verdict = behaviour.record_red_run(observations)
+            verdict = behaviour.record_red_run(observation)
+            assert behaviour.contract is not None
+            contract_digest = behaviour.contract.digest
             if not verdict.is_valid:
                 assert verdict.rejection is not None
                 await append_event(
@@ -88,7 +85,11 @@ class Behaviours:
                     project_id,
                     "behaviour.red_rejected",
                     subject_id=behaviour_id,
-                    payload={"rejection": verdict.rejection.value, "reason": verdict.reason},
+                    payload={
+                        "rejection": verdict.rejection.value,
+                        "reason": verdict.reason,
+                        "contract_digest": contract_digest,
+                    },
                     correlation_id=correlation,
                 )
                 return verdict
@@ -97,7 +98,7 @@ class Behaviours:
                 project_id,
                 "behaviour.test_red_verified",
                 subject_id=behaviour_id,
-                payload={"reason": verdict.reason, "contract_digest": behaviour.contract_digest},
+                payload={"reason": verdict.reason, "contract_digest": contract_digest},
                 correlation_id=correlation,
             )
             await enqueue(
@@ -110,7 +111,7 @@ class Behaviours:
                     behaviour_id=behaviour_id,
                     sender=CONTROL_PLANE,
                     recipient="builder",
-                    idempotency_key=f"build:{project_id}:{behaviour_id}:{behaviour.contract_digest}",
+                    idempotency_key=f"build:{project_id}:{behaviour_id}:{contract_digest}",
                     correlation_id=correlation,
                     causation_id=verified.event_id,
                 ),
@@ -144,22 +145,20 @@ class Behaviours:
             ).fetchone()
             if row is None:
                 raise LookupError(f"unknown behaviour {behaviour_id!r} in project {project_id!r}")
-            expectation = row["red_expectation"]
+            contract = row["contract"]
             behaviour = Behaviour(
                 behaviour_id=row["behaviour_id"],
                 summary=row["summary"],
                 state=BehaviourState(row["state"]),
-                red_expectation=RedExpectation(**expectation) if expectation else None,
-                contract_digest=row["contract_digest"],
+                contract=ProcessContract.from_dict(contract) if contract else None,
             )
             yield connection, behaviour, row["correlation_id"]
             await connection.execute(
-                "UPDATE behaviours SET state = %s, red_expectation = %s, contract_digest = %s "
+                "UPDATE behaviours SET state = %s, contract = %s "
                 "WHERE project_id = %s AND behaviour_id = %s",
                 (
                     behaviour.state.value,
-                    Jsonb(asdict(behaviour.red_expectation)) if behaviour.red_expectation else None,
-                    behaviour.contract_digest,
+                    Jsonb(behaviour.contract.to_dict()) if behaviour.contract else None,
                     project_id,
                     behaviour_id,
                 ),

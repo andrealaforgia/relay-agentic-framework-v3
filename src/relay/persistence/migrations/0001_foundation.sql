@@ -9,8 +9,7 @@ CREATE TABLE behaviours (
     behaviour_id    text NOT NULL,
     summary         text NOT NULL,
     state           text NOT NULL,
-    red_expectation jsonb,
-    contract_digest text,
+    contract        jsonb,
     correlation_id  uuid NOT NULL,
     PRIMARY KEY (project_id, behaviour_id)
 );

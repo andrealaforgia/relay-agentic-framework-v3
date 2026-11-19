@@ -11,10 +11,10 @@ import redis.asyncio as redis
 from psycopg_pool import AsyncConnectionPool
 
 from relay.application.behaviours import Behaviours
-from relay.domain.evidence import Outcome, RedExpectation, TestObservation
 from relay.persistence.outbox import OutboxPublisher, pending_messages
 from relay.persistence.receipts import act_once
 from relay.transport.streams import Streams
+from tests.integration.fixtures import CONTRACT, FAILS_AS_REGISTERED
 
 PROJECT = "vat-calculator"
 
@@ -30,12 +30,8 @@ async def one_build_request_in_the_outbox(database: AsyncConnectionPool) -> None
     await behaviours.open_project(PROJECT)
     await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
     await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(
-        PROJECT, "B1", RedExpectation("t::vat", "assert 100 == 120"), "sha256:abc"
-    )
-    await behaviours.record_red_run(
-        PROJECT, "B1", [TestObservation("t::vat", Outcome.FAILED, "assert 100 == 120")]
-    )
+    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
+    await behaviours.record_red_run(PROJECT, "B1", FAILS_AS_REGISTERED)
 
 
 async def drain(streams: Streams, database: AsyncConnectionPool, effects: list[str]) -> None:

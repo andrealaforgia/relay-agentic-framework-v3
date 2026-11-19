@@ -8,14 +8,11 @@ from psycopg_pool import AsyncConnectionPool
 
 from relay.application.behaviours import Behaviours
 from relay.domain.behaviour import BehaviourState, TransitionRefused
-from relay.domain.evidence import Outcome, RedExpectation, TestObservation
 from relay.persistence.ledger import read_events
 from relay.persistence.outbox import pending_messages
+from tests.integration.fixtures import CONTRACT, FAILS_AS_REGISTERED, SYNTAX_ERROR
 
 PROJECT = "vat-calculator"
-EXPECTATION = RedExpectation(test_id="t::vat", failure_contains="assert 100 == 120")
-FAILS_AS_REGISTERED = [TestObservation("t::vat", Outcome.FAILED, "assert 100 == 120")]
-SYNTAX_ERROR = [TestObservation("t::vat", Outcome.ERRORED, "SyntaxError: invalid syntax")]
 
 
 async def behaviour_awaiting_red(database: AsyncConnectionPool) -> Behaviours:
@@ -23,7 +20,7 @@ async def behaviour_awaiting_red(database: AsyncConnectionPool) -> Behaviours:
     await behaviours.open_project(PROJECT)
     await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
     await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", EXPECTATION, "sha256:abc")
+    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
     return behaviours
 
 
@@ -37,7 +34,7 @@ async def test_an_invalid_red_keeps_the_builder_blocked(database: AsyncConnectio
     assert await pending_messages(database) == []
     rejected = (await read_events(database, PROJECT))[-1]
     assert rejected.event_type == "behaviour.red_rejected"
-    assert rejected.payload["rejection"] == "errored_before_asserting"
+    assert rejected.payload["rejection"] == "unexpected_failure"
 
 
 async def test_a_valid_red_releases_exactly_one_build_request(

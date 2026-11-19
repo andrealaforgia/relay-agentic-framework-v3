@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
-from relay.domain.evidence import RedExpectation, RedVerdict, TestObservation, judge_red
+from relay.domain.evidence import ProcessContract, ProcessObservation, RedVerdict, judge_red
 
 
 class BehaviourState(StrEnum):
@@ -36,8 +35,7 @@ class Behaviour:
     behaviour_id: str
     summary: str
     state: BehaviourState = BehaviourState.PROPOSED
-    red_expectation: RedExpectation | None = None
-    contract_digest: str | None = None
+    contract: ProcessContract | None = None
 
     @classmethod
     def propose(cls, behaviour_id: str, summary: str) -> Behaviour:
@@ -47,16 +45,15 @@ class Behaviour:
         self._require("begin_test_design", BehaviourState.PROPOSED)
         self.state = BehaviourState.TEST_DESIGN
 
-    def register_acceptance_test(self, expectation: RedExpectation, contract_digest: str) -> None:
+    def register_acceptance_test(self, contract: ProcessContract) -> None:
         self._require("register_acceptance_test", BehaviourState.TEST_DESIGN)
-        self.red_expectation = expectation
-        self.contract_digest = contract_digest
+        self.contract = contract
         self.state = BehaviourState.VALIDATING_RED
 
-    def record_red_run(self, observations: Sequence[TestObservation]) -> RedVerdict:
+    def record_red_run(self, observation: ProcessObservation) -> RedVerdict:
         self._require("record_red_run", BehaviourState.VALIDATING_RED)
-        assert self.red_expectation is not None
-        verdict = judge_red(self.red_expectation, observations)
+        assert self.contract is not None
+        verdict = judge_red(self.contract, observation)
         if verdict.is_valid:
             self.state = BehaviourState.IMPLEMENTING
         return verdict

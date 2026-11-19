@@ -3,17 +3,29 @@
 import pytest
 
 from relay.domain.behaviour import Behaviour, BehaviourState, TransitionRefused
-from relay.domain.evidence import Outcome, RedExpectation, TestObservation
+from relay.domain.evidence import (
+    Baseline,
+    Expected,
+    Launch,
+    ProcessContract,
+    ProcessObservation,
+)
 
-EXPECTATION = RedExpectation(test_id="t::vat", failure_contains="assert 100 == 120")
-FAILS_AS_REGISTERED = [TestObservation("t::vat", Outcome.FAILED, "assert 100 == 120")]
-ERRORS = [TestObservation("t::vat", Outcome.ERRORED, "SyntaxError")]
+CONTRACT = ProcessContract(
+    contract_id="B1-standard-rate",
+    observes="the gross amount printed for a net amount at the standard rate",
+    launch=Launch(argv=("python3", "vat.py", "100")),
+    expect=Expected(exit_code=0, stdout="120\n"),
+    baseline=Baseline(exit_code=0, stdout="100\n"),
+)
+FAILS_AS_REGISTERED = ProcessObservation(exit_code=0, stdout=b"100\n")
+ERRORS = ProcessObservation(exit_code=1, stderr=b"SyntaxError")
 
 
 def awaiting_red() -> Behaviour:
     behaviour = Behaviour.propose("B1", "standard VAT rate is applied")
     behaviour.begin_test_design()
-    behaviour.register_acceptance_test(EXPECTATION, contract_digest="sha256:abc")
+    behaviour.register_acceptance_test(CONTRACT)
     return behaviour
 
 
@@ -56,7 +68,7 @@ def test_the_builder_cannot_start_before_red_validation() -> None:
 
 def test_a_refusal_names_what_was_attempted_and_what_is_required() -> None:
     with pytest.raises(TransitionRefused) as refusal:
-        Behaviour.propose("B1", "x").register_acceptance_test(EXPECTATION, "sha256:abc")
+        Behaviour.propose("B1", "x").register_acceptance_test(CONTRACT)
 
     assert refusal.value.attempted == "register_acceptance_test"
     assert refusal.value.current is BehaviourState.PROPOSED
