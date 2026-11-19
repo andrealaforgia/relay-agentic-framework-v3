@@ -11,7 +11,6 @@ from typing import Any
 import redis.asyncio as redis
 from redis.exceptions import ResponseError
 
-
 type _Entry = tuple[str, dict[str, str]]
 
 
@@ -36,7 +35,7 @@ class Streams:
         self, stream: str, *, group: str, consumer: str, count: int = 10
     ) -> list[Delivery]:
         await self._ensure_group(stream, group)
-        response: list[tuple[str, list[_Entry]]] = await self._client.xreadgroup(
+        response: Any = await self._client.xreadgroup(
             group, consumer, {self._key(stream): ">"}, count=count
         )
         return [_delivery(entry) for _, entries in response for entry in entries]
@@ -46,10 +45,10 @@ class Streams:
     ) -> list[Delivery]:
         """Take over deliveries another consumer received but never acknowledged."""
         await self._ensure_group(stream, group)
-        claimed: tuple[str, list[_Entry], list[str]] = await self._client.xautoclaim(
+        claimed: Any = await self._client.xautoclaim(
             self._key(stream), group, consumer, min_idle_time=idle_for_ms, count=count
         )
-        entries = claimed[1]
+        entries: list[_Entry] = claimed[1]
         return [_delivery(entry) for entry in entries]
 
     async def acknowledge(self, stream: str, group: str, delivery: Delivery) -> None:
