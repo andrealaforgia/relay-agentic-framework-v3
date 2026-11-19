@@ -3,7 +3,6 @@ The subject's own claims, and any file it writes, carry no weight."""
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -11,26 +10,7 @@ import pytest
 from relay.domain.evidence import Ineligibility, Launch
 from relay.git.checkout import CheckoutFailed, pristine_checkout
 from relay.testing.oracle import NativeIsolation, ProcessOracle
-
-VAT_RETURNS_NET = "import sys\nprint(int(sys.argv[1]))\n"
-
-
-def commit(repository: Path, files: dict[str, str]) -> str:
-    def git(*arguments: str) -> str:
-        return subprocess.run(
-            ["git", "-C", str(repository), *arguments], check=True, capture_output=True, text=True
-        ).stdout.strip()
-
-    if not (repository / ".git").exists():
-        repository.mkdir(parents=True, exist_ok=True)
-        git("init", "-q", "-b", "main")
-        git("config", "user.email", "verifier@relay.test")
-        git("config", "user.name", "Verifier")
-    for name, content in files.items():
-        (repository / name).write_text(content)
-    git("add", "-A")
-    git("commit", "-q", "-m", "change")
-    return git("rev-parse", "HEAD")
+from tests.integration.fixtures import VAT_RETURNS_NET, commit
 
 
 async def observe(tmp_path: Path, files: dict[str, str], launch: Launch):  # type: ignore[no-untyped-def]

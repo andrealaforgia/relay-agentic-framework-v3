@@ -5,7 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from relay.domain.evidence import ProcessContract, ProcessObservation, RedVerdict, judge_red
+from relay.domain.evidence import (
+    EvidencePolicy,
+    Execution,
+    ProcessContract,
+    RedVerdict,
+    judge_red,
+)
 
 
 class BehaviourState(StrEnum):
@@ -50,10 +56,10 @@ class Behaviour:
         self.contract = contract
         self.state = BehaviourState.VALIDATING_RED
 
-    def record_red_run(self, observation: ProcessObservation) -> RedVerdict:
+    def record_red_run(self, execution: Execution, policy: EvidencePolicy) -> RedVerdict:
         self._require("record_red_run", BehaviourState.VALIDATING_RED)
         assert self.contract is not None
-        verdict = judge_red(self.contract, observation)
+        verdict = judge_red(self.contract, execution, policy)
         if verdict.is_valid:
             self.state = BehaviourState.IMPLEMENTING
         return verdict

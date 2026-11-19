@@ -5,15 +5,18 @@ import pytest
 
 from relay.domain.evidence import (
     Baseline,
+    EvidencePolicy,
+    Execution,
     Expected,
     Ineligibility,
     Launch,
     ProcessContract,
     ProcessObservation,
     RedRejection,
+    RedVerdict,
     judge_green,
-    judge_red,
 )
+from relay.domain.evidence import judge_red as judge_red_execution
 
 CONTRACT = ProcessContract(
     contract_id="B1-standard-rate",
@@ -22,6 +25,11 @@ CONTRACT = ProcessContract(
     expect=Expected(exit_code=0, stdout="120\n"),
     baseline=Baseline(exit_code=0, stdout="100\n"),
 )
+
+
+def judge_red(contract: ProcessContract, observation: ProcessObservation) -> RedVerdict:
+    execution = Execution(revision="a" * 40, isolation="container", observation=observation)
+    return judge_red_execution(contract, execution, EvidencePolicy())
 
 
 def ran(exit_code: int, stdout: str = "", stderr: str = "") -> ProcessObservation:
@@ -138,3 +146,13 @@ def test_a_contract_is_identified_by_its_content() -> None:
     assert same.digest == CONTRACT.digest
     assert CONTRACT.digest.startswith("sha256:")
     assert different.digest != CONTRACT.digest
+
+
+def test_native_execution_is_not_evidence_unless_the_project_approves_it() -> None:
+    native = Execution(revision="a" * 40, isolation="native", observation=ran(0, "100\n"))
+
+    refused = judge_red_execution(CONTRACT, native, EvidencePolicy(native_approved=False))
+    admitted = judge_red_execution(CONTRACT, native, EvidencePolicy(native_approved=True))
+
+    assert refused.rejection is RedRejection.ISOLATION_NOT_APPROVED
+    assert admitted.is_valid

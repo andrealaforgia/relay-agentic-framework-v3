@@ -125,6 +125,25 @@ class ProcessContract:
         )
 
 
+@dataclass(frozen=True)
+class Execution:
+    """One run by the oracle: which revision, under which isolation, and what was seen."""
+
+    revision: str
+    isolation: str
+    observation: ProcessObservation
+
+
+@dataclass(frozen=True)
+class EvidencePolicy:
+    """Which isolation modes may produce gate-bearing evidence for a project."""
+
+    native_approved: bool = False
+
+    def admits(self, isolation: str) -> bool:
+        return isolation != "native" or self.native_approved
+
+
 class RedRejection(StrEnum):
     NOT_EXECUTED = "not_executed"
     TIMED_OUT = "timed_out"
@@ -132,6 +151,7 @@ class RedRejection(StrEnum):
     OUTPUT_OVERFLOW = "output_overflow"
     ALREADY_PASSES = "already_passes"
     UNEXPECTED_FAILURE = "unexpected_failure"
+    ISOLATION_NOT_APPROVED = "isolation_not_approved"
 
 
 @dataclass(frozen=True)
@@ -150,10 +170,18 @@ class GreenVerdict:
     reason: str
 
 
-def judge_red(contract: ProcessContract, observation: ProcessObservation) -> RedVerdict:
+def judge_red(
+    contract: ProcessContract, execution: Execution, policy: EvidencePolicy
+) -> RedVerdict:
     def rejected(rejection: RedRejection, explanation: str) -> RedVerdict:
         return RedVerdict(rejection, f"{contract.contract_id}: {explanation}")
 
+    observation = execution.observation
+    if not policy.admits(execution.isolation):
+        return rejected(
+            RedRejection.ISOLATION_NOT_APPROVED,
+            f"{execution.isolation} execution is not approved as evidence for this project",
+        )
     if observation.ineligibility is not None:
         return rejected(
             RedRejection(observation.ineligibility.value),

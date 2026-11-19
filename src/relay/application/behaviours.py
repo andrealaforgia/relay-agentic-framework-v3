@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from psycopg.types.json import Jsonb
 
 from relay.domain.behaviour import Behaviour, BehaviourState
-from relay.domain.evidence import ProcessContract, ProcessObservation, RedVerdict
+from relay.domain.evidence import EvidencePolicy, Execution, ProcessContract, RedVerdict
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
 from relay.persistence.outbox import enqueue
@@ -23,10 +23,20 @@ class Behaviours:
     def __init__(self, pool: Pool) -> None:
         self._pool = pool
 
-    async def open_project(self, project_id: str) -> None:
+    async def open_project(
+        self, project_id: str, *, native_evidence_approved: bool = False
+    ) -> None:
         async with self._pool.connection() as connection, connection.transaction():
-            await connection.execute("INSERT INTO projects (project_id) VALUES (%s)", (project_id,))
-            await append_event(connection, project_id, "project.opened")
+            await connection.execute(
+                "INSERT INTO projects (project_id, native_evidence_approved) VALUES (%s, %s)",
+                (project_id, native_evidence_approved),
+            )
+            await append_event(
+                connection,
+                project_id,
+                "project.opened",
+                payload={"native_evidence_approved": native_evidence_approved},
+            )
 
     async def propose(self, project_id: str, behaviour_id: str, summary: str) -> None:
         behaviour = Behaviour.propose(behaviour_id, summary)
@@ -72,12 +82,23 @@ class Behaviours:
             )
 
     async def record_red_run(
-        self, project_id: str, behaviour_id: str, observation: ProcessObservation
+        self, project_id: str, behaviour_id: str, execution: Execution
     ) -> RedVerdict:
+        """Judge one oracle run. The run, the verdict and any release commit together."""
         async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
-            verdict = behaviour.record_red_run(observation)
+            verdict = behaviour.record_red_run(execution, await _policy(connection, project_id))
             assert behaviour.contract is not None
             contract_digest = behaviour.contract.digest
+            execution_id = await _record_execution(
+                connection, project_id, behaviour_id, "red", contract_digest, execution
+            )
+            evidence = {
+                "reason": verdict.reason,
+                "execution_id": str(execution_id),
+                "revision": execution.revision,
+                "isolation": execution.isolation,
+                "contract_digest": contract_digest,
+            }
             if not verdict.is_valid:
                 assert verdict.rejection is not None
                 await append_event(
@@ -85,11 +106,7 @@ class Behaviours:
                     project_id,
                     "behaviour.red_rejected",
                     subject_id=behaviour_id,
-                    payload={
-                        "rejection": verdict.rejection.value,
-                        "reason": verdict.reason,
-                        "contract_digest": contract_digest,
-                    },
+                    payload={"rejection": verdict.rejection.value, **evidence},
                     correlation_id=correlation,
                 )
                 return verdict
@@ -98,7 +115,7 @@ class Behaviours:
                 project_id,
                 "behaviour.test_red_verified",
                 subject_id=behaviour_id,
-                payload={"reason": verdict.reason, "contract_digest": contract_digest},
+                payload=evidence,
                 correlation_id=correlation,
             )
             await enqueue(
@@ -114,9 +131,22 @@ class Behaviours:
                     idempotency_key=f"build:{project_id}:{behaviour_id}:{contract_digest}",
                     correlation_id=correlation,
                     causation_id=verified.event_id,
+                    payload={"base_revision": execution.revision},
                 ),
             )
             return verdict
+
+    async def contract_of(self, project_id: str, behaviour_id: str) -> ProcessContract:
+        async with self._pool.connection() as connection:
+            row = await (
+                await connection.execute(
+                    "SELECT contract FROM behaviours WHERE project_id = %s AND behaviour_id = %s",
+                    (project_id, behaviour_id),
+                )
+            ).fetchone()
+        if row is None or row["contract"] is None:
+            raise LookupError(f"behaviour {behaviour_id!r} has no registered acceptance contract")
+        return ProcessContract.from_dict(row["contract"])
 
     async def state_of(self, project_id: str, behaviour_id: str) -> BehaviourState:
         async with self._pool.connection() as connection:
@@ -163,3 +193,44 @@ class Behaviours:
                     behaviour_id,
                 ),
             )
+
+
+async def _policy(connection: Connection, project_id: str) -> EvidencePolicy:
+    row = await (
+        await connection.execute(
+            "SELECT native_evidence_approved FROM projects WHERE project_id = %s", (project_id,)
+        )
+    ).fetchone()
+    assert row is not None
+    return EvidencePolicy(native_approved=row["native_evidence_approved"])
+
+
+async def _record_execution(
+    connection: Connection,
+    project_id: str,
+    behaviour_id: str,
+    purpose: str,
+    contract_digest: str,
+    execution: Execution,
+) -> uuid.UUID:
+    execution_id = uuid.uuid7()
+    observation = execution.observation
+    await connection.execute(
+        "INSERT INTO executions (execution_id, project_id, behaviour_id, purpose, revision, "
+        "contract_digest, isolation, exit_code, stdout, stderr, ineligibility) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            execution_id,
+            project_id,
+            behaviour_id,
+            purpose,
+            execution.revision,
+            contract_digest,
+            execution.isolation,
+            observation.exit_code,
+            observation.stdout,
+            observation.stderr,
+            observation.ineligibility.value if observation.ineligibility else None,
+        ),
+    )
+    return execution_id
