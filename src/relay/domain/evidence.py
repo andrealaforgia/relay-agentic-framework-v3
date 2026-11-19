@@ -33,7 +33,9 @@ class RedExpectation:
 
     def __post_init__(self) -> None:
         if not self.failure_contains.strip():
-            raise ValueError("failure_contains must name the expected failure; blank matches anything")
+            raise ValueError(
+                "failure_contains must name the expected failure; blank matches anything"
+            )
 
 
 @dataclass(frozen=True)
@@ -57,7 +59,10 @@ class RedVerdict:
 
 _NOT_AN_ASSERTION_FAILURE = {
     Outcome.PASSED: (RedRejection.ALREADY_PASSES, "already passes on the baseline"),
-    Outcome.ERRORED: (RedRejection.ERRORED_BEFORE_ASSERTING, "errored before reaching its assertion"),
+    Outcome.ERRORED: (
+        RedRejection.ERRORED_BEFORE_ASSERTING,
+        "errored before reaching its assertion",
+    ),
     Outcome.SKIPPED: (RedRejection.SKIPPED, "was skipped"),
     Outcome.TIMED_OUT: (RedRejection.TIMED_OUT, "timed out"),
 }

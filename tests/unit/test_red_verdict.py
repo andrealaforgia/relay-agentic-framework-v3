@@ -17,9 +17,7 @@ EXPECTATION = RedExpectation(
 
 
 def observed(outcome: Outcome, failure_text: str = "") -> TestObservation:
-    return TestObservation(
-        test_id=EXPECTATION.test_id, outcome=outcome, failure_text=failure_text
-    )
+    return TestObservation(test_id=EXPECTATION.test_id, outcome=outcome, failure_text=failure_text)
 
 
 def test_the_registered_assertion_failing_is_a_valid_red() -> None:
@@ -48,8 +46,11 @@ def test_anything_other_than_an_assertion_failure_is_not_red(
 
 
 def test_a_test_that_never_ran_is_not_red() -> None:
-    other = TestObservation(test_id="tests/test_other.py::test_x", outcome=Outcome.FAILED,
-                            failure_text="assert 100 == 120")
+    other = TestObservation(
+        test_id="tests/test_other.py::test_x",
+        outcome=Outcome.FAILED,
+        failure_text="assert 100 == 120",
+    )
 
     verdict = judge_red(EXPECTATION, [other])
 
