@@ -75,8 +75,8 @@ Each slice is a vertical cut with executable acceptance tests against real Postg
 | Slice | Proves | Specification scenarios | Status |
 |---|---|---|---|
 | 1a | Red gate in durable state; ledger; outbox; act once | 4 (state level), 11 (application effect) | Done |
-| 1b | Process oracle: wrong value is red; failure to launch, timeout, unregistered failure and a forged report are not | 4 | Next |
-| 1c | Green on the same contract; contract bundle protected; frozen regression selection | 5 | |
+| 1b | Process oracle: wrong value is red; failure to launch, timeout, unregistered failure and a forged report are not; container boundary shown with live canaries | 4 | Done |
+| 1c | Green paired with its red on the same contract and execution settings; contract protected; frozen regression selection | 5 | Next |
 | 2 | QA and Sentinel on one candidate; stale base rejected; one trunk advance across crashes | 6, 11 | |
 | 3 | Claude-only story to the human gate; restart at the gate | 1, 3, 8, 14 | |
 | 4 | Two providers disagree across machines; round cap escalates | 2, 7 | |
