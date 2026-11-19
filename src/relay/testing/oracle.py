@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 import os
 import signal
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -17,14 +19,19 @@ _LAUNCHER_STATUSES = frozenset({125, 126, 127})
 _DEFAULT_CAPTURE_LIMIT_BYTES = 4 * 1024 * 1024
 
 
+@dataclass(frozen=True)
+class PreparedLaunch:
+    command: tuple[str, ...]
+    environment: dict[str, str]
+    stop_command: tuple[str, ...] | None = None
+
+
 class Isolation(Protocol):
     """How the subject is kept away from the supervisor that observes it."""
 
     name: str
 
-    def command(self, workdir: Path, argv: tuple[str, ...]) -> tuple[str, ...]: ...
-
-    def environment(self, workdir: Path) -> dict[str, str]: ...
+    def prepare(self, workdir: Path, argv: tuple[str, ...]) -> PreparedLaunch: ...
 
 
 class NativeIsolation:
@@ -33,11 +40,45 @@ class NativeIsolation:
 
     name = "native"
 
-    def command(self, workdir: Path, argv: tuple[str, ...]) -> tuple[str, ...]:
-        return argv
+    def prepare(self, workdir: Path, argv: tuple[str, ...]) -> PreparedLaunch:
+        environment = {
+            "PATH": os.environ.get("PATH", os.defpath),
+            "HOME": str(workdir),
+            "LANG": "C.UTF-8",
+        }
+        return PreparedLaunch(argv, environment)
 
-    def environment(self, workdir: Path) -> dict[str, str]:
-        return {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(workdir), "LANG": "C.UTF-8"}
+
+class ContainerIsolation:
+    """Runs the subject in a disposable container: no network, read-only root and checkout,
+    no capabilities, bounded memory, processes and CPU, and none of the host's environment."""
+
+    name = "container"
+
+    def __init__(self, image: str) -> None:
+        if "@sha256:" not in image:
+            raise ValueError(f"the runner image must be pinned by digest, not {image!r}")
+        self.image = image
+
+    def prepare(self, workdir: Path, argv: tuple[str, ...]) -> PreparedLaunch:
+        container = f"relay-oracle-{uuid.uuid4().hex}"
+        command = (
+            "docker", "run", "--rm", "--interactive", "--name", container,
+            "--network", "none",
+            "--read-only",
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--pids-limit", "256",
+            "--memory", "512m",
+            "--cpus", "1",
+            "--user", f"{os.getuid()}:{os.getgid()}",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+            "--volume", f"{workdir}:/subject:ro",
+            "--workdir", "/subject",
+            self.image,
+            *argv,
+        )  # fmt: skip
+        return PreparedLaunch(command, dict(os.environ), ("docker", "rm", "--force", container))
 
 
 class ProcessOracle:
@@ -48,11 +89,12 @@ class ProcessOracle:
         self._capture_limit = capture_limit_bytes
 
     async def observe(self, workdir: Path, launch: Launch) -> ProcessObservation:
+        prepared = self.isolation.prepare(workdir, launch.argv)
         try:
             process = await asyncio.create_subprocess_exec(
-                *self.isolation.command(workdir, launch.argv),
+                *prepared.command,
                 cwd=workdir,
-                env=self.isolation.environment(workdir),
+                env=prepared.environment,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -77,7 +119,7 @@ class ProcessOracle:
                 exit_code,
             ) = await asyncio.wait_for(capture, timeout=launch.timeout_seconds)
         except TimeoutError:
-            await _stop(process)
+            await _stop(process, prepared.stop_command)
             return ProcessObservation(ineligibility=Ineligibility.TIMED_OUT)
         return ProcessObservation(
             exit_code=exit_code,
@@ -117,7 +159,13 @@ async def _read_up_to(stream: asyncio.StreamReader, limit: int) -> tuple[bytes, 
     return bytes(kept), overflowed
 
 
-async def _stop(process: asyncio.subprocess.Process) -> None:
-    with contextlib.suppress(ProcessLookupError):
+async def _stop(process: asyncio.subprocess.Process, stop_command: tuple[str, ...] | None) -> None:
+    if stop_command is not None:
+        stopper = await asyncio.create_subprocess_exec(
+            *stop_command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
+        await stopper.wait()
+    # macOS answers EPERM, not ESRCH, when the group's only member has already exited.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(process.pid, signal.SIGKILL)
     await process.wait()
