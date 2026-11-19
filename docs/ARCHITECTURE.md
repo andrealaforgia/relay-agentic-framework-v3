@@ -1,6 +1,6 @@
 # Relay v3: architectural assessment, migration plan and agreed architecture
 
-Status: Architecture Proposal v2, accepted with reservations by Claude (Fable 5.2) and Codex (`gpt-6.2-astra`) after three rounds. The exchange is in `docs/consensus/spec-v1.0/`. The reservations are the seven Product Owner decisions in section 5 and the unproven provider execution boundary in section 4.
+Status: Architecture Proposal v2, accepted with reservations by Claude (Fable 5.2) and Codex (`gpt-6.2-astra`) after three rounds. The exchange is in `docs/consensus/spec-v1.0/`. Four of the seven Product Owner decisions have since been made (`docs/DECISIONS.md`); two of them differ from what the models recommended and amend the proposal as marked below. The provider execution boundary in section 4 remains unproven.
 
 ## 1. What was inspected
 
@@ -18,7 +18,7 @@ Reused only where aligned with the new specification.
 
 | Old component | Verdict | Reason |
 |---|---|---|
-| Evidence runner, receipts, evidence replay | Port with changes | Deterministic test execution: baseline digests for every test file, collect before run, per-test outcomes, skips do not count, digest-pinned container with no network. Needs detaching from the old envelope and a positive match on the registered failure. |
+| Evidence runner, receipts, evidence replay | Port the isolation and digest mechanisms only | Its digest-pinned, no-network container and baseline file digests are reused. Its pytest reporter runs inside the subject's process, so under decision PO-1 it carries no gate authority and is not ported as a gate. |
 | Fault classifier | Port, as diagnostics only | Distinguishes "did not run" from "failed". It never establishes a red on its own. |
 | Claude and Codex runners | Port the stream parsers | Rewrite as async adapters with stdin prompts, process-group kill, structured output and Codex usage capture. The old default of bypassing permission checks is dropped. |
 | Usage fold, pricing table | Port with changes | Separate observed, estimated and unknown; version the table; never price an unknown model as a known one. |
@@ -52,7 +52,7 @@ There is no data migration: old ledgers are Redis streams with a different envel
 
 **Paid calls.** Invocation intent is persisted before the call. A reply lost after intent is an `unknown` effect: the reservation is kept, the work is parked and the Product Owner decides. Relay never makes a second paid call on its own.
 
-**Evidence.** The Verifier registers the test id and the expected failure before the run. Red requires that test to be collected, executed and failed by assertion with the registered failure. Errors, skips, timeouts, non-execution and other failures are rejected with a reason. Green requires the same contract passing on the candidate plus a frozen regression selection. Every behaviour gets its own red. The execution manifest pins baseline SHA, contract bundle digest, runner image, command, runner configuration and environment. No generic JUnit XML: each test framework is admitted through an adapter that supplies collection, execution and attempt identity.
+**Evidence (amended by PO-1).** Gate-bearing evidence comes only from an oracle outside the code under test. The Verifier registers, before any run, a contract: how to launch the subject, the expected observation, and the observation the baseline is expected to produce. Relay launches the subject in an isolated checkout of the pinned revision and evaluates the predicate itself. Red requires that the subject launched, ran to completion, did not satisfy the expectation, and produced the registered baseline observation. Failure to launch, a timeout or any other observation is rejected with a reason. Green requires the same contract satisfied on the candidate, plus a frozen regression selection. Every behaviour gets its own red. The execution manifest pins revision, contract digest, isolation mode, command and environment. The first oracle adapter observes a process (arguments, standard input, exit code, standard output); further interfaces need their own adapters. A test framework's report, and any file the subject writes, has no gate authority.
 
 **Ownership.** A deterministic importer checks each changeset's paths. The Builder owns production and unit-test paths; the contract bundle (acceptance tests, fixtures, invocation, runner configuration) belongs to the Verifier. A Verifier amendment creates a successor contract and reopens red.
 
@@ -62,17 +62,11 @@ There is no data migration: old ledgers are Redis streams with a different envel
 
 **Consensus.** Immutable proposals identified by (project, logical id, revision, sha256). Responses bind to the exact revision. Escalation is a blocked state with a named owner, never agreement. Counterpart outcome is recorded as `disabled`, `unavailable`, `substituted` or `completed`.
 
-## 5. Open Product Owner decisions
+## 5. Product Owner decisions
 
-| Decision | Recommended default (both models) |
-|---|---|
-| Evidence assurance | Accept the in-process pytest reporter for now, state its forgery limitation in the evidence record and on the dashboard, keep an adversarial fixture as a permanent test. |
-| Story approval | After verified integration. Rejection opens a remediation or revert decision; trunk is never rewritten. |
-| Host trust and native execution | Trust enrolled operators. Unsandboxed native test execution needs explicit project approval and is marked on its evidence. |
-| Review and security policy | Ship `claude-only` and `dual-provider` presets. Unresolved high and critical Sentinel findings block, with no override in v1. |
-| Unknown paid calls and budgets | Pause for a human decision. Govern unpriced subscription calls by call and wall-clock limits. |
-| First Git and CI target | Configured remote with enforced trunk ownership; no hosted CI in v1. |
-| Product Owner interface | Central inbox through the `relay` CLI and a thin Claude Code skill that calls it. |
+Made: PO-1 external oracle only; PO-2 approval after integration; PO-3 live conversational session as the interface, with every exchange persisted so recovery never depends on the session; PO-4 plain Git remote. See `docs/DECISIONS.md`.
+
+Open, on recommended defaults: trust enrolled operators, with unsandboxed native execution needing explicit project approval and a mark on its evidence; `claude-only` and `dual-provider` presets, with unresolved high and critical Sentinel findings blocking and no override in v1; pause for a human decision after an unknown paid call.
 
 ## 6. Slice order
 
@@ -81,7 +75,7 @@ Each slice is a vertical cut with executable acceptance tests against real Postg
 | Slice | Proves | Specification scenarios | Status |
 |---|---|---|---|
 | 1a | Red gate in durable state; ledger; outbox; act once | 4 (state level), 11 (application effect) | Done |
-| 1b | Evidence runner: wrong value, failed setup, nothing collected, forged claim, forged report | 4 | Next |
+| 1b | Process oracle: wrong value is red; failure to launch, timeout, unregistered failure and a forged report are not | 4 | Next |
 | 1c | Green on the same contract; contract bundle protected; frozen regression selection | 5 | |
 | 2 | QA and Sentinel on one candidate; stale base rejected; one trunk advance across crashes | 6, 11 | |
 | 3 | Claude-only story to the human gate; restart at the gate | 1, 3, 8, 14 | |
