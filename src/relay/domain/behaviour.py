@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from relay.domain.evidence import (
-    EvidencePolicy,
     Execution,
     ProcessContract,
     RedVerdict,
@@ -56,10 +55,15 @@ class Behaviour:
         self.contract = contract
         self.state = BehaviourState.VALIDATING_RED
 
-    def record_red_run(self, execution: Execution, policy: EvidencePolicy) -> RedVerdict:
-        self._require("record_red_run", BehaviourState.VALIDATING_RED)
+    def require_awaiting_red(self) -> ProcessContract:
+        """Refuse a red run that has no work left to do, before anything is launched."""
+        self._require("run_red", BehaviourState.VALIDATING_RED)
         assert self.contract is not None
-        verdict = judge_red(self.contract, execution, policy)
+        return self.contract
+
+    def record_red_run(self, execution: Execution) -> RedVerdict:
+        contract = self.require_awaiting_red()
+        verdict = judge_red(contract, execution)
         if verdict.is_valid:
             self.state = BehaviourState.IMPLEMENTING
         return verdict

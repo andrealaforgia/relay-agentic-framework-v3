@@ -5,7 +5,6 @@ import pytest
 from relay.domain.behaviour import Behaviour, BehaviourState, TransitionRefused
 from relay.domain.evidence import (
     Baseline,
-    EvidencePolicy,
     Execution,
     Expected,
     Launch,
@@ -20,8 +19,8 @@ CONTRACT = ProcessContract(
     expect=Expected(exit_code=0, stdout="120\n"),
     baseline=Baseline(exit_code=0, stdout="100\n"),
 )
-FAILS_AS_REGISTERED = Execution("a" * 40, "container", ProcessObservation(0, b"100\n"))
-ERRORS = Execution("a" * 40, "container", ProcessObservation(1, b"", b"SyntaxError"))
+FAILS_AS_REGISTERED = Execution("a" * 40, "container", "image", ProcessObservation(0, b"100\n"))
+ERRORS = Execution("a" * 40, "container", "image", ProcessObservation(1, b"", b"SyntaxError"))
 
 
 def awaiting_red() -> Behaviour:
@@ -42,7 +41,7 @@ def test_registering_the_acceptance_test_starts_red_validation() -> None:
 def test_a_valid_red_releases_the_behaviour_to_the_builder() -> None:
     behaviour = awaiting_red()
 
-    verdict = behaviour.record_red_run(FAILS_AS_REGISTERED, EvidencePolicy())
+    verdict = behaviour.record_red_run(FAILS_AS_REGISTERED)
 
     assert verdict.is_valid
     assert behaviour.state is BehaviourState.IMPLEMENTING
@@ -51,7 +50,7 @@ def test_a_valid_red_releases_the_behaviour_to_the_builder() -> None:
 def test_an_invalid_red_keeps_the_builder_blocked() -> None:
     behaviour = awaiting_red()
 
-    verdict = behaviour.record_red_run(ERRORS, EvidencePolicy())
+    verdict = behaviour.record_red_run(ERRORS)
 
     assert not verdict.is_valid
     assert behaviour.state is BehaviourState.VALIDATING_RED
@@ -62,7 +61,7 @@ def test_the_builder_cannot_start_before_red_validation() -> None:
     behaviour.begin_test_design()
 
     with pytest.raises(TransitionRefused) as refusal:
-        behaviour.record_red_run(FAILS_AS_REGISTERED, EvidencePolicy())
+        behaviour.record_red_run(FAILS_AS_REGISTERED)
 
     assert "test_design" in str(refusal.value)
     assert behaviour.state is BehaviourState.TEST_DESIGN

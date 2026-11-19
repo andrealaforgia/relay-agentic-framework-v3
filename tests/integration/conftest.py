@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import uuid
 from collections.abc import AsyncIterator
 
@@ -48,3 +49,22 @@ async def broker(namespace: str) -> AsyncIterator[redis.Redis]:
     if keys:
         await client.delete(*keys)
     await client.aclose()
+
+
+@pytest.fixture(scope="session")
+def runner_image() -> str:
+    """A digest-pinned image for the oracle's container."""
+    subprocess.run(["docker", "pull", "-q", "python:3.14-alpine"], check=True, capture_output=True)
+    return subprocess.run(
+        [
+            "docker",
+            "image",
+            "inspect",
+            "python:3.14-alpine",
+            "--format",
+            "{{index .RepoDigests 0}}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()

@@ -9,9 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from typing import Any
+
+MAX_TIMEOUT_SECONDS = 300
+# Only an isolation that keeps the subject away from the recorder can open a gate.
+GATE_BEARING_ISOLATIONS = frozenset({"container"})
 
 
 @dataclass(frozen=True)
@@ -23,6 +28,12 @@ class Launch:
     def __post_init__(self) -> None:
         if not self.argv:
             raise ValueError("a launch needs at least the program to run")
+        timeout = self.timeout_seconds
+        is_a_number = isinstance(timeout, int | float) and not isinstance(timeout, bool)
+        if not (is_a_number and math.isfinite(timeout) and 0 < timeout <= MAX_TIMEOUT_SECONDS):
+            raise ValueError(
+                f"timeout_seconds must be a positive number of at most {MAX_TIMEOUT_SECONDS}"
+            )
 
 
 @dataclass(frozen=True)
@@ -127,21 +138,16 @@ class ProcessContract:
 
 @dataclass(frozen=True)
 class Execution:
-    """One run by the oracle: which revision, under which isolation, and what was seen."""
+    """One run by the oracle: which revision, in which runtime, and what was seen."""
 
     revision: str
     isolation: str
+    runtime_identity: str
     observation: ProcessObservation
 
 
-@dataclass(frozen=True)
-class EvidencePolicy:
-    """Which isolation modes may produce gate-bearing evidence for a project."""
-
-    native_approved: bool = False
-
-    def admits(self, isolation: str) -> bool:
-        return isolation != "native" or self.native_approved
+def is_gate_bearing(isolation: str) -> bool:
+    return isolation in GATE_BEARING_ISOLATIONS
 
 
 class RedRejection(StrEnum):
@@ -151,7 +157,7 @@ class RedRejection(StrEnum):
     OUTPUT_OVERFLOW = "output_overflow"
     ALREADY_PASSES = "already_passes"
     UNEXPECTED_FAILURE = "unexpected_failure"
-    ISOLATION_NOT_APPROVED = "isolation_not_approved"
+    ISOLATION_NOT_ADMISSIBLE = "isolation_not_admissible"
 
 
 @dataclass(frozen=True)
@@ -170,18 +176,21 @@ class GreenVerdict:
     reason: str
 
 
-def judge_red(
-    contract: ProcessContract, execution: Execution, policy: EvidencePolicy
-) -> RedVerdict:
+def refuse_isolation(contract: ProcessContract, isolation: str) -> RedVerdict:
+    return RedVerdict(
+        RedRejection.ISOLATION_NOT_ADMISSIBLE,
+        f"{contract.contract_id}: {isolation} execution does not keep the subject away from "
+        "the recorder, so it cannot open a gate",
+    )
+
+
+def judge_red(contract: ProcessContract, execution: Execution) -> RedVerdict:
     def rejected(rejection: RedRejection, explanation: str) -> RedVerdict:
         return RedVerdict(rejection, f"{contract.contract_id}: {explanation}")
 
     observation = execution.observation
-    if not policy.admits(execution.isolation):
-        return rejected(
-            RedRejection.ISOLATION_NOT_APPROVED,
-            f"{execution.isolation} execution is not approved as evidence for this project",
-        )
+    if not is_gate_bearing(execution.isolation):
+        return refuse_isolation(contract, execution.isolation)
     if observation.ineligibility is not None:
         return rejected(
             RedRejection(observation.ineligibility.value),

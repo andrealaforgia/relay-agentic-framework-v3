@@ -41,15 +41,34 @@ class Streams:
         return [_delivery(entry) for _, entries in response for entry in entries]
 
     async def claim_abandoned(
-        self, stream: str, *, group: str, consumer: str, idle_for_ms: int, count: int = 10
+        self,
+        stream: str,
+        *,
+        group: str,
+        consumer: str,
+        idle_for_ms: int,
+        count: int = 10,
+        page_size: int = 100,
     ) -> list[Delivery]:
         """Take over deliveries another consumer received but never acknowledged."""
         await self._ensure_group(stream, group)
-        claimed: Any = await self._client.xautoclaim(
-            self._key(stream), group, consumer, min_idle_time=idle_for_ms, count=count
-        )
-        entries: list[_Entry] = claimed[1]
-        return [_delivery(entry) for entry in entries]
+        claimed_entries: list[_Entry] = []
+        cursor = "0-0"
+        while len(claimed_entries) < count:
+            # One page may hold only entries that are not idle long enough; keep scanning.
+            page: Any = await self._client.xautoclaim(
+                self._key(stream),
+                group,
+                consumer,
+                min_idle_time=idle_for_ms,
+                start_id=cursor,
+                count=min(page_size, count - len(claimed_entries)),
+            )
+            cursor = page[0]
+            claimed_entries += page[1]
+            if cursor == "0-0":
+                break
+        return [_delivery(entry) for entry in claimed_entries]
 
     async def acknowledge(self, stream: str, group: str, delivery: Delivery) -> None:
         await self._client.xack(self._key(stream), group, delivery.entry_id)

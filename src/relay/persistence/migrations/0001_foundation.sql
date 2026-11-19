@@ -1,5 +1,8 @@
 CREATE TABLE projects (
     project_id    text PRIMARY KEY,
+    -- The only source Relay will test and integrate for this project.
+    repository    text NOT NULL,
+    trunk         text NOT NULL DEFAULT 'main',
     last_sequence bigint NOT NULL DEFAULT 0,
     opened_at     timestamptz NOT NULL DEFAULT now()
 );

@@ -5,7 +5,6 @@ import pytest
 
 from relay.domain.evidence import (
     Baseline,
-    EvidencePolicy,
     Execution,
     Expected,
     Ineligibility,
@@ -28,8 +27,7 @@ CONTRACT = ProcessContract(
 
 
 def judge_red(contract: ProcessContract, observation: ProcessObservation) -> RedVerdict:
-    execution = Execution(revision="a" * 40, isolation="container", observation=observation)
-    return judge_red_execution(contract, execution, EvidencePolicy())
+    return judge_red_execution(contract, Execution("a" * 40, "container", "image", observation))
 
 
 def ran(exit_code: int, stdout: str = "", stderr: str = "") -> ProcessObservation:
@@ -148,11 +146,19 @@ def test_a_contract_is_identified_by_its_content() -> None:
     assert different.digest != CONTRACT.digest
 
 
-def test_native_execution_is_not_evidence_unless_the_project_approves_it() -> None:
-    native = Execution(revision="a" * 40, isolation="native", observation=ran(0, "100\n"))
+@pytest.mark.parametrize("isolation", ["native", "", "Container", "something-new"])
+def test_only_a_known_isolating_runtime_can_open_a_gate(isolation: str) -> None:
+    execution = Execution("a" * 40, isolation, "whatever", ran(0, "100\n"))
 
-    refused = judge_red_execution(CONTRACT, native, EvidencePolicy(native_approved=False))
-    admitted = judge_red_execution(CONTRACT, native, EvidencePolicy(native_approved=True))
+    assert (
+        judge_red_execution(CONTRACT, execution).rejection is RedRejection.ISOLATION_NOT_ADMISSIBLE
+    )
 
-    assert refused.rejection is RedRejection.ISOLATION_NOT_APPROVED
-    assert admitted.is_valid
+
+@pytest.mark.parametrize("timeout", [None, 0, -1, float("inf"), float("nan"), 301, "10", True])
+def test_a_launch_cannot_disable_or_stretch_its_deadline(timeout: object) -> None:
+    document = CONTRACT.to_dict()
+    document["launch"]["timeout_seconds"] = timeout
+
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        ProcessContract.from_dict(document)

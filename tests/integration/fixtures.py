@@ -1,35 +1,19 @@
-"""A VAT calculator whose baseline returns the net amount unchanged."""
+"""A VAT calculator whose baseline returns the net amount unchanged, in a real Git repository."""
 
 import subprocess
 from pathlib import Path
 
-from relay.domain.evidence import (
-    Baseline,
-    Execution,
-    Expected,
-    Launch,
-    ProcessContract,
-    ProcessObservation,
-)
+from relay.domain.evidence import Baseline, Expected, Launch, ProcessContract
 
 CONTRACT = ProcessContract(
     contract_id="B1-standard-rate",
     observes="the gross amount printed for a net amount at the standard rate",
-    launch=Launch(argv=("python3", "vat.py", "100")),
+    launch=Launch(argv=("python3", "vat.py", "100"), timeout_seconds=30),
     expect=Expected(exit_code=0, stdout="120\n"),
     baseline=Baseline(exit_code=0, stdout="100\n"),
 )
-BASELINE_REVISION = "b" * 40
-FAILS_AS_REGISTERED = Execution(
-    BASELINE_REVISION, "container", ProcessObservation(exit_code=0, stdout=b"100\n")
-)
-SYNTAX_ERROR = Execution(
-    BASELINE_REVISION,
-    "container",
-    ProcessObservation(exit_code=1, stderr=b"SyntaxError: invalid syntax"),
-)
-
 VAT_RETURNS_NET = "import sys\nprint(int(sys.argv[1]))\n"
+VAT_APPLIES_STANDARD_RATE = "import sys\nprint(int(sys.argv[1]) * 120 // 100)\n"
 
 
 def commit(repository: Path, files: dict[str, str]) -> str:
