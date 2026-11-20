@@ -1003,13 +1003,13 @@ async def test_a_push_that_could_not_even_be_started_is_not_a_push_to_wait_for(
     base, _ = await ready_to_integrate(world)
     real = subprocess.Popen
 
-    def no_file_descriptors_for_a_push(command: list[str], **options: Any) -> Any:
+    def no_git_for_a_push(command: list[str], **options: Any) -> Any:
         if "push" in command:
-            raise OSError(24, "Too many open files")
+            raise FileNotFoundError(2, "No such file or directory", "git")
         return real(command, **options)
 
     with monkeypatch.context() as patched:
-        patched.setattr(checkout_module.subprocess, "Popen", no_file_descriptors_for_a_push)
+        patched.setattr(checkout_module.subprocess, "Popen", no_git_for_a_push)
         receipt = await world.integrate()
     world.hook_flag("refuse").touch()
     assert receipt.outcome is Outcome.PENDING
@@ -1056,31 +1056,25 @@ async def test_a_send_whose_error_arrives_after_the_integration_was_settled_says
     assert "integration.push_unanswered" not in await world.events()
 
 
-async def test_a_failure_after_git_was_launched_keeps_the_send_unanswered(
+async def test_a_launch_that_may_have_run_git_keeps_the_send_unanswered(
     world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Git may have run and may have pushed. A later refusal must not free the project."""
+    """The launcher failed without proof that Git stayed put. Git may have pushed, so a
+    later refusal must not free the project."""
     base, _ = await ready_to_integrate(world)
+    real = subprocess.Popen
 
-    def fails_after_launch(*_: Any, **__: Any) -> None:
-        raise OSError(11, "Resource temporarily unavailable")
+    def acknowledgement_lost_for_a_push(command: list[str], **options: Any) -> Any:
+        if "push" in command:
+            raise OSError(5, "Input/output error")
+        return real(command, **options)
 
     with monkeypatch.context() as patched:
-        real = checkout_module.subprocess.Popen
-
-        def only_for_a_push(command: list[str], **options: Any) -> Any:
-            process = real(command, **options)
-            if "push" in command:
-                process.kill()  # the test must not really push; Relay cannot know that
-                process.wait()
-                patched.setattr(checkout_module, "_collect", fails_after_launch)
-            return process
-
-        patched.setattr(checkout_module.subprocess, "Popen", only_for_a_push)
-        with pytest.raises(OSError, match="temporarily unavailable"):
-            await world.integrate()
+        patched.setattr(checkout_module.subprocess, "Popen", acknowledgement_lost_for_a_push)
+        receipt = await world.integrate()
     world.hook_flag("refuse").touch()
 
+    assert receipt.outcome is Outcome.PENDING
     assert await world.integration.reconcile() == 0
 
     assert world.trunk() == base
@@ -1088,6 +1082,7 @@ async def test_a_failure_after_git_was_launched_keeps_the_send_unanswered(
     assert await world.column("SELECT sends_started - sends_resolved FROM integration_intents") == [
         1
     ]
+    assert "integration.push_not_started" not in await world.events()
 
 
 async def test_the_last_answer_to_arrive_settles_an_intent_already_refused(

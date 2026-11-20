@@ -1,12 +1,21 @@
 """A yes-or-no question to Git has three outcomes: yes, no, and no answer. Only the first
 two are answers."""
 
+import asyncio
+import os
+import threading
 from pathlib import Path
 
 import pytest
 
 from relay.git import checkout
-from relay.git.checkout import CheckoutFailed, NotStarted, git_answers_yes, git_result
+from relay.git.checkout import (
+    CheckoutFailed,
+    NotStarted,
+    RemoteUnavailable,
+    git_answers_yes,
+    git_result,
+)
 
 
 async def test_exit_zero_is_yes_and_exit_one_is_no(tmp_path: Path) -> None:
@@ -19,37 +28,58 @@ async def test_any_other_exit_is_git_failing_to_answer(tmp_path: Path) -> None:
         await git_answers_yes("-C", str(tmp_path / "not-a-repository"), "cat-file", "-e", "HEAD")
 
 
-async def test_a_git_that_could_not_be_started_is_told_apart_from_one_that_failed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def no_file_descriptors(*_: object, **__: object) -> None:
-        raise OSError(24, "Too many open files")
-
-    monkeypatch.setattr(checkout.subprocess, "Popen", no_file_descriptors)
+async def test_a_git_that_does_not_exist_never_ran(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(checkout, "_TRUSTED_GIT", ("/nonexistent/git",))
 
     with pytest.raises(NotStarted, match="could not be started"):
         await git_result("push", "somewhere")
 
 
-async def test_a_git_that_does_not_exist_never_ran(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(checkout, "_TRUSTED_GIT", ("/nonexistent/git",))
+async def test_a_failure_before_anything_is_launched_never_ran(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def no_file_descriptors(*_: object, **__: object) -> None:
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(checkout.tempfile, "TemporaryFile", no_file_descriptors)
 
     with pytest.raises(NotStarted):
         await git_result("push", "somewhere")
 
 
-async def test_a_failure_after_git_was_launched_is_never_called_not_started(
+async def test_a_launch_failure_that_does_not_prove_git_stayed_put_is_an_unknown_outcome(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Once the process exists, whatever goes wrong on this side says nothing about what
-    Git has already done."""
+    """The launcher reads an acknowledgement from the child after starting it. A failure
+    there arrives with Git possibly already running."""
 
-    def cannot_start_a_reader(*_: object, **__: object) -> None:
-        raise OSError(11, "Resource temporarily unavailable")
+    def acknowledgement_lost(*_: object, **__: object) -> None:
+        raise OSError(5, "Input/output error")
 
-    monkeypatch.setattr(checkout, "_collect", cannot_start_a_reader)
+    monkeypatch.setattr(checkout.subprocess, "Popen", acknowledgement_lost)
 
-    with pytest.raises(OSError, match="temporarily unavailable") as failure:
-        await git_result("--version")
+    with pytest.raises(RemoteUnavailable, match="may or may not have run") as failure:
+        await git_result("push", "somewhere")
 
-    assert not isinstance(failure.value, CheckoutFailed)
+    assert not isinstance(failure.value, NotStarted)
+
+
+async def test_a_git_stopped_for_taking_too_long_leaves_nothing_behind(tmp_path: Path) -> None:
+    """Its children may hold its output open for as long as they like."""
+    (tmp_path / "git-remote-slow").write_text("#!/bin/sh\nsleep 5 &\nwait\n")
+    (tmp_path / "git-remote-slow").chmod(0o755)
+    environment = dict(checkout._GIT_ENVIRONMENT)
+    environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
+    before = (threading.active_count(), len(os.listdir("/dev/fd")))
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(checkout, "_GIT_ENVIRONMENT", environment)
+        for _ in range(3):
+            with pytest.raises(RemoteUnavailable, match="no answer in time"):
+                await git_result("ls-remote", f"slow://{tmp_path.name}", timeout=0.3)
+
+    assert (threading.active_count(), len(os.listdir("/dev/fd"))) == before
+    still_running = await asyncio.create_subprocess_exec(
+        "pgrep", "-f", f"ls-remote slow://{tmp_path.name}", stdout=asyncio.subprocess.DEVNULL
+    )
+    assert await still_running.wait() == 1, "a Git that was given up on is still running"
