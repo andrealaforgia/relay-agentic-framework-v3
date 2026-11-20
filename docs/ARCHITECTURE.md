@@ -81,7 +81,10 @@ Each slice is a vertical cut with executable acceptance tests against real Postg
 | 1c | Green paired with its red: same contract, same runtime, candidate built on the red's revision and read from the Builder's attempt ref. The contract lives in PostgreSQL, so a Builder's changeset cannot alter it. Regression checks against earlier behaviours wait for slice 2, where integration first makes earlier behaviours part of trunk. | 5 (without regression) | Done |
 | 2a | QA and Sentinel review the same pinned, published candidate; findings, per-candidate verification, the gate, recovery | 6 | Accepted |
 | 2b | Integration: required checks on the exact candidate, one authorised trunk update, stale base, crash reconciliation | 5 (regression), 11 | Accepted |
-| 3 | Claude-only story to the human gate; restart at the gate | 1, 3, 8, 14 | |
+| 3a-i | Stories above behaviours; a roadmap gate and a story gate decided once, by a person, on the stored review; restart with an empty broker | 8, 14 | Accepted |
+| 3a-ii | Questions and changed decisions; corrections; pause and cancel; feature completion | 3 | Design conditions agreed |
+| 3b | Workers and the Claude adapter driving the canonical agents | 1 (in part) | |
+| 3c | CLI, the live session, packaging, usage instructions | 1 | |
 | 4 | Two providers disagree across machines; round cap escalates | 2, 7 | |
 | 5 | Lost lease, late result, unknown paid call | 10, 11 | |
 | 6 | Bounded autonomy, budgets, pause and cancel | 8, 9 | |

@@ -212,11 +212,13 @@ class TrunkWorld:
                 await asyncio.sleep(0.05)
 
     async def until_someone_waits_for_a_lock(self) -> None:
-        """Until PostgreSQL itself reports a transaction blocked behind another."""
+        """Until PostgreSQL itself reports one of this test's own transactions blocked
+        behind another. Other tests share the database, each in a schema of its own, and
+        a connection carries its schema in its application name."""
         async with asyncio.timeout(30):
             while await self.column(
                 "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
-                "AND datname = current_database()"
+                "AND application_name = 'relay:' || current_schema()"
             ) == [0]:
                 await asyncio.sleep(0.05)
 

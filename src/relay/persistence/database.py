@@ -21,6 +21,9 @@ async def open_pool(url: str, schema: str | None = None) -> AsyncIterator[Pool]:
     kwargs: dict[str, Any] = {"row_factory": dict_row}
     if schema is not None:
         kwargs["options"] = f"-c search_path={schema}"
+        # Shows in pg_stat_activity, so whoever is looking at a busy or blocked
+        # connection can tell which Relay it belongs to.
+        kwargs["application_name"] = f"relay:{schema}"
     pool: Pool = AsyncConnectionPool(url, kwargs=kwargs, open=False, min_size=1, max_size=8)
     await pool.open()
     try:
