@@ -15,10 +15,11 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from relay.application import behaviours as behaviours_module
+from relay.application import reviews as reviews_module
 from relay.application import stories as stories_module
 from relay.application.behaviours import Behaviours
 from relay.application.features import Features
-from relay.application.reviews import Reviews
+from relay.application.reviews import Reviews, SubmissionRefused
 from relay.application.stories import StoryDraft
 from relay.domain.behaviour import BehaviourState
 from relay.domain.story import ActionRefused, StoryState
@@ -35,6 +36,7 @@ from tests.integration.fixtures import (
     HeldAtABarrier,
     build_grant,
     held_at_the_barrier,
+    prepare_review,
     run_green,
 )
 from tests.integration.story_world import GREETS, STANDARD_RATE
@@ -551,3 +553,108 @@ async def test_a_refusal_names_the_question_the_story_and_the_contract_together(
             VERIFIER, PROJECT, "S1", story_revision=revision, list_revision=listed, basis=1
         )
     assert f"question {again}" in str(refused.value) and "S1 is not current" in str(refused.value)
+
+
+async def test_a_refusal_seen_by_one_publisher_does_not_undo_anothers_publication(
+    world: DecisionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One publisher is refused and sees the ref absent. Before it acts on that, another
+    publishes the candidate. The first must not then block what is published."""
+    base = await world.awaiting_builder("B1")
+    world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
+    assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
+    real_publish, real_resolve = Mirror.publish, reviews_module.resolve_ref
+    refused_once: list[bool] = []
+    other = Reviews(world.database, world.mirrors)
+
+    async def refused_the_first_time(self: Mirror, *arguments: Any) -> None:
+        if not refused_once:
+            refused_once.append(True)
+            raise RemoteRejected("[remote rejected] declined by a hook")
+        await real_publish(self, *arguments)
+
+    async def another_publishes_after_the_absent_reading(
+        repository: str, ref: str, **options: Any
+    ) -> str | None:
+        seen = await real_resolve(repository, ref, **options)
+        if refused_once == [True]:
+            refused_once.append(True)  # only after the first publisher's refusal
+            assert await other.publish_candidates() == 1
+        return seen
+
+    monkeypatch.setattr(Mirror, "publish", refused_the_first_time)
+    monkeypatch.setattr(reviews_module, "resolve_ref", another_publishes_after_the_absent_reading)
+
+    assert await world.reviews.publish_candidates() == 0
+
+    assert await world.column("SELECT publication || ':' || state FROM review_cycles") == [
+        "published:open"
+    ]
+    assert await world.state("B1") is BehaviourState.REVIEW
+    assert await world.column("SELECT state FROM assignments WHERE kind = 'review'") == [
+        "wanted",
+        "wanted",
+    ]
+
+
+@pytest.mark.parametrize("afterwards", ["the ref is right", "the ref is still wrong"])
+async def test_a_conflict_seen_while_a_decision_lands_blocks_nothing_until_it_is_seen_again(
+    world: DecisionWorld, monkeypatch: pytest.MonkeyPatch, afterwards: str
+) -> None:
+    base = await world.awaiting_builder("B1")
+    world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
+    assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
+    assert await world.reviews.publish_candidates() == 1
+    [capability] = await world.column("SELECT capability FROM review_tasks WHERE role = 'qa'")
+    assumed = await world.decisions.assume(ANALYST, PROJECT, "F1", story_id="S1", text="pounds")
+    real_resolve = reviews_module.resolve_ref
+    wrong: list[str] = []
+
+    async def moved(repository: str, ref: str, **options: Any) -> str | None:
+        if not wrong:
+            wrong.append(base)
+            await world.replace(assumed, "pence")  # lands while Git is being asked
+        return wrong[0] if "candidates" in ref else await real_resolve(repository, ref, **options)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(reviews_module, "resolve_ref", moved)
+        with pytest.raises((SubmissionRefused, ActionRefused)):
+            await prepare_review(world.reviews, str(capability), world.tmp_path / "tree")
+        assert await world.column("SELECT state FROM review_cycles") == ["open"]
+        assert await world.state("B1") is BehaviourState.REVIEW
+        await world.reconfirm_everything()
+        if afterwards == "the ref is still wrong":
+            with pytest.raises(SubmissionRefused, match="no longer names"):
+                await prepare_review(world.reviews, str(capability), world.tmp_path / "again")
+            assert await world.column("SELECT state FROM review_cycles") == ["blocked"]
+            return
+    await prepare_review(world.reviews, str(capability), world.tmp_path / "again")
+    assert await world.column("SELECT count(*) FROM review_checkouts") == [1]
+
+
+async def test_a_seal_is_refused_once_with_the_question_the_story_and_every_stale_contract(
+    world: DecisionWorld,
+) -> None:
+    await world.deliver("B1")
+    greeting = replace(CONTRACT, contract_id="B2-greeting")
+    await world.behaviours.propose(PROJECT, "S1", "B2", "a greeting", ["AC1"], basis=0)
+    await world.behaviours.begin_test_design(PROJECT, "B2")
+    await world.behaviours.register_acceptance_test(PROJECT, "B2", greeting, basis=0)
+    await decided(world)
+    again = await world.ask("S1")
+    revision, listed = await world.stories.revisions_of(PROJECT, "S1")
+
+    with pytest.raises(ActionRefused) as refused:
+        await world.stories.seal(
+            VERIFIER, PROJECT, "S1", story_revision=revision, list_revision=listed, basis=1
+        )
+
+    said = str(refused.value)
+    for reason in (
+        f"question {again}",
+        "S1 is not current",
+        "the contract of B1 is not current",
+        "the contract of B2 is not current",
+    ):
+        assert reason in said, said
+    assert said.count("S1 is not current") == 1

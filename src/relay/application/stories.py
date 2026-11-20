@@ -28,7 +28,6 @@ from relay.application.closure import (
     feature_basis,
     lock_gate,
     require_basis,
-    require_current,
     require_open,
     require_startable,
     story_basis,
@@ -215,11 +214,10 @@ class Stories:
             await lock_gate(connection, project_id)
             story = await _locked_story(connection, project_id, story_id)
             _require_at_work(story)
-            await require_startable(connection, project_id, story_id)
+            listed = await _behaviours_of(connection, project_id, story_id)
+            await _require_all_startable(connection, project_id, story_id, listed)
             _require_revisions(story, story_revision, list_revision, story["list_revision"])
             require_basis(basis, await story_basis(connection, project_id, story_id))
-            listed = await _behaviours_of(connection, project_id, story_id)
-            await _require_all_current(connection, project_id, story_id, listed)
             require_sealable(
                 story["criteria"].keys(),
                 {row["behaviour_id"]: row["demonstrates"] for row in listed},
@@ -266,19 +264,18 @@ class Stories:
             await lock_gate(connection, project_id)
             story = await _locked_story(connection, project_id, story_id)
             _require_at_work(story)
-            await require_startable(connection, project_id, story_id)
+            await _require_all_startable(
+                connection,
+                project_id,
+                story_id,
+                await _behaviours_of(connection, project_id, story_id),
+            )
             if _is_unsealed(story):
                 raise ActionRefused("only a sealed list of behaviours can be assessed")
             _require_revisions(story, story_revision, list_revision, story["sealed_revision"])
             require_basis(basis, await story_basis(connection, project_id, story_id))
             if seal != story["seal_id"]:
                 raise ActionRefused("this assessment is of a seal that is no longer the story's")
-            await _require_all_current(
-                connection,
-                project_id,
-                story_id,
-                await _behaviours_of(connection, project_id, story_id),
-            )
             if await _assessment(connection, story) is not None:
                 raise ActionRefused("this sealed list has already been assessed")
             await connection.execute(
@@ -745,13 +742,30 @@ async def _cancel(connection: Connection, project_id: str, feature_id: str) -> N
     )
 
 
-async def _require_all_current(
+async def _require_all_startable(
     connection: Connection, project_id: str, story_id: str, listed: Sequence[Mapping[str, Any]]
 ) -> None:
-    """A seal and an assessment vouch for the story and for every behaviour in its list."""
-    await require_current(connection, project_id, story_id)
-    for behaviour in listed:
-        await require_current(connection, project_id, story_id, behaviour["behaviour_id"])
+    """A seal and an assessment vouch for the story and for every behaviour in its list.
+    Refused once, with every reason: the closure, the story, each stale contract."""
+    stopped = await closure_of_story(connection, project_id, story_id)
+    if stopped == CANCELLED:
+        require_open(stopped)
+    reasons = [f"the feature is {stopped}"] if stopped else []
+    for behaviour in listed or [{"behaviour_id": None}]:
+        row = await (
+            await connection.execute(
+                "SELECT not_current(%s, %s, %s) AS why",
+                (project_id, story_id, behaviour["behaviour_id"]),
+            )
+        ).fetchone()
+        assert row is not None
+        for why in (row["why"] or "").split("; and "):
+            if why and why not in reasons:
+                reasons.append(why)
+    if reasons:
+        raise ActionRefused(
+            "; and ".join(reasons) + ": nothing is vouched for until each is cleared"
+        )
 
 
 def _require_role(principal: Principal, role: str) -> None:

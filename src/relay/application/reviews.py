@@ -753,17 +753,27 @@ class Reviews:
         return row
 
     async def _stop_publication(self, cycle: dict[str, Any], reason: str) -> None:
-        """Publication failed for good. That blocks the cycle, unless a decision of the
-        Product Owner's has meanwhile made it stale: then the cycle is the Verifier's to
-        keep or replace, and the failure is recorded and left for the next attempt."""
-        if not await self._block(cycle["cycle_id"], reason, unless_stale=True):
-            await self._defer(cycle, f"{reason}; left as it is until the cycle is reconfirmed")
+        """Publication failed for good, as this publisher saw it. That blocks the cycle
+        only if the cycle is still waiting to be published (another publisher may have
+        succeeded meanwhile) and still current (a decision may have made it the
+        Verifier's to keep or replace). Otherwise what was seen is recorded and nothing
+        is changed."""
+        if not await self._block(cycle["cycle_id"], reason, while_unpublished=True):
+            await self._defer(cycle, f"{reason}; seen, and not acted on")
 
-    async def _block(self, cycle_id: uuid.UUID, reason: str, *, unless_stale: bool = False) -> bool:
+    async def _block(
+        self, cycle_id: uuid.UUID, reason: str, *, while_unpublished: bool = False
+    ) -> bool:
         """Stop a cycle that can no longer be trusted. Locks are taken in the same order
         as a submission takes them (behaviour, then cycle), and the cycle's state is read
-        again under them, so the two cannot deadlock or overwrite each other. Returns
-        False, having changed nothing, if asked to leave a stale cycle alone and it is."""
+        again under them, so the two cannot deadlock or overwrite each other.
+
+        What a caller saw, it saw before taking these locks, and it has authority over the
+        cycle only if the cycle is still what it was looking at. A cycle that a decision
+        of the Product Owner's has made stale is left alone: it is the Verifier's to keep
+        or replace, and a real conflict will be seen again when work resumes. A publisher
+        (`while_unpublished`) also leaves alone a cycle someone else has published.
+        Returns False, having changed nothing, in those cases."""
         async with self._pool.connection() as connection, connection.transaction():
             located = await (
                 await connection.execute(
@@ -778,12 +788,21 @@ class Reviews:
                 "SELECT 1 FROM behaviours WHERE project_id = %s AND behaviour_id = %s FOR UPDATE",
                 (project_id, behaviour_id),
             )
-            if unless_stale:
-                try:
-                    await _require_current(
-                        connection, {"project_id": project_id, "behaviour_id": behaviour_id}
+            try:
+                await _require_current(
+                    connection, {"project_id": project_id, "behaviour_id": behaviour_id}
+                )
+            except ActionRefused:
+                return False
+            if while_unpublished:
+                cycle = await (
+                    await connection.execute(
+                        "SELECT publication FROM review_cycles WHERE cycle_id = %s FOR UPDATE",
+                        (cycle_id,),
                     )
-                except ActionRefused:
+                ).fetchone()
+                assert cycle is not None
+                if cycle["publication"] != "pending":
                     return False
             stopped = await (
                 await connection.execute(

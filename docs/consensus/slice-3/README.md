@@ -68,6 +68,27 @@ The build contract is `round-19-claude-3a-ii-step-2-design-v4.md`: design v3 wit
 
 What step 2 will not do, by design: change anything already in review, integrated or approved, or change a story's text or a roadmap's content. Those are corrections, step 3. Until step 3 exists, a scope stopped for such a reason stays stopped and says why.
 
+## Slice 3a-ii, step 2 as built
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 20 | CHALLENGE, 6 blocking of 9 | A reconfirmation grant accepted in another project; a story's context read under the wrong feature; a late green recorded under a later contract; a deadlock between an assumption and the first roadmap; publication ahead of reconfirmation; a reconfirmation whose follow-up was cut short |
+| 21 | CHALLENGE, 2 blocking of 5 | A spent grant acknowledging a different request; a refused publication blocking a cycle a decision had made stale |
+| 22 | CHALLENGE, 2 blocking of 3 | A late refusal blocking a cycle another publisher had published; a conflict seen while a decision lands blocking the cycle |
+
+Seventeen findings, all reachable through a real entry point, all fixed with a test that fails without the fix. The fixes for round 22 are in `round-23-claude-3a-ii-step-2-closing.md` and were **not reviewed by Astra**, as D-8 provides.
+
+Six departures from design v4 are listed in `round-20-claude-3a-ii-step-2-submission.md`. Astra accepted them, two of them only once a grant was bound to its project (round 20, finding 1).
+
+Reservations carried forward:
+
+- **Step 2 cannot change what is already in review, integrated or approved, nor a story's text or a roadmap's content.** A decision that requires such a change leaves its scope stopped until the owner reconfirms or the feature is cancelled. That is step 3.
+- **Races are tested inside one process**, by making the interleaving happen with a stand-in at the Git call or a held lock. No test runs two control-plane processes against each other.
+- **A stale cycle is never blocked by something seen about its candidate ref.** It cannot be reviewed or integrated while stale, and a real conflict blocks it when work resumes.
+- The round 22 fixes have had no second pair of eyes.
+
+What this step showed: I wrote the largest increment's code before its tests, and it showed twice. Deliberate breakage caught only 29 of 52 cases at first, against 25 of 27 for the increment I had written test-first. And Astra's first round found six blocking defects in it, including a grant that worked across projects, which no test of mine had two projects to notice. From round 20 on every fix was test-first.
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.
