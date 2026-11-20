@@ -5,7 +5,10 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from relay.application.behaviours import Behaviours
+from relay.application.stories import Stories, StoryDraft
 from relay.domain.evidence import Baseline, Expected, Launch, ProcessContract
+from relay.domain.story import HumanAction, Principal, PrincipalKind
 from relay.testing.oracle import Isolation, Run
 
 CONTRACT = ProcessContract(
@@ -126,3 +129,32 @@ async def held_at_the_barrier(run: asyncio.Task[Any], barrier: HeldAtABarrier) -
     if not reached.done():
         reached.cancel()
         raise AssertionError("the run ended before reaching the barrier") from run.exception()
+
+
+PRODUCT_OWNER = Principal(PrincipalKind.HUMAN, "product-owner")
+ANALYST = Principal(PrincipalKind.WORKER, "worker-analyst", role="analyst")
+VERIFIER = Principal(PrincipalKind.WORKER, "worker-verifier", role="verifier")
+
+
+async def in_a_story(behaviours: Behaviours, project: str) -> None:
+    """The shortest real route to somewhere a behaviour can live: a feature, a one-story
+    roadmap the Product Owner approves, and so story S1 released with criterion AC1."""
+    stories = Stories(behaviours._pool)
+    await stories.open_feature(PRODUCT_OWNER, project, "F1", "prices must include VAT")
+    story = StoryDraft("S1", "Standard rate", "a gross price is shown", {"AC1": "120 for 100"})
+    gate = await stories.publish_roadmap(ANALYST, project, "F1", [story])
+    await stories.decide(HumanAction(PRODUCT_OWNER, f"approve-{gate}", str(gate), "approve"))
+    # The notice that the roadmap was waiting has done its job. Tests that count what is
+    # still to be sent are counting what their own behaviour caused.
+    async with behaviours._pool.connection() as connection:
+        await connection.execute(
+            "UPDATE outbox SET published_at = now() WHERE stream LIKE %s", ("%:inbox:%",)
+        )
+
+
+STORY_SET_UP = [
+    "feature.opened",
+    "roadmap.gate_opened",
+    "gate.approved",
+    "story.released",
+]

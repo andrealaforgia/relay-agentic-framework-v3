@@ -27,6 +27,7 @@ from tests.integration.fixtures import (
     HeldAtABarrier,
     commit,
     held_at_the_barrier,
+    in_a_story,
     publish_attempt,
     publish_tag_as_attempt,
 )
@@ -43,7 +44,8 @@ async def released_to_builder(
         database, repository.parent / "mirrors", ProcessOracle(ContainerIsolation(runner_image))
     )
     await behaviours.open_project(PROJECT, str(repository))
-    await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
+    await in_a_story(behaviours, PROJECT)
+    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
     await behaviours.begin_test_design(PROJECT, "B1")
     await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
@@ -179,7 +181,8 @@ async def test_green_cannot_be_run_before_red(
         database, tmp_path / "mirrors", ProcessOracle(ContainerIsolation(runner_image))
     )
     await behaviours.open_project(PROJECT, str(repository))
-    await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
+    await in_a_story(behaviours, PROJECT)
+    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
     await behaviours.begin_test_design(PROJECT, "B1")
     await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
     publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=trunk)
@@ -246,7 +249,8 @@ async def test_another_projects_candidate_on_the_same_repository_is_not_this_pro
     repository = tmp_path / "subject"
     behaviours, red_revision = await released_to_builder(database, repository, runner_image)
     await behaviours.open_project("other-team", str(repository))
-    await behaviours.propose("other-team", "B1", "standard VAT rate is applied")
+    await in_a_story(behaviours, "other-team")
+    await behaviours.propose("other-team", "S1", "B1", "standard VAT rate is applied", ["AC1"])
     await behaviours.begin_test_design("other-team", "B1")
     await behaviours.register_acceptance_test("other-team", "B1", CONTRACT)
     assert (await behaviours.run_red("other-team", "B1")).is_valid
@@ -275,7 +279,8 @@ async def test_a_candidate_that_hangs_is_reported_as_a_timeout(
         database, tmp_path / "mirrors", ProcessOracle(ContainerIsolation(runner_image))
     )
     await behaviours.open_project(PROJECT, str(repository))
-    await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
+    await in_a_story(behaviours, PROJECT)
+    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
     await behaviours.begin_test_design(PROJECT, "B1")
     await behaviours.register_acceptance_test(PROJECT, "B1", quick)
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
@@ -403,7 +408,8 @@ async def test_a_red_in_flight_when_the_red_is_reopened_cannot_fill_the_new_cycl
         database, tmp_path / "mirrors", ProcessOracle(ContainerIsolation(runner_image))
     )
     await behaviours.open_project(PROJECT, str(repository))
-    await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
+    await in_a_story(behaviours, PROJECT)
+    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
     await behaviours.begin_test_design(PROJECT, "B1")
     await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
     held = HeldAtABarrier(ContainerIsolation(runner_image))
@@ -493,7 +499,8 @@ async def test_a_red_released_after_the_replacement_red_was_accepted_is_still_re
         database, tmp_path / "mirrors", ProcessOracle(ContainerIsolation(runner_image))
     )
     await behaviours.open_project(PROJECT, str(repository))
-    await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
+    await in_a_story(behaviours, PROJECT)
+    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
     await behaviours.begin_test_design(PROJECT, "B1")
     await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
     held = HeldAtABarrier(ContainerIsolation(runner_image))

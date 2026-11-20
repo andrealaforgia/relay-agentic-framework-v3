@@ -32,6 +32,7 @@ from tests.integration.fixtures import (
     VAT_APPLIES_STANDARD_RATE,
     VAT_RETURNS_NET,
     commit,
+    in_a_story,
     publish_attempt,
 )
 
@@ -65,7 +66,8 @@ class World:
     async def release_to_builder(self) -> None:
         self.red_revision = commit(self.repository, {"vat.py": VAT_RETURNS_NET})
         await self.behaviours.open_project(PROJECT, str(self.repository))
-        await self.behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
+        await in_a_story(self.behaviours, PROJECT)
+        await self.behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
         await self.behaviours.begin_test_design(PROJECT, "B1")
         await self.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
         assert (await self.behaviours.run_red(PROJECT, "B1")).is_valid
@@ -786,7 +788,10 @@ async def test_one_projects_unreachable_repository_does_not_hold_up_another(
     second.behaviours = first.behaviours
     second_trunk = commit(second.repository, {"vat.py": VAT_RETURNS_NET})
     await first.behaviours.open_project("other-project", str(second.repository))
-    await first.behaviours.propose("other-project", "B1", "standard VAT rate is applied")
+    await in_a_story(first.behaviours, "other-project")
+    await first.behaviours.propose(
+        "other-project", "S1", "B1", "standard VAT rate is applied", ["AC1"]
+    )
     await first.behaviours.begin_test_design("other-project", "B1")
     await first.behaviours.register_acceptance_test("other-project", "B1", CONTRACT)
     assert (await first.behaviours.run_red("other-project", "B1")).is_valid
@@ -940,7 +945,10 @@ async def test_one_unreadable_legacy_mirror_does_not_stop_adoption_for_another_p
     other_repository = tmp_path / "second" / "subject"
     other_trunk = commit(other_repository, {"vat.py": VAT_RETURNS_NET})
     await first.behaviours.open_project("other-project", str(other_repository))
-    await first.behaviours.propose("other-project", "B1", "standard VAT rate is applied")
+    await in_a_story(first.behaviours, "other-project")
+    await first.behaviours.propose(
+        "other-project", "S1", "B1", "standard VAT rate is applied", ["AC1"]
+    )
     await first.behaviours.begin_test_design("other-project", "B1")
     await first.behaviours.register_acceptance_test("other-project", "B1", CONTRACT)
     assert (await first.behaviours.run_red("other-project", "B1")).is_valid

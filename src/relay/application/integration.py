@@ -26,6 +26,7 @@ from relay.application.behaviours import (
     save_behaviour,
 )
 from relay.application.reviews import gate_of
+from relay.application.stories import evaluate_story_gate, require_story_at_work
 from relay.domain.behaviour import Behaviour, BehaviourState
 from relay.domain.evidence import CheckContract, Execution, ProcessContract, is_gate_bearing
 from relay.domain.identifiers import require_identifier
@@ -225,6 +226,7 @@ class Integration:
             behaviour, row = await _locked_behaviour(connection, project_id, behaviour_id)
             answer_again = await _batch_of_request(connection, project_id, behaviour_id, request_id)
             if answer_again is None:
+                await require_story_at_work(connection, project_id, row, entering_design=False)
                 cycle = await _live_cycle(connection, project_id, behaviour_id)
                 if (
                     behaviour.state is not BehaviourState.REVIEW
@@ -708,6 +710,9 @@ class Integration:
                 },
                 correlation_id=row["correlation_id"],
             )
+            # The last behaviour of a sealed list reaching trunk is what opens its
+            # story's gate, here, in the transaction that records it.
+            await evaluate_story_gate(connection, intent["project_id"], row["story_id"])
             return IntegrationReceipt(Outcome.INTEGRATED, intent["batch_id"])
 
     async def _refused(

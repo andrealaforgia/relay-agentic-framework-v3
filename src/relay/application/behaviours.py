@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import tempfile
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -13,6 +13,7 @@ from typing import Any
 from psycopg.types.json import Jsonb
 
 from relay.application.reviews import open_cycle
+from relay.application.stories import add_behaviour_to_story, require_story_at_work
 from relay.domain.behaviour import Behaviour, BehaviourState
 from relay.domain.evidence import (
     Execution,
@@ -54,38 +55,78 @@ class Behaviours:
     def _mirror(self, project_id: str) -> Mirror:
         return Mirror(self._mirrors / f"{require_identifier('project', project_id)}.git")
 
-    async def open_project(self, project_id: str, repository: str, trunk: str = "main") -> None:
+    async def open_project(
+        self,
+        project_id: str,
+        repository: str,
+        trunk: str = "main",
+        *,
+        behaviours_in_order: bool = True,
+    ) -> None:
+        """`behaviours_in_order` is the specification's default of one piece of
+        implementation work at a time: a behaviour waits for the ones before it in its
+        story to be integrated."""
         async with self._pool.connection() as connection, connection.transaction():
             await connection.execute(
-                "INSERT INTO projects (project_id, repository, trunk) VALUES (%s, %s, %s)",
+                "INSERT INTO projects (project_id, repository, trunk, behaviours_in_order) "
+                "VALUES (%s, %s, %s, %s)",
                 (
                     require_identifier("project", project_id),
                     canonical_repository(repository),
                     trunk,
+                    behaviours_in_order,
                 ),
             )
             await append_event(connection, project_id, "project.opened", payload={"trunk": trunk})
 
-    async def propose(self, project_id: str, behaviour_id: str, summary: str) -> None:
+    async def propose(
+        self,
+        project_id: str,
+        story_id: str,
+        behaviour_id: str,
+        summary: str,
+        demonstrates: Sequence[str],
+    ) -> None:
+        """Add a behaviour to a story that is being worked on, naming the acceptance
+        criteria it will demonstrate. There is no behaviour without a story."""
         behaviour = Behaviour.propose(behaviour_id, summary)
         correlation_id = uuid.uuid7()
         async with self._pool.connection() as connection, connection.transaction():
+            position = await add_behaviour_to_story(connection, project_id, story_id, demonstrates)
             await connection.execute(
-                "INSERT INTO behaviours (project_id, behaviour_id, summary, state, correlation_id) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (project_id, behaviour_id, summary, behaviour.state.value, correlation_id),
+                "INSERT INTO behaviours (project_id, behaviour_id, summary, state, "
+                "correlation_id, story_id, position, demonstrates) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    project_id,
+                    behaviour_id,
+                    summary,
+                    behaviour.state.value,
+                    correlation_id,
+                    story_id,
+                    position,
+                    list(demonstrates),
+                ),
             )
             await append_event(
                 connection,
                 project_id,
                 "behaviour.proposed",
                 subject_id=behaviour_id,
-                payload={"summary": summary},
+                payload={
+                    "summary": summary,
+                    "story_id": story_id,
+                    "demonstrates": list(demonstrates),
+                },
                 correlation_id=correlation_id,
             )
 
     async def begin_test_design(self, project_id: str, behaviour_id: str) -> None:
-        async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
+        async with self._changing(project_id, behaviour_id, starts="design") as (
+            connection,
+            behaviour,
+            correlation,
+        ):
             behaviour.begin_test_design()
             await append_event(
                 connection,
@@ -98,7 +139,11 @@ class Behaviours:
     async def register_acceptance_test(
         self, project_id: str, behaviour_id: str, contract: ProcessContract
     ) -> None:
-        async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
+        async with self._changing(project_id, behaviour_id, starts="work") as (
+            connection,
+            behaviour,
+            correlation,
+        ):
             behaviour.register_acceptance_test(contract)
             await append_event(
                 connection,
@@ -116,7 +161,11 @@ class Behaviours:
         source nor the observation: Relay reads the trunk head itself, launches the subject
         itself, and records the run, the verdict and any release in one transaction.
         """
-        async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
+        async with self._changing(project_id, behaviour_id, starts="work") as (
+            connection,
+            behaviour,
+            correlation,
+        ):
             contract = behaviour.require_awaiting_red()
             cycle = behaviour.red_cycle
             isolation = self._oracle.isolation
@@ -197,7 +246,11 @@ class Behaviours:
         project's own repository, checks it was built on the revision the red was observed
         on, launches it itself and pairs the result with that red.
         """
-        async with self._changing(project_id, behaviour_id) as (connection, behaviour, _):
+        async with self._changing(project_id, behaviour_id, starts="work") as (
+            connection,
+            behaviour,
+            _,
+        ):
             contract = behaviour.require_awaiting_green()
             isolation = self._oracle.isolation
             repository, _ = await source_of(connection, project_id)
@@ -388,9 +441,14 @@ class Behaviours:
 
     @asynccontextmanager
     async def _changing(
-        self, project_id: str, behaviour_id: str
+        self, project_id: str, behaviour_id: str, starts: str | None = None
     ) -> AsyncIterator[tuple[Connection, Behaviour, uuid.UUID]]:
-        """Lock the behaviour, let the caller change it, and save it in the same transaction."""
+        """Lock the behaviour, let the caller change it, and save it in the same transaction.
+
+        `starts` marks an operation that begins something new on the behaviour ("design"
+        for entering test design, "work" for anything after): it is refused unless the
+        behaviour's story is being worked on. Recording what an operation already in
+        flight observed is never refused."""
         async with self._pool.connection() as connection, connection.transaction():
             row = await (
                 await connection.execute(
@@ -401,6 +459,10 @@ class Behaviours:
             ).fetchone()
             if row is None:
                 raise LookupError(f"unknown behaviour {behaviour_id!r} in project {project_id!r}")
+            if starts is not None:
+                await require_story_at_work(
+                    connection, project_id, row, entering_design=starts == "design"
+                )
             behaviour = load_behaviour(row)
             yield connection, behaviour, row["correlation_id"]
             await save_behaviour(connection, project_id, behaviour)

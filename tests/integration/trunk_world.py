@@ -18,7 +18,12 @@ from relay.domain.evidence import Baseline, CheckContract, Expected, Launch, Pro
 from relay.persistence.ledger import read_events
 from relay.persistence.outbox import pending_messages
 from relay.testing.oracle import ContainerIsolation, Isolation, ProcessOracle
-from tests.integration.fixtures import CONTRACT, VAT_APPLIES_STANDARD_RATE, VAT_RETURNS_NET
+from tests.integration.fixtures import (
+    CONTRACT,
+    VAT_APPLIES_STANDARD_RATE,
+    VAT_RETURNS_NET,
+    in_a_story,
+)
 
 PROJECT = "vat-calculator"
 TRUNK = "refs/heads/main"
@@ -102,7 +107,11 @@ class TrunkWorld:
         self.git("remote", "add", "origin", str(self.remote))
         self.advance_trunk({"README": "a VAT calculator\n"})
         base = self.advance_trunk({"vat.py": VAT_RETURNS_NET})
-        await self.behaviours.open_project(self.project, address or str(self.remote))
+        # These tests put several behaviours in flight together, which the default forbids.
+        await self.behaviours.open_project(
+            self.project, address or str(self.remote), behaviours_in_order=False
+        )
+        await in_a_story(self.behaviours, self.project)
         return base
 
     def advance_trunk(self, files: dict[str, str]) -> str:
@@ -127,7 +136,7 @@ class TrunkWorld:
         self, behaviour: str = "B1", contract: ProcessContract = CONTRACT
     ) -> str:
         """A behaviour with a verified red on the current trunk. Returns that revision."""
-        await self.behaviours.propose(self.project, behaviour, contract.observes)
+        await self.behaviours.propose(self.project, "S1", behaviour, contract.observes, ["AC1"])
         await self.behaviours.begin_test_design(self.project, behaviour)
         await self.behaviours.register_acceptance_test(self.project, behaviour, contract)
         assert (await self.behaviours.run_red(self.project, behaviour)).is_valid

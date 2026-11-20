@@ -31,10 +31,12 @@ from relay.testing.oracle import (
 )
 from tests.integration.fixtures import (
     CONTRACT,
+    STORY_SET_UP,
     VAT_APPLIES_STANDARD_RATE,
     VAT_RETURNS_NET,
     CountingLaunches,
     commit,
+    in_a_story,
 )
 
 PROJECT = "vat-calculator"
@@ -58,7 +60,8 @@ async def awaiting_red(
 ) -> Behaviours:
     behaviours = Behaviours(database, repository.parent / "mirrors", ProcessOracle(isolation))
     await behaviours.open_project(PROJECT, str(repository))
-    await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
+    await in_a_story(behaviours, PROJECT)
+    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
     await behaviours.begin_test_design(PROJECT, "B1")
     await behaviours.register_acceptance_test(PROJECT, "B1", contract)
     return behaviours
@@ -239,7 +242,8 @@ async def test_a_failed_checkout_is_on_the_ledger_and_the_builder_stays_blocked(
     container = CountingLaunches(ContainerIsolation(runner_image))
     behaviours = Behaviours(database, tmp_path / "mirrors", ProcessOracle(container))
     await behaviours.open_project(PROJECT, str(tmp_path / "subject"), trunk="no-such-branch")
-    await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
+    await in_a_story(behaviours, PROJECT)
+    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
     await behaviours.begin_test_design(PROJECT, "B1")
     await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
 
@@ -269,6 +273,7 @@ async def test_the_ledger_is_gap_free_and_in_order(
     assert [event.sequence for event in events] == list(range(1, len(events) + 1))
     assert [event.event_type for event in events] == [
         "project.opened",
+        *STORY_SET_UP,
         "behaviour.proposed",
         "behaviour.test_design_started",
         "behaviour.acceptance_test_registered",
@@ -408,12 +413,16 @@ async def test_a_behaviour_id_relay_could_never_build_is_refused_when_proposed(
 ) -> None:
     behaviours = Behaviours(database, tmp_path / "mirrors", ProcessOracle(NativeIsolation()))
     await behaviours.open_project(PROJECT, str(tmp_path / "subject"))
+    await in_a_story(behaviours, PROJECT)
 
     with pytest.raises(ValueError, match="behaviour id"):
-        await behaviours.propose(PROJECT, behaviour_id, "standard VAT rate is applied")
+        await behaviours.propose(
+            PROJECT, "S1", behaviour_id, "standard VAT rate is applied", ["AC1"]
+        )
 
     assert [event.event_type for event in await read_events(database, PROJECT)] == [
-        "project.opened"
+        "project.opened",
+        *STORY_SET_UP,
     ]
 
 
