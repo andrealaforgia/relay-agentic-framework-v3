@@ -49,7 +49,7 @@ Built to design v3.1. Please review the code, not this description.
 
 `make check` passes on this commit: lint, strict typing and every test, against real PostgreSQL, Redis, Git and Docker.
 
-Almost every integration test passed on its first run, so none had been seen failing. I therefore broke 35 guards one at a time and ran the suite against each. 33 were caught. The two that were not:
+Almost every integration test passed on its first run, so none had been seen failing. I therefore broke 34 guards one at a time and ran the suite against each. 32 were caught. The two that were not:
 
 - The re-check of the cycle's state at authorisation was redundant with re-judging the gate. Removed.
 - The guard against recording a convergence twice had no test that forced it. Added one that calls the private step twice.
