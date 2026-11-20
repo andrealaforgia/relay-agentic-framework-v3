@@ -28,29 +28,16 @@ from relay.testing.oracle import (
     Isolation,
     NativeIsolation,
     ProcessOracle,
-    Run,
 )
 from tests.integration.fixtures import (
     CONTRACT,
     VAT_APPLIES_STANDARD_RATE,
     VAT_RETURNS_NET,
+    CountingLaunches,
     commit,
 )
 
 PROJECT = "vat-calculator"
-
-
-class CountingLaunches:
-    """Wraps an isolation and counts how often a subject was actually launched."""
-
-    def __init__(self, isolation: Isolation) -> None:
-        self._isolation = isolation
-        self.name = isolation.name
-        self.launches = 0
-
-    async def run(self, workdir: Path, launch: Launch, capture_limit: int) -> Run:
-        self.launches += 1
-        return await self._isolation.run(workdir, launch, capture_limit)
 
 
 def resolved_image_id(image: str) -> str:
@@ -118,13 +105,15 @@ async def test_the_evidence_is_recorded_with_what_produced_it(
     assert verified.payload["revision"] == trunk
     assert verified.payload["contract_digest"] == CONTRACT.digest
     assert verified.payload["isolation"] == "container"
-    assert verified.payload["runtime_identity"] == resolved_image_id(runner_image)
+    assert verified.payload["runtime_identity"].startswith(
+        resolved_image_id(runner_image) + ";settings="
+    )
     async with database.connection() as connection:
         execution = await (await connection.execute("SELECT * FROM executions")).fetchone()
     assert execution is not None
     assert str(execution["execution_id"]) == verified.payload["execution_id"]
     assert (execution["purpose"], execution["revision"]) == ("red", trunk)
-    assert execution["runtime_identity"] == resolved_image_id(runner_image)
+    assert execution["runtime_identity"] == verified.payload["runtime_identity"]
     assert (execution["exit_code"], bytes(execution["stdout"])) == (0, b"100\n")
 
 
@@ -409,3 +398,27 @@ async def test_a_failure_does_not_copy_the_repository_address_into_the_ledger(
     assert failed.event_type == "behaviour.red_preparation_failed"
     assert "canary-address" not in failed.payload["reason"]
     assert "canary-address" not in str(failure.value)
+
+
+@pytest.mark.parametrize("behaviour_id", ["checkout/VAT", "", "-B1", "B 1", "x" * 65])
+async def test_a_behaviour_id_relay_could_never_build_is_refused_when_proposed(
+    database: AsyncConnectionPool, tmp_path: Path, behaviour_id: str
+) -> None:
+    behaviours = Behaviours(database, ProcessOracle(NativeIsolation()))
+    await behaviours.open_project(PROJECT, str(tmp_path / "subject"))
+
+    with pytest.raises(ValueError, match="behaviour id"):
+        await behaviours.propose(PROJECT, behaviour_id, "standard VAT rate is applied")
+
+    assert [event.event_type for event in await read_events(database, PROJECT)] == [
+        "project.opened"
+    ]
+
+
+async def test_a_project_id_that_could_reshape_a_ref_is_refused(
+    database: AsyncConnectionPool, tmp_path: Path
+) -> None:
+    behaviours = Behaviours(database, ProcessOracle(NativeIsolation()))
+
+    with pytest.raises(ValueError, match="project id"):
+        await behaviours.open_project("vat/../../heads", str(tmp_path / "subject"))

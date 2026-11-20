@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import os
 import shutil
 import signal
@@ -91,6 +92,22 @@ class ContainerIsolation:
     host's environment or Docker client configuration."""
 
     name = "container"
+    # Fixed on purpose, including the user: nothing here may vary with the host or the
+    # account the supervisor runs under.
+    settings: tuple[str, ...] = (
+        # An init process, so the subject is not PID 1 (which ignores signals) and a
+        # death by signal is reported as one.
+        "--init",
+        "--network", "none",
+        "--read-only",
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges",
+        "--pids-limit", "256",
+        "--memory", "512m",
+        "--cpus", "1",
+        "--user", "65534:65534",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+    )  # fmt: skip
 
     def __init__(self, image: str) -> None:
         if "@sha256:" not in image:
@@ -107,24 +124,18 @@ class ContainerIsolation:
             await self._remove(container)
 
     async def _run(self, container: str, workdir: Path, launch: Launch, capture_limit: int) -> Run:
+        # The subject runs as a fixed unprivileged user, the same on every runner host,
+        # so it must be able to read a checkout made by whoever runs the supervisor.
+        if workdir.is_dir():
+            await asyncio.to_thread(_make_world_readable, workdir)
+        log_limit = max(capture_limit * 2, 1024 * 1024)
         created = await self._docker(
             "create", "--interactive", "--name", container,
-            # An init process, so the subject is not PID 1 (which ignores signals) and a
-            # death by signal is reported as one.
-            "--init",
-            "--network", "none",
-            "--read-only",
-            "--cap-drop", "ALL",
-            "--security-opt", "no-new-privileges",
-            "--pids-limit", "256",
-            "--memory", "512m",
-            "--cpus", "1",
-            "--user", f"{os.getuid()}:{os.getgid()}",
-            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+            *self.settings,
             # Bound what the engine stores of the subject's output; a rotated log no longer
             # matches the attached capture, so such a run is refused rather than trusted.
             "--log-driver", "json-file",
-            "--log-opt", f"max-size={max(capture_limit * 2, 1024 * 1024)}",
+            "--log-opt", f"max-size={log_limit}",
             "--log-opt", "max-file=1",
             # --mount, unlike --volume, fails when the source is missing instead of
             # creating an empty directory and running against that.
@@ -136,8 +147,12 @@ class ContainerIsolation:
         if created.exit_code != 0:
             return Run(
                 ProcessObservation(stderr=created.stderr, ineligibility=Ineligibility.NOT_EXECUTED),
-                self.image,
+                self._identity(self.image, log_limit),
             )
+        created_state = await self._state(container)
+        identity = self._identity(
+            created_state.image_id if created_state else self.image, log_limit
+        )
         # Attaching delivers standard input and waits for the subject to finish. What the
         # subject wrote is then read back from the engine, a second and independent capture.
         attached = await self._docker(
@@ -147,13 +162,17 @@ class ContainerIsolation:
             capture_limit=capture_limit,
         )  # fmt: skip
         if attached.timed_out:
-            return Run(ProcessObservation(ineligibility=Ineligibility.TIMED_OUT), self.image)
+            return Run(ProcessObservation(ineligibility=Ineligibility.TIMED_OUT), identity)
         state = await self._state(container)
         logged = await self._docker("logs", container, capture_limit=capture_limit)
-        return Run(
-            reconcile_container_run(attached, logged, state),
-            state.image_id if state else self.image,
-        )
+        return Run(reconcile_container_run(attached, logged, state), identity)
+
+    def _identity(self, image: str, log_limit: int) -> str:
+        """Everything about the runtime that could change what a subject does: the resolved,
+        platform-specific image and the settings the container was created with. A red and a
+        green are comparable only when this is the same for both."""
+        settings = hashlib.sha256(repr((self.settings, log_limit)).encode()).hexdigest()[:16]
+        return f"{image};settings={settings}"
 
     async def _state(self, container: str) -> ContainerState | None:
         inspected = await self._docker(
@@ -222,6 +241,15 @@ def reconcile_container_run(
 
 
 _TRUSTED_DIRECTORY = Path("/")
+
+
+def _make_world_readable(directory: Path) -> None:
+    for root, _, files in os.walk(directory):
+        os.chmod(root, os.stat(root).st_mode | 0o555)
+        for name in files:
+            path = os.path.join(root, name)
+            if not os.path.islink(path):
+                os.chmod(path, os.stat(path).st_mode | 0o444)
 
 
 def _trusted_path() -> str:

@@ -236,3 +236,18 @@ def test_a_green_rejection_explains_itself() -> None:
 
     assert verdict.rejection is GreenRejection.EXPECTATION_NOT_MET
     assert "B1-standard-rate" in verdict.reason
+
+
+def test_a_timed_out_candidate_is_reported_as_a_timeout_even_if_the_runtime_looks_different() -> (
+    None
+):
+    timed_out = Execution(
+        CANDIDATE,
+        "container",
+        "an-identity-that-could-not-be-resolved",
+        ProcessObservation(ineligibility=Ineligibility.TIMED_OUT),
+    )
+
+    verdict = judge_green_execution(CONTRACT, timed_out, RED, candidate_descends_from_red=True)
+
+    assert verdict.rejection is GreenRejection.TIMED_OUT

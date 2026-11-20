@@ -8,6 +8,8 @@ import shutil
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from relay.domain.identifiers import require_identifier
+
 _FULL_COMMIT_HASH = re.compile(r"[0-9a-f]{40}")
 _BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 _URL_USERINFO = re.compile(r"//[^/@\s]+@")
@@ -54,17 +56,21 @@ async def trunk_head(repository: str, trunk: str) -> str:
     return await _resolve(repository, f"refs/heads/{trunk}", f"branch {trunk!r}")
 
 
-def attempt_ref(behaviour_id: str, attempt: int) -> str:
-    """Where a Builder publishes the candidate for one attempt at one behaviour."""
-    if not _BRANCH_NAME.fullmatch(behaviour_id) or "/" in behaviour_id:
-        raise CheckoutFailed(f"not usable in a ref name: {behaviour_id!r}")
+def attempt_ref(project_id: str, behaviour_id: str, attempt: int) -> str:
+    """Where a Builder publishes the candidate for one attempt at one behaviour of one
+    project. The project is part of the name: several projects may share a repository."""
+    try:
+        require_identifier("project", project_id)
+        require_identifier("behaviour", behaviour_id)
+    except ValueError as invalid:
+        raise CheckoutFailed(f"not usable in a ref name: {invalid}") from None
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
         raise CheckoutFailed("an attempt is a positive whole number")
-    return f"refs/relay/attempts/{behaviour_id}/{attempt}"
+    return f"refs/relay/attempts/{project_id}/{behaviour_id}/{attempt}"
 
 
-async def attempt_head(repository: str, behaviour_id: str, attempt: int) -> str:
-    ref = attempt_ref(behaviour_id, attempt)
+async def attempt_head(repository: str, project_id: str, behaviour_id: str, attempt: int) -> str:
+    ref = attempt_ref(project_id, behaviour_id, attempt)
     return await _resolve(repository, ref, f"candidate for attempt {attempt} of {behaviour_id}")
 
 
@@ -94,8 +100,14 @@ async def candidate_checkout(
     await _git("-C", str(into), "fetch", "--quiet", "origin", ref, redact=repository)
     if await _git("-C", str(into), "rev-parse", "FETCH_HEAD") != revision:
         raise CheckoutFailed("the candidate moved while it was being fetched")
+    # A ref may point at a tag object; checking that out would run the tagged commit
+    # while the evidence named the tag. Only a commit is a candidate.
+    if await _git("-C", str(into), "cat-file", "-t", revision) != "commit":
+        raise CheckoutFailed("the candidate is not a commit")
     descends = await _succeeds("-C", str(into), "merge-base", "--is-ancestor", built_on, revision)
     await _git("-C", str(into), "checkout", "--quiet", "--detach", revision)
+    if await _git("-C", str(into), "rev-parse", "HEAD") != revision:
+        raise CheckoutFailed("the checked-out revision is not the candidate")
     shutil.rmtree(into / ".git")
     return into, descends
 

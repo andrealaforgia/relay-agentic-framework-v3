@@ -354,6 +354,61 @@ async def test_the_engine_is_told_to_bound_what_it_stores_of_the_subjects_output
     }
 
 
+async def test_the_subject_runs_as_the_same_fixed_user_whoever_runs_the_supervisor(
+    tmp_path: Path, runner_image: str
+) -> None:
+    whoami = "import os\nprint(os.getuid(), os.getgid())\n"
+    revision = commit(tmp_path / "subject", {"id.py": whoami})
+    workdir = await pristine_checkout(str(tmp_path / "subject"), revision, tmp_path / "checkout")
+
+    observation = await ProcessOracle(ContainerIsolation(runner_image)).observe(
+        workdir, Launch(argv=("python3", "id.py"), timeout_seconds=30)
+    )
+
+    assert observation.stdout == b"65534 65534\n"
+    assert os.getuid() != 65534
+
+
+async def test_different_container_settings_give_a_different_runtime_identity(
+    tmp_path: Path, runner_image: str
+) -> None:
+    class MoreMemory(ContainerIsolation):
+        settings = tuple(
+            "1g" if setting == "512m" else setting for setting in ContainerIsolation.settings
+        )
+
+    revision = commit(tmp_path / "subject", {"vat.py": VAT_RETURNS_NET})
+    workdir = await pristine_checkout(str(tmp_path / "subject"), revision, tmp_path / "checkout")
+    launch = Launch(argv=("python3", "vat.py", "1"), timeout_seconds=30)
+
+    usual = await ContainerIsolation(runner_image).run(workdir, launch, 1_000_000)
+    again = await ContainerIsolation(runner_image).run(workdir, launch, 1_000_000)
+    different = await MoreMemory(runner_image).run(workdir, launch, 1_000_000)
+
+    assert usual.runtime_identity == again.runtime_identity
+    assert usual.runtime_identity != different.runtime_identity
+    assert usual.runtime_identity.split(";")[0] == different.runtime_identity.split(";")[0]
+
+
+async def test_a_timed_out_run_still_reports_the_runtime_it_ran_in(
+    tmp_path: Path, runner_image: str
+) -> None:
+    revision = commit(
+        tmp_path / "subject",
+        {"vat.py": VAT_RETURNS_NET, "hang.py": "import time\ntime.sleep(60)\n"},
+    )
+    workdir = await pristine_checkout(str(tmp_path / "subject"), revision, tmp_path / "checkout")
+    isolation = ContainerIsolation(runner_image)
+
+    completed = await isolation.run(workdir, Launch(argv=("python3", "vat.py", "1")), 1_000_000)
+    timed_out = await isolation.run(
+        workdir, Launch(argv=("python3", "hang.py"), timeout_seconds=2), 1_000_000
+    )
+
+    assert timed_out.observation.ineligibility is Ineligibility.TIMED_OUT
+    assert timed_out.runtime_identity == completed.runtime_identity
+
+
 def test_an_unpinned_image_is_refused() -> None:
     with pytest.raises(ValueError, match="pinned by digest"):
         ContainerIsolation("python:3.14-alpine")

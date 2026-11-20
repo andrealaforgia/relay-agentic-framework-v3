@@ -112,3 +112,19 @@ def test_green_cannot_be_recorded_before_red() -> None:
         awaiting_red().record_green_run(PASSES, RED, candidate_descends_from_red=True)
 
     assert refusal.value.current is BehaviourState.VALIDATING_RED
+
+
+def test_a_red_can_be_reopened_while_implementing_and_only_then() -> None:
+    behaviour = implementing()
+
+    behaviour.reopen_red()
+
+    assert behaviour.state is BehaviourState.VALIDATING_RED
+    with pytest.raises(TransitionRefused):
+        behaviour.reopen_red()
+
+
+@pytest.mark.parametrize("behaviour_id", ["checkout/VAT", "", "-B1", "B 1"])
+def test_a_behaviour_id_must_be_usable_in_a_ref(behaviour_id: str) -> None:
+    with pytest.raises(ValueError, match="behaviour id"):
+        Behaviour.propose(behaviour_id, "x")

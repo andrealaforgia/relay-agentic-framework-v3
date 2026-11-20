@@ -235,6 +235,23 @@ def judge_red(contract: ProcessContract, execution: Execution) -> RedVerdict:
     )
 
 
+def refuse_green_before_launch(
+    contract: ProcessContract, isolation: str, red: PairedRed | None
+) -> GreenVerdict | None:
+    """Reasons a green run cannot count that are known before anything is launched."""
+    if not is_gate_bearing(isolation):
+        return GreenVerdict(
+            GreenRejection.ISOLATION_NOT_ADMISSIBLE,
+            f"{contract.contract_id}: {isolation} execution cannot open a gate",
+        )
+    if red is None or red.contract_digest != contract.digest:
+        return GreenVerdict(
+            GreenRejection.NO_PAIRED_RED,
+            f"{contract.contract_id}: no accepted red exists for this contract",
+        )
+    return None
+
+
 def judge_green(
     contract: ProcessContract,
     execution: Execution,
@@ -250,27 +267,26 @@ def judge_green(
         return GreenVerdict(rejection, f"{contract.contract_id}: {explanation}")
 
     observation = execution.observation
-    if not is_gate_bearing(execution.isolation):
-        return rejected(
-            GreenRejection.ISOLATION_NOT_ADMISSIBLE,
-            f"{execution.isolation} execution cannot open a gate",
-        )
-    if red is None or red.contract_digest != contract.digest:
-        return rejected(GreenRejection.NO_PAIRED_RED, "no accepted red exists for this contract")
+    if refusal := refuse_green_before_launch(contract, execution.isolation, red):
+        return refusal
+    assert red is not None
     if execution.revision == red.revision or not candidate_descends_from_red:
         return rejected(
             GreenRejection.NOT_BUILT_ON_THE_RED_REVISION,
             "the candidate is not a change built on the revision the red was observed on",
         )
-    if execution.runtime_identity != red.runtime_identity:
-        return rejected(
-            GreenRejection.RUNTIME_CHANGED,
-            "the runtime differs from the one the red was observed in; a fresh red is needed",
-        )
+    # What was observed comes first: a run that timed out is reported as a timeout, not
+    # as a runtime difference it may never have got far enough to establish.
     if observation.ineligibility is not None:
         return rejected(
             GreenRejection(observation.ineligibility.value),
             f"the run is ineligible ({observation.ineligibility.value.replace('_', ' ')})",
+        )
+    if execution.runtime_identity != red.runtime_identity:
+        return rejected(
+            GreenRejection.RUNTIME_CHANGED,
+            "the runtime differs from the one the red was observed in; reopen the red "
+            "to observe it again in this runtime",
         )
     if not contract.is_satisfied_by(observation):
         return rejected(GreenRejection.EXPECTATION_NOT_MET, "the expectation was not observed")

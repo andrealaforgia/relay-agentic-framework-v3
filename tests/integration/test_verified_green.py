@@ -12,16 +12,18 @@ from psycopg_pool import AsyncConnectionPool
 
 from relay.application.behaviours import Behaviours
 from relay.domain.behaviour import BehaviourState, TransitionRefused
-from relay.domain.evidence import GreenRejection
+from relay.domain.evidence import GreenRejection, Launch, ProcessContract
 from relay.git.checkout import CheckoutFailed
 from relay.persistence.ledger import read_events
-from relay.testing.oracle import ContainerIsolation, ProcessOracle
+from relay.testing.oracle import ContainerIsolation, NativeIsolation, ProcessOracle
 from tests.integration.fixtures import (
     CONTRACT,
     VAT_APPLIES_STANDARD_RATE,
     VAT_RETURNS_NET,
+    CountingLaunches,
     commit,
     publish_attempt,
+    publish_tag_as_attempt,
 )
 
 PROJECT = "vat-calculator"
@@ -201,4 +203,149 @@ async def test_a_caller_cannot_supply_the_candidate_or_the_observation(
     assert [event.event_type for event in await read_events(database, PROJECT)][: len(before)] == [
         event.event_type for event in before
     ]
+    assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
+
+
+async def executions(database: AsyncConnectionPool) -> int:
+    async with database.connection() as connection:
+        row = await (await connection.execute("SELECT count(*) AS n FROM executions")).fetchone()
+    assert row is not None
+    return int(row["n"])
+
+
+async def test_an_attempt_ref_pointing_at_a_tag_never_reaches_review(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    repository = tmp_path / "subject"
+    behaviours, red_revision = await released_to_builder(database, repository, runner_image)
+    passing = publish_attempt(
+        repository, "B1", 9, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision
+    )
+    for attempt, target in ((1, red_revision), (2, passing)):
+        publish_tag_as_attempt(repository, "B1", attempt, pointing_at=target)
+
+        with pytest.raises(CheckoutFailed, match="not a commit"):
+            await behaviours.run_green(PROJECT, "B1", attempt=attempt)
+
+    assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
+    assert await executions(database) == 1
+
+
+async def test_another_projects_candidate_on_the_same_repository_is_not_this_projects(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    repository = tmp_path / "subject"
+    behaviours, red_revision = await released_to_builder(database, repository, runner_image)
+    await behaviours.open_project("other-team", str(repository))
+    await behaviours.propose("other-team", "B1", "standard VAT rate is applied")
+    await behaviours.begin_test_design("other-team", "B1")
+    await behaviours.register_acceptance_test("other-team", "B1", CONTRACT)
+    assert (await behaviours.run_red("other-team", "B1")).is_valid
+    publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision)
+
+    with pytest.raises(CheckoutFailed, match="attempt 1"):
+        await behaviours.run_green("other-team", "B1", attempt=1)
+
+    assert await behaviours.state_of("other-team", "B1") is BehaviourState.IMPLEMENTING
+    assert (await behaviours.run_green(PROJECT, "B1", attempt=1)).is_valid
+
+
+async def test_a_candidate_that_hangs_is_reported_as_a_timeout(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    repository = tmp_path / "subject"
+    trunk = commit(repository, {"vat.py": VAT_RETURNS_NET})
+    quick = ProcessContract(
+        CONTRACT.contract_id,
+        CONTRACT.observes,
+        Launch(argv=CONTRACT.launch.argv, timeout_seconds=3),
+        CONTRACT.expect,
+        CONTRACT.baseline,
+    )
+    behaviours = Behaviours(database, ProcessOracle(ContainerIsolation(runner_image)))
+    await behaviours.open_project(PROJECT, str(repository))
+    await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
+    await behaviours.begin_test_design(PROJECT, "B1")
+    await behaviours.register_acceptance_test(PROJECT, "B1", quick)
+    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    publish_attempt(repository, "B1", 1, {"vat.py": "import time\ntime.sleep(60)\n"}, on=trunk)
+
+    verdict = await behaviours.run_green(PROJECT, "B1", attempt=1)
+
+    assert verdict.rejection is GreenRejection.TIMED_OUT
+    assert (await last_event(database)).payload["rejection"] == "timed_out"
+
+
+async def test_native_execution_is_refused_for_green_before_anything_is_launched(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    repository = tmp_path / "subject"
+    _, red_revision = await released_to_builder(database, repository, runner_image)
+    publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision)
+    native = CountingLaunches(NativeIsolation())
+    on_a_native_runner = Behaviours(database, ProcessOracle(native))
+
+    verdict = await on_a_native_runner.run_green(PROJECT, "B1", attempt=1)
+
+    assert verdict.rejection is GreenRejection.ISOLATION_NOT_ADMISSIBLE
+    assert native.launches == 0
+    assert await executions(database) == 1
+    refused = await last_event(database)
+    assert refused.payload["rejection"] == "isolation_not_admissible"
+    assert "execution_id" not in refused.payload
+    assert await on_a_native_runner.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
+
+
+async def test_with_no_red_on_record_green_is_refused_before_anything_is_launched(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    repository = tmp_path / "subject"
+    _, red_revision = await released_to_builder(database, repository, runner_image)
+    publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision)
+    container = CountingLaunches(ContainerIsolation(runner_image))
+    behaviours = Behaviours(database, ProcessOracle(container))
+    async with database.connection() as connection:
+        await connection.execute("UPDATE behaviours SET red_execution_id = NULL")
+
+    verdict = await behaviours.run_green(PROJECT, "B1", attempt=1)
+
+    assert verdict.rejection is GreenRejection.NO_PAIRED_RED
+    assert container.launches == 0
+    assert await executions(database) == 1
+    assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
+
+
+async def test_after_a_runtime_change_the_red_can_be_reopened_and_the_work_completed(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    repository = tmp_path / "subject"
+    behaviours, red_revision = await released_to_builder(database, repository, runner_image)
+    publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision)
+    async with database.connection() as connection:
+        await connection.execute("UPDATE executions SET runtime_identity = 'sha256:an-older-image'")
+    stuck = await behaviours.run_green(PROJECT, "B1", attempt=1)
+    assert stuck.rejection is GreenRejection.RUNTIME_CHANGED
+
+    await behaviours.reopen_red(PROJECT, "B1", reason="runner image upgraded")
+
+    reopened = await last_event(database)
+    assert reopened.event_type == "behaviour.red_reopened"
+    assert reopened.payload["reason"] == "runner image upgraded"
+    assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.VALIDATING_RED
+    async with database.connection() as connection:
+        row = await (await connection.execute("SELECT red_execution_id FROM behaviours")).fetchone()
+    assert row == {"red_execution_id": None}, "the superseded red must no longer be paired"
+    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await behaviours.run_green(PROJECT, "B1", attempt=1)).is_valid
+    assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.REVIEW
+
+
+async def test_reopening_a_red_needs_a_reason(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    behaviours, _ = await released_to_builder(database, tmp_path / "subject", runner_image)
+
+    with pytest.raises(ValueError, match="reason"):
+        await behaviours.reopen_red(PROJECT, "B1", reason="  ")
+
     assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING

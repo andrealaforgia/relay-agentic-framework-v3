@@ -18,11 +18,12 @@ from relay.domain.evidence import (
     GreenVerdict,
     PairedRed,
     ProcessContract,
-    ProcessObservation,
     RedVerdict,
     is_gate_bearing,
+    refuse_green_before_launch,
     refuse_isolation,
 )
+from relay.domain.identifiers import require_identifier
 from relay.git.checkout import (
     CheckoutFailed,
     attempt_head,
@@ -50,7 +51,11 @@ class Behaviours:
         async with self._pool.connection() as connection, connection.transaction():
             await connection.execute(
                 "INSERT INTO projects (project_id, repository, trunk) VALUES (%s, %s, %s)",
-                (project_id, require_credential_free(repository), trunk),
+                (
+                    require_identifier("project", project_id),
+                    require_credential_free(repository),
+                    trunk,
+                ),
             )
             await append_event(connection, project_id, "project.opened", payload={"trunk": trunk})
 
@@ -188,18 +193,16 @@ class Behaviours:
             repository, _ = await _source(connection, project_id)
             red = await _paired_red(connection, project_id, behaviour_id)
 
-        if red is None or not is_gate_bearing(isolation.name):
-            # Nothing to pair with, or nothing that could count: judge without launching.
-            unlaunched = Execution("0" * 40, isolation.name, "", ProcessObservation())
-            return await self._record_green(
-                project_id, behaviour_id, attempt, unlaunched, red, descends=False, ran=False
-            )
+        if refusal := refuse_green_before_launch(contract, isolation.name, red):
+            await self._green_refused(project_id, behaviour_id, attempt, contract, refusal)
+            return refusal
+        assert red is not None
         try:
-            candidate = await attempt_head(repository, behaviour_id, attempt)
+            candidate = await attempt_head(repository, project_id, behaviour_id, attempt)
             with tempfile.TemporaryDirectory(prefix="relay-green-") as scratch:
                 workdir, descends = await candidate_checkout(
                     repository,
-                    attempt_ref(behaviour_id, attempt),
+                    attempt_ref(project_id, behaviour_id, attempt),
                     candidate,
                     red.revision,
                     Path(scratch) / "subject",
@@ -209,8 +212,53 @@ class Behaviours:
             await self._preparation_failed("green", project_id, behaviour_id, contract, failure)
             raise
         return await self._record_green(
-            project_id, behaviour_id, attempt, execution, red, descends=descends, ran=True
+            project_id, behaviour_id, attempt, execution, red, descends=descends
         )
+
+    async def reopen_red(self, project_id: str, behaviour_id: str, reason: str) -> None:
+        """Send a behaviour back for a fresh red and drop the old pairing, on the record."""
+        if not reason.strip():
+            raise ValueError("reopening a red needs a stated reason")
+        async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
+            behaviour.reopen_red()
+            await connection.execute(
+                "UPDATE behaviours SET red_execution_id = NULL "
+                "WHERE project_id = %s AND behaviour_id = %s",
+                (project_id, behaviour_id),
+            )
+            await append_event(
+                connection,
+                project_id,
+                "behaviour.red_reopened",
+                subject_id=behaviour_id,
+                payload={"reason": reason},
+                correlation_id=correlation,
+            )
+
+    async def _green_refused(
+        self,
+        project_id: str,
+        behaviour_id: str,
+        attempt: int,
+        contract: ProcessContract,
+        refusal: GreenVerdict,
+    ) -> None:
+        """Nothing was launched and no execution is claimed; the refusal is still recorded."""
+        assert refusal.rejection is not None
+        async with self._changing(project_id, behaviour_id) as (connection, _, correlation):
+            await append_event(
+                connection,
+                project_id,
+                "behaviour.green_rejected",
+                subject_id=behaviour_id,
+                payload={
+                    "attempt": attempt,
+                    "rejection": refusal.rejection.value,
+                    "reason": refusal.reason,
+                    "contract_digest": contract.digest,
+                },
+                correlation_id=correlation,
+            )
 
     async def _record_green(
         self,
@@ -218,10 +266,9 @@ class Behaviours:
         behaviour_id: str,
         attempt: int,
         execution: Execution,
-        red: PairedRed | None,
+        red: PairedRed,
         *,
         descends: bool,
-        ran: bool,
     ) -> GreenVerdict:
         async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
             verdict = behaviour.record_green_run(
@@ -229,22 +276,19 @@ class Behaviours:
             )
             contract = behaviour.contract
             assert contract is not None
+            execution_id = await _record_execution(
+                connection, project_id, behaviour_id, "green", contract.digest, execution
+            )
             evidence: dict[str, Any] = {
                 "attempt": attempt,
                 "reason": verdict.reason,
                 "contract_digest": contract.digest,
-                "red_revision": red.revision if red else None,
+                "red_revision": red.revision,
+                "execution_id": str(execution_id),
+                "candidate_revision": execution.revision,
+                "isolation": execution.isolation,
+                "runtime_identity": execution.runtime_identity,
             }
-            if ran:
-                execution_id = await _record_execution(
-                    connection, project_id, behaviour_id, "green", contract.digest, execution
-                )
-                evidence |= {
-                    "execution_id": str(execution_id),
-                    "candidate_revision": execution.revision,
-                    "isolation": execution.isolation,
-                    "runtime_identity": execution.runtime_identity,
-                }
             if verdict.rejection is not None:
                 evidence["rejection"] = verdict.rejection.value
             else:

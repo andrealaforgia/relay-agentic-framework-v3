@@ -14,6 +14,7 @@ from relay.domain.evidence import (
     judge_green,
     judge_red,
 )
+from relay.domain.identifiers import require_identifier
 
 
 class BehaviourState(StrEnum):
@@ -47,7 +48,7 @@ class Behaviour:
 
     @classmethod
     def propose(cls, behaviour_id: str, summary: str) -> Behaviour:
-        return cls(behaviour_id=behaviour_id, summary=summary)
+        return cls(behaviour_id=require_identifier("behaviour", behaviour_id), summary=summary)
 
     def begin_test_design(self) -> None:
         self._require("begin_test_design", BehaviourState.PROPOSED)
@@ -87,6 +88,12 @@ class Behaviour:
         if verdict.is_valid:
             self.state = BehaviourState.REVIEW
         return verdict
+
+    def reopen_red(self) -> None:
+        """Hand the behaviour back for a fresh red, when the one on record can no longer
+        be paired (the runtime changed, say). The contract stays; the old pairing does not."""
+        self._require("reopen_red", BehaviourState.IMPLEMENTING)
+        self.state = BehaviourState.VALIDATING_RED
 
     def _require(self, attempted: str, *required: BehaviourState) -> None:
         if self.state not in required:
