@@ -213,3 +213,35 @@ def test_a_red_that_finishes_after_its_feature_was_cancelled_changes_nothing() -
 
     assert verdict.rejection is RedRejection.SUPERSEDED
     assert behaviour.state is BehaviourState.VALIDATING_RED
+
+
+def test_a_red_launched_for_a_contract_that_was_then_amended_changes_nothing() -> None:
+    behaviour = awaiting_red()
+    launched_in = behaviour.red_cycle
+    amended = ProcessContract(
+        contract_id="B1-reduced-rate",
+        observes=CONTRACT.observes,
+        launch=CONTRACT.launch,
+        expect=Expected(exit_code=0, stdout="105\n"),
+        baseline=CONTRACT.baseline,
+    )
+
+    behaviour.amend_contract(amended)
+    late = behaviour.record_red_run(FAILS_AS_REGISTERED, started_in_cycle=launched_in)
+
+    assert late.rejection is RedRejection.SUPERSEDED
+    assert (behaviour.state, behaviour.contract) == (BehaviourState.VALIDATING_RED, amended)
+    assert behaviour.record_red_run(
+        FAILS_AS_REGISTERED, started_in_cycle=behaviour.red_cycle
+    ).is_valid
+
+
+def test_a_contract_is_amended_only_before_its_behaviour_goes_to_review() -> None:
+    behaviour = implementing()
+    behaviour.amend_contract(CONTRACT)
+    assert behaviour.state is BehaviourState.VALIDATING_RED
+
+    in_review = implementing()
+    in_review.record_green_run(PASSES, RED, RED, candidate_descends_from_red=True, still_owed=True)
+    with pytest.raises(TransitionRefused):
+        in_review.amend_contract(CONTRACT)

@@ -232,17 +232,18 @@ async def retire_reconfirmations(
 
 
 async def complete_reconfirmation(
-    connection: Connection, grant_id: uuid.UUID, subject: str, subject_id: str, basis: int
+    connection: Connection, grant_id: uuid.UUID, subject: str, subject_id: str
 ) -> None:
     """A reconfirmation, or the amendment that stands in its place, is done under the
-    grant that holds exactly this work now: this subject, for this basis."""
+    grant that holds exactly this work now. Which basis it is for needs no checking
+    here: a later decision retires the assignment, and a pause or a question takes the
+    grant back, so a grant that still holds is for the basis in force."""
     done = await (
         await connection.execute(
             "UPDATE assignments SET state = 'done', first_effect_at = now() "
             "WHERE grant_id = %s AND state = 'granted' AND kind = 'reconfirm' AND subject = %s "
-            "AND coalesce(behaviour_id, story_id, feature_id) = %s "
-            "AND (issued_on->>'basis')::integer = %s RETURNING assignment_id",
-            (grant_id, subject, subject_id, basis),
+            "AND coalesce(behaviour_id, story_id, feature_id) = %s RETURNING assignment_id",
+            (grant_id, subject, subject_id),
         )
     ).fetchone()
     if done is None:

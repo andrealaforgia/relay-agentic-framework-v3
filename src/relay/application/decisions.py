@@ -32,14 +32,11 @@ from relay.application.assignments import (
 from relay.application.behaviours import CONTROL_PLANE, load_behaviour, save_behaviour
 from relay.application.closure import (
     CANCELLED,
-    closure_of_behaviour,
     closure_of_feature,
-    closure_of_story,
     feature_basis,
     lock_gate,
     require_basis,
     require_current,
-    require_open,
     story_basis,
 )
 from relay.application.features import Features
@@ -374,7 +371,6 @@ class Decisions:
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id)
             await _locked_project(connection, project_id)
-            require_open(await closure_of_feature(connection, project_id, feature_id))
             require_basis(basis, await feature_basis(connection, project_id, feature_id))
             roadmap = await (
                 await connection.execute(
@@ -385,7 +381,7 @@ class Decisions:
             ).fetchone()
             if roadmap is None or roadmap["revision"] != revision:
                 raise ActionRefused(f"revision {revision} is not {feature_id}'s roadmap")
-            await complete_reconfirmation(connection, grant, "roadmap", feature_id, basis)
+            await complete_reconfirmation(connection, grant, "roadmap", feature_id)
             await connection.execute(
                 "UPDATE roadmaps SET current_on = %s WHERE project_id = %s AND feature_id = %s "
                 "AND revision = %s",
@@ -422,7 +418,6 @@ class Decisions:
             await lock_gate(connection, project_id)
             await lock_story(connection, project_id, story_id)
             await _locked_project(connection, project_id)
-            require_open(await closure_of_story(connection, project_id, story_id))
             require_basis(basis, await story_basis(connection, project_id, story_id))
             stood = await (
                 await connection.execute(
@@ -433,7 +428,7 @@ class Decisions:
             ).fetchone()
             if stood is None:
                 raise ActionRefused(f"revision {revision} is not {story_id} as it stands")
-            await complete_reconfirmation(connection, grant, "story", story_id, basis)
+            await complete_reconfirmation(connection, grant, "story", story_id)
             await _reconfirmed(
                 connection, project_id, principal, grant, "story", story_id, basis,
                 {"revision": revision},
@@ -461,7 +456,6 @@ class Decisions:
             row = await _locked_behaviour_row(connection, project_id, behaviour_id)
             await lock_story(connection, project_id, row["story_id"])
             await _locked_project(connection, project_id)
-            require_open(await closure_of_behaviour(connection, project_id, behaviour_id))
             require_basis(basis, await story_basis(connection, project_id, row["story_id"]))
             behaviour = load_behaviour(row)
             if behaviour.contract is None or behaviour.contract.digest != contract_digest:
@@ -471,7 +465,7 @@ class Decisions:
                 raise ActionRefused(
                     f"that is not the evidence {behaviour_id} has now: read it again"
                 )
-            await complete_reconfirmation(connection, grant, "behaviour", behaviour_id, basis)
+            await complete_reconfirmation(connection, grant, "behaviour", behaviour_id)
             await connection.execute(
                 "UPDATE behaviours SET current_on = %s WHERE project_id = %s AND behaviour_id = %s",
                 (basis, project_id, behaviour_id),
@@ -506,7 +500,6 @@ class Decisions:
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id)
             row = await _locked_behaviour_row(connection, project_id, behaviour_id)
-            require_open(await closure_of_behaviour(connection, project_id, behaviour_id))
             require_basis(basis, await story_basis(connection, project_id, row["story_id"]))
             await require_current(connection, project_id, row["story_id"])
             behaviour = load_behaviour(row)
@@ -519,7 +512,7 @@ class Decisions:
                     f"{behaviour_id} is {behaviour.state.value}: changing its contract now "
                     "needs a correction"
                 ) from None
-            await complete_reconfirmation(connection, grant, "behaviour", behaviour_id, basis)
+            await complete_reconfirmation(connection, grant, "behaviour", behaviour_id)
             await retire_all_of_behaviour(connection, project_id, behaviour_id)
             await save_behaviour(connection, project_id, behaviour)
             await connection.execute(
@@ -633,7 +626,12 @@ async def _after_a_decision(connection: Connection, scope: dict[str, Any]) -> No
     """What a decision of the Product Owner's does to its scope, in its own transaction,
     under the exclusive gate lock: everything in scope was made under other decisions,
     so what a person was about to approve is withdrawn, seals are cleared, and each
-    owner is asked to reconfirm or change what is theirs."""
+    owner is asked to reconfirm or change what is theirs. Nothing can be released by it:
+    whatever it touches now waits for those owners.
+
+    The reconfirmations and the amendment need no check of their own that the scope is
+    open. A pause or a question takes back every grant that has done nothing, and these
+    grants do nothing until the moment they complete."""
     project_id, feature_id = scope["project_id"], scope["feature_id"]
     story_scope: str | None = scope["scope_story"] or None
     stories = await (
@@ -705,7 +703,6 @@ async def _after_a_decision(connection: Connection, scope: dict[str, Any]) -> No
                 story_id=story["story_id"],
                 behaviour_id=behaviour["behaviour_id"],
             )
-    await release_next(connection, project_id)
 
 
 async def _owe_reconfirmation(

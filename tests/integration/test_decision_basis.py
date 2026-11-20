@@ -324,6 +324,7 @@ async def test_a_review_written_from_a_tree_handed_over_before_the_decision_is_n
 
     with pytest.raises(ActionRefused, match="not current"):
         await world.reviews.prepare_review(capability, world.tmp_path / "too-soon", grant)
+    assert not (world.tmp_path / "too-soon").exists()  # refused before any tree is fetched
     await world.reconfirm_everything()
     after = await world.reviews.prepare_review(capability, world.tmp_path / "after", grant)
 
