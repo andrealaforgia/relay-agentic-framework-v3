@@ -11,8 +11,19 @@ Decisions made by Andrea. Model recommendations are noted where he chose differe
 
 | PO-5 | 2026-11-20 | **Gate-bearing runs use the local Docker engine.** Confirms M-1 below. | Native execution never opens a gate; every runner host needs a local Docker engine. |
 | PO-6 | 2026-11-20 | **Commit and push frequently to the GitHub remote** (`andrealaforgia/relay-agentic-framework-v3`, public). | Trunk is pushed after each green, committed step. |
+| PO-7 | 2026-11-20 | **Where a decision is the Product Owner's, Relay's build goes with Claude's recommendation.** Andrea's words: "For any decision you depend on me, go with anything you recommend". | Each such decision is recorded below as delegated, with the recommendation that was applied, so he can overturn it. Claude's reading, not his words: this does not cover destructive or irreversible actions, which are still confirmed first. |
 
-Still on recommended defaults, not yet explicitly confirmed: review and security policy presets; pause on unknown paid calls; trust in enrolled worker hosts.
+Decided under PO-7 on 2026-11-20, each on Claude's recommendation:
+
+| Id | Decision |
+|---|---|
+| D-1 | **Order of work:** core slices 2 and 3 first, then ingest slices 1 and 2, then the two interleaved. |
+| D-2 | **Ingest evidence:** a project's own test-suite results may count as "observed" for ingest, always labelled as the project's own report. Gates stay oracle-only under PO-1. |
+| D-3 | **PostgreSQL only.** The SQLite option in section 6.3 of the ingest specification is dropped. |
+| D-4 | **Mutation testing has no percentage threshold.** No surviving mutant on changed lines; each survivor is a QA finding that QA kills or dispositions as equivalent, never the Builder; a ratchet on Relay's own domain code; a time box whose expiry is reported, not passed. |
+| D-5 | **Review capabilities stay in plaintext for now**, readable only by trusted database accounts. They are stored as hashes, and redacted from every view, no later than the slice that first exposes them outside the control plane (the API and dashboard). |
+| D-6 | **The recommended defaults stand:** the review and security policy presets, pausing on unknown paid calls, and trusting enrolled worker hosts. |
+| D-7 | **Trunk moved during the checks** blocks the behaviour for a person, who retries, unless Astra's review of slice 2b argues for reopening the red directly. |
 
 ## Consequences drawn by the models, for the Product Owner to confirm or overturn
 
@@ -22,10 +33,4 @@ Still on recommended defaults, not yet explicitly confirmed: review and security
 
 ## Open questions for the Product Owner
 
-- Mutation testing policy. Recommended by Claude, awaiting a decision: no percentage threshold; instead no surviving mutant on changed lines, each survivor a QA finding that is killed or dispositioned as equivalent by QA (never by the Builder); a ratchet on Relay's own domain code; a time box whose expiry is reported, not passed. (Arises from the plan to add mutation testing as a deterministic QA check.)
-
-## Questions raised by the ingest specification (`relay-ingest-spec.md`, read 2026-11-20, not yet adopted)
-
-- Order of work. Claude recommends core slices 2 and 3 first, then ingest slices 1 and 2, then interleaving.
-- Whether a project's own test-suite results may count as "observed" for ingest, labelled as the project's own report, while gates stay oracle-only under PO-1.
-- Whether to drop the SQLite option in the ingest specification's section 6.3 and stay PostgreSQL only.
+None. See PO-7 and D-1 to D-7.
