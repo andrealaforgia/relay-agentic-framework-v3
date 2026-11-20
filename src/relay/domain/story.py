@@ -92,8 +92,9 @@ class Candidate:
     feature_id: str
     story_id: str
     state: StoryState
-    # Its feature is closed, or a question is open over it: it may not start, and the
-    # stories after it in its feature wait behind it.
+    # Its feature is closed, a question is open over it, or its roadmap or its own text
+    # is waiting to be reconfirmed after a decision: it may not start, and the stories
+    # after it in its feature wait behind it.
     stopped: bool = False
 
 

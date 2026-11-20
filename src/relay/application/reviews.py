@@ -28,7 +28,13 @@ from relay.application.assignments import (
     retire_reviews_of_cycle,
     start_review,
 )
-from relay.application.closure import CANCELLED, closure_of_behaviour, lock_gate, require_open
+from relay.application.closure import (
+    CANCELLED,
+    closure_of_behaviour,
+    lock_gate,
+    require_current,
+    require_open,
+)
 from relay.application.stories import require_story_at_work
 from relay.domain.behaviour import Behaviour, BehaviourState
 from relay.domain.identifiers import require_identifier
@@ -120,6 +126,15 @@ class Receipt:
     disposition: str
     finding_ids: tuple[str, ...]
     cycle_is_current: bool
+
+
+@dataclass(frozen=True)
+class Checkout:
+    """The tree a reviewer was handed, and the receipt for it. A review written from this
+    tree is submitted naming this receipt, so it cannot pass for one written from another."""
+
+    tree: Path
+    receipt: uuid.UUID
 
 
 class UnknownCapability(Exception):
@@ -464,7 +479,7 @@ class Reviews:
             timeout=self._remote_timeout,
         )
 
-    async def prepare_review(self, capability: str, into: Path, grant: uuid.UUID) -> Path:
+    async def prepare_review(self, capability: str, into: Path, grant: uuid.UUID) -> Checkout:
         """Give a reviewer the tree to review: exactly the cycle's commit, from the control
         plane's pinned copy, after confirming the published ref still names that commit.
         The caller names the grant it was given for this review, and the checkout receipt
@@ -478,6 +493,7 @@ class Reviews:
             )
             if not await holds(connection, grant, task["assignment_id"]):
                 raise ActionRefused("this grant is not the current one for this review")
+            await _require_current(connection, task)
         commit = task["candidate_revision"]
         try:
             names_the_commit = (
@@ -505,19 +521,23 @@ class Reviews:
             require_open(
                 await closure_of_behaviour(connection, task["project_id"], task["behaviour_id"])
             )
+            story_id = await _require_current(connection, task)
             await start_review(connection, grant, task["assignment_id"])
+            receipt = uuid.uuid7()
             await connection.execute(
-                "INSERT INTO review_checkouts (receipt_id, task_id, revision, grant_id) "
-                "VALUES (%s, %s, %s, %s)",
-                (uuid.uuid7(), task["task_id"], commit, grant),
+                "INSERT INTO review_checkouts (receipt_id, task_id, revision, grant_id, basis) "
+                "VALUES (%s, %s, %s, %s, story_basis(%s, %s))",
+                (receipt, task["task_id"], commit, grant, task["project_id"], story_id),
             )
-        return tree
+        return Checkout(tree, receipt)
 
-    async def submit_review(self, capability: str, review: Review, grant: uuid.UUID) -> Receipt:
+    async def submit_review(
+        self, capability: str, review: Review, grant: uuid.UUID, checkout: uuid.UUID
+    ) -> Receipt:
         """Record one reviewer's review. Every request gets exactly one answer however often
         it is retried, and only the first accepted submission of a task has any effect.
-        That first submission has to come under the grant that holds the review now, and
-        that grant has to be the one the tree was handed over to."""
+        That first submission names the checkout it was written from: one made under the
+        grant that holds the review now, and under the decisions in force now."""
         task_id = (await self._task(capability))["task_id"]
         async with self._pool.connection() as connection, connection.transaction():
             task = await _locked_task(connection, task_id)
@@ -545,7 +565,7 @@ class Reviews:
                 return await _store(connection, task, review, "conflicting", is_current)
             if not accepting:
                 return await _store(connection, task, review, "stale", is_current)
-            if not await _has_checkout(connection, task_id, grant):
+            if not await _has_checkout(connection, task_id, grant, checkout):
                 raise SubmissionRefused("no tree was prepared for this review under this grant")
             return await self._accept(connection, task, review)
 
@@ -855,17 +875,35 @@ async def _locked_task(connection: Connection, task_id: uuid.UUID) -> dict[str, 
     return task
 
 
-async def _has_checkout(connection: Connection, task_id: uuid.UUID, grant: uuid.UUID) -> bool:
-    """Whether a tree was handed over under this grant, and this grant holds the review now."""
+async def _has_checkout(
+    connection: Connection, task_id: uuid.UUID, grant: uuid.UUID, receipt: uuid.UUID
+) -> bool:
+    """Whether this receipt is for a tree handed over under this grant, this grant holds
+    the review now, and no decision of the Product Owner's has been made since."""
     row = await (
         await connection.execute(
             "SELECT 1 FROM review_checkouts c JOIN review_tasks t USING (task_id) "
             "JOIN assignments a USING (assignment_id) WHERE c.task_id = %s "
-            "AND c.grant_id = %s AND a.grant_id = %s LIMIT 1",
-            (task_id, grant, grant),
+            "AND c.receipt_id = %s AND c.grant_id = %s AND a.grant_id = %s "
+            "AND c.basis = story_basis(a.project_id, a.story_id)",
+            (task_id, receipt, grant, grant),
         )
     ).fetchone()
     return row is not None
+
+
+async def _require_current(connection: Connection, task: Mapping[str, Any]) -> str:
+    """A review relies on the story, the contract and the evidence so far. Returns the story."""
+    row = await (
+        await connection.execute(
+            "SELECT story_id FROM behaviours WHERE project_id = %s AND behaviour_id = %s",
+            (task["project_id"], task["behaviour_id"]),
+        )
+    ).fetchone()
+    assert row is not None
+    story_id: str = row["story_id"]
+    await require_current(connection, task["project_id"], story_id, task["behaviour_id"])
+    return story_id
 
 
 async def _store(

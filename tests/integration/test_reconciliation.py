@@ -365,13 +365,15 @@ async def test_a_review_checked_out_by_a_process_that_died_is_granted_afresh_and
     qa = Principal(PrincipalKind.WORKER, "worker-qa", role="qa")
     claims = Assignments(world.database)
     before = await claims.claim(qa, task["assignment_id"])
-    await world.reviews.prepare_review(task["capability"], world.tmp_path / "tree", before)
+    handed_over = await world.reviews.prepare_review(
+        task["capability"], world.tmp_path / "tree", before
+    )
 
     await restarted(world).start()
 
     with pytest.raises(SubmissionRefused, match="no tree was prepared"):
         # The tree was handed over under a grant that holds nothing now.
-        await world.reviews.submit_review(task["capability"], Review(), before)
+        await world.reviews.submit_review(task["capability"], Review(), before, handed_over.receipt)
     with pytest.raises(ActionRefused, match="not the current one"):
         await world.reviews.prepare_review(task["capability"], world.tmp_path / "late", before)
     after = await claims.claim(

@@ -109,6 +109,7 @@ class Behaviour:
         *,
         candidate_descends_from_red: bool,
         still_owed: bool,
+        basis_moved: bool = False,
     ) -> GreenVerdict:
         """Judge a candidate against the red it was launched to answer, provided that red
         is still the one on record now and the build this run answers is still owed: a
@@ -121,6 +122,12 @@ class Behaviour:
                 GreenRejection.RED_SUPERSEDED,
                 f"{contract.contract_id}: the red this run answered is no longer the one on "
                 "record, or the behaviour moved on while this run was in flight",
+            )
+        if basis_moved:
+            return GreenVerdict(
+                GreenRejection.BASIS_SUPERSEDED,
+                f"{contract.contract_id}: a decision of the Product Owner's was made while "
+                "this run was in flight; what it observed is kept and decides nothing",
             )
         if not still_owed:
             return GreenVerdict(
@@ -142,6 +149,15 @@ class Behaviour:
         """Hand the behaviour back for a fresh red, when the one on record can no longer
         be paired (the runtime changed, say). The contract stays; the old pairing does not."""
         self._require("reopen_red", BehaviourState.IMPLEMENTING)
+        self.state = BehaviourState.VALIDATING_RED
+        self.red_cycle += 1
+
+    def amend_contract(self, contract: ProcessContract) -> None:
+        """The Verifier replaces the contract, because a decision changed what the
+        behaviour should show. The pairing with the old red ends: a fresh red is needed,
+        and a red still in flight for the old contract will find the cycle has moved."""
+        self._require("amend_contract", BehaviourState.VALIDATING_RED, BehaviourState.IMPLEMENTING)
+        self.contract = contract
         self.state = BehaviourState.VALIDATING_RED
         self.red_cycle += 1
 

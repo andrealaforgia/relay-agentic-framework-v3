@@ -482,15 +482,21 @@ async def test_a_worker_whose_grant_was_taken_back_cannot_submit_on_its_successo
     await world.close("resume")
     second_worker = Principal(PrincipalKind.WORKER, "worker-qa-2", role="qa")
     second = await claims.claim(second_worker, owed)
-    await world.reviews.prepare_review(capability, world.tmp_path / "tree", second)
+    handed_over = await world.reviews.prepare_review(capability, world.tmp_path / "tree", second)
 
     for not_the_holder in (first, uuid.uuid7()):
         with pytest.raises(SubmissionRefused, match="no tree was prepared"):
-            await world.reviews.submit_review(capability, Review(), not_the_holder)
+            await world.reviews.submit_review(
+                capability, Review(), not_the_holder, handed_over.receipt
+            )
 
-    blocked = await world.reviews.submit_review(capability, Review(findings=(INJECTION,)), second)
+    blocked = await world.reviews.submit_review(
+        capability, Review(findings=(INJECTION,)), second, handed_over.receipt
+    )
     assert blocked.disposition == "effective"
     assert await world.column("SELECT count(*) FROM review_submissions") == [1]
     assert (
-        await world.reviews.submit_review(capability, Review(findings=(INJECTION,)), first)
+        await world.reviews.submit_review(
+            capability, Review(findings=(INJECTION,)), first, uuid.uuid7()
+        )
     ) == blocked  # an exact replay of what was accepted is answered, whoever asks

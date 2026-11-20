@@ -21,3 +21,45 @@ $$;
 -- on. Null until a contract is registered. The Verifier vouches for the contract and
 -- its evidence together or not at all, so one number serves for all of it.
 ALTER TABLE behaviours ADD COLUMN current_on integer;
+
+-- Why work on a story, or on one of its behaviours, may not start: something it relies
+-- on was made under decisions that have since changed, and its owner has not
+-- reconfirmed it. Null if everything is current.
+CREATE FUNCTION not_current(project text, story text, behaviour text) RETURNS text
+LANGUAGE sql STABLE AS $$
+    SELECT CASE
+        WHEN s.current_on <> story_basis(s.project_id, s.story_id) THEN
+            s.story_id || ' is not current: it was confirmed on decision basis '
+            || s.current_on || ' and the basis is now ' || story_basis(s.project_id, s.story_id)
+        WHEN b.contract IS NOT NULL AND b.current_on <> story_basis(s.project_id, s.story_id) THEN
+            'the contract of ' || b.behaviour_id || ' is not current: it was confirmed on '
+            || 'decision basis ' || b.current_on || ' and the basis is now '
+            || story_basis(s.project_id, s.story_id)
+    END
+    FROM stories s LEFT JOIN behaviours b
+      ON b.project_id = s.project_id AND b.story_id = s.story_id AND b.behaviour_id = behaviour
+    WHERE s.project_id = project AND s.story_id = story
+$$;
+
+-- The basis each of these began on. What it produces counts only if the basis has not
+-- moved by the time it finishes.
+ALTER TABLE green_runs ADD COLUMN basis integer NOT NULL;
+ALTER TABLE review_checkouts ADD COLUMN basis integer NOT NULL;
+ALTER TABLE check_batches ADD COLUMN basis integer NOT NULL;
+ALTER TABLE executions ADD COLUMN basis integer;
+
+-- An owner's statement that something made under earlier decisions still stands under
+-- the present ones. It is a record of its own: it never rewrites the basis anything
+-- was made on.
+CREATE TABLE reconfirmations (
+    reconfirmation_id uuid PRIMARY KEY,
+    project_id        text NOT NULL REFERENCES projects,
+    subject           text NOT NULL CHECK (subject IN ('behaviour', 'story', 'roadmap')),
+    subject_id        text NOT NULL,
+    basis             integer NOT NULL,
+    by                text NOT NULL,
+    grant_id          uuid NOT NULL,
+    -- What was vouched for: a revision, or a contract digest with the evidence kept.
+    statement         jsonb NOT NULL,
+    recorded_at       timestamptz NOT NULL DEFAULT clock_timestamp()
+);

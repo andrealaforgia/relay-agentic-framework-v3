@@ -42,10 +42,8 @@ async def pending_messages(pool: Pool) -> list[OutboxMessage]:
 # question open over it) is held back. One that
 # was selected before the closure committed may still go out; it cannot be granted.
 _FOR_A_CLOSED_FEATURE = (
-    "SELECT 1 FROM assignments a JOIN behaviours b USING (project_id, behaviour_id) "
-    "JOIN stories s USING (project_id, story_id) "
-    "WHERE a.command_message_id = o.message_id "
-    "AND standing(s.project_id, s.feature_id, s.story_id) IS NOT NULL"
+    "SELECT 1 FROM assignments a WHERE a.command_message_id = o.message_id "
+    "AND standing(a.project_id, a.feature_id, a.story_id) IS NOT NULL"
 )
 
 

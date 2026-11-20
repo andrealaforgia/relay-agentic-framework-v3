@@ -16,21 +16,44 @@ import hashlib
 import json
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from relay.application.assignments import revoke_unstarted_grants
+from relay.application.assignments import (
+    RECONFIRM,
+    complete_reconfirmation,
+    owe,
+    retire_all_of_behaviour,
+    retire_reconfirmations,
+    revoke_unstarted_grants,
+)
+from relay.application.behaviours import CONTROL_PLANE, load_behaviour, save_behaviour
 from relay.application.closure import (
     CANCELLED,
+    closure_of_behaviour,
     closure_of_feature,
+    closure_of_story,
     feature_basis,
     lock_gate,
+    require_basis,
+    require_current,
+    require_open,
     story_basis,
 )
 from relay.application.features import Features
-from relay.application.stories import _record, _recorded, release_next
+from relay.application.stories import (
+    _close_gate,
+    _locked_project,
+    _record,
+    _recorded,
+    lock_story,
+    release_next,
+    reopen_roadmap_gate,
+)
+from relay.domain.behaviour import TransitionRefused
+from relay.domain.evidence import ProcessContract
 from relay.domain.story import (
     ON_A_DECISION,
     ON_A_QUESTION,
@@ -45,6 +68,7 @@ from relay.domain.story import (
 )
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
+from relay.transport.envelope import Envelope, MessageKind
 
 PRODUCT_OWNER = "product_owner"
 MODEL = "model"
@@ -227,7 +251,7 @@ class Decisions:
                     "text": action.payload["text"],
                 },
             )
-            await release_next(connection, project_id)
+            await _after_a_decision(connection, question)
             receipt = Receipt("effective", "answered")
             await _record(connection, action, receipt)
         await self._features.reconcile(project_id)
@@ -261,8 +285,13 @@ class Decisions:
                 )
             ).fetchone()
             assert old is not None
-            if old["replaced"]:
-                receipt = Receipt("stale", "nothing changed: that decision was already replaced")
+            pointless = (
+                "that decision was already replaced"
+                if old["replaced"]
+                else await _beyond_changing(connection, old)
+            )
+            if pointless:
+                receipt = Receipt("stale", f"nothing changed: {pointless}")
                 await _record(connection, action, receipt)
                 return receipt
             new_id = await _decide(
@@ -284,6 +313,7 @@ class Decisions:
                     "text": action.payload["text"],
                 },
             )
+            await _after_a_decision(connection, old)
             receipt = Receipt("effective", "replaced")
             await _record(connection, action, receipt)
         await self._features.reconcile(project_id)
@@ -320,6 +350,198 @@ class Decisions:
                 payload={"decision_id": str(decision_id), "by": principal.identity, "text": text},
             )
             return decision_id
+
+    async def evidence_of(self, project_id: str, behaviour_id: str) -> Evidence:
+        """What a behaviour currently has on record, as the Verifier must name it when
+        reconfirming the contract."""
+        async with self._pool.connection() as connection:
+            return await _evidence_of(connection, project_id, behaviour_id)
+
+    async def reconfirm_roadmap(
+        self,
+        principal: Principal,
+        project_id: str,
+        feature_id: str,
+        *,
+        grant: uuid.UUID,
+        basis: int,
+        revision: int,
+    ) -> None:
+        """The Analyst states that the roadmap stands under the decisions now in force.
+        One already approved needs no new approval; one still proposed is put to the
+        Product Owner again, showing those decisions."""
+        _require_role(principal, "analyst")
+        async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
+            await _locked_project(connection, project_id)
+            require_open(await closure_of_feature(connection, project_id, feature_id))
+            require_basis(basis, await feature_basis(connection, project_id, feature_id))
+            roadmap = await (
+                await connection.execute(
+                    "SELECT revision FROM roadmaps WHERE project_id = %s AND feature_id = %s "
+                    "AND state <> 'superseded' ORDER BY revision DESC LIMIT 1 FOR UPDATE",
+                    (project_id, feature_id),
+                )
+            ).fetchone()
+            if roadmap is None or roadmap["revision"] != revision:
+                raise ActionRefused(f"revision {revision} is not {feature_id}'s roadmap")
+            await complete_reconfirmation(connection, grant, "roadmap", feature_id, basis)
+            await connection.execute(
+                "UPDATE roadmaps SET current_on = %s WHERE project_id = %s AND feature_id = %s "
+                "AND revision = %s",
+                (basis, project_id, feature_id, revision),
+            )
+            await _reconfirmed(
+                connection,
+                project_id,
+                principal,
+                grant,
+                "roadmap",
+                feature_id,
+                basis,
+                {"revision": revision},
+            )
+            await reopen_roadmap_gate(connection, project_id, feature_id)
+            await release_next(connection, project_id)
+        await self._features.reconcile(project_id)
+
+    async def reconfirm_story(
+        self,
+        principal: Principal,
+        project_id: str,
+        story_id: str,
+        *,
+        grant: uuid.UUID,
+        basis: int,
+        revision: int,
+    ) -> None:
+        """The Analyst states that the story's text and criteria stand under the
+        decisions now in force."""
+        _require_role(principal, "analyst")
+        async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
+            await lock_story(connection, project_id, story_id)
+            await _locked_project(connection, project_id)
+            require_open(await closure_of_story(connection, project_id, story_id))
+            require_basis(basis, await story_basis(connection, project_id, story_id))
+            stood = await (
+                await connection.execute(
+                    "UPDATE stories SET current_on = %s WHERE project_id = %s AND story_id = %s "
+                    "AND revision = %s RETURNING story_id",
+                    (basis, project_id, story_id, revision),
+                )
+            ).fetchone()
+            if stood is None:
+                raise ActionRefused(f"revision {revision} is not {story_id} as it stands")
+            await complete_reconfirmation(connection, grant, "story", story_id, basis)
+            await _reconfirmed(
+                connection, project_id, principal, grant, "story", story_id, basis,
+                {"revision": revision},
+            )  # fmt: skip
+            await release_next(connection, project_id)
+        await self._features.reconcile(project_id)
+
+    async def reconfirm_contract(
+        self,
+        principal: Principal,
+        project_id: str,
+        behaviour_id: str,
+        *,
+        grant: uuid.UUID,
+        basis: int,
+        contract_digest: str,
+        evidence: Evidence,
+    ) -> None:
+        """The Verifier states that the contract stands under the decisions now in
+        force, and so does every piece of evidence the behaviour has, named exactly.
+        It is all of it or none: a Verifier who cannot vouch for all of it amends."""
+        _require_role(principal, "verifier")
+        async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
+            row = await _locked_behaviour_row(connection, project_id, behaviour_id)
+            await lock_story(connection, project_id, row["story_id"])
+            await _locked_project(connection, project_id)
+            require_open(await closure_of_behaviour(connection, project_id, behaviour_id))
+            require_basis(basis, await story_basis(connection, project_id, row["story_id"]))
+            behaviour = load_behaviour(row)
+            if behaviour.contract is None or behaviour.contract.digest != contract_digest:
+                raise ActionRefused(f"that is not the contract {behaviour_id} has now")
+            on_record = await _evidence_of(connection, project_id, behaviour_id)
+            if evidence != on_record:
+                raise ActionRefused(
+                    f"that is not the evidence {behaviour_id} has now: read it again"
+                )
+            await complete_reconfirmation(connection, grant, "behaviour", behaviour_id, basis)
+            await connection.execute(
+                "UPDATE behaviours SET current_on = %s WHERE project_id = %s AND behaviour_id = %s",
+                (basis, project_id, behaviour_id),
+            )
+            await _reconfirmed(
+                connection,
+                project_id,
+                principal,
+                grant,
+                "behaviour",
+                behaviour_id,
+                basis,
+                {"contract_digest": contract_digest, "retains": asdict(evidence)},
+            )
+        await self._features.reconcile(project_id)
+
+    async def amend_contract(
+        self,
+        principal: Principal,
+        project_id: str,
+        behaviour_id: str,
+        contract: ProcessContract,
+        *,
+        grant: uuid.UUID,
+        basis: int,
+        replaces: str,
+    ) -> None:
+        """The Verifier replaces a contract that no longer stands. It is the other way
+        of completing the reconfirmation owed for the behaviour, and needs the same
+        grant. Everything gathered for the old contract is set aside: a fresh red first."""
+        _require_role(principal, "verifier")
+        async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
+            row = await _locked_behaviour_row(connection, project_id, behaviour_id)
+            require_open(await closure_of_behaviour(connection, project_id, behaviour_id))
+            require_basis(basis, await story_basis(connection, project_id, row["story_id"]))
+            await require_current(connection, project_id, row["story_id"])
+            behaviour = load_behaviour(row)
+            if behaviour.contract is None or behaviour.contract.digest != replaces:
+                raise ActionRefused(f"that is not the contract {behaviour_id} has now")
+            try:
+                behaviour.amend_contract(contract)
+            except TransitionRefused:
+                raise ActionRefused(
+                    f"{behaviour_id} is {behaviour.state.value}: changing its contract now "
+                    "needs a correction"
+                ) from None
+            await complete_reconfirmation(connection, grant, "behaviour", behaviour_id, basis)
+            await retire_all_of_behaviour(connection, project_id, behaviour_id)
+            await save_behaviour(connection, project_id, behaviour)
+            await connection.execute(
+                "UPDATE behaviours SET current_on = %s, red_execution_id = NULL "
+                "WHERE project_id = %s AND behaviour_id = %s",
+                (basis, project_id, behaviour_id),
+            )
+            await append_event(
+                connection,
+                project_id,
+                "behaviour.contract_amended",
+                subject_id=behaviour_id,
+                payload={
+                    "by": principal.identity,
+                    "basis": basis,
+                    "replaces": replaces,
+                    "contract": contract.to_dict(),
+                    "contract_digest": contract.digest,
+                },
+                correlation_id=row["correlation_id"],
+            )
+        await self._features.reconcile(project_id)
 
     async def context_for(
         self, project_id: str, feature_id: str, story_id: str | None = None
@@ -377,6 +599,216 @@ class Decisions:
             )
             for row in rows
         ]
+
+
+@dataclass(frozen=True)
+class Evidence:
+    """What a behaviour has on record, by identifier: the accepted red; the accepted
+    green, the review cycle and the integration, where there is one."""
+
+    red: str | None = None
+    green: str | None = None
+    cycle: str | None = None
+    integration: str | None = None
+
+
+async def _evidence_of(connection: Connection, project_id: str, behaviour_id: str) -> Evidence:
+    row = await (
+        await connection.execute(
+            "SELECT b.red_execution_id::text AS red, c.green_execution_id::text AS green, "
+            "c.cycle_id::text AS cycle, i.intent_id::text AS integration FROM behaviours b "
+            "LEFT JOIN LATERAL (SELECT * FROM review_cycles c WHERE c.project_id = b.project_id "
+            "AND c.behaviour_id = b.behaviour_id AND c.state IN ('open', 'satisfied', 'integrated') "
+            "ORDER BY c.created_at DESC LIMIT 1) c ON TRUE "
+            "LEFT JOIN integration_intents i ON i.cycle_id = c.cycle_id AND i.state = 'integrated' "
+            "WHERE b.project_id = %s AND b.behaviour_id = %s",
+            (project_id, behaviour_id),
+        )
+    ).fetchone()
+    assert row is not None
+    return Evidence(**row)
+
+
+async def _after_a_decision(connection: Connection, scope: dict[str, Any]) -> None:
+    """What a decision of the Product Owner's does to its scope, in its own transaction,
+    under the exclusive gate lock: everything in scope was made under other decisions,
+    so what a person was about to approve is withdrawn, seals are cleared, and each
+    owner is asked to reconfirm or change what is theirs."""
+    project_id, feature_id = scope["project_id"], scope["feature_id"]
+    story_scope: str | None = scope["scope_story"] or None
+    stories = await (
+        await connection.execute(
+            "SELECT story_id, story_basis(project_id, story_id) AS basis FROM stories "
+            "WHERE project_id = %s AND feature_id = %s AND (%s::text IS NULL OR story_id = %s) "
+            "AND state NOT IN ('approved', 'rejected', 'cancelled') ORDER BY position FOR UPDATE",
+            (project_id, feature_id, story_scope, story_scope),
+        )
+    ).fetchall()
+    in_scope = [story["story_id"] for story in stories]
+    await _locked_project(connection, project_id)
+    gates = await (
+        await connection.execute(
+            "SELECT * FROM gates WHERE project_id = %s AND feature_id = %s AND state = 'open' "
+            "AND ((kind = 'roadmap' AND %s::text IS NULL) OR story_id = ANY(%s)) FOR UPDATE",
+            (project_id, feature_id, story_scope, in_scope),
+        )
+    ).fetchall()
+    for gate in gates:
+        await _close_gate(connection, gate, "superseded", "superseded")
+    await connection.execute(
+        "UPDATE stories SET seal_id = NULL, sealed_revision = NULL, state = CASE "
+        "WHEN state = 'awaiting_approval' THEN 'released' ELSE state END "
+        "WHERE project_id = %s AND story_id = ANY(%s)",
+        (project_id, in_scope),
+    )
+    await revoke_unstarted_grants(connection, project_id, feature_id, story_scope)
+    await retire_reconfirmations(connection, project_id, feature_id, story_scope)
+    if story_scope is None:
+        roadmap = await (
+            await connection.execute(
+                "SELECT 1 FROM roadmaps WHERE project_id = %s AND feature_id = %s "
+                "AND state <> 'superseded' LIMIT 1",
+                (project_id, feature_id),
+            )
+        ).fetchone()
+        if roadmap is not None:
+            await _owe_reconfirmation(
+                connection,
+                project_id,
+                feature_id,
+                "analyst",
+                await feature_basis(connection, project_id, feature_id),
+            )
+    for story in stories:
+        await _owe_reconfirmation(
+            connection,
+            project_id,
+            feature_id,
+            "analyst",
+            story["basis"],
+            story_id=story["story_id"],
+        )
+        contracts = await (
+            await connection.execute(
+                "SELECT behaviour_id, correlation_id FROM behaviours WHERE project_id = %s "
+                "AND story_id = %s AND contract IS NOT NULL ORDER BY position",
+                (project_id, story["story_id"]),
+            )
+        ).fetchall()
+        for behaviour in contracts:
+            await _owe_reconfirmation(
+                connection,
+                project_id,
+                feature_id,
+                "verifier",
+                story["basis"],
+                story_id=story["story_id"],
+                behaviour_id=behaviour["behaviour_id"],
+            )
+    await release_next(connection, project_id)
+
+
+async def _owe_reconfirmation(
+    connection: Connection,
+    project_id: str,
+    feature_id: str,
+    role: str,
+    basis: int,
+    *,
+    story_id: str | None = None,
+    behaviour_id: str | None = None,
+) -> None:
+    subject = behaviour_id or story_id or feature_id
+    await owe(
+        connection,
+        RECONFIRM,
+        Envelope(
+            message_kind=MessageKind.COMMAND,
+            event_type="reconfirmation.requested",
+            project_id=project_id,
+            sender=CONTROL_PLANE,
+            recipient=role,
+            idempotency_key=f"reconfirm:{project_id}:{subject}:{basis}",
+            correlation_id=uuid.uuid7(),
+            story_id=story_id if behaviour_id is None else None,
+            behaviour_id=behaviour_id,
+            payload={"basis": basis, "feature_id": feature_id},
+        ),
+        issued_on={"basis": basis},
+        feature_id=feature_id,
+    )
+
+
+async def _beyond_changing(connection: Connection, decision: dict[str, Any]) -> str:
+    """Why replacing this decision would change nothing, or an empty string. A decision
+    of a cancelled feature, or one about a story already approved, has nothing left to
+    govern: replacing it would only owe work nobody can use."""
+    row = await (
+        await connection.execute(
+            "SELECT f.closed_by, (SELECT s.state FROM stories s WHERE s.project_id = f.project_id "
+            "AND s.feature_id = f.feature_id AND s.story_id = %s) AS story_state "
+            "FROM features f WHERE f.project_id = %s AND f.feature_id = %s",
+            (decision["scope_story"], decision["project_id"], decision["feature_id"]),
+        )
+    ).fetchone()
+    assert row is not None
+    if row["closed_by"] == CANCELLED:
+        return "the feature is cancelled"
+    if row["story_state"] == "approved":
+        return f"{decision['scope_story']} is approved, and changing it is a correction"
+    return ""
+
+
+async def _reconfirmed(
+    connection: Connection,
+    project_id: str,
+    principal: Principal,
+    grant: uuid.UUID,
+    subject: str,
+    subject_id: str,
+    basis: int,
+    statement: dict[str, Any],
+) -> None:
+    await connection.execute(
+        "INSERT INTO reconfirmations (reconfirmation_id, project_id, subject, subject_id, basis, "
+        "by, grant_id, statement) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            uuid.uuid7(),
+            project_id,
+            subject,
+            subject_id,
+            basis,
+            principal.identity,
+            grant,
+            Jsonb(statement),
+        ),
+    )
+    await append_event(
+        connection,
+        project_id,
+        f"{subject}.reconfirmed",
+        subject_id=subject_id,
+        payload={"by": principal.identity, "basis": basis, **statement},
+    )
+
+
+async def _locked_behaviour_row(
+    connection: Connection, project_id: str, behaviour_id: str
+) -> dict[str, Any]:
+    row = await (
+        await connection.execute(
+            "SELECT * FROM behaviours WHERE project_id = %s AND behaviour_id = %s FOR UPDATE",
+            (project_id, behaviour_id),
+        )
+    ).fetchone()
+    if row is None:
+        raise ActionRefused(f"unknown behaviour {behaviour_id!r}")
+    return row
+
+
+def _require_role(principal: Principal, role: str) -> None:
+    if principal.kind is not PrincipalKind.WORKER or principal.role != role:
+        raise ActionRefused(f"this is for the {role} to do")
 
 
 async def _decide(

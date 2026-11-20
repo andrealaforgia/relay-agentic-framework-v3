@@ -14,11 +14,11 @@ from psycopg_pool import AsyncConnectionPool
 
 from relay.application import behaviours as behaviours_module
 from relay.application.assignments import Assignments
-from relay.application.decisions import Decisions
 from relay.application.integration import Outcome
 from relay.application.stories import StoryDraft
 from relay.domain.story import ActionRefused, HumanAction, Receipt, StoryState
 from relay.testing.oracle import ContainerIsolation
+from tests.integration.decision_world import RATE, DecisionWorld
 from tests.integration.fixtures import (
     ANALYST,
     BUILDER,
@@ -28,54 +28,19 @@ from tests.integration.fixtures import (
     HeldAtABarrier,
     held_at_the_barrier,
 )
-from tests.integration.story_world import GREETS, STANDARD_RATE, StoryWorld, at_the_story_gate
+from tests.integration.story_world import GREETS, STANDARD_RATE, at_the_story_gate
 from tests.integration.trunk_world import PROJECT, ZERO_STAYS_ZERO
-
-RATE = {
-    "text": "Which VAT rate applies to books?",
-    "why": "the expected gross amount depends on it",
-    "options": ["zero-rated", "standard rate"],
-}
-
-
-class Asking(StoryWorld):
-    def __init__(self, *arguments: Any, **options: Any) -> None:
-        super().__init__(*arguments, **options)
-        self.decisions = Decisions(self.database, self.features)
-        self.asked = 0
-
-    async def ask(self, story: str | None = "S1", feature: str = "F1") -> uuid.UUID:
-        self.asked += 1
-        return await self.decisions.ask(
-            VERIFIER, f"ask-{self.asked}", PROJECT, feature, story_id=story, **RATE
-        )
-
-    async def answer(self, question: uuid.UUID, text: str = "zero-rated") -> Receipt:
-        self.requests += 1
-        return await self.decisions.answer(
-            HumanAction(
-                PRODUCT_OWNER, f"answer-{self.requests}", str(question), "answer", {"text": text}
-            )
-        )
-
-    async def replace(self, decision: uuid.UUID, text: str) -> Receipt:
-        self.requests += 1
-        return await self.decisions.replace(
-            HumanAction(
-                PRODUCT_OWNER, f"replace-{self.requests}", str(decision), "replace", {"text": text}
-            )
-        )
 
 
 @pytest.fixture
-async def world(database: AsyncConnectionPool, tmp_path: Path, runner_image: str) -> Asking:
-    world = Asking(database, tmp_path, runner_image)
+async def world(database: AsyncConnectionPool, tmp_path: Path, runner_image: str) -> DecisionWorld:
+    world = DecisionWorld(database, tmp_path, runner_image)
     world.base = await world.open()
     return world
 
 
 async def test_an_open_question_stops_its_story_and_the_answer_becomes_shared_context(
-    world: Asking,
+    world: DecisionWorld,
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
@@ -104,12 +69,19 @@ async def test_an_open_question_stops_its_story_and_the_answer_becomes_shared_co
     ]
     assert context.basis == 1
     assert (await world.decisions.context_for(PROJECT, "F1", "S2")).basis == 0
+    with pytest.raises(ActionRefused, match="S1 is not current"):
+        await world.behaviours.run_red(PROJECT, "B1")
+    assert [(each["role"], each["subject"]) for each in await world.owed()] == [
+        ("analyst", "story"),
+        ("verifier", "behaviour"),
+    ]
+    await world.reconfirm_everything()
     assert (await world.behaviours.run_red(PROJECT, "B1")).is_valid
     assert (await world.events()).count("question.asked") == 1
     assert "question.answered" in await world.events()
 
 
-async def test_asking_again_after_a_lost_reply_is_the_same_question(world: Asking) -> None:
+async def test_asking_again_after_a_lost_reply_is_the_same_question(world: DecisionWorld) -> None:
     await world.roadmap(STANDARD_RATE)
 
     first = await world.decisions.ask(VERIFIER, "ask-1", PROJECT, "F1", story_id="S1", **RATE)
@@ -128,7 +100,7 @@ async def test_asking_again_after_a_lost_reply_is_the_same_question(world: Askin
 
 
 async def test_a_question_asked_before_any_roadmap_stops_planning_until_it_is_answered(
-    world: Asking,
+    world: DecisionWorld,
 ) -> None:
     await world.stories.open_feature(PRODUCT_OWNER, PROJECT, "F1", "prices need VAT")
     question = await world.ask(story=None)
@@ -146,7 +118,7 @@ async def test_a_question_asked_before_any_roadmap_stops_planning_until_it_is_an
     assert (await world.decisions.context_for(PROJECT, "F1")).basis == 1
 
 
-async def test_only_a_person_answers_and_a_question_is_answered_once(world: Asking) -> None:
+async def test_only_a_person_answers_and_a_question_is_answered_once(world: DecisionWorld) -> None:
     await world.roadmap(STANDARD_RATE)
     question = await world.ask("S1")
     answer = HumanAction(PRODUCT_OWNER, "a1", str(question), "answer", {"text": "zero-rated"})
@@ -168,7 +140,7 @@ async def test_only_a_person_answers_and_a_question_is_answered_once(world: Aski
     assert (await world.events()).count("question.answered") == 1
 
 
-async def test_a_decision_is_replaced_once_and_keeps_its_scope(world: Asking) -> None:
+async def test_a_decision_is_replaced_once_and_keeps_its_scope(world: DecisionWorld) -> None:
     await world.roadmap(STANDARD_RATE, GREETS)
     await world.answer(await world.ask("S1"))
     [original] = (await world.decisions.context_for(PROJECT, "F1", "S1")).decisions
@@ -190,7 +162,7 @@ async def test_a_decision_is_replaced_once_and_keeps_its_scope(world: Asking) ->
         )
 
 
-async def test_what_a_model_assumed_is_kept_apart_and_moves_nothing(world: Asking) -> None:
+async def test_what_a_model_assumed_is_kept_apart_and_moves_nothing(world: DecisionWorld) -> None:
     await world.roadmap(STANDARD_RATE)
 
     assumed = await world.decisions.assume(
@@ -213,7 +185,7 @@ async def test_what_a_model_assumed_is_kept_apart_and_moves_nothing(world: Askin
 
 
 async def test_a_stopped_story_is_not_released_and_nothing_in_its_feature_jumps_it(
-    world: Asking,
+    world: DecisionWorld,
 ) -> None:
     first = await world.roadmap(STANDARD_RATE, GREETS)
     question = await world.ask("S1")
@@ -233,7 +205,7 @@ async def test_a_stopped_story_is_not_released_and_nothing_in_its_feature_jumps_
 
 
 async def test_answering_releases_the_story_that_was_waiting_only_for_the_answer(
-    world: Asking,
+    world: DecisionWorld,
 ) -> None:
     gate = await world.roadmap(STANDARD_RATE, GREETS)
     question = await world.ask("S1")
@@ -241,13 +213,15 @@ async def test_answering_releases_the_story_that_was_waiting_only_for_the_answer
     assert await world.story("S1") is StoryState.PLANNED
 
     await world.answer(question)
+    assert await world.story("S1") is StoryState.PLANNED  # written before the answer
+    assert await world.reconfirm_everything() == 1
 
     assert await world.story("S1") is StoryState.RELEASED
-    assert (await world.events())[-2:] == ["question.answered", "story.released"]
+    assert (await world.events())[-2:] == ["story.reconfirmed", "story.released"]
 
 
 async def test_a_gate_is_not_decided_while_a_question_covers_it_and_is_stale_once_answered(
-    world: Asking,
+    world: DecisionWorld,
 ) -> None:
     gate = await world.roadmap(STANDARD_RATE)
     question = await world.ask(story=None)
@@ -261,7 +235,7 @@ async def test_a_gate_is_not_decided_while_a_question_covers_it_and_is_stale_onc
 
 
 async def test_a_pause_and_a_question_each_stop_the_story_until_each_is_cleared(
-    world: Asking,
+    world: DecisionWorld,
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
@@ -276,11 +250,14 @@ async def test_a_pause_and_a_question_each_stop_the_story_until_each_is_cleared(
     with pytest.raises(ActionRefused, match=f"question {feature_wide}"):
         await world.behaviours.begin_test_design(PROJECT, "B1")
     await world.answer(feature_wide)
+    with pytest.raises(ActionRefused, match="not current"):
+        await world.behaviours.begin_test_design(PROJECT, "B1")
+    await world.reconfirm_everything()
 
     await world.behaviours.begin_test_design(PROJECT, "B1")
 
 
-async def test_cancelling_a_feature_withdraws_its_questions(world: Asking) -> None:
+async def test_cancelling_a_feature_withdraws_its_questions(world: DecisionWorld) -> None:
     await world.roadmap(STANDARD_RATE)
     question = await world.ask("S1")
 
@@ -293,7 +270,7 @@ async def test_cancelling_a_feature_withdraws_its_questions(world: Asking) -> No
         await world.ask("S1")
 
 
-async def test_asking_takes_back_a_grant_that_has_done_nothing_yet(world: Asking) -> None:
+async def test_asking_takes_back_a_grant_that_has_done_nothing_yet(world: DecisionWorld) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.awaiting_builder("B1")
     [build] = await world.column("SELECT assignment_id FROM assignments")
@@ -307,11 +284,14 @@ async def test_asking_takes_back_a_grant_that_has_done_nothing_yet(world: Asking
     with pytest.raises(ActionRefused, match="question"):
         await claims.claim(BUILDER, build)
     await world.answer(question)
+    with pytest.raises(ActionRefused, match="not current"):
+        await claims.claim(BUILDER, build)
+    await world.reconfirm_everything()
     assert await claims.claim(BUILDER, build) != before
 
 
 async def test_checks_that_finish_under_a_question_run_again_once_it_is_answered(
-    world: Asking,
+    world: DecisionWorld,
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.integration.require_check(PROJECT, ZERO_STAYS_ZERO)
@@ -325,14 +305,16 @@ async def test_checks_that_finish_under_a_question_run_again_once_it_is_answered
     assert (await running).outcome is Outcome.HELD
     assert world.trunk() == base
 
-    await world.answer(question)  # nothing else is called
+    await world.answer(question)
+    assert world.trunk() == base
+    await world.reconfirm_everything()  # and nothing else is called
 
     assert world.trunk() == candidate
     assert await world.column("SELECT count(*) FROM integration_intents") == [1]
 
 
 async def test_a_question_waits_for_work_that_was_admitted_before_it(
-    world: Asking, monkeypatch: pytest.MonkeyPatch
+    world: DecisionWorld, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
@@ -356,7 +338,9 @@ async def test_a_question_waits_for_work_that_was_admitted_before_it(
     assert (await world.events())[-2:] == ["behaviour.test_design_started", "question.asked"]
 
 
-async def test_a_question_is_about_a_feature_or_one_of_its_own_stories(world: Asking) -> None:
+async def test_a_question_is_about_a_feature_or_one_of_its_own_stories(
+    world: DecisionWorld,
+) -> None:
     await world.roadmap(STANDARD_RATE)
     another = StoryDraft("T1", "Another feature", "something else", {"AC1": "it works"})
     await world.roadmap(another, feature="F2")
@@ -372,7 +356,7 @@ async def test_a_question_is_about_a_feature_or_one_of_its_own_stories(world: As
     assert await world.decisions.open_questions(PROJECT) == []
 
 
-async def test_an_approved_story_is_beyond_questions(world: Asking) -> None:
+async def test_an_approved_story_is_beyond_questions(world: DecisionWorld) -> None:
     gate, _ = await at_the_story_gate(world)
     await world.decide(gate)
     assert await world.story("S1") is StoryState.APPROVED

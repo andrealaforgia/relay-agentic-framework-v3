@@ -10,6 +10,8 @@ export or a push.
 
 from __future__ import annotations
 
+from typing import Any
+
 from relay.domain.story import ActionRefused
 from relay.persistence.database import Connection
 
@@ -103,3 +105,43 @@ def require_basis(read: int, now: int) -> None:
             f"this was written on decision basis {read}; the basis is now {now}: "
             "read the context again"
         )
+
+
+async def require_current(
+    connection: Connection, project_id: str, story_id: str, behaviour_id: str | None = None
+) -> None:
+    """Refuse to start work that relies on something made under decisions that have
+    since changed: the story, and with a behaviour named, that behaviour's contract and
+    the evidence gathered for it."""
+    row = await (
+        await connection.execute(
+            "SELECT not_current(%s, %s, %s) AS why", (project_id, story_id, behaviour_id)
+        )
+    ).fetchone()
+    assert row is not None
+    if row["why"] is not None:
+        raise ActionRefused(f"{row['why']}: its owner reconfirms it before work goes on")
+
+
+async def decisions_in_force(
+    connection: Connection, project_id: str, feature_id: str, story_id: str | None = None
+) -> list[dict[str, Any]]:
+    """The decisions that stand over a feature, or over one story of it: those not
+    replaced, the Product Owner's and a model's told apart, in the order they were made."""
+    return await (
+        await connection.execute(
+            "SELECT d.decision_id, d.number, d.source, d.text, d.scope_story, d.replaces "
+            "FROM decisions d WHERE d.project_id = %s AND d.feature_id = %s "
+            "AND (d.scope_story = '' OR d.scope_story = %s) AND NOT EXISTS "
+            "(SELECT 1 FROM decisions n WHERE n.replaces = d.decision_id) ORDER BY d.number",
+            (project_id, feature_id, story_id),
+        )
+    ).fetchall()
+
+
+def as_shown(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Decisions as a gate's manifest records them: what was in force when it opened."""
+    return [
+        {"number": each["number"], "source": each["source"], "text": each["text"]}
+        for each in decisions
+    ]

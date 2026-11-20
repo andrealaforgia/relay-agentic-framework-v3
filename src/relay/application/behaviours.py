@@ -182,13 +182,15 @@ class Behaviours:
         source nor the observation: Relay reads the trunk head itself, launches the subject
         itself, and records the run, the verdict and any release in one transaction.
         """
-        async with self._changing(project_id, behaviour_id, starts="work") as (
+        async with self._changing(project_id, behaviour_id, starts="evidence") as (
             connection,
             behaviour,
             correlation,
         ):
             contract = behaviour.require_awaiting_red()
             cycle = behaviour.red_cycle
+            story_id = await _story_of(connection, project_id, behaviour_id)
+            launched_on = await story_basis(connection, project_id, story_id)
             isolation = self._oracle.isolation
             if not is_gate_bearing(isolation.name):
                 refusal = refuse_isolation(contract, isolation.name)
@@ -209,11 +211,16 @@ class Behaviours:
 
         async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
             closed_by = await closure_of_behaviour(connection, project_id, behaviour_id)
+            # A run that outlives a cancel, or a decision of the Product Owner's, is
+            # kept as what was seen and changes nothing.
+            overtaken = closed_by == CANCELLED or launched_on != await story_basis(
+                connection, project_id, story_id
+            )
             verdict = behaviour.record_red_run(
-                execution, started_in_cycle=cycle, withdrawn=closed_by == CANCELLED
+                execution, started_in_cycle=cycle, withdrawn=overtaken
             )
             execution_id = await record_execution(
-                connection, project_id, behaviour_id, "red", contract.digest, execution
+                connection, project_id, behaviour_id, "red", contract.digest, execution, launched_on
             )
             evidence = {
                 "execution_id": str(execution_id),
@@ -277,18 +284,20 @@ class Behaviours:
         withdrawn while the run is in flight, what it observed is kept and changes nothing.
         """
         attempt_ref(project_id, behaviour_id, attempt)  # refuse a malformed attempt first
-        async with self._changing(project_id, behaviour_id, starts="work") as (
+        async with self._changing(project_id, behaviour_id, starts="evidence") as (
             connection,
             behaviour,
             _,
         ):
             contract = behaviour.require_awaiting_green()
+            story_id = await _story_of(connection, project_id, behaviour_id)
             run = await start_green_run(
                 connection,
                 grant,
                 project_id=project_id,
                 behaviour_id=behaviour_id,
                 attempt=attempt,
+                basis=await story_basis(connection, project_id, story_id),
             )
             isolation = self._oracle.isolation
             repository, _ = await source_of(connection, project_id)
@@ -323,7 +332,7 @@ class Behaviours:
         """Send a behaviour back for a fresh red and drop the old pairing, on the record."""
         if not reason.strip():
             raise ValueError("reopening a red needs a stated reason")
-        async with self._changing(project_id, behaviour_id, starts="work") as (
+        async with self._changing(project_id, behaviour_id, starts="evidence") as (
             connection,
             behaviour,
             correlation,
@@ -389,11 +398,15 @@ class Behaviours:
                 await _paired_red(connection, project_id, behaviour_id),
                 candidate_descends_from_red=descends,
                 still_owed=await finish_green_run(connection, run),
+                basis_moved=run.basis
+                != await story_basis(
+                    connection, project_id, await _story_of(connection, project_id, behaviour_id)
+                ),
             )
             contract = behaviour.contract
             assert contract is not None
             execution_id = await record_execution(
-                connection, project_id, behaviour_id, "green", contract.digest, execution
+                connection, project_id, behaviour_id, "green", contract.digest, execution, run.basis
             )
             evidence: dict[str, Any] = {
                 "attempt": attempt,
@@ -515,7 +528,11 @@ class Behaviours:
                 raise LookupError(f"unknown behaviour {behaviour_id!r} in project {project_id!r}")
             if starts is not None:
                 await require_story_at_work(
-                    connection, project_id, row, entering_design=starts == "design"
+                    connection,
+                    project_id,
+                    row,
+                    entering_design=starts == "design",
+                    on_its_contract=starts == "evidence",
                 )
             behaviour = load_behaviour(row)
             yield connection, behaviour, row["correlation_id"]
@@ -592,13 +609,14 @@ async def record_execution(
     purpose: str,
     contract_digest: str,
     execution: Execution,
+    basis: int | None = None,
 ) -> uuid.UUID:
     execution_id = uuid.uuid7()
     observation = execution.observation
     await connection.execute(
         "INSERT INTO executions (execution_id, project_id, behaviour_id, purpose, revision, "
-        "contract_digest, isolation, runtime_identity, exit_code, stdout, stderr, ineligibility) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        "contract_digest, isolation, runtime_identity, exit_code, stdout, stderr, ineligibility, "
+        "basis) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (
             execution_id,
             project_id,
@@ -612,6 +630,7 @@ async def record_execution(
             observation.stdout,
             observation.stderr,
             observation.ineligibility.value if observation.ineligibility else None,
+            basis,
         ),
     )
     return execution_id

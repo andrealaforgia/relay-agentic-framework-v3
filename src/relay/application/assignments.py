@@ -16,7 +16,12 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from relay.application.closure import closure_of_behaviour, lock_gate, require_open
+from relay.application.closure import (
+    closure_of_feature,
+    lock_gate,
+    require_current,
+    require_open,
+)
 from relay.domain.story import ActionRefused, Principal, PrincipalKind
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
@@ -27,6 +32,7 @@ BUILD = "build"
 REMEDIATE = "remediate"
 REVIEW = "review"
 INTEGRATE = "integrate"
+RECONFIRM = "reconfirm"
 _LIVE = ("wanted", "granted")
 
 
@@ -36,18 +42,40 @@ async def owe(
     command: Envelope,
     *,
     issued_on: dict[str, Any],
+    feature_id: str | None = None,
 ) -> uuid.UUID:
     """Record that this work is owed and announce it, in the caller's transaction. The
-    command is addressed to the role that may claim it and carries the assignment's id."""
-    assert command.behaviour_id is not None
+    command is addressed to the role that may claim it and carries the assignment's id.
+    Its subject is the behaviour the command names; failing that the story; failing
+    that the roadmap of the feature given."""
     assignment_id = uuid.uuid7()
     command = replace(command, payload={**command.payload, "assignment_id": str(assignment_id)})
+    story_id = command.story_id
+    if command.behaviour_id is not None:
+        subject = "behaviour"
+        located = await (
+            await connection.execute(
+                "SELECT s.feature_id, s.story_id FROM behaviours b "
+                "JOIN stories s USING (project_id, story_id) "
+                "WHERE b.project_id = %s AND b.behaviour_id = %s",
+                (command.project_id, command.behaviour_id),
+            )
+        ).fetchone()
+        assert located is not None
+        feature_id, story_id = located["feature_id"], located["story_id"]
+    else:
+        subject = "story" if story_id is not None else "roadmap"
+    assert feature_id is not None
     await connection.execute(
-        "INSERT INTO assignments (assignment_id, project_id, behaviour_id, kind, role, "
-        "issued_on, command_message_id) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        "INSERT INTO assignments (assignment_id, project_id, subject, feature_id, story_id, "
+        "behaviour_id, kind, role, issued_on, command_message_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (
             assignment_id,
             command.project_id,
+            subject,
+            feature_id,
+            story_id,
             command.behaviour_id,
             kind,
             command.recipient,
@@ -66,7 +94,7 @@ async def retire_all_of_behaviour(
 
 
 async def retire_all_of_feature(connection: Connection, project_id: str, feature_id: str) -> None:
-    await _retire(connection, f"project_id = %s AND {_IN_FEATURE}", (project_id, feature_id))
+    await _retire(connection, "project_id = %s AND feature_id = %s", (project_id, feature_id))
 
 
 async def revoke_unstarted_grants(
@@ -78,9 +106,7 @@ async def revoke_unstarted_grants(
     await _revoke(
         connection,
         project_id,
-        f"first_effect_at IS NULL AND {_IN_FEATURE} AND (%s::text IS NULL OR behaviour_id IN "
-        "(SELECT b.behaviour_id FROM behaviours b WHERE b.project_id = assignments.project_id "
-        "AND b.story_id = %s))",
+        "first_effect_at IS NULL AND feature_id = %s AND (%s::text IS NULL OR story_id = %s)",
         (feature_id, story_id, story_id),
     )
 
@@ -94,10 +120,8 @@ async def announce_again(connection: Connection, project_id: str) -> int:
         await connection.execute(
             "UPDATE outbox SET published_at = NULL WHERE message_id IN "
             "(SELECT a.command_message_id FROM assignments a "
-            "JOIN behaviours b USING (project_id, behaviour_id) "
-            "JOIN stories s USING (project_id, story_id) "
             "WHERE a.project_id = %s AND a.state = 'wanted' "
-            "AND standing(s.project_id, s.feature_id, s.story_id) IS NULL) "
+            "AND standing(a.project_id, a.feature_id, a.story_id) IS NULL) "
             "RETURNING message_id",
             (project_id,),
         )
@@ -110,6 +134,8 @@ class GreenRun:
     run_id: uuid.UUID
     assignment_id: uuid.UUID
     grant_id: uuid.UUID
+    # The decision basis the run began on.
+    basis: int
 
 
 async def start_green_run(
@@ -119,6 +145,7 @@ async def start_green_run(
     project_id: str,
     behaviour_id: str,
     attempt: int,
+    basis: int,
 ) -> GreenRun:
     """The first effect of a build or a remediation: a record, committed before anything
     is launched, that this grant began a green run. Refused unless the grant is still the
@@ -131,10 +158,11 @@ async def start_green_run(
     )
     if assignment_id is None:
         raise ActionRefused("this grant is not the current one for this behaviour's build")
-    run = GreenRun(uuid.uuid7(), assignment_id, grant_id)
+    run = GreenRun(uuid.uuid7(), assignment_id, grant_id, basis)
     await connection.execute(
-        "INSERT INTO green_runs (run_id, assignment_id, grant_id, attempt) VALUES (%s, %s, %s, %s)",
-        (run.run_id, run.assignment_id, grant_id, attempt),
+        "INSERT INTO green_runs (run_id, assignment_id, grant_id, attempt, basis) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (run.run_id, run.assignment_id, grant_id, attempt, basis),
     )
     return run
 
@@ -188,6 +216,37 @@ async def revoke_every_grant(connection: Connection, project_id: str) -> None:
         (project_id,),
     )
     await _revoke(connection, project_id, "TRUE", ())
+
+
+async def retire_reconfirmations(
+    connection: Connection, project_id: str, feature_id: str, story_id: str | None
+) -> None:
+    """A later decision in the same scope makes the reconfirmations owed for an earlier
+    one pointless: new ones are owed for the new basis."""
+    await _retire(
+        connection,
+        "project_id = %s AND feature_id = %s AND kind = 'reconfirm' "
+        "AND (%s::text IS NULL OR story_id = %s)",
+        (project_id, feature_id, story_id, story_id),
+    )
+
+
+async def complete_reconfirmation(
+    connection: Connection, grant_id: uuid.UUID, subject: str, subject_id: str, basis: int
+) -> None:
+    """A reconfirmation, or the amendment that stands in its place, is done under the
+    grant that holds exactly this work now: this subject, for this basis."""
+    done = await (
+        await connection.execute(
+            "UPDATE assignments SET state = 'done', first_effect_at = now() "
+            "WHERE grant_id = %s AND state = 'granted' AND kind = 'reconfirm' AND subject = %s "
+            "AND coalesce(behaviour_id, story_id, feature_id) = %s "
+            "AND (issued_on->>'basis')::integer = %s RETURNING assignment_id",
+            (grant_id, subject, subject_id, basis),
+        )
+    ).fetchone()
+    if done is None:
+        raise ActionRefused("this grant is not the current one for this reconfirmation")
 
 
 async def retire_reviews_of_cycle(connection: Connection, cycle_id: uuid.UUID) -> None:
@@ -252,8 +311,29 @@ class Assignments:
                 raise ActionRefused("the control plane takes up integrations itself")
             if principal.kind is not PrincipalKind.WORKER or principal.role != assignment["role"]:
                 raise ActionRefused(f"this work is for a {assignment['role']} to claim")
-            project_id, behaviour_id = assignment["project_id"], assignment["behaviour_id"]
-            require_open(await closure_of_behaviour(connection, project_id, behaviour_id))
+            project_id = assignment["project_id"]
+            subject_id = (
+                assignment["behaviour_id"] or assignment["story_id"] or assignment["feature_id"]
+            )
+            require_open(
+                await closure_of_feature(
+                    connection, project_id, assignment["feature_id"], assignment["story_id"]
+                )
+            )
+            if assignment["kind"] != RECONFIRM:
+                # Ordinary work relies on the story, the contract and the evidence so
+                # far being current. Reconfirming is how they become so.
+                await require_current(
+                    connection, project_id, assignment["story_id"], assignment["behaviour_id"]
+                )
+            elif assignment["behaviour_id"] is not None and await _has_an_unsettled_integration(
+                connection, project_id, assignment["behaviour_id"]
+            ):
+                # The Verifier is asked to vouch for what is on record, and what will be
+                # on record is not known until the push has its answer.
+                raise ActionRefused(
+                    f"the integration of {assignment['behaviour_id']} has not settled yet"
+                )
             if assignment["state"] == "granted":
                 if assignment["granted_to"] != principal.identity:
                     raise ActionRefused("this work is already granted to another worker")
@@ -271,7 +351,7 @@ class Assignments:
                 connection,
                 project_id,
                 "assignment.granted",
-                subject_id=behaviour_id,
+                subject_id=subject_id,
                 payload={
                     "assignment_id": str(assignment_id),
                     "grant_id": str(grant_id),
@@ -282,19 +362,13 @@ class Assignments:
             return grant_id
 
 
-_IN_FEATURE = (
-    "behaviour_id IN (SELECT b.behaviour_id FROM behaviours b "
-    "JOIN stories s USING (project_id, story_id) "
-    "WHERE b.project_id = assignments.project_id AND s.feature_id = %s)"
-)
-
-
 async def _revoke(
     connection: Connection, project_id: str, where: str, parameters: tuple[Any, ...]
 ) -> None:
     revoked = await (
         await connection.execute(
-            "SELECT assignment_id, behaviour_id, grant_id, granted_to FROM assignments "
+            "SELECT assignment_id, coalesce(behaviour_id, story_id, feature_id) AS behaviour_id, "
+            "grant_id, granted_to FROM assignments "
             f"WHERE project_id = %s AND state = 'granted' AND {where} "
             "ORDER BY assignment_id FOR UPDATE",
             (project_id, *parameters),
@@ -330,6 +404,19 @@ async def _first_effect(
         )
     ).fetchone()
     return row["assignment_id"] if row else None
+
+
+async def _has_an_unsettled_integration(
+    connection: Connection, project_id: str, behaviour_id: str
+) -> bool:
+    row = await (
+        await connection.execute(
+            "SELECT 1 FROM integration_intents WHERE project_id = %s AND behaviour_id = %s "
+            "AND state = 'outstanding'",
+            (project_id, behaviour_id),
+        )
+    ).fetchone()
+    return row is not None
 
 
 async def _retire(connection: Connection, where: str, parameters: tuple[Any, ...]) -> None:

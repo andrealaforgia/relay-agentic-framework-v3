@@ -4,9 +4,14 @@
 CREATE TABLE assignments (
     assignment_id   uuid PRIMARY KEY,
     project_id      text NOT NULL,
-    behaviour_id    text NOT NULL,
+    -- What the work is about: a behaviour, a story, or a feature's roadmap. Its feature
+    -- is always recorded, and its story unless the subject is the roadmap.
+    subject         text NOT NULL CHECK (subject IN ('behaviour', 'story', 'roadmap')),
+    feature_id      text NOT NULL,
+    story_id        text,
+    behaviour_id    text,
     kind            text NOT NULL
-                    CHECK (kind IN ('build', 'remediate', 'review', 'integrate')),
+                    CHECK (kind IN ('build', 'remediate', 'review', 'integrate', 'reconfirm')),
     role            text NOT NULL,
     issued_on       jsonb NOT NULL,
     state           text NOT NULL DEFAULT 'wanted'
@@ -17,6 +22,9 @@ CREATE TABLE assignments (
     command_message_id uuid,
     created_at      timestamptz NOT NULL DEFAULT clock_timestamp(),
     FOREIGN KEY (project_id, behaviour_id) REFERENCES behaviours,
+    FOREIGN KEY (project_id, feature_id) REFERENCES features,
+    CHECK ((subject = 'behaviour') = (behaviour_id IS NOT NULL)),
+    CHECK ((subject = 'roadmap') = (story_id IS NULL)),
     CHECK (state <> 'wanted' OR grant_id IS NULL),
     CHECK (state <> 'granted' OR grant_id IS NOT NULL),
     CHECK ((grant_id IS NULL) = (granted_to IS NULL))

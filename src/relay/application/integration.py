@@ -19,7 +19,14 @@ from typing import Any
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
-from relay.application.assignments import INTEGRATE, REMEDIATE, owe, retire, take_up
+from relay.application.assignments import (
+    INTEGRATE,
+    REMEDIATE,
+    announce_again,
+    owe,
+    retire,
+    take_up,
+)
 from relay.application.behaviours import (
     CONTROL_PLANE,
     load_behaviour,
@@ -31,6 +38,7 @@ from relay.application.closure import (
     closure_of_behaviour,
     lock_gate,
     require_open,
+    story_basis,
 )
 from relay.application.reviews import gate_of
 from relay.application.stories import evaluate_story_gate, lock_story, require_story_at_work
@@ -311,7 +319,9 @@ class Integration:
                 else:
                     generation = parent["generation"] + 1
             if answer_again is None:
-                await require_story_at_work(connection, project_id, row, entering_design=False)
+                await require_story_at_work(
+                    connection, project_id, row, entering_design=False, on_its_contract=True
+                )
                 cycle = await _live_cycle(connection, project_id, behaviour_id)
                 if (
                     behaviour.state is not BehaviourState.REVIEW
@@ -338,6 +348,7 @@ class Integration:
                         "behaviour_id": behaviour_id,
                         "request_id": request_id,
                         "generation": generation,
+                        "basis": await story_basis(connection, project_id, row["story_id"]),
                         "cycle_id": cycle["cycle_id"],
                         "candidate_revision": cycle["candidate_revision"],
                         "expected_trunk": head,
@@ -490,7 +501,13 @@ class Integration:
             runs = []
             for check, execution in executions:
                 execution_id = await record_execution(
-                    connection, project_id, behaviour_id, "check", check.digest, execution
+                    connection,
+                    project_id,
+                    behaviour_id,
+                    "check",
+                    check.digest,
+                    execution,
+                    batch["basis"],
                 )
                 satisfied = check.is_satisfied_by(execution)
                 await connection.execute(
@@ -812,6 +829,8 @@ class Integration:
                 "UPDATE integration_intents SET state = 'integrated' WHERE intent_id = %s",
                 (intent_id,),
             )
+            # A reconfirmation that could not be claimed while this was outstanding can be now.
+            await announce_again(connection, intent["project_id"])
             await connection.execute(
                 "UPDATE review_cycles SET state = 'integrated' WHERE cycle_id = %s",
                 (intent["cycle_id"],),
@@ -903,6 +922,8 @@ class Integration:
                 "WHERE intent_id = %s",
                 (reason, intent_id),
             )
+            # A reconfirmation that could not be claimed while this was outstanding can be now.
+            await announce_again(connection, intent["project_id"])
             await append_event(
                 connection,
                 intent["project_id"],
@@ -1169,7 +1190,7 @@ async def _insert_batch(connection: Connection, batch: dict[str, Any], *, state:
     await connection.execute(
         "INSERT INTO check_batches (batch_id, project_id, behaviour_id, request_id, cycle_id, "
         "candidate_revision, expected_trunk, check_policy_version, regression_digest, members, "
-        "state, generation) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        "state, generation, basis) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (
             batch["batch_id"],
             batch["project_id"],
@@ -1183,6 +1204,7 @@ async def _insert_batch(connection: Connection, batch: dict[str, Any], *, state:
             Jsonb([check.to_dict() for check in batch["members"]]),
             state,
             batch["generation"],
+            batch["basis"],
         ),
     )
 
@@ -1208,6 +1230,8 @@ async def _why_stale(
         or row["candidate_revision"] != cycle["candidate_revision"]
     ):
         return "the red or the candidate on record is no longer the one that was reviewed"
+    if batch["basis"] != await story_basis(connection, batch["project_id"], row["story_id"]):
+        return "a decision of the Product Owner's was made while these checks were running"
     if (await gate_of(connection, cycle)).state is not GateState.SATISFIED:
         return "the review gate is no longer satisfied"
     checks = await _regression_set(connection, batch["project_id"])
@@ -1272,6 +1296,8 @@ async def _park(
         "UPDATE integration_intents SET state = 'rejected', reason = %s WHERE intent_id = %s",
         (reason, intent["intent_id"]),
     )
+    # A reconfirmation that could not be claimed while this was outstanding can be now.
+    await announce_again(connection, intent["project_id"])
     # A conflict on the candidate ref could not stop this intent while it was owed. The
     # intent is over, so the conflict now stops the cycle being used for another.
     await connection.execute(

@@ -21,11 +21,14 @@ from relay.application.assignments import retire_all_of_feature, revoke_unstarte
 from relay.application.closure import (
     CANCELLED,
     PAUSED,
+    as_shown,
     closure_of_feature,
     closure_of_story,
+    decisions_in_force,
     feature_basis,
     lock_gate,
     require_basis,
+    require_current,
     require_open,
     story_basis,
 )
@@ -170,6 +173,7 @@ class Stories:
                 "feature_id": feature_id,
                 "problem": feature["problem"],
                 "roadmap_revision": 1,
+                "decisions": as_shown(await decisions_in_force(connection, project_id, feature_id)),
                 "stories": [
                     {
                         "story_id": story.story_id,
@@ -214,6 +218,7 @@ class Stories:
             _require_revisions(story, story_revision, list_revision, story["list_revision"])
             require_basis(basis, await story_basis(connection, project_id, story_id))
             listed = await _behaviours_of(connection, project_id, story_id)
+            await _require_all_current(connection, project_id, story_id, listed)
             require_sealable(
                 story["criteria"].keys(),
                 {row["behaviour_id"]: row["demonstrates"] for row in listed},
@@ -267,6 +272,12 @@ class Stories:
             require_basis(basis, await story_basis(connection, project_id, story_id))
             if seal != story["seal_id"]:
                 raise ActionRefused("this assessment is of a seal that is no longer the story's")
+            await _require_all_current(
+                connection,
+                project_id,
+                story_id,
+                await _behaviours_of(connection, project_id, story_id),
+            )
             if await _assessment(connection, story) is not None:
                 raise ActionRefused("this sealed list has already been assessed")
             await connection.execute(
@@ -444,6 +455,7 @@ async def add_behaviour_to_story(
     _require_at_work(story)
     require_open(await closure_of_story(connection, project_id, story_id))
     require_basis(basis, await story_basis(connection, project_id, story_id))
+    await require_current(connection, project_id, story_id)
     if not demonstrates:
         # It could be built and integrated, and then no list containing it could ever
         # be sealed: the story would hold the project and never reach its gate.
@@ -461,7 +473,12 @@ async def add_behaviour_to_story(
 
 
 async def require_story_at_work(
-    connection: Connection, project_id: str, behaviour: Mapping[str, Any], *, entering_design: bool
+    connection: Connection,
+    project_id: str,
+    behaviour: Mapping[str, Any],
+    *,
+    entering_design: bool,
+    on_its_contract: bool = False,
 ) -> None:
     """Refuse to start anything on a behaviour whose story is not being worked on. Called
     with the behaviour's row already locked; the story is locked after it, shared, so the
@@ -475,6 +492,14 @@ async def require_story_at_work(
     assert story is not None
     _require_at_work(story)
     require_open(await closure_of_story(connection, project_id, behaviour["story_id"]))
+    # Work that runs, reviews or integrates the behaviour relies on its contract and the
+    # evidence gathered so far; work before that relies on the story alone.
+    await require_current(
+        connection,
+        project_id,
+        behaviour["story_id"],
+        behaviour["behaviour_id"] if on_its_contract else None,
+    )
     if entering_design:
         earlier = await (
             await connection.execute(
@@ -592,6 +617,46 @@ async def close_feature(pool: Pool, project_id: str, action: HumanAction) -> Rec
         return receipt
 
 
+async def reopen_roadmap_gate(connection: Connection, project_id: str, feature_id: str) -> None:
+    """A roadmap still waiting for approval was reconfirmed after a decision: put it to
+    the Product Owner again, as it stands, with the decisions now in force."""
+    roadmap = await (
+        await connection.execute(
+            "SELECT revision FROM roadmaps WHERE project_id = %s AND feature_id = %s "
+            "AND state = 'proposed' ORDER BY revision DESC LIMIT 1",
+            (project_id, feature_id),
+        )
+    ).fetchone()
+    if roadmap is None:
+        return  # approved already: the Product Owner has seen it and made the decision
+    feature = await _locked_feature(connection, project_id, feature_id)
+    listed = await (
+        await connection.execute(
+            "SELECT story_id, title, outcome, criteria FROM stories WHERE project_id = %s "
+            "AND feature_id = %s AND roadmap_revision = %s ORDER BY position",
+            (project_id, feature_id, roadmap["revision"]),
+        )
+    ).fetchall()
+    await _open_gate(
+        connection,
+        project_id,
+        feature_id,
+        kind="roadmap",
+        story_id=None,
+        basis={
+            "roadmap_revision": roadmap["revision"],
+            "decisions": await feature_basis(connection, project_id, feature_id),
+        },
+        manifest={
+            "feature_id": feature_id,
+            "problem": feature["problem"],
+            "roadmap_revision": roadmap["revision"],
+            "decisions": as_shown(await decisions_in_force(connection, project_id, feature_id)),
+            "stories": [dict(story) for story in listed],
+        },
+    )
+
+
 async def release_next(connection: Connection, project_id: str) -> None:
     """Start the one story of this project that may start now, if there is one. Run in
     the transaction of every event that can free the project's place or add a story to
@@ -608,7 +673,9 @@ async def release_next(connection: Connection, project_id: str) -> None:
     rows = await (
         await connection.execute(
             "SELECT s.feature_id, s.story_id, s.state, "
-            "standing(s.project_id, s.feature_id, s.story_id) IS NOT NULL AS stopped "
+            "(standing(s.project_id, s.feature_id, s.story_id) IS NOT NULL "
+            "OR r.current_on <> feature_basis(s.project_id, s.feature_id) "
+            "OR not_current(s.project_id, s.story_id, NULL) IS NOT NULL) AS stopped "
             "FROM stories s JOIN roadmaps r USING (project_id, feature_id) "
             "JOIN features f USING (project_id, feature_id) "
             "WHERE s.project_id = %s AND r.revision = s.roadmap_revision AND r.state = 'approved' "
@@ -676,6 +743,15 @@ async def _cancel(connection: Connection, project_id: str, feature_id: str) -> N
         "WHERE b.project_id = %s AND s.feature_id = %s)",
         (project_id, project_id, feature_id),
     )
+
+
+async def _require_all_current(
+    connection: Connection, project_id: str, story_id: str, listed: Sequence[Mapping[str, Any]]
+) -> None:
+    """A seal and an assessment vouch for the story and for every behaviour in its list."""
+    await require_current(connection, project_id, story_id)
+    for behaviour in listed:
+        await require_current(connection, project_id, story_id, behaviour["behaviour_id"])
 
 
 def _require_role(principal: Principal, role: str) -> None:
@@ -900,9 +976,14 @@ async def _story_review(
             "assessment_id": str(assessment["assessment_id"]),
             "statement": assessment["statement"],
         },
-        # Answers the Product Owner gave to questions about this story. None can exist
-        # yet; the gate decisions themselves are in the ledger, not here.
-        "question_answers": [],
+        # The decisions in force over this story when the gate opened: the Product
+        # Owner's answers and what a model assumed, told apart. A snapshot; the gate
+        # decisions themselves are in the ledger, not here.
+        "decisions": as_shown(
+            await decisions_in_force(
+                connection, story["project_id"], story["feature_id"], story["story_id"]
+            )
+        ),
         # Not measured yet. Unknown is not zero, and is never shown as zero.
         "usage": "unknown",
     }

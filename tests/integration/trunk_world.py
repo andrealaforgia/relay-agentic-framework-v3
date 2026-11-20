@@ -141,8 +141,9 @@ class TrunkWorld:
         self, behaviour: str = "B1", contract: ProcessContract = CONTRACT, story: str = "S1"
     ) -> str:
         """A behaviour with a verified red on the current trunk. Returns that revision."""
+        basis = await self.basis(story)
         await self.behaviours.propose(
-            self.project, story, behaviour, contract.observes, ["AC1"], basis=0
+            self.project, story, behaviour, contract.observes, ["AC1"], basis=basis
         )
         if self.side_by_side:
             # Relay makes a behaviour wait for the ones before it in its story. The
@@ -153,7 +154,9 @@ class TrunkWorld:
                     "UPDATE behaviours SET position = 1 WHERE project_id = %s", (self.project,)
                 )
         await self.behaviours.begin_test_design(self.project, behaviour)
-        await self.behaviours.register_acceptance_test(self.project, behaviour, contract, basis=0)
+        await self.behaviours.register_acceptance_test(
+            self.project, behaviour, contract, basis=basis
+        )
         assert (await self.behaviours.run_red(self.project, behaviour)).is_valid
         return self.trunk()
 
@@ -233,6 +236,12 @@ class TrunkWorld:
         async with asyncio.timeout(30):
             while not flag.exists():
                 await asyncio.sleep(0.05)
+
+    async def basis(self, story: str = "S1") -> int:
+        """The decision basis a role would read with the story, just before it submits."""
+        [basis] = await self.column(f"SELECT story_basis('{self.project}', '{story}')")
+        assert isinstance(basis, int)
+        return basis
 
     async def state(self, behaviour: str = "B1") -> BehaviourState:
         return await self.behaviours.state_of(self.project, behaviour)

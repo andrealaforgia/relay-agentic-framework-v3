@@ -213,7 +213,7 @@ async def prepare_review(reviews: Reviews, capability: str, into: Path) -> Path:
         reviewer = Principal(PrincipalKind.WORKER, f"worker-{task['role']}", role=task["role"])
         with contextlib.suppress(ActionRefused):
             grant = await Assignments(pool).claim(reviewer, task["assignment_id"])
-    return await reviews.prepare_review(capability, into, grant)
+    return (await reviews.prepare_review(capability, into, grant)).tree
 
 
 async def announce_wanted_work_again(pool: AsyncConnectionPool, project: str) -> int:
@@ -222,16 +222,19 @@ async def announce_wanted_work_again(pool: AsyncConnectionPool, project: str) ->
 
 
 async def submit_review(reviews: Reviews, capability: str, review: Review) -> SubmissionReceipt:
-    """Submit as the worker that holds the review now would: under its current grant.
-    Where nobody holds it, a grant nobody was given."""
+    """Submit as the worker that holds the review now would: under its current grant, and
+    from the tree it was last handed. Where there is neither, identifiers nobody was given."""
     async with reviews._pool.connection() as connection:
         held = await (
             await connection.execute(
-                "SELECT a.grant_id FROM review_tasks t JOIN assignments a USING (assignment_id) "
+                "SELECT a.grant_id, (SELECT c.receipt_id FROM review_checkouts c "
+                "WHERE c.task_id = t.task_id AND c.grant_id = a.grant_id "
+                "ORDER BY c.prepared_at DESC, c.receipt_id DESC LIMIT 1) AS receipt "
+                "FROM review_tasks t JOIN assignments a USING (assignment_id) "
                 "WHERE t.capability = %s AND a.grant_id IS NOT NULL",
                 (capability,),
             )
         ).fetchone()
-    return await reviews.submit_review(
-        capability, review, held["grant_id"] if held else uuid.uuid7()
-    )
+    grant = held["grant_id"] if held else uuid.uuid7()
+    receipt = (held["receipt"] if held else None) or uuid.uuid7()
+    return await reviews.submit_review(capability, review, grant, receipt)

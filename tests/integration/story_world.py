@@ -92,12 +92,6 @@ class StoryWorld(TrunkWorld):
             seal=seal or uuid.uuid7(),
         )
 
-    async def basis(self, story: str = "S1") -> int:
-        """The decision basis a role would read with the story, just before it submits."""
-        [basis] = await self.column(f"SELECT story_basis('{self.project}', '{story}')")
-        assert isinstance(basis, int)
-        return basis
-
     async def story(self, story: str = "S1") -> StoryState:
         return await self.stories.state_of(self.project, story)
 
