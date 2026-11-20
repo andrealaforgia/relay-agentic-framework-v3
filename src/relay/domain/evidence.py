@@ -170,10 +170,36 @@ class RedVerdict:
         return self.rejection is None
 
 
+class GreenRejection(StrEnum):
+    ISOLATION_NOT_ADMISSIBLE = "isolation_not_admissible"
+    NO_PAIRED_RED = "no_paired_red"
+    NOT_BUILT_ON_THE_RED_REVISION = "not_built_on_the_red_revision"
+    RUNTIME_CHANGED = "runtime_changed"
+    NOT_EXECUTED = "not_executed"
+    TIMED_OUT = "timed_out"
+    KILLED_BY_SIGNAL = "killed_by_signal"
+    OUTPUT_OVERFLOW = "output_overflow"
+    EXPECTATION_NOT_MET = "expectation_not_met"
+
+
 @dataclass(frozen=True)
 class GreenVerdict:
-    is_valid: bool
+    rejection: GreenRejection | None
     reason: str
+
+    @property
+    def is_valid(self) -> bool:
+        return self.rejection is None
+
+
+@dataclass(frozen=True)
+class PairedRed:
+    """The accepted red a green must answer: same contract, same runtime, and a
+    candidate that was built on top of the revision the red was observed on."""
+
+    revision: str
+    contract_digest: str
+    runtime_identity: str
 
 
 def refuse_isolation(contract: ProcessContract, isolation: str) -> RedVerdict:
@@ -209,7 +235,43 @@ def judge_red(contract: ProcessContract, execution: Execution) -> RedVerdict:
     )
 
 
-def judge_green(contract: ProcessContract, observation: ProcessObservation) -> GreenVerdict:
-    if contract.is_satisfied_by(observation):
-        return GreenVerdict(True, f"{contract.contract_id}: the expectation was observed")
-    return GreenVerdict(False, f"{contract.contract_id}: the expectation was not observed")
+def judge_green(
+    contract: ProcessContract,
+    execution: Execution,
+    red: PairedRed | None,
+    *,
+    candidate_descends_from_red: bool,
+) -> GreenVerdict:
+    """A passing run is only a run. It certifies a change in behaviour when the same
+    contract was seen failing as registered, in the same runtime, on a revision the
+    candidate was built on."""
+
+    def rejected(rejection: GreenRejection, explanation: str) -> GreenVerdict:
+        return GreenVerdict(rejection, f"{contract.contract_id}: {explanation}")
+
+    observation = execution.observation
+    if not is_gate_bearing(execution.isolation):
+        return rejected(
+            GreenRejection.ISOLATION_NOT_ADMISSIBLE,
+            f"{execution.isolation} execution cannot open a gate",
+        )
+    if red is None or red.contract_digest != contract.digest:
+        return rejected(GreenRejection.NO_PAIRED_RED, "no accepted red exists for this contract")
+    if execution.revision == red.revision or not candidate_descends_from_red:
+        return rejected(
+            GreenRejection.NOT_BUILT_ON_THE_RED_REVISION,
+            "the candidate is not a change built on the revision the red was observed on",
+        )
+    if execution.runtime_identity != red.runtime_identity:
+        return rejected(
+            GreenRejection.RUNTIME_CHANGED,
+            "the runtime differs from the one the red was observed in; a fresh red is needed",
+        )
+    if observation.ineligibility is not None:
+        return rejected(
+            GreenRejection(observation.ineligibility.value),
+            f"the run is ineligible ({observation.ineligibility.value.replace('_', ' ')})",
+        )
+    if not contract.is_satisfied_by(observation):
+        return rejected(GreenRejection.EXPECTATION_NOT_MET, "the expectation was not observed")
+    return GreenVerdict(None, f"{contract.contract_id}: the expectation was observed")

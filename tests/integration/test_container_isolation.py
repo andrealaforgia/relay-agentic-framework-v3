@@ -21,6 +21,7 @@ from relay.domain.evidence import (
     Expected,
     Ineligibility,
     Launch,
+    PairedRed,
     ProcessContract,
     judge_green,
     judge_red,
@@ -167,8 +168,9 @@ async def test_a_subject_killed_inside_the_container_cannot_pass_either_gate(
     as_red = ProcessContract("B", "x", launch, Expected(0, "ok\n"), Baseline(137, stdout="100\n"))
     as_green = ProcessContract("B", "x", launch, Expected(137, "100\n"), Baseline(0, stdout="no\n"))
     execution = Execution(revision, "container", runner_image, observation)
+    paired = PairedRed("a" * 40, as_green.digest, runner_image)
     assert not judge_red(as_red, execution).is_valid
-    assert not judge_green(as_green, observation).is_valid
+    assert not judge_green(as_green, execution, paired, candidate_descends_from_red=True).is_valid
 
 
 async def test_the_subject_sees_only_the_files_of_the_revision_and_no_git_metadata(
@@ -320,6 +322,36 @@ async def test_output_beyond_the_capture_limit_is_an_overflow_in_a_container_too
     ).observe(workdir, Launch(argv=("python3", "vat.py"), timeout_seconds=30))
 
     assert observation.ineligibility is Ineligibility.OUTPUT_OVERFLOW
+
+
+async def test_the_engine_is_told_to_bound_what_it_stores_of_the_subjects_output(
+    tmp_path: Path, runner_image: str
+) -> None:
+    class RecordsLogConfiguration(ContainerIsolation):
+        log_configuration: dict[str, Any] | None = None
+
+        async def _docker(self, *arguments: str, **options: Any) -> oracle.Captured:
+            captured = await super()._docker(*arguments, **options)
+            if arguments[0] == "create":
+                name = arguments[arguments.index("--name") + 1]
+                inspected = await super()._docker(
+                    "inspect", "--format", "{{json .HostConfig.LogConfig}}", name
+                )
+                self.log_configuration = json.loads(inspected.stdout)
+            return captured
+
+    revision = commit(tmp_path / "subject", {"vat.py": VAT_RETURNS_NET})
+    workdir = await pristine_checkout(str(tmp_path / "subject"), revision, tmp_path / "checkout")
+    isolation = RecordsLogConfiguration(runner_image)
+
+    await ProcessOracle(isolation, capture_limit_bytes=1_000_000).observe(
+        workdir, Launch(argv=("python3", "vat.py", "1"), timeout_seconds=30)
+    )
+
+    assert isolation.log_configuration == {
+        "Type": "json-file",
+        "Config": {"max-file": "1", "max-size": "2000000"},
+    }
 
 
 def test_an_unpinned_image_is_refused() -> None:

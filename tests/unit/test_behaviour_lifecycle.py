@@ -7,7 +7,9 @@ from relay.domain.evidence import (
     Baseline,
     Execution,
     Expected,
+    GreenRejection,
     Launch,
+    PairedRed,
     ProcessContract,
     ProcessObservation,
 )
@@ -74,3 +76,39 @@ def test_a_refusal_names_what_was_attempted_and_what_is_required() -> None:
     assert refusal.value.attempted == "register_acceptance_test"
     assert refusal.value.current is BehaviourState.PROPOSED
     assert refusal.value.required == (BehaviourState.TEST_DESIGN,)
+
+
+RED = PairedRed("a" * 40, CONTRACT.digest, "image")
+PASSES = Execution("c" * 40, "container", "image", ProcessObservation(0, b"120\n"))
+STILL_FAILS = Execution("c" * 40, "container", "image", ProcessObservation(0, b"100\n"))
+
+
+def implementing() -> Behaviour:
+    behaviour = awaiting_red()
+    behaviour.record_red_run(FAILS_AS_REGISTERED)
+    return behaviour
+
+
+def test_a_paired_green_sends_the_behaviour_to_review() -> None:
+    behaviour = implementing()
+
+    verdict = behaviour.record_green_run(PASSES, RED, candidate_descends_from_red=True)
+
+    assert verdict.is_valid
+    assert behaviour.state is BehaviourState.REVIEW
+
+
+def test_a_candidate_that_still_fails_stays_with_the_builder() -> None:
+    behaviour = implementing()
+
+    verdict = behaviour.record_green_run(STILL_FAILS, RED, candidate_descends_from_red=True)
+
+    assert verdict.rejection is GreenRejection.EXPECTATION_NOT_MET
+    assert behaviour.state is BehaviourState.IMPLEMENTING
+
+
+def test_green_cannot_be_recorded_before_red() -> None:
+    with pytest.raises(TransitionRefused) as refusal:
+        awaiting_red().record_green_run(PASSES, RED, candidate_descends_from_red=True)
+
+    assert refusal.value.current is BehaviourState.VALIDATING_RED

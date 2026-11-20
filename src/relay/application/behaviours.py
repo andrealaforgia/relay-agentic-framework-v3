@@ -15,13 +15,19 @@ from psycopg.types.json import Jsonb
 from relay.domain.behaviour import Behaviour, BehaviourState
 from relay.domain.evidence import (
     Execution,
+    GreenVerdict,
+    PairedRed,
     ProcessContract,
+    ProcessObservation,
     RedVerdict,
     is_gate_bearing,
     refuse_isolation,
 )
 from relay.git.checkout import (
     CheckoutFailed,
+    attempt_head,
+    attempt_ref,
+    candidate_checkout,
     pristine_checkout,
     require_credential_free,
     trunk_head,
@@ -115,7 +121,7 @@ class Behaviours:
                 workdir = await pristine_checkout(repository, revision, Path(scratch) / "subject")
                 execution = await self._oracle.execute(revision, workdir, contract.launch)
         except CheckoutFailed as failure:
-            await self._red_preparation_failed(project_id, behaviour_id, contract, failure)
+            await self._preparation_failed("red", project_id, behaviour_id, contract, failure)
             raise
 
         async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
@@ -134,6 +140,11 @@ class Behaviours:
                     connection, project_id, behaviour_id, correlation, verdict, contract, evidence
                 )
                 return verdict
+            await connection.execute(
+                "UPDATE behaviours SET red_execution_id = %s "
+                "WHERE project_id = %s AND behaviour_id = %s",
+                (execution_id, project_id, behaviour_id),
+            )
             verified = await append_event(
                 connection,
                 project_id,
@@ -161,6 +172,94 @@ class Behaviours:
                     causation_id=verified.event_id,
                     payload={"base_revision": execution.revision},
                 ),
+            )
+            return verdict
+
+    async def run_green(self, project_id: str, behaviour_id: str, attempt: int) -> GreenVerdict:
+        """Observe the contract on the candidate a Builder published for this attempt.
+
+        The caller names an attempt, nothing more. Relay reads the candidate from the
+        project's own repository, checks it was built on the revision the red was observed
+        on, launches it itself and pairs the result with that red.
+        """
+        async with self._changing(project_id, behaviour_id) as (connection, behaviour, _):
+            contract = behaviour.require_awaiting_green()
+            isolation = self._oracle.isolation
+            repository, _ = await _source(connection, project_id)
+            red = await _paired_red(connection, project_id, behaviour_id)
+
+        if red is None or not is_gate_bearing(isolation.name):
+            # Nothing to pair with, or nothing that could count: judge without launching.
+            unlaunched = Execution("0" * 40, isolation.name, "", ProcessObservation())
+            return await self._record_green(
+                project_id, behaviour_id, attempt, unlaunched, red, descends=False, ran=False
+            )
+        try:
+            candidate = await attempt_head(repository, behaviour_id, attempt)
+            with tempfile.TemporaryDirectory(prefix="relay-green-") as scratch:
+                workdir, descends = await candidate_checkout(
+                    repository,
+                    attempt_ref(behaviour_id, attempt),
+                    candidate,
+                    red.revision,
+                    Path(scratch) / "subject",
+                )
+                execution = await self._oracle.execute(candidate, workdir, contract.launch)
+        except CheckoutFailed as failure:
+            await self._preparation_failed("green", project_id, behaviour_id, contract, failure)
+            raise
+        return await self._record_green(
+            project_id, behaviour_id, attempt, execution, red, descends=descends, ran=True
+        )
+
+    async def _record_green(
+        self,
+        project_id: str,
+        behaviour_id: str,
+        attempt: int,
+        execution: Execution,
+        red: PairedRed | None,
+        *,
+        descends: bool,
+        ran: bool,
+    ) -> GreenVerdict:
+        async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
+            verdict = behaviour.record_green_run(
+                execution, red, candidate_descends_from_red=descends
+            )
+            contract = behaviour.contract
+            assert contract is not None
+            evidence: dict[str, Any] = {
+                "attempt": attempt,
+                "reason": verdict.reason,
+                "contract_digest": contract.digest,
+                "red_revision": red.revision if red else None,
+            }
+            if ran:
+                execution_id = await _record_execution(
+                    connection, project_id, behaviour_id, "green", contract.digest, execution
+                )
+                evidence |= {
+                    "execution_id": str(execution_id),
+                    "candidate_revision": execution.revision,
+                    "isolation": execution.isolation,
+                    "runtime_identity": execution.runtime_identity,
+                }
+            if verdict.rejection is not None:
+                evidence["rejection"] = verdict.rejection.value
+            else:
+                await connection.execute(
+                    "UPDATE behaviours SET candidate_revision = %s "
+                    "WHERE project_id = %s AND behaviour_id = %s",
+                    (execution.revision, project_id, behaviour_id),
+                )
+            await append_event(
+                connection,
+                project_id,
+                "behaviour.green_verified" if verdict.is_valid else "behaviour.green_rejected",
+                subject_id=behaviour_id,
+                payload=evidence,
+                correlation_id=correlation,
             )
             return verdict
 
@@ -201,15 +300,20 @@ class Behaviours:
             correlation_id=correlation,
         )
 
-    async def _red_preparation_failed(
-        self, project_id: str, behaviour_id: str, contract: ProcessContract, failure: Exception
+    async def _preparation_failed(
+        self,
+        colour: str,
+        project_id: str,
+        behaviour_id: str,
+        contract: ProcessContract,
+        failure: Exception,
     ) -> None:
         """Nothing ran, and the ledger says so: a failed checkout is not a silent non-event."""
         async with self._changing(project_id, behaviour_id) as (connection, _, correlation):
             await append_event(
                 connection,
                 project_id,
-                "behaviour.red_preparation_failed",
+                f"behaviour.{colour}_preparation_failed",
                 subject_id=behaviour_id,
                 payload={"reason": str(failure)[:500], "contract_digest": contract.digest},
                 correlation_id=correlation,
@@ -258,6 +362,20 @@ async def _source(connection: Connection, project_id: str) -> tuple[str, str]:
     ).fetchone()
     assert row is not None
     return row["repository"], row["trunk"]
+
+
+async def _paired_red(
+    connection: Connection, project_id: str, behaviour_id: str
+) -> PairedRed | None:
+    row = await (
+        await connection.execute(
+            "SELECT e.revision, e.contract_digest, e.runtime_identity "
+            "FROM behaviours b JOIN executions e ON e.execution_id = b.red_execution_id "
+            "WHERE b.project_id = %s AND b.behaviour_id = %s",
+            (project_id, behaviour_id),
+        )
+    ).fetchone()
+    return PairedRed(**row) if row else None
 
 
 async def _record_execution(

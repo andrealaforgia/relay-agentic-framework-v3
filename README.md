@@ -2,9 +2,10 @@
 
 Version 3 of a distributed, multi-provider agentic software development framework. Agents negotiate and perform work; deterministic code validates evidence and controls every workflow transition.
 
-**Status: early. Relay cannot yet be used to build software.** Two slices exist, both without any model in the loop:
+**Status: early. Relay cannot yet be used to build software.** Three slices exist, all without any model in the loop:
 
 - The red gate: a behaviour reaches the Builder only when Relay itself has launched the project's trunk in an isolated container and observed the outcome registered beforehand.
+- The green gate: a Builder's candidate counts only when Relay itself observes the expected outcome on it, in the same runtime as the red, and the candidate was built on the commit the red was observed on.
 - The durable core: state, an append-only ledger and a transactional outbox in PostgreSQL; at-least-once delivery over Redis Streams with one durable effect.
 
 There is no CLI, no control-plane API, no worker, no provider adapter and no dashboard yet. Usage instructions will be written when there is something to use.

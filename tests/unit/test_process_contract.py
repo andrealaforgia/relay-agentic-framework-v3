@@ -7,14 +7,17 @@ from relay.domain.evidence import (
     Baseline,
     Execution,
     Expected,
+    GreenRejection,
+    GreenVerdict,
     Ineligibility,
     Launch,
+    PairedRed,
     ProcessContract,
     ProcessObservation,
     RedRejection,
     RedVerdict,
-    judge_green,
 )
+from relay.domain.evidence import judge_green as judge_green_execution
 from relay.domain.evidence import judge_red as judge_red_execution
 
 CONTRACT = ProcessContract(
@@ -27,7 +30,19 @@ CONTRACT = ProcessContract(
 
 
 def judge_red(contract: ProcessContract, observation: ProcessObservation) -> RedVerdict:
-    return judge_red_execution(contract, Execution("a" * 40, "container", "image", observation))
+    return judge_red_execution(contract, Execution(RED_REVISION, "container", "image", observation))
+
+
+RED_REVISION = "a" * 40
+CANDIDATE = "c" * 40
+RED = PairedRed(RED_REVISION, CONTRACT.digest, "image")
+
+
+def judge_green(contract: ProcessContract, observation: ProcessObservation) -> GreenVerdict:
+    """Judge a candidate properly paired with its red, so only the observation varies."""
+    red = PairedRed(RED_REVISION, contract.digest, "image")
+    execution = Execution(CANDIDATE, "container", "image", observation)
+    return judge_green_execution(contract, execution, red, candidate_descends_from_red=True)
 
 
 def ran(exit_code: int, stdout: str = "", stderr: str = "") -> ProcessObservation:
@@ -162,3 +177,62 @@ def test_a_launch_cannot_disable_or_stretch_its_deadline(timeout: object) -> Non
 
     with pytest.raises(ValueError, match="timeout_seconds"):
         ProcessContract.from_dict(document)
+
+
+def passing(
+    revision: str = CANDIDATE, isolation: str = "container", runtime: str = "image"
+) -> Execution:
+    return Execution(revision, isolation, runtime, ran(0, "120\n"))
+
+
+def test_a_pass_paired_with_its_red_is_green() -> None:
+    verdict = judge_green_execution(CONTRACT, passing(), RED, candidate_descends_from_red=True)
+
+    assert verdict.is_valid
+
+
+def test_a_pass_with_no_red_behind_it_certifies_nothing() -> None:
+    verdict = judge_green_execution(CONTRACT, passing(), None, candidate_descends_from_red=True)
+
+    assert verdict.rejection is GreenRejection.NO_PAIRED_RED
+
+
+def test_a_red_for_a_different_contract_does_not_pair() -> None:
+    other = PairedRed(RED_REVISION, "sha256:another-contract", "image")
+
+    verdict = judge_green_execution(CONTRACT, passing(), other, candidate_descends_from_red=True)
+
+    assert verdict.rejection is GreenRejection.NO_PAIRED_RED
+
+
+def test_a_candidate_not_built_on_the_red_revision_is_refused() -> None:
+    unrelated = judge_green_execution(CONTRACT, passing(), RED, candidate_descends_from_red=False)
+    unchanged = judge_green_execution(
+        CONTRACT, passing(revision=RED_REVISION), RED, candidate_descends_from_red=True
+    )
+
+    assert unrelated.rejection is GreenRejection.NOT_BUILT_ON_THE_RED_REVISION
+    assert unchanged.rejection is GreenRejection.NOT_BUILT_ON_THE_RED_REVISION
+
+
+def test_a_pass_in_a_different_runtime_needs_a_fresh_red() -> None:
+    verdict = judge_green_execution(
+        CONTRACT, passing(runtime="another-image"), RED, candidate_descends_from_red=True
+    )
+
+    assert verdict.rejection is GreenRejection.RUNTIME_CHANGED
+
+
+def test_a_native_pass_is_not_green() -> None:
+    verdict = judge_green_execution(
+        CONTRACT, passing(isolation="native"), RED, candidate_descends_from_red=True
+    )
+
+    assert verdict.rejection is GreenRejection.ISOLATION_NOT_ADMISSIBLE
+
+
+def test_a_green_rejection_explains_itself() -> None:
+    verdict = judge_green(CONTRACT, ran(0, "100\n"))
+
+    assert verdict.rejection is GreenRejection.EXPECTATION_NOT_MET
+    assert "B1-standard-rate" in verdict.reason

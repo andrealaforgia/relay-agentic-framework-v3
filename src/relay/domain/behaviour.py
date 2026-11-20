@@ -7,8 +7,11 @@ from enum import StrEnum
 
 from relay.domain.evidence import (
     Execution,
+    GreenVerdict,
+    PairedRed,
     ProcessContract,
     RedVerdict,
+    judge_green,
     judge_red,
 )
 
@@ -66,6 +69,23 @@ class Behaviour:
         verdict = judge_red(contract, execution)
         if verdict.is_valid:
             self.state = BehaviourState.IMPLEMENTING
+        return verdict
+
+    def require_awaiting_green(self) -> ProcessContract:
+        """Refuse a green run on a behaviour that is not being implemented."""
+        self._require("run_green", BehaviourState.IMPLEMENTING)
+        assert self.contract is not None
+        return self.contract
+
+    def record_green_run(
+        self, execution: Execution, red: PairedRed | None, *, candidate_descends_from_red: bool
+    ) -> GreenVerdict:
+        contract = self.require_awaiting_green()
+        verdict = judge_green(
+            contract, execution, red, candidate_descends_from_red=candidate_descends_from_red
+        )
+        if verdict.is_valid:
+            self.state = BehaviourState.REVIEW
         return verdict
 
     def _require(self, attempted: str, *required: BehaviourState) -> None:

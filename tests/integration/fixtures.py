@@ -34,3 +34,25 @@ def commit(repository: Path, files: dict[str, str]) -> str:
     git("add", "-A")
     git("commit", "-q", "-m", "change")
     return git("rev-parse", "HEAD")
+
+
+def publish_attempt(
+    repository: Path, behaviour_id: str, attempt: int, files: dict[str, str], *, on: str
+) -> str:
+    """What a Builder does: commit a change on top of `on` and publish it under the attempt's
+    ref, leaving trunk where it was. Returns the candidate's commit hash."""
+
+    def git(*arguments: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repository), *arguments], check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    git("checkout", "-q", "--detach", on)
+    for name, content in files.items():
+        (repository / name).write_text(content)
+    git("add", "-A")
+    git("commit", "-q", "--allow-empty", "-m", f"attempt {attempt}")
+    candidate = git("rev-parse", "HEAD")
+    git("update-ref", f"refs/relay/attempts/{behaviour_id}/{attempt}", candidate)
+    git("checkout", "-q", "main")
+    return candidate
