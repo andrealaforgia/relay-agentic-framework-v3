@@ -24,6 +24,7 @@ Decided under PO-7 on 2026-11-20, each on Claude's recommendation:
 | D-5 | **Review capabilities stay in plaintext for now**, readable only by trusted database accounts. They are stored as hashes, and redacted from every view, no later than the slice that first exposes them outside the control plane (the API and dashboard). |
 | D-6 | **The recommended defaults stand:** the review and security policy presets, pausing on unknown paid calls, and trusting enrolled worker hosts. |
 | D-7 | **Trunk moved during the checks** sends the behaviour straight back for a fresh red, with no person in between. Claude had first recommended blocking it for a person; Astra argued for reopening once a fresh reading shows trunk strictly beyond the expected head, and that is what is built. A hook refusal with trunk unmoved still waits for a person. |
+| D-8 | **Review rounds with Astra converge.** Andrea, 2026-11-20: "I don't mind the many rounds between you and Astra for design. I think, in general, it would be good to converge at some point." The rule is Claude's: at most three rounds per design or build step; anything reachable through Relay's real entry points is fixed; after the third round, remaining reachable findings are fixed without a further round and the rest are recorded as named reservations in the slice record. |
 
 ## Consequences drawn by the models, for the Product Owner to confirm or overturn
 
