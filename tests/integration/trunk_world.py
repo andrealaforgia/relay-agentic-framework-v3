@@ -107,12 +107,13 @@ class TrunkWorld:
         self.git("remote", "add", "origin", str(self.remote))
         self.advance_trunk({"README": "a VAT calculator\n"})
         base = self.advance_trunk({"vat.py": VAT_RETURNS_NET})
-        # These tests put several behaviours in flight together, which the default forbids.
-        await self.behaviours.open_project(
-            self.project, address or str(self.remote), behaviours_in_order=False
-        )
-        await in_a_story(self.behaviours, self.project)
+        await self.open_project(address or str(self.remote))
         return base
+
+    async def open_project(self, address: str) -> None:
+        # These tests put several behaviours in flight together, which the default forbids.
+        await self.behaviours.open_project(self.project, address, behaviours_in_order=False)
+        await in_a_story(self.behaviours, self.project)
 
     def advance_trunk(self, files: dict[str, str]) -> str:
         """Another writer moves trunk, outside Relay."""
@@ -133,10 +134,10 @@ class TrunkWorld:
         return self.remote / "hooks" / name
 
     async def awaiting_builder(
-        self, behaviour: str = "B1", contract: ProcessContract = CONTRACT
+        self, behaviour: str = "B1", contract: ProcessContract = CONTRACT, story: str = "S1"
     ) -> str:
         """A behaviour with a verified red on the current trunk. Returns that revision."""
-        await self.behaviours.propose(self.project, "S1", behaviour, contract.observes, ["AC1"])
+        await self.behaviours.propose(self.project, story, behaviour, contract.observes, ["AC1"])
         await self.behaviours.begin_test_design(self.project, behaviour)
         await self.behaviours.register_acceptance_test(self.project, behaviour, contract)
         assert (await self.behaviours.run_red(self.project, behaviour)).is_valid

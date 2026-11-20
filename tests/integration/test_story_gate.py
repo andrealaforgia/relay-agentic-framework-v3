@@ -1,0 +1,426 @@
+"""Scenarios 8 and 14: when every behaviour of a story is on trunk, Relay stops and asks
+the Product Owner, shows exactly what was done, and starts the next story only on a
+person's approval of that exact review. A restart changes none of it."""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from pathlib import Path
+from typing import Any
+
+import pytest
+import redis.asyncio as redis
+from psycopg_pool import AsyncConnectionPool
+
+from relay.application.integration import Outcome
+from relay.application.stories import Stories, StoryDraft
+from relay.domain.behaviour import BehaviourState
+from relay.domain.evidence import ProcessContract
+from relay.domain.story import ActionRefused, HumanAction, Receipt, SealRefused, StoryState
+from relay.persistence.outbox import OutboxPublisher
+from relay.transport.streams import Streams
+from tests.integration.fixtures import (
+    ANALYST,
+    CONTRACT,
+    PRODUCT_OWNER,
+    VERIFIER,
+)
+from tests.integration.trunk_world import GREETING, PROJECT, TrunkWorld
+
+STANDARD_RATE = StoryDraft(
+    "S1", "Standard rate", "a gross price is shown", {"AC1": "100 net is shown as 120"}
+)
+GREETS = StoryDraft("S2", "Greeting", "the shopper is greeted", {"AC1": "hello is printed"})
+
+
+class StoryWorld(TrunkWorld):
+    """A project with the specification's defaults and a roadmap of its own."""
+
+    def __init__(self, *arguments: Any, **options: Any) -> None:
+        super().__init__(*arguments, **options)
+        self.stories = Stories(self.database)
+        self.base = ""
+        self.requests = 0
+
+    async def open_project(self, address: str) -> None:
+        await self.behaviours.open_project(self.project, address)
+
+    async def roadmap(self, *stories: StoryDraft, feature: str = "F1") -> uuid.UUID:
+        await self.stories.open_feature(PRODUCT_OWNER, PROJECT, feature, "prices need VAT")
+        return await self.stories.publish_roadmap(ANALYST, PROJECT, feature, list(stories))
+
+    async def decide(self, gate: uuid.UUID, action: str = "approve", **payload: str) -> Receipt:
+        self.requests += 1
+        return await self.stories.decide(
+            HumanAction(PRODUCT_OWNER, f"request-{self.requests}", str(gate), action, payload)
+        )
+
+    async def deliver(
+        self,
+        behaviour: str,
+        story: str = "S1",
+        contract: ProcessContract = CONTRACT,
+        files: dict[str, str] | None = None,
+    ) -> str:
+        """One behaviour from proposal to trunk, by the real route."""
+        base = await self.awaiting_builder(behaviour, contract, story)
+        candidate = await self.reviewed(behaviour, files, on=base)
+        assert (await self.integrate(behaviour)).outcome is Outcome.INTEGRATED
+        return candidate
+
+    async def story(self, story: str = "S1") -> StoryState:
+        return await self.stories.state_of(PROJECT, story)
+
+    async def gate(self) -> uuid.UUID:
+        [item] = await self.stories.inbox(PROJECT)
+        return item.gate_id
+
+
+@pytest.fixture
+async def world(database: AsyncConnectionPool, tmp_path: Path, runner_image: str) -> StoryWorld:
+    world = StoryWorld(database, tmp_path, runner_image)
+    world.base = await world.open()
+    return world
+
+
+async def at_the_story_gate(world: StoryWorld) -> tuple[uuid.UUID, str]:
+    """Story 1 of two is delivered, sealed and assessed. Returns its gate and its commit."""
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    candidate = await world.deliver("B1")
+    await world.stories.seal(VERIFIER, PROJECT, "S1")
+    await world.stories.assess(ANALYST, PROJECT, "S1", "B1 shows 120 for 100, as the story asks")
+    return await world.gate(), candidate
+
+
+async def test_nothing_is_released_until_a_person_approves_the_roadmap(world: StoryWorld) -> None:
+    gate = await world.roadmap(STANDARD_RATE, GREETS)
+
+    assert await world.story("S1") is StoryState.PLANNED
+    with pytest.raises(ActionRefused, match="planned"):
+        await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"])
+    [waiting] = await world.stories.inbox(PROJECT)
+    assert (waiting.gate_id, waiting.kind) == (gate, "roadmap")
+    assert [story["story_id"] for story in waiting.manifest["stories"]] == ["S1", "S2"]
+
+    receipt = await world.decide(gate)
+
+    assert receipt == Receipt("effective", "approved")
+    assert (await world.story("S1"), await world.story("S2")) == (
+        StoryState.RELEASED,
+        StoryState.PLANNED,
+    )
+    assert await world.stories.inbox(PROJECT) == []
+
+
+async def test_a_delivered_story_stops_at_its_gate_and_survives_a_restart_with_an_empty_broker(
+    world: StoryWorld, broker: redis.Redis, namespace: str
+) -> None:
+    gate, candidate = await at_the_story_gate(world)
+    [shown] = await world.stories.inbox(PROJECT)
+    executions = await world.column("SELECT count(*) FROM executions")
+    await OutboxPublisher(world.database, Streams(broker, prefix=namespace)).publish_pending()
+
+    assert await world.story("S1") is StoryState.AWAITING_APPROVAL
+    assert await world.story("S2") is StoryState.PLANNED
+    assert world.trunk() == candidate
+    [delivered] = shown.manifest["behaviours"]
+    assert delivered["integrated_revision"] == candidate
+    assert delivered["demonstrates"] == ["AC1"]
+    assert delivered["red_execution_id"] and delivered["green_execution_id"]
+    assert shown.manifest["assessment"]["statement"].startswith("B1 shows 120")
+    assert shown.manifest["usage"] == "unknown"
+    with pytest.raises(ActionRefused, match="awaiting approval"):
+        await world.behaviours.propose(PROJECT, "S1", "B2", "one more", ["AC1"])
+    with pytest.raises(ActionRefused, match="planned"):
+        await world.behaviours.propose(PROJECT, "S2", "B2", "greeting", ["AC1"])
+
+    for key in [key async for key in broker.scan_iter(f"{namespace}:*")]:
+        await broker.delete(key)
+    restarted = Stories(world.database)
+    [after] = await restarted.inbox(PROJECT)
+
+    assert (after.gate_id, after.manifest_digest) == (gate, shown.manifest_digest)
+    assert after.manifest == shown.manifest
+    assert await world.column("SELECT count(*) FROM executions") == executions
+
+    approval = HumanAction(PRODUCT_OWNER, "the-approval", str(gate), "approve")
+    first = await restarted.decide(approval)
+    again = await restarted.decide(approval)
+
+    assert first == again == Receipt("effective", "approved")
+    second_thoughts = await restarted.decide(
+        HumanAction(PRODUCT_OWNER, "another-request", str(gate), "approve")
+    )
+    assert second_thoughts.disposition == "stale"
+    assert await world.story("S1") is StoryState.APPROVED
+    assert await world.story("S2") is StoryState.RELEASED
+    assert (await world.events()).count("story.released") == 2
+    assert await restarted.inbox(PROJECT) == []
+    await world.behaviours.propose(PROJECT, "S2", "B2", "greeting", ["AC1"])
+
+
+async def test_the_gate_opens_whichever_comes_last_the_seal_the_assessment_or_the_integration(
+    world: StoryWorld,
+) -> None:
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    base = await world.awaiting_builder("B1")
+    await world.reviewed("B1", on=base)
+    await world.stories.seal(VERIFIER, PROJECT, "S1")
+    await world.stories.assess(ANALYST, PROJECT, "S1", "it will show 120 for 100")
+    assert await world.stories.inbox(PROJECT) == []
+
+    await world.integrate("B1")
+
+    assert await world.story("S1") is StoryState.AWAITING_APPROVAL
+    assert (await world.events())[-2:] == ["behaviour.integrated", "story.gate_opened"]
+
+
+async def test_a_list_that_leaves_an_acceptance_criterion_out_cannot_be_sealed(
+    world: StoryWorld,
+) -> None:
+    two_criteria = StoryDraft("S1", "Rates", "prices are right", {"AC1": "standard", "AC2": "zero"})
+    await world.decide(await world.roadmap(two_criteria))
+    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"])
+
+    with pytest.raises(SealRefused, match="AC2"):
+        await world.stories.seal(VERIFIER, PROJECT, "S1")
+    with pytest.raises(ActionRefused, match="no acceptance criteria"):
+        await world.behaviours.propose(PROJECT, "S1", "B2", "made up", ["AC9"])
+
+
+async def test_a_behaviour_added_after_the_seal_keeps_the_gate_shut_until_sealed_again(
+    world: StoryWorld,
+) -> None:
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    await world.deliver("B1")
+    await world.stories.seal(VERIFIER, PROJECT, "S1")
+    await world.behaviours.propose(PROJECT, "S1", "B2", "one more", ["AC1"])
+
+    with pytest.raises(ActionRefused, match="sealed"):
+        await world.stories.assess(ANALYST, PROJECT, "S1", "B1 is enough")
+
+    assert await world.story("S1") is StoryState.RELEASED
+    assert await world.stories.inbox(PROJECT) == []
+    await world.stories.seal(VERIFIER, PROJECT, "S1")
+    await world.stories.assess(ANALYST, PROJECT, "S1", "B1 and B2 together")
+    assert await world.stories.inbox(PROJECT) == [], "B2 is not on trunk yet"
+
+
+async def test_a_behaviour_waits_for_the_one_before_it_to_reach_trunk(world: StoryWorld) -> None:
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"])
+    await world.behaviours.propose(PROJECT, "S1", "B2", "one more", ["AC1"])
+
+    with pytest.raises(ActionRefused, match="waits for B1"):
+        await world.behaviours.begin_test_design(PROJECT, "B2")
+
+    assert await world.behaviours.state_of(PROJECT, "B2") is BehaviourState.PROPOSED
+    await world.behaviours.begin_test_design(PROJECT, "B1")
+
+
+async def test_a_second_feature_waits_for_the_project_and_gets_its_turn_without_a_restart(
+    world: StoryWorld,
+) -> None:
+    first = await world.roadmap(STANDARD_RATE)
+    second = await world.roadmap(GREETS, feature="F2")
+    await world.decide(first)
+    await world.decide(second)
+    assert (await world.story("S1"), await world.story("S2")) == (
+        StoryState.RELEASED,
+        StoryState.PLANNED,
+    )
+    await world.deliver("B1")
+    await world.stories.seal(VERIFIER, PROJECT, "S1")
+    await world.stories.assess(ANALYST, PROJECT, "S1", "done")
+    assert await world.story("S2") is StoryState.PLANNED
+
+    await world.decide(await world.gate())
+
+    assert await world.story("S2") is StoryState.RELEASED
+    assert (await world.events())[-2:] == ["gate.approved", "story.released"]
+
+
+async def test_asking_for_changes_reopens_the_same_story_and_releases_nothing(
+    world: StoryWorld,
+) -> None:
+    gate, candidate = await at_the_story_gate(world)
+
+    receipt = await world.decide(gate, "request_changes", reason="show the currency too")
+
+    assert receipt == Receipt("effective", "changes_requested")
+    assert await world.story("S1") is StoryState.CHANGES_REQUESTED
+    assert await world.story("S2") is StoryState.PLANNED
+    assert world.trunk() == candidate
+    assert await world.column("SELECT revision FROM stories WHERE story_id = 'S1'") == [2]
+    assert await world.stories.inbox(PROJECT) == []
+    with pytest.raises(ActionRefused, match="reason"):
+        await world.decide(gate, "request_changes", reason=" ")
+
+
+async def test_only_a_person_decides_at_a_gate_and_each_role_does_only_its_own_part(
+    world: StoryWorld,
+) -> None:
+    gate = await world.roadmap(STANDARD_RATE)
+
+    for worker in (ANALYST, VERIFIER):
+        with pytest.raises(ActionRefused, match="human"):
+            await world.stories.decide(HumanAction(worker, "r", str(gate), "approve"))
+    with pytest.raises(ActionRefused, match="human"):
+        await world.stories.open_feature(ANALYST, PROJECT, "F9", "a problem of its own making")
+    with pytest.raises(ActionRefused, match="analyst"):
+        await world.stories.publish_roadmap(PRODUCT_OWNER, PROJECT, "F1", [GREETS])
+    await world.decide(gate)
+    with pytest.raises(ActionRefused, match="verifier"):
+        await world.stories.seal(ANALYST, PROJECT, "S1")
+    with pytest.raises(ActionRefused, match="analyst"):
+        await world.stories.assess(VERIFIER, PROJECT, "S1", "looks fine to me")
+
+    assert await world.story("S1") is StoryState.RELEASED
+
+
+async def test_a_request_id_reused_for_another_gate_acknowledges_nothing(
+    world: StoryWorld,
+) -> None:
+    first = await world.roadmap(STANDARD_RATE)
+    second = await world.roadmap(GREETS, feature="F2")
+    await world.stories.decide(HumanAction(PRODUCT_OWNER, "one", str(first), "approve"))
+
+    with pytest.raises(ActionRefused, match="already used"):
+        await world.stories.decide(
+            HumanAction(PRODUCT_OWNER, "one", str(second), "request_changes", {"reason": "no"})
+        )
+
+    assert await world.column(f"SELECT state FROM gates WHERE gate_id = '{second}'") == ["open"]
+    assert await world.column("SELECT count(*) FROM human_actions") == [1]
+
+
+async def test_an_action_that_arrives_after_the_gate_was_decided_is_stale(
+    world: StoryWorld,
+) -> None:
+    gate = await world.roadmap(STANDARD_RATE)
+    await world.decide(gate, "request_changes", reason="split it")
+
+    late = await world.decide(gate)
+
+    assert late.disposition == "stale"
+    assert await world.story("S1") is StoryState.PLANNED
+    assert await world.column("SELECT state FROM roadmaps") == ["superseded"]
+
+
+async def test_of_an_approval_and_a_change_request_at_once_exactly_one_takes_effect(
+    world: StoryWorld,
+) -> None:
+    gate = await world.roadmap(STANDARD_RATE)
+
+    receipts = await asyncio.gather(
+        world.stories.decide(HumanAction(PRODUCT_OWNER, "a", str(gate), "approve")),
+        world.stories.decide(
+            HumanAction(PRODUCT_OWNER, "b", str(gate), "request_changes", {"reason": "no"})
+        ),
+    )
+
+    assert sorted(receipt.disposition for receipt in receipts) == ["effective", "stale"]
+    [effective] = [receipt for receipt in receipts if receipt.disposition == "effective"]
+    released = await world.story("S1") is StoryState.RELEASED
+    assert released == (effective.outcome == "approved")
+
+
+async def test_a_gate_whose_basis_has_changed_behind_it_approves_nothing(
+    world: StoryWorld,
+) -> None:
+    """No path in this step changes a story at its gate, so the change is written
+    directly. What is under test is that a decision looks again at what it decides on."""
+    gate, _ = await at_the_story_gate(world)
+    async with world.database.connection() as connection:
+        await connection.execute("UPDATE stories SET list_revision = list_revision + 1")
+
+    receipt = await world.decide(gate)
+
+    assert receipt.disposition == "stale"
+    assert await world.story("S2") is StoryState.PLANNED
+    assert await world.column(f"SELECT state FROM gates WHERE gate_id = '{gate}'") == ["superseded"]
+    assert await world.stories.inbox(PROJECT) == []
+
+
+async def test_a_gate_that_does_not_exist_cannot_be_decided(world: StoryWorld) -> None:
+    for target in ("not-a-gate", str(uuid.uuid4())):
+        with pytest.raises(ActionRefused, match="no such gate"):
+            await world.stories.decide(HumanAction(PRODUCT_OWNER, "r", target, "approve"))
+    with pytest.raises(ActionRefused, match="not something"):
+        await world.stories.decide(HumanAction(PRODUCT_OWNER, "r", str(uuid.uuid4()), "merge"))
+
+
+async def test_nothing_is_started_on_a_behaviour_whose_story_is_not_being_worked_on(
+    world: StoryWorld,
+) -> None:
+    """Written directly: by the real route a story reaches its gate only when all its
+    behaviours are on trunk, so none is left to start anything on."""
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"])
+    async with world.database.connection() as connection:
+        await connection.execute("UPDATE stories SET state = 'awaiting_approval'")
+
+    for start in (
+        world.behaviours.begin_test_design(PROJECT, "B1"),
+        world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT),
+        world.behaviours.run_red(PROJECT, "B1"),
+        world.behaviours.run_green(PROJECT, "B1", 1),
+        world.integrate("B1"),
+    ):
+        with pytest.raises(ActionRefused, match="awaiting approval"):
+            await start
+
+    assert await world.behaviours.state_of(PROJECT, "B1") is BehaviourState.PROPOSED
+
+
+async def test_a_feature_has_one_roadmap_and_a_sealed_list_one_assessment(
+    world: StoryWorld,
+) -> None:
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    with pytest.raises(ActionRefused, match="already has a roadmap"):
+        await world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [GREETS])
+    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"])
+    await world.stories.seal(VERIFIER, PROJECT, "S1")
+    await world.stories.assess(ANALYST, PROJECT, "S1", "it will do")
+
+    with pytest.raises(ActionRefused, match="already been assessed"):
+        await world.stories.assess(ANALYST, PROJECT, "S1", "on second thoughts, no")
+
+    assert await world.column("SELECT statement FROM story_assessments") == ["it will do"]
+
+
+async def test_an_assessment_of_an_earlier_list_does_not_open_the_gate_for_a_later_one(
+    world: StoryWorld,
+) -> None:
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"])
+    await world.stories.seal(VERIFIER, PROJECT, "S1")
+    await world.stories.assess(ANALYST, PROJECT, "S1", "B1 alone will do")
+    await world.behaviours.propose(PROJECT, "S1", "B2", "and a greeting", ["AC1"])
+    for behaviour, contract, files in (
+        ("B1", CONTRACT, None),
+        ("B2", GREETING, {"greeting.txt": "hello\n"}),
+    ):
+        await world.behaviours.begin_test_design(PROJECT, behaviour)
+        await world.behaviours.register_acceptance_test(PROJECT, behaviour, contract)
+        assert (await world.behaviours.run_red(PROJECT, behaviour)).is_valid
+        await world.reviewed(behaviour, files, on=world.trunk())
+        assert (await world.integrate(behaviour)).outcome is Outcome.INTEGRATED
+
+    assert await world.story("S1") is StoryState.RELEASED
+    assert await world.stories.inbox(PROJECT) == []
+
+
+async def test_a_roadmap_nobody_has_approved_releases_nothing_when_another_gate_is_decided(
+    world: StoryWorld,
+) -> None:
+    first = await world.roadmap(STANDARD_RATE)
+    await world.roadmap(GREETS, feature="F2")
+
+    await world.decide(first, "request_changes", reason="split it")
+
+    assert (await world.story("S1"), await world.story("S2")) == (
+        StoryState.PLANNED,
+        StoryState.PLANNED,
+    )
