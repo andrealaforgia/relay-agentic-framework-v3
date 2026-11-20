@@ -50,17 +50,19 @@ class StoryDraft:
     criteria: Mapping[str, str]
 
     def __post_init__(self) -> None:
+        # A copy of its own, taken before anything is checked: what is validated here,
+        # stored and shown must be one and the same thing.
+        criteria = MappingProxyType(dict(self.criteria))
+        object.__setattr__(self, "criteria", criteria)
         require_identifier("story", self.story_id)
         if not self.title.strip() or not self.outcome.strip():
             raise ValueError("a story needs a title and the outcome it is for")
-        if not self.criteria:
+        if not criteria:
             raise ValueError("a story needs at least one acceptance criterion")
-        for criterion_id, text in self.criteria.items():
+        for criterion_id, text in criteria.items():
             require_identifier("criterion", criterion_id)
             if not text.strip():
                 raise ValueError(f"criterion {criterion_id} says nothing")
-        # A copy of its own: what is stored and what is shown must be the same thing.
-        object.__setattr__(self, "criteria", MappingProxyType(dict(self.criteria)))
 
 
 @dataclass(frozen=True)
@@ -367,6 +369,10 @@ async def add_behaviour_to_story(
     has not vouched for until it is sealed again."""
     story = await _locked_story(connection, project_id, story_id)
     _require_at_work(story)
+    if not demonstrates:
+        # It could be built and integrated, and then no list containing it could ever
+        # be sealed: the story would hold the project and never reach its gate.
+        raise ActionRefused("a behaviour demonstrates at least one acceptance criterion")
     unknown = sorted(set(demonstrates) - set(story["criteria"]))
     if unknown:
         raise ActionRefused(f"{story_id} has no acceptance criteria {unknown}")

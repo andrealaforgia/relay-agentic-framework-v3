@@ -1,7 +1,11 @@
 """Stories above behaviours, and the Product Owner's gate above stories."""
 
+from collections.abc import Iterator, Mapping
+from typing import Any
+
 import pytest
 
+from relay.application.stories import StoryDraft
 from relay.domain.story import (
     ActionRefused,
     Candidate,
@@ -174,3 +178,39 @@ def test_what_an_action_carries_cannot_be_changed_after_it_is_made() -> None:
 
     assert action.payload == {"reason": "split it"}
     assert action.digest == digest
+
+
+class EmptiesItselfWhenItsItemsAreRead(Mapping[str, str]):
+    """Has one criterion until someone asks for its items, and none after that."""
+
+    def __init__(self) -> None:
+        self._criteria = {"AC1": "120 for 100"}
+
+    def __getitem__(self, key: str) -> str:
+        return self._criteria[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(list(self._criteria))
+
+    def __len__(self) -> int:
+        return len(self._criteria)
+
+    def items(self) -> Any:
+        shown = list(self._criteria.items())
+        self._criteria.clear()
+        return shown
+
+
+def test_what_a_story_draft_checks_is_what_it_keeps() -> None:
+    draft = StoryDraft("S1", "Standard rate", "a gross price", EmptiesItselfWhenItsItemsAreRead())
+
+    assert dict(draft.criteria) == {"AC1": "120 for 100"}
+
+
+def test_a_story_draft_keeps_its_criteria_whatever_happens_to_the_callers() -> None:
+    criteria = {"AC1": "120 for 100"}
+    draft = StoryDraft("S1", "Standard rate", "a gross price", criteria)
+
+    criteria["AC2"] = "slipped in afterwards"
+
+    assert dict(draft.criteria) == {"AC1": "120 for 100"}

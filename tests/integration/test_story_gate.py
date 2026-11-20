@@ -666,7 +666,7 @@ async def test_the_last_integration_and_an_assessment_arriving_together_both_fin
     integrating = asyncio.create_task(world.integrate("B1"))
     await recorded.wait()
     assessing = asyncio.create_task(world.assess("B1 shows 120 for 100"))
-    await asyncio.sleep(0.5)
+    await world.until_someone_waits_for_a_lock()
     go_on.set()
 
     assert (await integrating).outcome is Outcome.INTEGRATED
@@ -701,10 +701,53 @@ async def test_a_replayed_roadmap_approval_does_not_deadlock_the_release_of_that
     approving = asyncio.create_task(world.decide(await world.gate()))
     await holding.wait()
     replaying = asyncio.create_task(world.stories.decide(approval_of_second))
-    await asyncio.sleep(0.5)
+    await world.until_someone_waits_for_a_lock()
     go_on.set()
 
     assert (await approving).disposition == "effective"
     assert await replaying == original
     assert await world.story("S2") is StoryState.RELEASED
     assert (await world.events()).count("story.released") == 2
+
+
+async def test_a_behaviour_that_demonstrates_nothing_is_refused_when_proposed(
+    world: StoryWorld,
+) -> None:
+    """Accepted, it could reach trunk and then keep its story from ever being sealed."""
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    before = await world.stories.revisions_of(PROJECT, "S1")
+
+    with pytest.raises(ActionRefused, match="at least one acceptance criterion"):
+        await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", [])
+
+    assert await world.stories.revisions_of(PROJECT, "S1") == before
+    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"])
+    await world.seal()
+
+
+class OneThingThenAnother(list[str]):
+    """Says AC1 the first time it is read and AC2 every time after."""
+
+    def __init__(self) -> None:
+        super().__init__(["AC1"])
+        self._read = False
+
+    def __iter__(self) -> Any:
+        said = ["AC2"] if self._read else ["AC1"]
+        self._read = True
+        return iter(said)
+
+
+async def test_a_proposal_records_the_same_criteria_in_the_behaviour_and_in_the_ledger(
+    world: StoryWorld,
+) -> None:
+    two_criteria = StoryDraft("S1", "Rates", "prices are right", {"AC1": "standard", "AC2": "zero"})
+    await world.decide(await world.roadmap(two_criteria))
+
+    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", OneThingThenAnother())
+
+    [stored] = await world.column("SELECT demonstrates FROM behaviours")
+    [proposed] = await world.column(
+        "SELECT payload->'demonstrates' FROM events WHERE event_type = 'behaviour.proposed'"
+    )
+    assert stored == proposed == ["AC1"]

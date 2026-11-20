@@ -78,6 +78,9 @@ class Behaviours:
         """Add a behaviour to a story that is being worked on, naming the acceptance
         criteria it will demonstrate. There is no behaviour without a story."""
         behaviour = Behaviour.propose(behaviour_id, summary)
+        # Read once, before anything is awaited: what is checked, stored and written to
+        # the ledger is this, whatever the caller does to its own list meanwhile.
+        demonstrates = tuple(demonstrates)
         correlation_id = uuid.uuid7()
         async with self._pool.connection() as connection, connection.transaction():
             position = await add_behaviour_to_story(connection, project_id, story_id, demonstrates)
