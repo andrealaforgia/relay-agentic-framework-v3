@@ -1,6 +1,6 @@
 # Slice 3a-ii, step 1 as built: pause, resume and cancel
 
-Provenance: written by Claude (Fable 5.2) on 2026-11-20 for review by Astra (gpt-6.2-astra via Codex). Code at commit `1a3e1ab` on `main`. `make check` passes: 531 tests against real PostgreSQL, Redis, Git and Docker, and the same gate now runs in GitHub Actions on every push.
+Provenance: written by Claude (Fable 5.2) on 2026-11-20 for review by Astra (gpt-6.2-astra via Codex). Code at commit `1a3e1ab` on `main` (this document was added after it). `make check` passes: 531 tests against real PostgreSQL, Redis, Git and Docker, and the same gate now runs in GitHub Actions on every push.
 
 ## How this review is to converge (decision D-8)
 
@@ -29,14 +29,14 @@ The Product Owner has asked that reviews converge. This step gets **at most thre
 
 ## Tests
 
-`tests/integration/test_closure.py` (22), `test_assignments.py` (22), `test_reconciliation.py` (18), plus rules in `tests/unit`. The four exit histories:
+`tests/integration/test_closure.py` (19), `test_assignments.py` (22), `test_reconciliation.py` (18), plus rules in `tests/unit`. The four exit histories:
 
 1. Red in flight: `test_a_red_that_finishes_during_a_pause_is_judged_and_its_build_waits`, `test_a_red_that_finishes_after_a_cancel_is_kept_as_evidence_only`, `test_work_announced_before_a_restart_is_announced_again_after_it`.
 2. Review in flight: `test_a_review_checked_out_before_a_pause_may_finish_during_it`, `test_a_review_granted_before_a_pause_is_granted_afresh_after_it_and_done_once`, `test_a_review_of_a_cancelled_feature_is_kept_and_decides_nothing`, `test_a_review_checked_out_by_a_process_that_died_is_granted_afresh_and_done_once`.
 3. Last regression check in flight: `test_checks_that_finish_after_a_closure_authorise_nothing`, `test_checks_held_by_a_pause_run_again_after_the_resume_and_integrate_once`, `test_checks_left_running_by_a_process_that_died_are_closed_when_the_next_one_starts` (open, paused, cancelled), `test_an_integration_owed_for_checks_that_were_since_replaced_starts_nothing`.
 4. Intent already authorised: `test_a_push_authorised_before_a_pause_still_lands_and_opens_no_gate_*`, `test_a_push_authorised_before_a_closure_is_settled_by_the_next_start` (pause, cancel).
 
-Deliberate breakage across the step: 84 mutants. 72 were caught at once; 6 guards were shown redundant and removed; 6 led to new tests. None survives.
+Deliberate breakage across the step: 84 mutants. 70 were caught at once; 6 guards were shown redundant and removed; 8 led to new tests. None survives.
 
 ## Known limits I would record as reservations
 
