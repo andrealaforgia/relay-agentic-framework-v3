@@ -4,6 +4,7 @@ here is a row in PostgreSQL, so it survives the consumer that made it."""
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 
@@ -189,3 +190,38 @@ async def test_abandoned_work_is_found_beyond_the_first_page_of_pending_entries(
     )
 
     assert {delivery.message_id for delivery in claimed} == {d.message_id for d in received}
+
+
+async def test_looking_for_abandoned_work_when_there_is_none_terminates(
+    outbox: AsyncConnectionPool, broker: redis.Redis, namespace: str
+) -> None:
+    streams = Streams(broker, prefix=namespace)
+
+    async with asyncio.timeout(5):
+        claimed = await streams.claim_abandoned(
+            STREAM, group="builder", consumer="w", idle_for_ms=0
+        )
+
+    assert claimed == []
+
+
+async def test_recent_deliveries_are_skipped_and_the_scan_still_ends(
+    outbox: AsyncConnectionPool, broker: redis.Redis, namespace: str
+) -> None:
+    streams = Streams(broker, prefix=namespace)
+    await OutboxPublisher(outbox, streams).publish_pending()
+    await streams.read(STREAM, group="builder", consumer="worker-1")
+
+    async with asyncio.timeout(5):
+        claimed = await streams.claim_abandoned(
+            STREAM, group="builder", consumer="worker-2", idle_for_ms=3_600_000, page_size=1
+        )
+
+    assert claimed == []
+
+
+def test_a_client_that_returns_bytes_is_refused(namespace: str) -> None:
+    raw = redis.from_url("redis://localhost:56379/0")
+
+    with pytest.raises(ValueError, match="decode_responses"):
+        Streams(raw, prefix=namespace)

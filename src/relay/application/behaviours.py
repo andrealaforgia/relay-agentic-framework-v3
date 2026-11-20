@@ -20,7 +20,12 @@ from relay.domain.evidence import (
     is_gate_bearing,
     refuse_isolation,
 )
-from relay.git.checkout import CheckoutFailed, pristine_checkout, trunk_head
+from relay.git.checkout import (
+    CheckoutFailed,
+    pristine_checkout,
+    require_credential_free,
+    trunk_head,
+)
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
 from relay.persistence.outbox import enqueue
@@ -39,7 +44,7 @@ class Behaviours:
         async with self._pool.connection() as connection, connection.transaction():
             await connection.execute(
                 "INSERT INTO projects (project_id, repository, trunk) VALUES (%s, %s, %s)",
-                (project_id, repository, trunk),
+                (project_id, require_credential_free(repository), trunk),
             )
             await append_event(connection, project_id, "project.opened", payload={"trunk": trunk})
 
@@ -108,11 +113,10 @@ class Behaviours:
             revision = await trunk_head(repository, trunk)
             with tempfile.TemporaryDirectory(prefix="relay-red-") as scratch:
                 workdir = await pristine_checkout(repository, revision, Path(scratch) / "subject")
-                observation = await self._oracle.observe(workdir, contract.launch)
+                execution = await self._oracle.execute(revision, workdir, contract.launch)
         except CheckoutFailed as failure:
             await self._red_preparation_failed(project_id, behaviour_id, contract, failure)
             raise
-        execution = Execution(revision, isolation.name, isolation.runtime_identity, observation)
 
         async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
             verdict = behaviour.record_red_run(execution)

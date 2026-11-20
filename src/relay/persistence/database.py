@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from importlib import resources
@@ -28,23 +29,39 @@ async def open_pool(url: str, schema: str | None = None) -> AsyncIterator[Pool]:
         await pool.close()
 
 
+class MigrationDrift(Exception):
+    """A migration that was already applied no longer has the content that was applied."""
+
+
 async def migrate(pool: Pool) -> list[str]:
-    """Apply every migration not yet recorded, in filename order."""
+    """Apply every migration not yet recorded, in filename order. A recorded migration
+    whose file has since changed is an error, never a silent skip."""
     applied: list[str] = []
     async with pool.connection() as connection, connection.transaction():
         await connection.execute(
-            "CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY)"
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(version text PRIMARY KEY, checksum text NOT NULL)"
         )
         await connection.execute("LOCK TABLE schema_migrations IN EXCLUSIVE MODE")
-        rows = await (await connection.execute("SELECT version FROM schema_migrations")).fetchall()
-        done = {row["version"] for row in rows}
+        rows = await (await connection.execute("SELECT * FROM schema_migrations")).fetchall()
+        recorded = {row["version"]: row["checksum"] for row in rows}
         migrations = resources.files("relay.persistence") / "migrations"
         for script in sorted(migrations.iterdir(), key=lambda entry: entry.name):
-            if not script.name.endswith(".sql") or script.name in done:
+            if not script.name.endswith(".sql"):
                 continue
-            await connection.execute(script.read_text().encode())
+            content = script.read_bytes()
+            checksum = hashlib.sha256(content).hexdigest()
+            if script.name in recorded:
+                if recorded[script.name] != checksum:
+                    raise MigrationDrift(
+                        f"{script.name} was applied with different content; "
+                        "write a new migration instead of editing an applied one"
+                    )
+                continue
+            await connection.execute(content)
             await connection.execute(
-                "INSERT INTO schema_migrations (version) VALUES (%s)", (script.name,)
+                "INSERT INTO schema_migrations (version, checksum) VALUES (%s, %s)",
+                (script.name, checksum),
             )
             applied.append(script.name)
     return applied

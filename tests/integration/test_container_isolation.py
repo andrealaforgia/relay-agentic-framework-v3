@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import socket
 import subprocess
 from collections.abc import Iterator
 from functools import cache
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -187,9 +189,7 @@ async def test_the_operators_docker_proxy_settings_do_not_reach_the_subject(
     monkeypatch.setenv("HTTP_PROXY", proxy)
     # The client environment is resolved once per process; resolve it afresh here so this
     # test sees what a supervisor started with these settings would use.
-    monkeypatch.setattr(
-        oracle, "_docker_environment", cache(oracle._docker_environment.__wrapped__)
-    )
+    monkeypatch.setattr(oracle, "_docker_client", cache(oracle._docker_client.__wrapped__))
     shows = "import os\nprint(sorted(k for k in os.environ if 'proxy' in k.lower()))\n"
     revision = commit(tmp_path / "subject", {"env.py": shows})
     workdir = await pristine_checkout(str(tmp_path / "subject"), revision, tmp_path / "checkout")
@@ -221,6 +221,82 @@ async def test_cancelling_an_observation_does_not_leave_the_subject_running(
         await observing
 
     assert started.isdisjoint(await asyncio.to_thread(running_oracle_containers))
+
+
+async def test_the_docker_client_is_never_looked_up_in_the_subjects_checkout(
+    tmp_path: Path, runner_image: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    planted = tmp_path / "planted-docker-ran"
+    impostor = f"#!/bin/sh\ntouch {planted}\nexit 0\n"
+    revision = commit(tmp_path / "subject", {"docker": impostor, "vat.py": VAT_RETURNS_NET})
+    workdir = await pristine_checkout(str(tmp_path / "subject"), revision, tmp_path / "checkout")
+    (workdir / "docker").chmod(0o755)
+    monkeypatch.setenv("PATH", f".{os.pathsep}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(oracle, "_docker_client", cache(oracle._docker_client.__wrapped__))
+    monkeypatch.chdir(workdir)
+
+    observation = await ProcessOracle(ContainerIsolation(runner_image)).observe(
+        workdir, Launch(argv=("python3", "vat.py", "100"), timeout_seconds=30)
+    )
+
+    assert not planted.exists()
+    assert observation.stdout == b"100\n"
+    assert os.path.isabs(oracle._docker_client()[0])
+
+
+async def test_a_checkout_the_engine_cannot_see_is_not_executed_and_not_invented(
+    tmp_path: Path, runner_image: str
+) -> None:
+    invisible = tmp_path / "not-on-the-engine-host"
+
+    observation = await ProcessOracle(ContainerIsolation(runner_image)).observe(
+        invisible, Launch(argv=("python3", "vat.py", "100"), timeout_seconds=30)
+    )
+
+    assert observation.ineligibility is Ineligibility.NOT_EXECUTED
+    assert not invisible.exists()
+
+
+async def test_a_remote_engine_is_refused(
+    tmp_path: Path, runner_image: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DOCKER_HOST", "tcp://engine.example:2375")
+    monkeypatch.setattr(oracle, "_docker_client", cache(oracle._docker_client.__wrapped__))
+
+    with pytest.raises(RuntimeError, match="local Docker engine"):
+        await ProcessOracle(ContainerIsolation(runner_image)).observe(
+            tmp_path, Launch(argv=("true",), timeout_seconds=30)
+        )
+
+
+async def test_a_container_created_just_before_cancellation_is_still_removed(
+    tmp_path: Path, runner_image: str
+) -> None:
+    class CancelledAfterTheEngineCreates(ContainerIsolation):
+        created: str = ""
+
+        async def _docker(self, *arguments: str, **options: Any) -> oracle.Captured:
+            captured = await super()._docker(*arguments, **options)
+            if arguments[0] == "create":
+                self.created = arguments[arguments.index("--name") + 1]
+                raise asyncio.CancelledError
+            return captured
+
+    revision = commit(tmp_path / "subject", {"vat.py": VAT_RETURNS_NET})
+    workdir = await pristine_checkout(str(tmp_path / "subject"), revision, tmp_path / "checkout")
+    isolation = CancelledAfterTheEngineCreates(runner_image)
+
+    with pytest.raises(asyncio.CancelledError):
+        await ProcessOracle(isolation).observe(workdir, Launch(argv=("python3", "vat.py", "1")))
+
+    assert isolation.created
+    in_any_state = await asyncio.to_thread(
+        subprocess.run,
+        ["docker", "ps", "--all", "--quiet", "--filter", f"name={isolation.created}"],
+        capture_output=True,
+        text=True,
+    )
+    assert in_any_state.stdout.split() == []
 
 
 def test_an_unpinned_image_is_refused() -> None:

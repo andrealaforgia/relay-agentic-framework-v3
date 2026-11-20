@@ -6,9 +6,11 @@ import asyncio
 import re
 import shutil
 from pathlib import Path
+from urllib.parse import urlsplit
 
 _FULL_COMMIT_HASH = re.compile(r"[0-9a-f]{40}")
 _BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
+_URL_USERINFO = re.compile(r"//[^/@\s]+@")
 # No hooks, no user or system configuration, no credential prompts: this runs with
 # the supervisor's authority on content the supervisor does not trust.
 _TRUSTED_GIT = ("git", "-c", "core.hooksPath=/dev/null", "-c", "protocol.ext.allow=never")
@@ -24,15 +26,37 @@ class CheckoutFailed(Exception):
     pass
 
 
+def require_credential_free(repository: str) -> str:
+    """A repository locator is stored and shown; a secret inside it would be too.
+    Credentials are supplied to Git separately, never as part of the address."""
+    try:
+        address = urlsplit(repository)
+        carries_a_secret = address.password is not None or (
+            address.scheme in {"http", "https"} and address.username is not None
+        )
+    except ValueError:
+        carries_a_secret = False
+    if carries_a_secret:
+        raise ValueError("a repository address must not contain credentials")
+    return repository
+
+
 async def trunk_head(repository: str, trunk: str) -> str:
     """The commit the project's trunk points at now, read from the project's own repository."""
     if not _BRANCH_NAME.fullmatch(trunk):
         raise CheckoutFailed(f"not a branch name: {trunk!r}")
-    listing = await _git("ls-remote", "--", repository, f"refs/heads/{trunk}")
-    revision = listing.split()[0] if listing else ""
-    if not _FULL_COMMIT_HASH.fullmatch(revision):
-        raise CheckoutFailed(f"{repository} has no branch {trunk!r}")
-    return revision
+    wanted = f"refs/heads/{trunk}"
+    # ls-remote matches its pattern against the tail of every ref name, so another ref
+    # ending in the same words would be listed too. Only the exact ref is the trunk.
+    listing = await _git("ls-remote", "--", repository, wanted, redact=repository)
+    revisions = [
+        revision
+        for revision, _, ref in (line.partition("\t") for line in listing.splitlines())
+        if ref == wanted
+    ]
+    if len(revisions) != 1 or not _FULL_COMMIT_HASH.fullmatch(revisions[0]):
+        raise CheckoutFailed(f"the repository has no branch {trunk!r}")
+    return revisions[0]
 
 
 async def pristine_checkout(repository: str, revision: str, into: Path) -> Path:
@@ -40,7 +64,7 @@ async def pristine_checkout(repository: str, revision: str, into: Path) -> Path:
     address nor any credential embedded in it is exposed to whatever runs there."""
     if not _FULL_COMMIT_HASH.fullmatch(revision):
         raise CheckoutFailed(f"a revision must be a 40-character commit hash, not {revision!r}")
-    await _git("clone", "--quiet", "--no-checkout", "--", repository, str(into))
+    await _git("clone", "--quiet", "--no-checkout", "--", repository, str(into), redact=repository)
     await _git("-C", str(into), "checkout", "--quiet", "--detach", revision)
     head = await _git("-C", str(into), "rev-parse", "HEAD")
     if head != revision:
@@ -49,7 +73,7 @@ async def pristine_checkout(repository: str, revision: str, into: Path) -> Path:
     return into
 
 
-async def _git(*arguments: str) -> str:
+async def _git(*arguments: str, redact: str | None = None) -> str:
     process = await asyncio.create_subprocess_exec(
         *_TRUSTED_GIT,
         *arguments,
@@ -60,7 +84,9 @@ async def _git(*arguments: str) -> str:
     )
     stdout, stderr = await process.communicate()
     if process.returncode != 0:
-        raise CheckoutFailed(
-            f"git {arguments[0]} failed: {stderr.decode(errors='replace').strip()}"
-        )
+        detail = stderr.decode(errors="replace").strip()
+        if redact:
+            # Git echoes the address it was given; a failure must not carry it onwards.
+            detail = detail.replace(redact, "<repository>")
+        raise CheckoutFailed(f"git {arguments[0]} failed: {_URL_USERINFO.sub('//', detail)}")
     return stdout.decode().strip()

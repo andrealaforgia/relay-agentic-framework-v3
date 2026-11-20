@@ -3,12 +3,13 @@ The subject's own claims, and any file it writes, carry no weight."""
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from relay.domain.evidence import Ineligibility, Launch
-from relay.git.checkout import CheckoutFailed, pristine_checkout
+from relay.git.checkout import CheckoutFailed, pristine_checkout, trunk_head
 from relay.testing.oracle import NativeIsolation, ProcessOracle
 from tests.integration.fixtures import VAT_RETURNS_NET, commit
 
@@ -131,3 +132,27 @@ async def test_an_unknown_revision_fails_loudly(tmp_path: Path) -> None:
 
     with pytest.raises(CheckoutFailed):
         await pristine_checkout(str(tmp_path / "subject"), "0" * 40, tmp_path / "checkout")
+
+
+def branch(repository: Path, name: str, revision: str) -> None:
+    subprocess.run(["git", "-C", str(repository), "branch", "-f", name, revision], check=True)
+
+
+async def test_the_trunk_is_the_exactly_named_branch_not_one_that_ends_the_same_way(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "subject"
+    impostor = commit(repository, {"vat.py": VAT_RETURNS_NET})
+    trunk = commit(repository, {"vat.py": "print(120)\n"})
+    branch(repository, "a/refs/heads/main", impostor)
+
+    assert await trunk_head(str(repository), "main") == trunk
+
+
+async def test_a_look_alike_branch_does_not_stand_in_for_a_missing_trunk(tmp_path: Path) -> None:
+    repository = tmp_path / "subject"
+    impostor = commit(repository, {"vat.py": VAT_RETURNS_NET})
+    branch(repository, "a/refs/heads/release", impostor)
+
+    with pytest.raises(CheckoutFailed, match="no branch 'release'"):
+        await trunk_head(str(repository), "release")

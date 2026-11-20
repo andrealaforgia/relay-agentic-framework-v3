@@ -23,6 +23,9 @@ class Delivery:
 
 class Streams:
     def __init__(self, client: redis.Redis, prefix: str = "") -> None:
+        if not client.connection_pool.connection_kwargs.get("decode_responses"):
+            # Cursors and fields are compared as text; bytes would never match.
+            raise ValueError("Streams needs a Redis client created with decode_responses=True")
         self._client = client
         self._prefix = prefix
 

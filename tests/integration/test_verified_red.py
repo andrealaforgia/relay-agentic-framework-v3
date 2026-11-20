@@ -4,18 +4,32 @@ neither the source nor the observation."""
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from relay.application.behaviours import Behaviours
 from relay.domain.behaviour import BehaviourState, TransitionRefused
-from relay.domain.evidence import Launch, ProcessContract, ProcessObservation, RedRejection
+from relay.domain.evidence import (
+    Execution,
+    Launch,
+    ProcessContract,
+    ProcessObservation,
+    RedRejection,
+)
 from relay.git.checkout import CheckoutFailed
 from relay.persistence.ledger import read_events
 from relay.persistence.outbox import pending_messages
-from relay.testing.oracle import ContainerIsolation, Isolation, NativeIsolation, ProcessOracle
+from relay.testing.oracle import (
+    ContainerIsolation,
+    Isolation,
+    NativeIsolation,
+    ProcessOracle,
+    Run,
+)
 from tests.integration.fixtures import (
     CONTRACT,
     VAT_APPLIES_STANDARD_RATE,
@@ -32,12 +46,21 @@ class CountingLaunches:
     def __init__(self, isolation: Isolation) -> None:
         self._isolation = isolation
         self.name = isolation.name
-        self.runtime_identity = isolation.runtime_identity
         self.launches = 0
 
-    async def run(self, workdir: Path, launch: Launch, capture_limit: int) -> ProcessObservation:
+    async def run(self, workdir: Path, launch: Launch, capture_limit: int) -> Run:
         self.launches += 1
         return await self._isolation.run(workdir, launch, capture_limit)
+
+
+def resolved_image_id(image: str) -> str:
+    """The platform-specific image this host actually runs for a (possibly multi-platform) digest."""
+    return subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 async def awaiting_red(
@@ -95,13 +118,13 @@ async def test_the_evidence_is_recorded_with_what_produced_it(
     assert verified.payload["revision"] == trunk
     assert verified.payload["contract_digest"] == CONTRACT.digest
     assert verified.payload["isolation"] == "container"
-    assert verified.payload["runtime_identity"] == runner_image
+    assert verified.payload["runtime_identity"] == resolved_image_id(runner_image)
     async with database.connection() as connection:
         execution = await (await connection.execute("SELECT * FROM executions")).fetchone()
     assert execution is not None
     assert str(execution["execution_id"]) == verified.payload["execution_id"]
     assert (execution["purpose"], execution["revision"]) == ("red", trunk)
-    assert execution["runtime_identity"] == runner_image
+    assert execution["runtime_identity"] == resolved_image_id(runner_image)
     assert (execution["exit_code"], bytes(execution["stdout"])) == (0, b"100\n")
 
 
@@ -303,16 +326,56 @@ async def test_the_ledger_cannot_be_rewritten(
             await connection.execute("DELETE FROM events")
 
 
-def test_there_is_no_way_to_hand_the_application_an_observation() -> None:
-    """A supplied observation alone can create neither a verified event nor a build request,
-    because the application offers no operation that takes one."""
-    public = {name for name in vars(Behaviours) if not name.startswith("_")}
+async def test_a_caller_cannot_supply_the_observation_or_the_source(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    commit(tmp_path / "subject", {"vat.py": VAT_APPLIES_STANDARD_RATE})
+    behaviours = await awaiting_red(
+        database, tmp_path / "subject", ContainerIsolation(runner_image)
+    )
+    before = await read_events(database, PROJECT)
+    forged = ProcessObservation(exit_code=0, stdout=b"100\n")
+    run_red: Any = behaviours.run_red
 
-    assert public == {
-        "open_project",
-        "propose",
-        "begin_test_design",
-        "register_acceptance_test",
-        "run_red",
-        "state_of",
-    }
+    for supplied in (
+        {"observation": forged},
+        {"execution": Execution("a" * 40, "container", "image", forged)},
+        {"revision": "a" * 40},
+        {"repository": str(tmp_path / "elsewhere")},
+    ):
+        with pytest.raises(TypeError):
+            await run_red(PROJECT, "B1", **supplied)
+    with pytest.raises(TypeError):
+        await run_red(PROJECT, "B1", forged)
+
+    assert await read_events(database, PROJECT) == before
+    assert await builder_is_blocked(behaviours, database)
+
+
+async def test_a_repository_address_carrying_a_credential_is_refused_and_stored_nowhere(
+    database: AsyncConnectionPool,
+) -> None:
+    behaviours = Behaviours(database, ProcessOracle(NativeIsolation()))
+
+    with pytest.raises(ValueError, match="credentials") as refusal:
+        await behaviours.open_project(PROJECT, "https://relay:canary-secret@git.example/vat.git")
+
+    assert "canary-secret" not in str(refusal.value)
+    async with database.connection() as connection:
+        assert await (await connection.execute("SELECT 1 FROM projects")).fetchone() is None
+        assert await (await connection.execute("SELECT 1 FROM events")).fetchone() is None
+
+
+async def test_a_failure_does_not_copy_the_repository_address_into_the_ledger(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    missing = tmp_path / "canary-address-of-a-repository-that-is-not-there"
+    behaviours = await awaiting_red(database, missing, ContainerIsolation(runner_image))
+
+    with pytest.raises(CheckoutFailed) as failure:
+        await behaviours.run_red(PROJECT, "B1")
+
+    failed = (await read_events(database, PROJECT))[-1]
+    assert failed.event_type == "behaviour.red_preparation_failed"
+    assert "canary-address" not in failed.payload["reason"]
+    assert "canary-address" not in str(failure.value)
