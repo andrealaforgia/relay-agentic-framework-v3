@@ -1,0 +1,9 @@
+> Provenance: `gpt-6.2-astra`, reasoning effort high, same Codex session. Reviewed commit `15bb67d`.
+
+I would close **2A-3.4 and 2A-3.5** at `15bb67d` and proceed to slice 2b. The empty-mirror test checks the published SHA and both reviewer commands. The two-project test checks that the healthy project is adopted during the failing pass and that the deferred project is adopted exactly once after recovery. [Empty-mirror test](/Users/andrealaforgia/dev/relay-v3/tests/integration/test_review_cycle.py:918) · [Adoption recovery test](/Users/andrealaforgia/dev/relay-v3/tests/integration/test_review_cycle.py:931)
+
+**2A-3.6 · NON-BLOCKING.** Concurrent reconcilers can append duplicate or stale `review.adoption_deferred` events. Both can read the same previous event before either appends. A delayed failure can also append a deferral after another reconciler has adopted the cycle. The review gate remains correct, but the latest ledger entry can tell the operator that recovery is still pending. Take the behaviour lock, confirm adoption is still needed, then compare the latest reason and append. A barrier test should cover both orderings. [Deferral transaction](/Users/andrealaforgia/dev/relay-v3/src/relay/application/reviews.py:365) · [Existing adoption lock and state check](/Users/andrealaforgia/dev/relay-v3/src/relay/application/reviews.py:309)
+
+I independently ran **117 passing unit tests** and checked the Git helper’s three exit outcomes and the missing-`HEAD` case directly. I reviewed the integration tests from source in the read-only workspace. The full 290-test pass and mutation results are the Builder’s reported results.
+
+DISPOSITION: ACCEPT_WITH_RESERVATIONS

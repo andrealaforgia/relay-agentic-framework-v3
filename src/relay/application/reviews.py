@@ -363,7 +363,26 @@ class Reviews:
         return 1
 
     async def _adoption_deferred(self, project_id: str, behaviour_id: str, reason: str) -> None:
+        """Say once why a review could not be adopted yet. Under the behaviour's lock, and
+        only if it still needs adopting: another reconciler may have adopted it meanwhile,
+        and the ledger must not then end on "still pending"."""
         async with self._pool.connection() as connection, connection.transaction():
+            behaviour = await (
+                await connection.execute(
+                    "SELECT state FROM behaviours WHERE project_id = %s AND behaviour_id = %s "
+                    "FOR UPDATE",
+                    (project_id, behaviour_id),
+                )
+            ).fetchone()
+            live = await (
+                await connection.execute(
+                    "SELECT 1 FROM review_cycles WHERE project_id = %s AND behaviour_id = %s "
+                    "AND state IN ('open', 'satisfied')",
+                    (project_id, behaviour_id),
+                )
+            ).fetchone()
+            if behaviour is None or behaviour["state"] != "review" or live is not None:
+                return
             latest = await (
                 await connection.execute(
                     "SELECT event_type, payload FROM events WHERE project_id = %s "

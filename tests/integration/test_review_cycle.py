@@ -979,3 +979,29 @@ async def test_one_unreadable_legacy_mirror_does_not_stop_adoption_for_another_p
     assert await first.reviews.adopt_reviews_without_a_cycle() == 1
     assert await first.reviews.adopt_reviews_without_a_cycle() == 0
     assert await cycles() == ["other-project", PROJECT]
+
+
+async def test_a_deferral_that_arrives_after_the_review_was_adopted_is_not_recorded(
+    world: World,
+) -> None:
+    await world.green_candidate()
+    before = await world.events()
+
+    await world.reviews._adoption_deferred(PROJECT, "B1", "git fetch failed: a slow failure")
+
+    assert await world.events() == before
+
+
+async def test_two_reconcilers_failing_alike_record_one_deferral(world: World) -> None:
+    await world.green_candidate()
+    async with world.database.connection() as connection:
+        await connection.execute("DELETE FROM review_tasks")
+        await connection.execute("DELETE FROM review_cycles")
+    other = Reviews(world.database, world.mirrors)
+
+    await asyncio.gather(
+        world.reviews._adoption_deferred(PROJECT, "B1", "git fetch failed: no route"),
+        other._adoption_deferred(PROJECT, "B1", "git fetch failed: no route"),
+    )
+
+    assert (await world.events()).count("review.adoption_deferred") == 1
