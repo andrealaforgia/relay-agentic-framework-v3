@@ -107,7 +107,11 @@ class ContainerIsolation:
         "--cpus", "1",
         "--user", "65534:65534",
         "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+        "--workdir", "/subject",
     )  # fmt: skip
+    # Where the checkout appears to the subject. Part of the runtime identity, like the
+    # settings above, because a subject can observe it.
+    subject_mount = "/subject"
 
     def __init__(self, image: str) -> None:
         if "@sha256:" not in image:
@@ -124,35 +128,27 @@ class ContainerIsolation:
             await self._remove(container)
 
     async def _run(self, container: str, workdir: Path, launch: Launch, capture_limit: int) -> Run:
-        # The subject runs as a fixed unprivileged user, the same on every runner host,
-        # so it must be able to read a checkout made by whoever runs the supervisor.
+        # The subject runs as a fixed unprivileged user, the same on every runner host, so
+        # what it may read and execute must not depend on who made the checkout.
         if workdir.is_dir():
-            await asyncio.to_thread(_make_world_readable, workdir)
-        log_limit = max(capture_limit * 2, 1024 * 1024)
+            await asyncio.to_thread(normalise_permissions, workdir)
         created = await self._docker(
             "create", "--interactive", "--name", container,
             *self.settings,
             # Bound what the engine stores of the subject's output; a rotated log no longer
             # matches the attached capture, so such a run is refused rather than trusted.
             "--log-driver", "json-file",
-            "--log-opt", f"max-size={log_limit}",
+            "--log-opt", f"max-size={max(capture_limit * 2, 1024 * 1024)}",
             "--log-opt", "max-file=1",
             # --mount, unlike --volume, fails when the source is missing instead of
             # creating an empty directory and running against that.
-            "--mount", f"type=bind,source={workdir},target=/subject,readonly",
-            "--workdir", "/subject",
+            "--mount", f"type=bind,source={workdir},target={self.subject_mount},readonly",
             self.image,
             *launch.argv,
         )  # fmt: skip
         if created.exit_code != 0:
-            return Run(
-                ProcessObservation(stderr=created.stderr, ineligibility=Ineligibility.NOT_EXECUTED),
-                self._identity(self.image, log_limit),
-            )
-        created_state = await self._state(container)
-        identity = self._identity(
-            created_state.image_id if created_state else self.image, log_limit
-        )
+            return self._not_executed(created.stderr)
+        at_creation = await self._state(container)
         # Attaching delivers standard input and waits for the subject to finish. What the
         # subject wrote is then read back from the engine, a second and independent capture.
         attached = await self._docker(
@@ -161,18 +157,31 @@ class ContainerIsolation:
             timeout_seconds=launch.timeout_seconds,
             capture_limit=capture_limit,
         )  # fmt: skip
+        at_exit = await self._state(container)
+        resolved = at_exit or at_creation
+        if resolved is None:
+            # Without the engine's word on which image actually ran, the run cannot be
+            # compared with any other, so it cannot count.
+            return self._not_executed(b"the engine did not report which image ran")
+        identity = self._identity(resolved.image_id, capture_limit)
         if attached.timed_out:
             return Run(ProcessObservation(ineligibility=Ineligibility.TIMED_OUT), identity)
-        state = await self._state(container)
         logged = await self._docker("logs", container, capture_limit=capture_limit)
-        return Run(reconcile_container_run(attached, logged, state), identity)
+        return Run(reconcile_container_run(attached, logged, at_exit), identity)
 
-    def _identity(self, image: str, log_limit: int) -> str:
-        """Everything about the runtime that could change what a subject does: the resolved,
-        platform-specific image and the settings the container was created with. A red and a
-        green are comparable only when this is the same for both."""
-        settings = hashlib.sha256(repr((self.settings, log_limit)).encode()).hexdigest()[:16]
-        return f"{image};settings={settings}"
+    def _not_executed(self, detail: bytes) -> Run:
+        return Run(
+            ProcessObservation(stderr=detail, ineligibility=Ineligibility.NOT_EXECUTED),
+            "unresolved",
+        )
+
+    def _identity(self, image_id: str, capture_limit: int) -> str:
+        """Everything about the runtime that a subject could observe: the resolved,
+        platform-specific image, the settings the container was created with, where the
+        checkout is mounted and how much output is kept. A red and a green are comparable
+        only when this is the same for both."""
+        observable = repr((self.settings, self.subject_mount, capture_limit))
+        return f"{image_id};settings={hashlib.sha256(observable.encode()).hexdigest()[:16]}"
 
     async def _state(self, container: str) -> ContainerState | None:
         inspected = await self._docker(
@@ -243,13 +252,18 @@ def reconcile_container_run(
 _TRUSTED_DIRECTORY = Path("/")
 
 
-def _make_world_readable(directory: Path) -> None:
+def normalise_permissions(directory: Path) -> None:
+    """Make what the subject may read and execute depend only on what Git recorded: a file
+    is executable by everyone if Git marked it executable, and readable by everyone either
+    way. The host's umask and the account that made the checkout leave no trace."""
     for root, _, files in os.walk(directory):
-        os.chmod(root, os.stat(root).st_mode | 0o555)
+        os.chmod(root, 0o755)
         for name in files:
             path = os.path.join(root, name)
-            if not os.path.islink(path):
-                os.chmod(path, os.stat(path).st_mode | 0o444)
+            if os.path.islink(path):
+                continue
+            executable = os.stat(path).st_mode & 0o100
+            os.chmod(path, 0o755 if executable else 0o644)
 
 
 def _trusted_path() -> str:

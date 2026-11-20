@@ -12,6 +12,7 @@ from relay.domain.evidence import (
     PairedRed,
     ProcessContract,
     ProcessObservation,
+    RedRejection,
 )
 
 CONTRACT = ProcessContract(
@@ -43,7 +44,7 @@ def test_registering_the_acceptance_test_starts_red_validation() -> None:
 def test_a_valid_red_releases_the_behaviour_to_the_builder() -> None:
     behaviour = awaiting_red()
 
-    verdict = behaviour.record_red_run(FAILS_AS_REGISTERED)
+    verdict = behaviour.record_red_run(FAILS_AS_REGISTERED, started_in_cycle=0)
 
     assert verdict.is_valid
     assert behaviour.state is BehaviourState.IMPLEMENTING
@@ -52,7 +53,7 @@ def test_a_valid_red_releases_the_behaviour_to_the_builder() -> None:
 def test_an_invalid_red_keeps_the_builder_blocked() -> None:
     behaviour = awaiting_red()
 
-    verdict = behaviour.record_red_run(ERRORS)
+    verdict = behaviour.record_red_run(ERRORS, started_in_cycle=0)
 
     assert not verdict.is_valid
     assert behaviour.state is BehaviourState.VALIDATING_RED
@@ -63,7 +64,7 @@ def test_the_builder_cannot_start_before_red_validation() -> None:
     behaviour.begin_test_design()
 
     with pytest.raises(TransitionRefused) as refusal:
-        behaviour.record_red_run(FAILS_AS_REGISTERED)
+        behaviour.record_red_run(FAILS_AS_REGISTERED, started_in_cycle=0)
 
     assert "test_design" in str(refusal.value)
     assert behaviour.state is BehaviourState.TEST_DESIGN
@@ -78,21 +79,21 @@ def test_a_refusal_names_what_was_attempted_and_what_is_required() -> None:
     assert refusal.value.required == (BehaviourState.TEST_DESIGN,)
 
 
-RED = PairedRed("a" * 40, CONTRACT.digest, "image")
+RED = PairedRed("red-run", "a" * 40, CONTRACT.digest, "image")
 PASSES = Execution("c" * 40, "container", "image", ProcessObservation(0, b"120\n"))
 STILL_FAILS = Execution("c" * 40, "container", "image", ProcessObservation(0, b"100\n"))
 
 
 def implementing() -> Behaviour:
     behaviour = awaiting_red()
-    behaviour.record_red_run(FAILS_AS_REGISTERED)
+    behaviour.record_red_run(FAILS_AS_REGISTERED, started_in_cycle=0)
     return behaviour
 
 
 def test_a_paired_green_sends_the_behaviour_to_review() -> None:
     behaviour = implementing()
 
-    verdict = behaviour.record_green_run(PASSES, RED, candidate_descends_from_red=True)
+    verdict = behaviour.record_green_run(PASSES, RED, RED, candidate_descends_from_red=True)
 
     assert verdict.is_valid
     assert behaviour.state is BehaviourState.REVIEW
@@ -101,7 +102,7 @@ def test_a_paired_green_sends_the_behaviour_to_review() -> None:
 def test_a_candidate_that_still_fails_stays_with_the_builder() -> None:
     behaviour = implementing()
 
-    verdict = behaviour.record_green_run(STILL_FAILS, RED, candidate_descends_from_red=True)
+    verdict = behaviour.record_green_run(STILL_FAILS, RED, RED, candidate_descends_from_red=True)
 
     assert verdict.rejection is GreenRejection.EXPECTATION_NOT_MET
     assert behaviour.state is BehaviourState.IMPLEMENTING
@@ -109,7 +110,7 @@ def test_a_candidate_that_still_fails_stays_with_the_builder() -> None:
 
 def test_green_cannot_be_recorded_before_red() -> None:
     with pytest.raises(TransitionRefused) as refusal:
-        awaiting_red().record_green_run(PASSES, RED, candidate_descends_from_red=True)
+        awaiting_red().record_green_run(PASSES, RED, RED, candidate_descends_from_red=True)
 
     assert refusal.value.current is BehaviourState.VALIDATING_RED
 
@@ -128,3 +129,26 @@ def test_a_red_can_be_reopened_while_implementing_and_only_then() -> None:
 def test_a_behaviour_id_must_be_usable_in_a_ref(behaviour_id: str) -> None:
     with pytest.raises(ValueError, match="behaviour id"):
         Behaviour.propose(behaviour_id, "x")
+
+
+def test_a_red_run_that_began_before_a_reopening_cannot_fill_the_new_cycle() -> None:
+    behaviour = implementing()
+    behaviour.reopen_red()
+
+    late = behaviour.record_red_run(FAILS_AS_REGISTERED, started_in_cycle=0)
+
+    assert late.rejection is RedRejection.SUPERSEDED
+    assert behaviour.state is BehaviourState.VALIDATING_RED
+    assert behaviour.record_red_run(FAILS_AS_REGISTERED, started_in_cycle=1).is_valid
+
+
+def test_a_green_that_answered_a_superseded_red_does_not_reach_review() -> None:
+    behaviour = implementing()
+    newer_red = PairedRed("a-later-red-run", "b" * 40, CONTRACT.digest, "image")
+
+    replaced = behaviour.record_green_run(PASSES, RED, newer_red, candidate_descends_from_red=True)
+    removed = behaviour.record_green_run(PASSES, RED, None, candidate_descends_from_red=True)
+
+    assert replaced.rejection is GreenRejection.RED_SUPERSEDED
+    assert removed.rejection is GreenRejection.RED_SUPERSEDED
+    assert behaviour.state is BehaviourState.IMPLEMENTING

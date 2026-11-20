@@ -111,6 +111,7 @@ class Behaviours:
         """
         async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
             contract = behaviour.require_awaiting_red()
+            cycle = behaviour.red_cycle
             isolation = self._oracle.isolation
             if not is_gate_bearing(isolation.name):
                 refusal = refuse_isolation(contract, isolation.name)
@@ -130,7 +131,7 @@ class Behaviours:
             raise
 
         async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
-            verdict = behaviour.record_red_run(execution)
+            verdict = behaviour.record_red_run(execution, started_in_cycle=cycle)
             execution_id = await _record_execution(
                 connection, project_id, behaviour_id, "red", contract.digest, execution
             )
@@ -172,7 +173,9 @@ class Behaviours:
                     behaviour_id=behaviour_id,
                     sender=CONTROL_PLANE,
                     recipient="builder",
-                    idempotency_key=f"build:{project_id}:{behaviour_id}:{contract.digest}",
+                    # One build request per accepted red: a redelivery keeps the key, a
+                    # fresh red after reopening gets a new one.
+                    idempotency_key=f"build:{project_id}:{behaviour_id}:{execution_id}",
                     correlation_id=correlation,
                     causation_id=verified.event_id,
                     payload={"base_revision": execution.revision},
@@ -272,7 +275,10 @@ class Behaviours:
     ) -> GreenVerdict:
         async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
             verdict = behaviour.record_green_run(
-                execution, red, candidate_descends_from_red=descends
+                execution,
+                red,
+                await _paired_red(connection, project_id, behaviour_id),
+                candidate_descends_from_red=descends,
             )
             contract = behaviour.contract
             assert contract is not None
@@ -384,14 +390,16 @@ class Behaviours:
                 summary=row["summary"],
                 state=BehaviourState(row["state"]),
                 contract=ProcessContract.from_dict(contract) if contract else None,
+                red_cycle=row["red_cycle"],
             )
             yield connection, behaviour, row["correlation_id"]
             await connection.execute(
-                "UPDATE behaviours SET state = %s, contract = %s "
+                "UPDATE behaviours SET state = %s, contract = %s, red_cycle = %s "
                 "WHERE project_id = %s AND behaviour_id = %s",
                 (
                     behaviour.state.value,
                     Jsonb(behaviour.contract.to_dict()) if behaviour.contract else None,
+                    behaviour.red_cycle,
                     project_id,
                     behaviour_id,
                 ),
@@ -413,7 +421,7 @@ async def _paired_red(
 ) -> PairedRed | None:
     row = await (
         await connection.execute(
-            "SELECT e.revision, e.contract_digest, e.runtime_identity "
+            "SELECT e.execution_id::text, e.revision, e.contract_digest, e.runtime_identity "
             "FROM behaviours b JOIN executions e ON e.execution_id = b.red_execution_id "
             "WHERE b.project_id = %s AND b.behaviour_id = %s",
             (project_id, behaviour_id),

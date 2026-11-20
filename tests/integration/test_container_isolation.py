@@ -168,7 +168,7 @@ async def test_a_subject_killed_inside_the_container_cannot_pass_either_gate(
     as_red = ProcessContract("B", "x", launch, Expected(0, "ok\n"), Baseline(137, stdout="100\n"))
     as_green = ProcessContract("B", "x", launch, Expected(137, "100\n"), Baseline(0, stdout="no\n"))
     execution = Execution(revision, "container", runner_image, observation)
-    paired = PairedRed("a" * 40, as_green.digest, runner_image)
+    paired = PairedRed("red-run", "a" * 40, as_green.digest, runner_image)
     assert not judge_red(as_red, execution).is_valid
     assert not judge_green(as_green, execution, paired, candidate_descends_from_red=True).is_valid
 
@@ -407,6 +407,58 @@ async def test_a_timed_out_run_still_reports_the_runtime_it_ran_in(
 
     assert timed_out.observation.ineligibility is Ineligibility.TIMED_OUT
     assert timed_out.runtime_identity == completed.runtime_identity
+
+
+async def test_the_identity_is_the_engines_even_when_the_first_inspection_fails(
+    tmp_path: Path, runner_image: str
+) -> None:
+    class FirstInspectionFails(ContainerIsolation):
+        inspections = 0
+
+        async def _state(self, container: str) -> oracle.ContainerState | None:
+            self.inspections += 1
+            return None if self.inspections == 1 else await super()._state(container)
+
+    class NoInspectionWorks(ContainerIsolation):
+        async def _state(self, container: str) -> oracle.ContainerState | None:
+            return None
+
+    revision = commit(tmp_path / "subject", {"vat.py": VAT_RETURNS_NET})
+    workdir = await pristine_checkout(str(tmp_path / "subject"), revision, tmp_path / "checkout")
+    launch = Launch(argv=("python3", "vat.py", "1"), timeout_seconds=30)
+
+    usual = await ContainerIsolation(runner_image).run(workdir, launch, 1_000_000)
+    recovered = await FirstInspectionFails(runner_image).run(workdir, launch, 1_000_000)
+    unknown = await NoInspectionWorks(runner_image).run(workdir, launch, 1_000_000)
+
+    assert recovered.observation.is_eligible
+    assert recovered.runtime_identity == usual.runtime_identity
+    assert runner_image not in recovered.runtime_identity
+    assert unknown.observation.ineligibility is Ineligibility.NOT_EXECUTED
+
+
+async def test_the_runtime_identity_covers_the_mount_point_and_the_capture_limit(
+    tmp_path: Path, runner_image: str
+) -> None:
+    class MountedElsewhere(ContainerIsolation):
+        subject_mount = "/work"
+        settings = tuple(
+            "/work" if setting == "/subject" else setting for setting in ContainerIsolation.settings
+        )
+
+    revision = commit(tmp_path / "subject", {"cwd.py": "import os\nprint(os.getcwd())\n"})
+    workdir = await pristine_checkout(str(tmp_path / "subject"), revision, tmp_path / "checkout")
+    launch = Launch(argv=("python3", "cwd.py"), timeout_seconds=30)
+
+    usual = await ContainerIsolation(runner_image).run(workdir, launch, 1_000_000)
+    elsewhere = await MountedElsewhere(runner_image).run(workdir, launch, 1_000_000)
+    smaller_capture = await ContainerIsolation(runner_image).run(workdir, launch, 400_000)
+
+    assert (usual.observation.stdout, elsewhere.observation.stdout) == (b"/subject\n", b"/work\n")
+    assert (
+        len({usual.runtime_identity, elsewhere.runtime_identity, smaller_capture.runtime_identity})
+        == 3
+    )
 
 
 def test_an_unpinned_image_is_refused() -> None:

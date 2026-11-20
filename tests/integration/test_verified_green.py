@@ -4,6 +4,7 @@ paired with the red: same contract, same runtime, built on the revision the red 
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -12,15 +13,17 @@ from psycopg_pool import AsyncConnectionPool
 
 from relay.application.behaviours import Behaviours
 from relay.domain.behaviour import BehaviourState, TransitionRefused
-from relay.domain.evidence import GreenRejection, Launch, ProcessContract
+from relay.domain.evidence import GreenRejection, Launch, ProcessContract, RedRejection
 from relay.git.checkout import CheckoutFailed
 from relay.persistence.ledger import read_events
+from relay.persistence.outbox import pending_messages
 from relay.testing.oracle import ContainerIsolation, NativeIsolation, ProcessOracle
 from tests.integration.fixtures import (
     CONTRACT,
     VAT_APPLIES_STANDARD_RATE,
     VAT_RETURNS_NET,
     CountingLaunches,
+    HeldAtABarrier,
     commit,
     publish_attempt,
     publish_tag_as_attempt,
@@ -349,3 +352,76 @@ async def test_reopening_a_red_needs_a_reason(
         await behaviours.reopen_red(PROJECT, "B1", reason="  ")
 
     assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
+
+
+async def test_a_green_in_flight_when_its_red_is_superseded_does_not_reach_review(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    repository = tmp_path / "subject"
+    behaviours, first_red = await released_to_builder(database, repository, runner_image)
+    publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=first_red)
+    held = HeldAtABarrier(ContainerIsolation(runner_image))
+    in_flight = asyncio.create_task(
+        Behaviours(database, ProcessOracle(held)).run_green(PROJECT, "B1", attempt=1)
+    )
+    await held.observed.wait()
+
+    await behaviours.reopen_red(PROJECT, "B1", reason="trunk moved")
+    second_red = commit(repository, {"README.md": "trunk moved on; VAT still wrong"})
+    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    held.release.set()
+    verdict = await in_flight
+
+    assert verdict.rejection is GreenRejection.RED_SUPERSEDED
+    assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
+    async with database.connection() as connection:
+        row = await (
+            await connection.execute(
+                "SELECT e.revision, b.candidate_revision FROM behaviours b "
+                "JOIN executions e ON e.execution_id = b.red_execution_id"
+            )
+        ).fetchone()
+    assert row == {"revision": second_red, "candidate_revision": None}
+
+
+async def test_a_red_in_flight_when_the_red_is_reopened_cannot_fill_the_new_cycle(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    repository = tmp_path / "subject"
+    old_trunk = commit(repository, {"vat.py": VAT_RETURNS_NET})
+    behaviours = Behaviours(database, ProcessOracle(ContainerIsolation(runner_image)))
+    await behaviours.open_project(PROJECT, str(repository))
+    await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
+    await behaviours.begin_test_design(PROJECT, "B1")
+    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
+    held = HeldAtABarrier(ContainerIsolation(runner_image))
+    late = asyncio.create_task(Behaviours(database, ProcessOracle(held)).run_red(PROJECT, "B1"))
+    await held.observed.wait()
+
+    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    await behaviours.reopen_red(PROJECT, "B1", reason="trunk moved")
+    commit(repository, {"README.md": "trunk moved on"})
+    held.release.set()
+    verdict = await late
+
+    assert verdict.rejection is RedRejection.SUPERSEDED
+    assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.VALIDATING_RED
+    superseded = await last_event(database)
+    assert superseded.payload["rejection"] == "superseded"
+    assert superseded.payload["revision"] == old_trunk
+    async with database.connection() as connection:
+        row = await (await connection.execute("SELECT red_execution_id FROM behaviours")).fetchone()
+    assert row == {"red_execution_id": None}
+
+
+async def test_a_fresh_red_issues_a_build_request_with_a_new_idempotency_key(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    behaviours, _ = await released_to_builder(database, tmp_path / "subject", runner_image)
+    await behaviours.reopen_red(PROJECT, "B1", reason="runner image upgraded")
+    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+
+    first, second = await pending_messages(database)
+
+    assert first.envelope["event_type"] == second.envelope["event_type"] == "build.requested"
+    assert first.envelope["idempotency_key"] != second.envelope["idempotency_key"]

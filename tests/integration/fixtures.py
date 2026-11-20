@@ -1,5 +1,6 @@
 """A VAT calculator whose baseline returns the net amount unchanged, in a real Git repository."""
 
+import asyncio
 import subprocess
 from pathlib import Path
 
@@ -96,3 +97,20 @@ class CountingLaunches:
     async def run(self, workdir: Path, launch: Launch, capture_limit: int) -> Run:
         self.launches += 1
         return await self._isolation.run(workdir, launch, capture_limit)
+
+
+class HeldAtABarrier:
+    """Wraps an isolation so a run finishes observing but does not return until released,
+    which lets a test change the world while the run is in flight."""
+
+    def __init__(self, isolation: Isolation) -> None:
+        self._isolation = isolation
+        self.name = isolation.name
+        self.observed = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, workdir: Path, launch: Launch, capture_limit: int) -> Run:
+        run = await self._isolation.run(workdir, launch, capture_limit)
+        self.observed.set()
+        await self.release.wait()
+        return run

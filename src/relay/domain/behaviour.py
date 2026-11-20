@@ -7,9 +7,11 @@ from enum import StrEnum
 
 from relay.domain.evidence import (
     Execution,
+    GreenRejection,
     GreenVerdict,
     PairedRed,
     ProcessContract,
+    RedRejection,
     RedVerdict,
     judge_green,
     judge_red,
@@ -45,6 +47,7 @@ class Behaviour:
     summary: str
     state: BehaviourState = BehaviourState.PROPOSED
     contract: ProcessContract | None = None
+    red_cycle: int = 0
 
     @classmethod
     def propose(cls, behaviour_id: str, summary: str) -> Behaviour:
@@ -65,8 +68,13 @@ class Behaviour:
         assert self.contract is not None
         return self.contract
 
-    def record_red_run(self, execution: Execution) -> RedVerdict:
+    def record_red_run(self, execution: Execution, *, started_in_cycle: int) -> RedVerdict:
         contract = self.require_awaiting_red()
+        if started_in_cycle != self.red_cycle:
+            return RedVerdict(
+                RedRejection.SUPERSEDED,
+                f"{contract.contract_id}: this run began before the red was reopened",
+            )
         verdict = judge_red(contract, execution)
         if verdict.is_valid:
             self.state = BehaviourState.IMPLEMENTING
@@ -79,11 +87,26 @@ class Behaviour:
         return self.contract
 
     def record_green_run(
-        self, execution: Execution, red: PairedRed | None, *, candidate_descends_from_red: bool
+        self,
+        execution: Execution,
+        red_at_launch: PairedRed,
+        red_now: PairedRed | None,
+        *,
+        candidate_descends_from_red: bool,
     ) -> GreenVerdict:
+        """Judge a candidate against the red it was launched to answer, provided that red
+        is still the one on record now."""
         contract = self.require_awaiting_green()
+        if red_now != red_at_launch:
+            return GreenVerdict(
+                GreenRejection.RED_SUPERSEDED,
+                f"{contract.contract_id}: the red this run answered has since been superseded",
+            )
         verdict = judge_green(
-            contract, execution, red, candidate_descends_from_red=candidate_descends_from_red
+            contract,
+            execution,
+            red_at_launch,
+            candidate_descends_from_red=candidate_descends_from_red,
         )
         if verdict.is_valid:
             self.state = BehaviourState.REVIEW
@@ -94,6 +117,7 @@ class Behaviour:
         be paired (the runtime changed, say). The contract stays; the old pairing does not."""
         self._require("reopen_red", BehaviourState.IMPLEMENTING)
         self.state = BehaviourState.VALIDATING_RED
+        self.red_cycle += 1
 
     def _require(self, attempted: str, *required: BehaviourState) -> None:
         if self.state not in required:

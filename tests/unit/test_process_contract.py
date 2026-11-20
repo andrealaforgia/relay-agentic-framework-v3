@@ -35,12 +35,12 @@ def judge_red(contract: ProcessContract, observation: ProcessObservation) -> Red
 
 RED_REVISION = "a" * 40
 CANDIDATE = "c" * 40
-RED = PairedRed(RED_REVISION, CONTRACT.digest, "image")
+RED = PairedRed("red-run", RED_REVISION, CONTRACT.digest, "image")
 
 
 def judge_green(contract: ProcessContract, observation: ProcessObservation) -> GreenVerdict:
     """Judge a candidate properly paired with its red, so only the observation varies."""
-    red = PairedRed(RED_REVISION, contract.digest, "image")
+    red = PairedRed("red-run", RED_REVISION, contract.digest, "image")
     execution = Execution(CANDIDATE, "container", "image", observation)
     return judge_green_execution(contract, execution, red, candidate_descends_from_red=True)
 
@@ -198,7 +198,7 @@ def test_a_pass_with_no_red_behind_it_certifies_nothing() -> None:
 
 
 def test_a_red_for_a_different_contract_does_not_pair() -> None:
-    other = PairedRed(RED_REVISION, "sha256:another-contract", "image")
+    other = PairedRed("red-run", RED_REVISION, "sha256:another-contract", "image")
 
     verdict = judge_green_execution(CONTRACT, passing(), other, candidate_descends_from_red=True)
 

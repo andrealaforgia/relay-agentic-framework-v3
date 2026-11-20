@@ -158,6 +158,7 @@ class RedRejection(StrEnum):
     ALREADY_PASSES = "already_passes"
     UNEXPECTED_FAILURE = "unexpected_failure"
     ISOLATION_NOT_ADMISSIBLE = "isolation_not_admissible"
+    SUPERSEDED = "superseded"
 
 
 @dataclass(frozen=True)
@@ -173,6 +174,7 @@ class RedVerdict:
 class GreenRejection(StrEnum):
     ISOLATION_NOT_ADMISSIBLE = "isolation_not_admissible"
     NO_PAIRED_RED = "no_paired_red"
+    RED_SUPERSEDED = "red_superseded"
     NOT_BUILT_ON_THE_RED_REVISION = "not_built_on_the_red_revision"
     RUNTIME_CHANGED = "runtime_changed"
     NOT_EXECUTED = "not_executed"
@@ -197,6 +199,7 @@ class PairedRed:
     """The accepted red a green must answer: same contract, same runtime, and a
     candidate that was built on top of the revision the red was observed on."""
 
+    execution_id: str
     revision: str
     contract_digest: str
     runtime_identity: str
