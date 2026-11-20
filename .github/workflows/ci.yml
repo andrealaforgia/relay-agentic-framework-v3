@@ -3,9 +3,11 @@
 # a model, so the pipeline needs no provider credentials.
 name: CI
 
+# A push that changes only documents runs nothing: there is nothing in it to check.
 on:
   push:
     branches: [main]
+    paths-ignore: ["docs/**", "**.md"]
   pull_request:
 
 permissions:
