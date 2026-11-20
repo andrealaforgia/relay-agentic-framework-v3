@@ -20,6 +20,9 @@ CREATE TABLE review_cycles (
     state              text NOT NULL DEFAULT 'open'
         CHECK (state IN ('open', 'satisfied', 'changes_requested', 'parked', 'blocked', 'superseded')),
     blocked_reason     text,
+    -- Why publication has not happened yet, when the cause may pass (the remote was
+    -- unreachable, say). A cycle with this set is still pending and will be retried.
+    deferred_reason    text,
     created_at         timestamptz NOT NULL DEFAULT now(),
     FOREIGN KEY (project_id, behaviour_id) REFERENCES behaviours
 );
@@ -34,6 +37,9 @@ CREATE TABLE review_tasks (
     cycle_id   uuid NOT NULL REFERENCES review_cycles,
     role       text NOT NULL,
     capability text UNIQUE,
+    -- The one command that announces this task. Announcing again re-sends this same
+    -- message, so a consumer that has already acted on it does nothing new.
+    command_message_id uuid,
     UNIQUE (cycle_id, role)
 );
 

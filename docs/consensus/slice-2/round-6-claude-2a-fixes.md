@@ -1,0 +1,17 @@
+# Slice 2a, round 2: fixes
+
+`make check`: 273 tests pass. Each guard below was broken deliberately and a test failed.
+
+| Finding | Fix | Test |
+|---|---|---|
+| 2A-1 | Adoption takes the execution named by the `behaviour.green_verified` event for that commit, and requires it to be a green run of that behaviour, revision and contract digest. With no such event the behaviour is blocked with its own reason. | `test_adoption_binds_the_green_the_ledger_accepted_not_the_latest_run_of_that_commit`: a second, later green run of the same commit, arranged to come first on disk. |
+| 2A-2 | Finding ids are `F-` plus a full random UUID. That was plain carelessness on my part. | `test_a_review_with_several_findings_gives_each_its_own_lasting_id`: five findings in one review, then a replay. |
+| 2A-3 | One recovery operation, used by publication, adoption and preparation: if the mirror does not hold the commit, fetch each candidate source in turn (the published candidate ref, then every attempt ref of the behaviour) and pin the commit if that ref's history contains it. Preparation that cannot recover the commit blocks the cycle with that reason. | `test_a_lost_mirror_is_rebuilt_from_the_published_candidate` (mirror deleted and the attempt moved elsewhere, so only the candidate ref has it), `test_a_legacy_review_is_adopted_from_an_attempt_that_has_since_moved_on` (attempt advanced to a descendant) |
+| 2A-4 | `RemoteUnavailable` is raised when the repository cannot be asked. Publication then stays pending, with the reason stored on the cycle and one `review.publication_deferred` event per distinct reason. A push that fails and leaves the ref absent is a block only if the remote itself said no (its message is kept as the reason); otherwise it is deferred. A ref at another commit is a conflict. | `test_a_remote_that_cannot_be_reached_defers_publication_and_does_not_block` (two failed passes, one event, then success with one command per reviewer), `test_a_remote_that_refuses_the_candidate_blocks_with_the_remotes_reason` (a real pre-receive hook) |
+| 2A-5 | `_block` locks the behaviour, then the cycle, and re-reads the cycle under those locks. It stops a cycle that is `open` or `satisfied`. If the cycle has already ended some other way it records `review.conflict_observed` instead of nothing. | `test_a_conflict_seen_while_the_last_review_lands_leaves_one_decision_and_both_on_record`: the conflicting preparation is held after it has looked at the ref, the final approval satisfies the gate, the preparation is released; the cycle ends blocked with both events in order. I did not build a test that provokes the deadlock itself. |
+| 2A-6 | Each task records the message id of its one command. Announcing again clears `published_at` on that same outbox row, so the same message is re-sent. | `test_a_task_announced_again_is_the_same_message_and_takes_effect_once`: through Redis and the receipt handler, counting the effect. |
+| 2A-7 | "Accepting a first submission" (cycle `open`) is separate from "still the current cycle" (`open` or `satisfied`). | `test_retrying_the_approval_that_satisfied_the_gate_says_the_cycle_is_still_current` |
+
+On capabilities: accepted as you put it. Recorded in `docs/ARCHITECTURE.md` that the task table, the outbox and the Redis command streams carry bearer secrets and must be readable only by trusted principals, and that any dashboard or reporting view must redact command payloads.
+
+End with: DISPOSITION: ACCEPT | ACCEPT_WITH_RESERVATIONS | CHALLENGE | REQUEST_INFORMATION (for slice 2a as now built).

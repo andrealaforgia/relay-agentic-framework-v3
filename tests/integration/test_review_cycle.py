@@ -11,16 +11,21 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import redis.asyncio as redis
 from psycopg_pool import AsyncConnectionPool
 
+from relay.application import reviews as reviews_module
 from relay.application.behaviours import Behaviours
 from relay.application.reviews import NewFinding, Review, Reviews, UnknownCapability
 from relay.domain.behaviour import BehaviourState
 from relay.domain.review import Carried, Severity, SubmissionRefused
+from relay.git.checkout import RemoteUnavailable
 from relay.git.mirror import Mirror
 from relay.persistence.ledger import read_events
-from relay.persistence.outbox import pending_messages
+from relay.persistence.outbox import OutboxPublisher, pending_messages
+from relay.persistence.receipts import act_once
 from relay.testing.oracle import ContainerIsolation, ProcessOracle
+from relay.transport.streams import Streams
 from tests.integration.fixtures import (
     CONTRACT,
     VAT_APPLIES_STANDARD_RATE,
@@ -472,22 +477,38 @@ async def test_a_review_whose_commit_can_no_longer_be_obtained_is_blocked_visibl
     assert (await world.events()).count("review.recovery_blocked") == 1
 
 
-async def test_announcing_waiting_tasks_again_repeats_the_same_commands(world: World) -> None:
-    candidate, capabilities = await world.candidate_under_review()
+async def test_a_task_announced_again_is_the_same_message_and_takes_effect_once(
+    world: World, broker: redis.Redis, namespace: str
+) -> None:
+    """Through Redis and the consumer's receipt, as a real reviewer worker would see it."""
+    _, capabilities = await world.candidate_under_review()
     await world.review(capabilities["qa"], APPROVE)
+    streams = Streams(broker, prefix=namespace)
+    stream = f"relay:{PROJECT}:cmd:sentinel"
+    async with world.database.connection() as connection:
+        await connection.execute("CREATE TABLE reviews_started (message_id uuid NOT NULL)")
 
+    async def sentinel_worker() -> list[dict[str, Any]]:
+        deliveries = await streams.read(stream, group="sentinel", consumer="worker-1")
+        for delivery in deliveries:
+            async with world.database.connection() as connection, connection.transaction():
+                if await act_once(connection, "sentinel", delivery.message_id):
+                    await connection.execute(
+                        "INSERT INTO reviews_started VALUES (%s)", (delivery.message_id,)
+                    )
+            await streams.acknowledge(stream, "sentinel", delivery)
+        return [delivery.envelope for delivery in deliveries]
+
+    await OutboxPublisher(world.database, streams).publish_pending()
+    [first] = await sentinel_worker()
+    assert await world.reviews.announce_unreviewed_tasks() == 1, "only sentinel still owes a review"
+    await OutboxPublisher(world.database, streams).publish_pending()
+    [again] = await sentinel_worker()
+
+    assert again == first
+    assert await world.count("reviews_started") == 1
     assert await world.reviews.announce_unreviewed_tasks() == 1
-
-    commands = [
-        message.envelope
-        for message in await pending_messages(world.database)
-        if message.envelope["event_type"] == "review.requested"
-    ]
-    again = [command for command in commands if command["recipient"] == "sentinel"]
-    assert len(again) == 2 and len(commands) == 3
-    assert again[0]["idempotency_key"] == again[1]["idempotency_key"]
-    assert again[0]["payload"] == again[1]["payload"]
-    assert again[0]["payload"]["candidate_revision"] == candidate
+    assert await world.reviews.announce_unreviewed_tasks() == 0, "already waiting to be sent"
 
 
 async def test_two_publishers_at_once_announce_each_task_once(world: World) -> None:
@@ -526,3 +547,189 @@ async def test_two_recoveries_at_once_adopt_a_review_once(world: World) -> None:
     assert sum(adopted) == 1
     assert await world.cycle_states() == ["open"]
     assert (await world.events()).count("review.cycle_adopted") == 1
+
+
+async def cycle_row(world: World) -> dict[str, Any]:
+    async with world.database.connection() as connection:
+        row = await (
+            await connection.execute("SELECT * FROM review_cycles ORDER BY created_at DESC LIMIT 1")
+        ).fetchone()
+    assert row is not None
+    return row
+
+
+async def test_a_review_with_several_findings_gives_each_its_own_lasting_id(world: World) -> None:
+    _, capabilities = await world.candidate_under_review()
+    several = Review(findings=(INJECTION, STYLE, INJECTION, STYLE, INJECTION))
+
+    first = await world.review(capabilities["sentinel"], several)
+    replay = await world.reviews.submit_review(capabilities["sentinel"], several)
+
+    assert len(set(first.finding_ids)) == 5
+    assert replay.finding_ids == first.finding_ids
+    assert await world.count("findings") == 5
+
+
+async def test_retrying_the_approval_that_satisfied_the_gate_says_the_cycle_is_still_current(
+    world: World,
+) -> None:
+    _, capabilities = await world.candidate_under_review()
+    await world.review(capabilities["qa"], APPROVE)
+    last = await world.review(capabilities["sentinel"], APPROVE)
+
+    replay = await world.reviews.submit_review(capabilities["sentinel"], APPROVE)
+
+    assert (replay.submission_id, replay.disposition) == (last.submission_id, "effective")
+    assert replay.cycle_is_current is True
+    assert (await world.events()).count("review.gate_satisfied") == 1
+
+
+async def test_adoption_binds_the_green_the_ledger_accepted_not_the_latest_run_of_that_commit(
+    world: World,
+) -> None:
+    candidate = await world.green_candidate()
+    accepted = (await cycle_row(world))["green_execution_id"]
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "INSERT INTO executions (execution_id, project_id, behaviour_id, purpose, revision, "
+            "contract_digest, isolation, runtime_identity, exit_code, stdout, stderr, recorded_at) "
+            "SELECT gen_random_uuid(), project_id, behaviour_id, purpose, revision, contract_digest, "
+            "isolation, runtime_identity, exit_code, stdout, stderr, now() + interval '1 hour' "
+            "FROM executions WHERE execution_id = %s",
+            (accepted,),
+        )
+        await connection.execute("DELETE FROM review_tasks")
+        await connection.execute("DELETE FROM review_cycles")
+        # Rewrite the accepted row so that, on disk, the other run comes first: a query
+        # that merely takes "a green run of this commit" then finds the wrong one.
+        await connection.execute(
+            "UPDATE executions SET stdout = stdout WHERE execution_id = %s", (accepted,)
+        )
+        others = await (
+            await connection.execute(
+                "SELECT execution_id FROM executions WHERE purpose = 'green' AND revision = %s",
+                (candidate,),
+            )
+        ).fetchall()
+    assert len(others) == 2 and others[0]["execution_id"] != accepted
+
+    assert await world.reviews.adopt_reviews_without_a_cycle() == 1
+
+    adopted = await cycle_row(world)
+    assert adopted["green_execution_id"] == accepted
+    assert adopted["candidate_revision"] == candidate
+
+
+async def test_a_lost_mirror_is_rebuilt_from_the_published_candidate(world: World) -> None:
+    candidate, capabilities = await world.candidate_under_review()
+    shutil.rmtree(world.mirrors)
+    publish_attempt(
+        world.repository, "B1", 1, {"vat.py": "print('moved')\n"}, on=world.red_revision
+    )
+
+    tree = await world.reviews.prepare_review(capabilities["qa"], world.tmp_path / "qa-tree")
+
+    assert (tree / "vat.py").read_text().startswith(VAT_APPLIES_STANDARD_RATE)
+    assert await Mirror(world.mirrors / f"{PROJECT}.git").holds(candidate)
+    assert await world.cycle_states() == ["open"]
+
+
+async def test_a_legacy_review_is_adopted_from_an_attempt_that_has_since_moved_on(
+    world: World,
+) -> None:
+    candidate = await world.green_candidate()
+    async with world.database.connection() as connection:
+        await connection.execute("DELETE FROM review_tasks")
+        await connection.execute("DELETE FROM review_cycles")
+    shutil.rmtree(world.mirrors)
+    publish_attempt(world.repository, "B1", 1, {"NOTES.md": "more work on top"}, on=candidate)
+
+    assert await world.reviews.adopt_reviews_without_a_cycle() == 1
+    assert await world.reviews.publish_candidates() == 1
+
+    assert await Mirror(world.mirrors / f"{PROJECT}.git").holds(candidate)
+    assert world.remote_ref(await candidate_ref_of(world)) == candidate
+    assert await world.state() is BehaviourState.REVIEW
+
+
+async def test_a_remote_that_cannot_be_reached_defers_publication_and_does_not_block(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = await world.green_candidate()
+    real = reviews_module.refs_under
+    real_resolve = reviews_module.resolve_ref
+
+    async def unreachable(*_: object) -> None:
+        raise RemoteUnavailable("git ls-remote failed: could not connect")
+
+    monkeypatch.setattr(reviews_module, "resolve_ref", unreachable)
+    monkeypatch.setattr(reviews_module, "refs_under", unreachable)
+    assert await world.reviews.publish_candidates() == 0
+    assert await world.reviews.publish_candidates() == 0
+
+    assert await world.cycle_states() == ["open"]
+    assert await world.state() is BehaviourState.REVIEW
+    assert (await cycle_row(world))["deferred_reason"] == "git ls-remote failed: could not connect"
+    assert (await world.events()).count("review.publication_deferred") == 1
+    assert await world.capabilities(candidate) == {}
+
+    monkeypatch.setattr(reviews_module, "resolve_ref", real_resolve)
+    monkeypatch.setattr(reviews_module, "refs_under", real)
+    assert await world.reviews.publish_candidates() == 1
+
+    assert set(await world.capabilities(candidate)) == {"qa", "sentinel"}
+    assert (await cycle_row(world))["deferred_reason"] is None
+
+
+async def test_a_remote_that_refuses_the_candidate_blocks_with_the_remotes_reason(
+    world: World,
+) -> None:
+    candidate = await world.green_candidate()
+    hook = world.repository / ".git" / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\necho 'candidates are not accepted here' >&2\nexit 1\n")
+    hook.chmod(0o755)
+
+    assert await world.reviews.publish_candidates() == 0
+
+    blocked = await cycle_row(world)
+    assert blocked["state"] == "blocked"
+    assert "hook declined" in blocked["blocked_reason"]
+    assert await world.state() is BehaviourState.BLOCKED
+    assert await world.capabilities(candidate) == {}
+
+
+async def test_a_conflict_seen_while_the_last_review_lands_leaves_one_decision_and_both_on_record(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sentinel has approved; QA has its tree. The candidate ref moves. Someone prepares
+    again and sees the conflict, but before it can act QA's final approval satisfies the
+    gate. Both things happened; the cycle must end blocked, with both on the ledger."""
+    _, capabilities = await world.candidate_under_review()
+    await world.review(capabilities["sentinel"], APPROVE)
+    await world.reviews.prepare_review(capabilities["qa"], world.tmp_path / "qa-tree")
+    world.move_remote_ref(await candidate_ref_of(world), world.red_revision)
+    seen, release = asyncio.Event(), asyncio.Event()
+    real_resolve = reviews_module.resolve_ref
+
+    async def held_after_looking(repository: str, ref: str) -> str | None:
+        found = await real_resolve(repository, ref)
+        seen.set()
+        await release.wait()
+        return found
+
+    monkeypatch.setattr(reviews_module, "resolve_ref", held_after_looking)
+    preparing = asyncio.create_task(
+        world.reviews.prepare_review(capabilities["sentinel"], world.tmp_path / "again")
+    )
+    await asyncio.wait_for(seen.wait(), 30)
+
+    final = await world.reviews.submit_review(capabilities["qa"], APPROVE)
+    release.set()
+    with pytest.raises(SubmissionRefused, match="no longer names"):
+        await preparing
+
+    assert final.disposition == "effective"
+    assert await world.cycle_states() == ["blocked"]
+    assert await world.state() is BehaviourState.BLOCKED
+    events = await world.events()
+    assert events.index("review.gate_satisfied") < events.index("review.cycle_blocked")

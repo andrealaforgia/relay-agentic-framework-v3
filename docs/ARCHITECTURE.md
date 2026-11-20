@@ -60,6 +60,8 @@ There is no data migration: old ledgers are Redis streams with a different envel
 
 **Provider execution boundary.** Not yet proven. Each adapter gets a written contract (mounts, environment, credentials, subprocess permissions, network) and must pass canary probes on the real CLI before it is eligible for a role. A canary passes only when the probe attempted the operation and the enforcement layer denied it.
 
+**Review capabilities are bearer secrets.** A reviewer acts on a task by presenting a capability sent only in its review command. Those capabilities sit in plaintext in the review task table, the outbox and the Redis command streams, so all three must be readable only by trusted principals. A dashboard or reporting account may read workflow state but must never be shown command payloads; any operational view redacts them.
+
 **Consensus.** Immutable proposals identified by (project, logical id, revision, sha256). Responses bind to the exact revision. Escalation is a blocked state with a named owner, never agreement. Counterpart outcome is recorded as `disabled`, `unavailable`, `substituted` or `completed`.
 
 ## 5. Product Owner decisions
@@ -77,7 +79,8 @@ Each slice is a vertical cut with executable acceptance tests against real Postg
 | 1a | Red gate in durable state; ledger; outbox; act once | 4 (state level), 11 (application effect) | Done |
 | 1b | Process oracle: wrong value is red; failure to launch, timeout, unregistered failure and a forged report are not; container boundary shown with live canaries | 4 | Done |
 | 1c | Green paired with its red: same contract, same runtime, candidate built on the red's revision and read from the Builder's attempt ref. The contract lives in PostgreSQL, so a Builder's changeset cannot alter it. Regression checks against earlier behaviours wait for slice 2, where integration first makes earlier behaviours part of trunk. | 5 (without regression) | Done |
-| 2 | QA and Sentinel on one candidate; stale base rejected; one trunk advance across crashes. Must also show: a pre-existing required check failing on the exact candidate keeps trunk where it is; review dispatch for a behaviour already in `review` survives a restart | 5 (regression), 6, 11 | Next |
+| 2a | QA and Sentinel review the same pinned, published candidate; findings, per-candidate verification, the gate, recovery | 6 | Built, in review |
+| 2b | Integration: required checks on the exact candidate, one authorised trunk update, stale base, crash reconciliation | 5 (regression), 11 | Design agreed (v3.1) |
 | 3 | Claude-only story to the human gate; restart at the gate | 1, 3, 8, 14 | |
 | 4 | Two providers disagree across machines; round cap escalates | 2, 7 | |
 | 5 | Lost lease, late result, unknown paid call | 10, 11 | |

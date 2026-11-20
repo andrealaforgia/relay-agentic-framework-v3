@@ -31,6 +31,11 @@ class CheckoutFailed(Exception):
     pass
 
 
+class RemoteUnavailable(CheckoutFailed):
+    """The repository could not be asked. Nothing is known; the same request may succeed
+    later. Never grounds for a permanent decision."""
+
+
 def require_credential_free(repository: str) -> str:
     """A repository address is stored and shown; a secret inside it would be too.
     Credentials are supplied to Git separately, never as part of the address. The
@@ -88,7 +93,10 @@ async def resolve_ref(repository: str, wanted: str) -> str | None:
     """The object the exactly named ref points at now, or None if there is no such ref."""
     # ls-remote matches its pattern against the tail of every ref name, so another ref
     # ending in the same words would be listed too. Only the exact ref counts.
-    listing = await git("ls-remote", "--", repository, wanted, redact=repository)
+    try:
+        listing = await git("ls-remote", "--", repository, wanted, redact=repository)
+    except CheckoutFailed as failure:
+        raise RemoteUnavailable(str(failure)) from None
     revisions = [
         revision
         for revision, _, ref in (line.partition("\t") for line in listing.splitlines())

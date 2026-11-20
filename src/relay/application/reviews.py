@@ -33,7 +33,7 @@ from relay.domain.review import (
     judge_gate,
     require_authority_over,
 )
-from relay.git.checkout import CheckoutFailed, refs_under, resolve_ref
+from relay.git.checkout import CheckoutFailed, RemoteUnavailable, refs_under, resolve_ref
 from relay.git.mirror import Mirror
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
@@ -190,23 +190,30 @@ class Reviews:
 
     async def _publish(self, cycle: dict[str, Any]) -> int:
         mirror = self._mirror(cycle["project_id"])
-        commit, ref, repository = (
-            cycle["candidate_revision"],
-            cycle["candidate_ref"],
-            cycle["repository"],
-        )
+        commit, ref = cycle["candidate_revision"], cycle["candidate_ref"]
+        repository = cycle["repository"]
         try:
-            if not await mirror.holds(commit):
-                raise CheckoutFailed("the control plane no longer holds the judged commit")
+            if not await self._recover(cycle):
+                await self._block(cycle["cycle_id"], _COMMIT_LOST)
+                return 0
             if await resolve_ref(repository, ref) is None:
                 try:
                     await mirror.publish(repository, commit, ref)
-                except CheckoutFailed:
-                    pass  # refused: another publisher may have just created it; look again
+                except CheckoutFailed as refused:
+                    # Another publisher may have just created it, the remote may have said
+                    # no, or the push may not have arrived. Look again before deciding.
+                    now = await resolve_ref(repository, ref)
+                    if now is None and _is_a_definite_refusal(refused):
+                        reason = f"the remote refused the candidate: {refused}"
+                        await self._block(cycle["cycle_id"], reason[:500])
+                        return 0
+                    if now is None:
+                        raise RemoteUnavailable(str(refused)) from None
             if await resolve_ref(repository, ref) != commit:
-                raise CheckoutFailed("the candidate ref does not name the judged commit")
-        except CheckoutFailed as failure:
-            await self._block(cycle["cycle_id"], str(failure)[:500])
+                await self._block(cycle["cycle_id"], "the candidate ref names another commit")
+                return 0
+        except RemoteUnavailable as unavailable:
+            await self._defer(cycle, str(unavailable)[:500])
             return 0
         async with self._pool.connection() as connection, connection.transaction():
             current = await (
@@ -219,7 +226,8 @@ class Reviews:
             if current["publication"] != "pending" or current["state"] != "open":
                 return 0
             await connection.execute(
-                "UPDATE review_cycles SET publication = 'published' WHERE cycle_id = %s",
+                "UPDATE review_cycles SET publication = 'published', deferred_reason = NULL "
+                "WHERE cycle_id = %s",
                 (cycle["cycle_id"],),
             )
             published = await append_event(
@@ -241,16 +249,16 @@ class Reviews:
             ).fetchall()
             for task in tasks:
                 capability = secrets.token_urlsafe(32)
+                command = _review_command(
+                    cycle, task["task_id"], task["role"], capability, published.event_id
+                )
                 await connection.execute(
-                    "UPDATE review_tasks SET capability = %s WHERE task_id = %s",
-                    (capability, task["task_id"]),
+                    "UPDATE review_tasks SET capability = %s, command_message_id = %s "
+                    "WHERE task_id = %s",
+                    (capability, command.message_id, task["task_id"]),
                 )
                 await enqueue(
-                    connection,
-                    f"relay:{cycle['project_id']}:cmd:{task['role']}",
-                    _review_command(
-                        cycle, task["task_id"], task["role"], capability, published.event_id
-                    ),
+                    connection, f"relay:{cycle['project_id']}:cmd:{task['role']}", command
                 )
         return 1
 
@@ -276,19 +284,15 @@ class Reviews:
     async def _adopt(self, orphan: dict[str, Any]) -> int:
         project_id, behaviour_id = orphan["project_id"], orphan["behaviour_id"]
         commit = orphan["candidate_revision"]
-        mirror = self._mirror(project_id)
-        if not await mirror.holds(commit):
-            attempts = await refs_under(
-                orphan["repository"], f"refs/relay/attempts/{project_id}/{behaviour_id}/"
-            )
-            source = next((ref for ref, revision in attempts.items() if revision == commit), None)
-            if source is not None:
-                await mirror.pin_from(orphan["repository"], source, commit)
+        try:
+            recovered = await self._recover(orphan)
+        except RemoteUnavailable:
+            return 0  # nothing is known yet; the next pass will ask again
         async with self._pool.connection() as connection, connection.transaction():
             row = await (
                 await connection.execute(
-                    "SELECT state FROM behaviours WHERE project_id = %s AND behaviour_id = %s "
-                    "FOR UPDATE",
+                    "SELECT state FROM behaviours WHERE project_id = %s "
+                    "AND behaviour_id = %s FOR UPDATE",
                     (project_id, behaviour_id),
                 )
             ).fetchone()
@@ -301,7 +305,8 @@ class Reviews:
             ).fetchone()
             if row is None or row["state"] != "review" or live is not None:
                 return 0
-            if not await mirror.holds(commit):
+            green = await _accepted_green(connection, project_id, behaviour_id, commit)
+            if not recovered or green is None:
                 await connection.execute(
                     "UPDATE behaviours SET state = 'blocked' "
                     "WHERE project_id = %s AND behaviour_id = %s",
@@ -314,23 +319,15 @@ class Reviews:
                     subject_id=behaviour_id,
                     payload={
                         "candidate_revision": commit,
-                        "reason": "the commit that was judged green can no longer be obtained",
+                        "reason": _COMMIT_LOST if not recovered else _NO_ACCEPTED_GREEN,
                     },
                 )
                 return 0
-            green = await (
-                await connection.execute(
-                    "SELECT execution_id FROM executions WHERE project_id = %s AND behaviour_id = %s "
-                    "AND purpose = 'green' AND revision = %s ORDER BY recorded_at DESC LIMIT 1",
-                    (project_id, behaviour_id, commit),
-                )
-            ).fetchone()
-            assert green is not None
             cycle_id = await open_cycle(
                 connection,
                 project_id,
                 behaviour_id,
-                green_execution_id=green["execution_id"],
+                green_execution_id=green,
                 red_execution_id=orphan["red_execution_id"],
                 candidate=commit,
             )
@@ -339,30 +336,45 @@ class Reviews:
                 project_id,
                 "review.cycle_adopted",
                 subject_id=behaviour_id,
-                payload={"cycle_id": str(cycle_id), "candidate_revision": commit},
+                payload={
+                    "cycle_id": str(cycle_id),
+                    "candidate_revision": commit,
+                    "green_execution_id": str(green),
+                },
             )
         return 1
 
+    async def _recover(self, record: Mapping[str, Any]) -> bool:
+        """The one way a judged commit is brought back: from the control plane's pin, or
+        else from any place the repository may still have it, whether the published
+        candidate ref or a Builder's attempt whose history contains it."""
+        project_id, behaviour_id = record["project_id"], record["behaviour_id"]
+        if await self._mirror(project_id).holds(record["candidate_revision"]):
+            return True
+        attempts = await refs_under(
+            record["repository"], f"refs/relay/attempts/{project_id}/{behaviour_id}/"
+        )
+        published = [record["candidate_ref"]] if record.get("candidate_ref") else []
+        return await self._mirror(project_id).recover(
+            record["repository"], record["candidate_revision"], [*published, *sorted(attempts)]
+        )
+
     async def announce_unreviewed_tasks(self) -> int:
-        """Announce again every task that is still waiting for its review. The command is
-        the same one, with the same idempotency key, so a consumer that already has it
+        """Send again the command of every task still waiting for its review. It is the
+        same message with the same identity, so a consumer that has already acted on it
         does nothing new."""
         async with self._pool.connection() as connection, connection.transaction():
-            waiting = await (
+            again = await (
                 await connection.execute(
-                    "SELECT t.task_id, t.role, t.capability, c.* FROM review_tasks t "
+                    "UPDATE outbox SET published_at = NULL WHERE published_at IS NOT NULL "
+                    "AND message_id IN (SELECT t.command_message_id FROM review_tasks t "
                     "JOIN review_cycles c USING (cycle_id) WHERE c.state = 'open' "
                     "AND c.publication = 'published' AND NOT EXISTS (SELECT 1 FROM "
-                    "review_submissions s WHERE s.task_id = t.task_id AND s.disposition = 'effective')"
+                    "review_submissions s WHERE s.task_id = t.task_id "
+                    "AND s.disposition = 'effective')) RETURNING message_id"
                 )
             ).fetchall()
-            for task in waiting:
-                await enqueue(
-                    connection,
-                    f"relay:{task['project_id']}:cmd:{task['role']}",
-                    _review_command(task, task["task_id"], task["role"], task["capability"], None),
-                )
-        return len(waiting)
+        return len(again)
 
     async def prepare_review(self, capability: str, into: Path) -> Path:
         """Give a reviewer the tree to review: exactly the cycle's commit, from the control
@@ -371,11 +383,21 @@ class Reviews:
         if task["state"] != "open" or task["publication"] != "published":
             raise SubmissionRefused("this review is no longer open")
         commit = task["candidate_revision"]
-        if await resolve_ref(task["repository"], task["candidate_ref"]) != commit:
+        try:
+            names_the_commit = (
+                await resolve_ref(task["repository"], task["candidate_ref"]) == commit
+            )
+            recovered = names_the_commit and await self._recover(task)
+        except RemoteUnavailable as unavailable:
+            raise SubmissionRefused(f"the repository cannot be reached: {unavailable}") from None
+        if not names_the_commit:
             await self._block(
                 task["cycle_id"], "the candidate ref no longer names the reviewed commit"
             )
             raise SubmissionRefused("the candidate ref no longer names the commit under review")
+        if not recovered:
+            await self._block(task["cycle_id"], _COMMIT_LOST)
+            raise SubmissionRefused(_COMMIT_LOST)
         tree = await self._mirror(task["project_id"]).export(commit, into)
         async with self._pool.connection() as connection:
             await connection.execute(
@@ -390,7 +412,8 @@ class Reviews:
         task_id = (await self._task(capability))["task_id"]
         async with self._pool.connection() as connection, connection.transaction():
             task = await _locked_task(connection, task_id)
-            is_current = task["state"] == "open"
+            accepting = task["state"] == "open"
+            is_current = task["state"] in ("open", "satisfied")
             effective = await (
                 await connection.execute(
                     "SELECT submission_id, content_digest, finding_ids FROM review_submissions "
@@ -407,7 +430,7 @@ class Reviews:
                         cycle_is_current=is_current,
                     )
                 return await _store(connection, task, review, "conflicting", is_current)
-            if not is_current:
+            if not accepting:
                 return await _store(connection, task, review, "stale", is_current)
             if not await _has_checkout(connection, task_id):
                 raise SubmissionRefused("no tree was prepared for this review")
@@ -449,7 +472,7 @@ class Reviews:
         require_authority_over(task["role"], review.carried, known)
         finding_ids = []
         for finding in review.findings:
-            finding_id = f"F-{uuid.uuid7().hex[:16]}"
+            finding_id = f"F-{uuid.uuid4()}"
             finding_ids.append(finding_id)
             await connection.execute(
                 "INSERT INTO findings (finding_id, project_id, behaviour_id, role, severity, claim, "
@@ -580,27 +603,93 @@ class Reviews:
         return row
 
     async def _block(self, cycle_id: uuid.UUID, reason: str) -> None:
+        """Stop a cycle that can no longer be trusted. Locks are taken in the same order
+        as a submission takes them (behaviour, then cycle), and the cycle's state is read
+        again under them, so the two cannot deadlock or overwrite each other."""
         async with self._pool.connection() as connection, connection.transaction():
-            cycle = await (
+            located = await (
+                await connection.execute(
+                    "SELECT project_id, behaviour_id FROM review_cycles WHERE cycle_id = %s",
+                    (cycle_id,),
+                )
+            ).fetchone()
+            assert located is not None
+            project_id, behaviour_id = located["project_id"], located["behaviour_id"]
+            await connection.execute(
+                "SELECT 1 FROM behaviours WHERE project_id = %s AND behaviour_id = %s FOR UPDATE",
+                (project_id, behaviour_id),
+            )
+            stopped = await (
                 await connection.execute(
                     "UPDATE review_cycles SET state = 'blocked', blocked_reason = %s "
-                    "WHERE cycle_id = %s AND state = 'open' RETURNING project_id, behaviour_id",
+                    "WHERE cycle_id = %s AND state IN ('open', 'satisfied') RETURNING cycle_id",
                     (reason, cycle_id),
                 )
             ).fetchone()
-            if cycle is None:
-                return
-            await connection.execute(
-                "UPDATE behaviours SET state = 'blocked' WHERE project_id = %s AND behaviour_id = %s",
-                (cycle["project_id"], cycle["behaviour_id"]),
-            )
+            if stopped is not None:
+                await connection.execute(
+                    "UPDATE behaviours SET state = 'blocked' "
+                    "WHERE project_id = %s AND behaviour_id = %s AND state = 'review'",
+                    (project_id, behaviour_id),
+                )
             await append_event(
                 connection,
-                cycle["project_id"],
-                "review.cycle_blocked",
-                subject_id=cycle["behaviour_id"],
+                project_id,
+                "review.cycle_blocked" if stopped is not None else "review.conflict_observed",
+                subject_id=behaviour_id,
                 payload={"cycle_id": str(cycle_id), "reason": reason},
             )
+
+    async def _defer(self, cycle: dict[str, Any], reason: str) -> None:
+        """Publication could not be attempted or confirmed. The cycle stays pending and
+        the reason is recorded once, not on every retry."""
+        async with self._pool.connection() as connection, connection.transaction():
+            changed = await (
+                await connection.execute(
+                    "UPDATE review_cycles SET deferred_reason = %s WHERE cycle_id = %s "
+                    "AND publication = 'pending' AND deferred_reason IS DISTINCT FROM %s "
+                    "RETURNING cycle_id",
+                    (reason, cycle["cycle_id"], reason),
+                )
+            ).fetchone()
+            if changed is not None:
+                await append_event(
+                    connection,
+                    cycle["project_id"],
+                    "review.publication_deferred",
+                    subject_id=cycle["behaviour_id"],
+                    payload={"cycle_id": str(cycle["cycle_id"]), "reason": reason},
+                )
+
+
+_COMMIT_LOST = "the commit that was judged green can no longer be obtained"
+_NO_ACCEPTED_GREEN = "no accepted green is on record for the commit in review"
+
+
+def _is_a_definite_refusal(failure: CheckoutFailed) -> bool:
+    """Whether the remote itself answered no, as opposed to not answering."""
+    return any(sign in str(failure) for sign in ("remote rejected", "hook declined", "denied"))
+
+
+async def _accepted_green(
+    connection: Connection, project_id: str, behaviour_id: str, commit: str
+) -> uuid.UUID | None:
+    """The execution the ledger says was verified green for this commit. Other runs of the
+    same commit exist too (rejected, superseded); only the ledger says which one counted."""
+    row = await (
+        await connection.execute(
+            "SELECT e.execution_id FROM events v JOIN executions e "
+            "ON e.execution_id = (v.payload->>'execution_id')::uuid "
+            "WHERE v.project_id = %s AND v.subject_id = %s "
+            "AND v.event_type = 'behaviour.green_verified' "
+            "AND v.payload->>'candidate_revision' = %s AND e.purpose = 'green' "
+            "AND e.revision = %s AND e.project_id = %s AND e.behaviour_id = %s "
+            "AND e.contract_digest = v.payload->>'contract_digest' "
+            "ORDER BY v.sequence DESC LIMIT 1",
+            (project_id, behaviour_id, commit, commit, project_id, behaviour_id),
+        )
+    ).fetchone()
+    return row["execution_id"] if row else None
 
 
 _TASK_QUERY = (
@@ -715,7 +804,7 @@ def _review_command(
     task_id: uuid.UUID,
     role: str,
     capability: str,
-    cause: uuid.UUID | None,
+    cause: uuid.UUID,
 ) -> Envelope:
     return Envelope(
         message_kind=MessageKind.COMMAND,

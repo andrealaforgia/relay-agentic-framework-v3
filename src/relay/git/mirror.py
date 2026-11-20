@@ -10,6 +10,7 @@ commit from this mirror by its recorded hash, never by resolving a name again.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 
 from relay.git.checkout import (
@@ -47,6 +48,32 @@ class Mirror:
             await self._git("update-ref", f"{_PINS}/{expected}", expected)
         finally:
             await git_succeeds("-C", str(self._path), "update-ref", "-d", scratch)
+
+    async def recover(self, repository: str, commit: str, refs: Sequence[str]) -> bool:
+        """Make sure this exact commit is pinned, fetching it if need be from any of the
+        given refs whose history still contains it. True if it is pinned afterwards."""
+        _require_hash(commit)
+        if await self.holds(commit):
+            return True
+        await self._ensure_exists()
+        for ref in refs:
+            scratch = f"{_INCOMING}/{uuid.uuid4().hex}"
+            try:
+                await self._git(
+                    "fetch", "--quiet", "--no-tags", "--", repository, f"+{ref}:{scratch}",
+                    redact=repository,
+                )  # fmt: skip
+                is_a_commit = await git_succeeds(
+                    "-C", str(self._path), "cat-file", "-e", f"{commit}^{{commit}}"
+                )
+                if is_a_commit and await self.descends(scratch, commit):
+                    await self._git("update-ref", f"{_PINS}/{commit}", commit)
+                    return True
+            except CheckoutFailed:
+                continue  # this ref is gone or unreachable; another may still do
+            finally:
+                await git_succeeds("-C", str(self._path), "update-ref", "-d", scratch)
+        return False
 
     async def holds(self, commit: str) -> bool:
         """Whether this commit is pinned here, and so safe from pruning. An object that
