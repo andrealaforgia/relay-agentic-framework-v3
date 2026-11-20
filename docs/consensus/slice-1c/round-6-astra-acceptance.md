@@ -1,0 +1,9 @@
+> Provenance: `gpt-6.2-astra`, reasoning effort high, same Codex session. Reviewed commit `96c47e8`.
+
+**C2.2b.1 and the C2.2c test gap are closed in `96c47e8`.** The scan compares full byte paths and entry types before changing permissions. Folding `Rates/reduced` into `rates/reduced` now fails that comparison even when both files survive. The non-UTF-8 test reads the original byte pathname and checks its contents. [Checkout comparison](/Users/andrealaforgia/dev/relay-v3/src/relay/git/checkout.py:154) · [Directory collision test](/Users/andrealaforgia/dev/relay-v3/tests/integration/test_process_oracle.py:396) · [Byte-name assertion](/Users/andrealaforgia/dev/relay-v3/tests/integration/test_process_oracle.py:342)
+
+**C2.2d · NON-BLOCKING · The replacement scan drops the previous hard-link check.** Two regular filenames sharing one inode now pass the name-and-type comparison. If Git records different executable bits for them, the last `chmod` sets the mode for both. The previous fixture exercised this case; its replacement removes one filename instead. A fresh Git checkout in Relay’s private workspace normally creates separate working files, so this does not block slice 1c. Retaining the inode check alongside the new comparison would preserve both guarantees. [File classification](/Users/andrealaforgia/dev/relay-v3/src/relay/git/checkout.py:178) · [Permission application](/Users/andrealaforgia/dev/relay-v3/src/relay/git/checkout.py:158) · [Replacement fixture](/Users/andrealaforgia/dev/relay-v3/tests/integration/test_process_oracle.py:275)
+
+I independently ran all 100 unit tests and reviewed the changed Git integration tests from source. The full 218-test pass is the Builder’s reported result.
+
+DISPOSITION: ACCEPT_WITH_RESERVATIONS

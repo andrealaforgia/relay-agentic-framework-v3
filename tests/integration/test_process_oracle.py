@@ -282,6 +282,24 @@ async def test_two_tracked_names_folded_into_one_file_fail_the_checkout(
         await pristine_checkout(str(repository), revision, tmp_path / "checkout")
 
 
+async def test_two_tracked_names_sharing_one_file_fail_the_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "subject"
+    revision = commit(repository, {"a.txt": "one", "b.txt": "two"})
+    remove_tree = shutil.rmtree
+
+    def with_both_names_on_one_file(path: Path) -> None:
+        (path.parent / "b.txt").unlink()
+        os.link(path.parent / "a.txt", path.parent / "b.txt")
+        remove_tree(path)
+
+    monkeypatch.setattr("relay.git.checkout.shutil.rmtree", with_both_names_on_one_file)
+
+    with pytest.raises(CheckoutFailed, match="not exactly the tracked tree"):
+        await pristine_checkout(str(repository), revision, tmp_path / "checkout")
+
+
 def repository_with_a_tracked_link(repository: Path, target: Path) -> str:
     repository.mkdir()
     subprocess.run(["git", "-C", str(repository), "init", "-q", "-b", "main"], check=True)

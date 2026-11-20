@@ -23,3 +23,9 @@ Still on recommended defaults, not yet explicitly confirmed: review and security
 ## Open questions for the Product Owner
 
 - Mutation testing policy. Recommended by Claude, awaiting a decision: no percentage threshold; instead no surviving mutant on changed lines, each survivor a QA finding that is killed or dispositioned as equivalent by QA (never by the Builder); a ratchet on Relay's own domain code; a time box whose expiry is reported, not passed. (Arises from the plan to add mutation testing as a deterministic QA check.)
+
+## Questions raised by the ingest specification (`relay-ingest-spec.md`, read 2026-11-20, not yet adopted)
+
+- Order of work. Claude recommends core slices 2 and 3 first, then ingest slices 1 and 2, then interleaving.
+- Whether a project's own test-suite results may count as "observed" for ingest, labelled as the project's own report, while gates stay oracle-only under PO-1.
+- Whether to drop the SQLite option in the ingest specification's section 6.3 and stay PostgreSQL only.

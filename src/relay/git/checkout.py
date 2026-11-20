@@ -153,6 +153,10 @@ async def _leave_only_the_tracked_files(checkout: Path) -> None:
     directories: list[bytes] = []
     if _entries_on_disk(root, b"", directories) != tracked:
         raise CheckoutFailed("the checkout on this host is not exactly the tracked tree")
+    files = [os.lstat(os.path.join(root, name)) for name in permissions]
+    if len({(file.st_dev, file.st_ino) for file in files}) != len(files):
+        # Two names for one file: setting the mode of one would set it for the other.
+        raise CheckoutFailed("the checkout on this host is not exactly the tracked tree")
     for directory in directories:
         os.chmod(directory, 0o755)
     for name, mode_bits in permissions.items():
