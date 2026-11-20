@@ -28,7 +28,7 @@ from tests.integration.fixtures import (
     HeldAtABarrier,
     held_at_the_barrier,
 )
-from tests.integration.story_world import GREETS, STANDARD_RATE, StoryWorld
+from tests.integration.story_world import GREETS, STANDARD_RATE, StoryWorld, at_the_story_gate
 from tests.integration.trunk_world import PROJECT, ZERO_STAYS_ZERO
 
 RATE = {
@@ -348,3 +348,32 @@ async def test_a_question_waits_for_work_that_was_admitted_before_it(
     await asking
 
     assert (await world.events())[-2:] == ["behaviour.test_design_started", "question.asked"]
+
+
+async def test_a_question_is_about_a_feature_or_one_of_its_own_stories(world: Asking) -> None:
+    await world.roadmap(STANDARD_RATE)
+    another = StoryDraft("T1", "Another feature", "something else", {"AC1": "it works"})
+    await world.roadmap(another, feature="F2")
+
+    for feature, story, why_not in (
+        ("F1", "S9", "not a story of"),
+        ("F1", "T1", "not a story of"),
+        ("F9", None, "unknown feature"),
+    ):
+        with pytest.raises(ActionRefused, match=why_not):
+            await world.ask(story, feature=feature)
+
+    assert await world.decisions.open_questions(PROJECT) == []
+
+
+async def test_an_approved_story_is_beyond_questions(world: Asking) -> None:
+    gate, _ = await at_the_story_gate(world)
+    await world.decide(gate)
+    assert await world.story("S1") is StoryState.APPROVED
+
+    with pytest.raises(ActionRefused, match="correction"):
+        await world.ask("S1")
+    with pytest.raises(ActionRefused, match="correction"):
+        await world.decisions.assume(ANALYST, PROJECT, "F1", story_id="S1", text="too late")
+
+    await world.ask("S2")
