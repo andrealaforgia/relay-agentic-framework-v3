@@ -55,26 +55,14 @@ class Behaviours:
     def _mirror(self, project_id: str) -> Mirror:
         return Mirror(self._mirrors / f"{require_identifier('project', project_id)}.git")
 
-    async def open_project(
-        self,
-        project_id: str,
-        repository: str,
-        trunk: str = "main",
-        *,
-        behaviours_in_order: bool = True,
-    ) -> None:
-        """`behaviours_in_order` is the specification's default of one piece of
-        implementation work at a time: a behaviour waits for the ones before it in its
-        story to be integrated."""
+    async def open_project(self, project_id: str, repository: str, trunk: str = "main") -> None:
         async with self._pool.connection() as connection, connection.transaction():
             await connection.execute(
-                "INSERT INTO projects (project_id, repository, trunk, behaviours_in_order) "
-                "VALUES (%s, %s, %s, %s)",
+                "INSERT INTO projects (project_id, repository, trunk) VALUES (%s, %s, %s)",
                 (
                     require_identifier("project", project_id),
                     canonical_repository(repository),
                     trunk,
-                    behaviours_in_order,
                 ),
             )
             await append_event(connection, project_id, "project.opened", payload={"trunk": trunk})

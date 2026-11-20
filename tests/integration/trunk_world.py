@@ -60,6 +60,8 @@ exit 0
 
 
 class TrunkWorld:
+    side_by_side = True
+
     def __init__(
         self,
         database: AsyncConnectionPool,
@@ -111,8 +113,7 @@ class TrunkWorld:
         return base
 
     async def open_project(self, address: str) -> None:
-        # These tests put several behaviours in flight together, which the default forbids.
-        await self.behaviours.open_project(self.project, address, behaviours_in_order=False)
+        await self.behaviours.open_project(self.project, address)
         await in_a_story(self.behaviours, self.project)
 
     def advance_trunk(self, files: dict[str, str]) -> str:
@@ -138,6 +139,14 @@ class TrunkWorld:
     ) -> str:
         """A behaviour with a verified red on the current trunk. Returns that revision."""
         await self.behaviours.propose(self.project, story, behaviour, contract.observes, ["AC1"])
+        if self.side_by_side:
+            # Relay makes a behaviour wait for the ones before it in its story. The
+            # integration tests need candidates competing for trunk, which no caller can
+            # arrange, so this fixture puts them all in first place.
+            async with self.database.connection() as connection:
+                await connection.execute(
+                    "UPDATE behaviours SET position = 1 WHERE project_id = %s", (self.project,)
+                )
         await self.behaviours.begin_test_design(self.project, behaviour)
         await self.behaviours.register_acceptance_test(self.project, behaviour, contract)
         assert (await self.behaviours.run_red(self.project, behaviour)).is_valid
@@ -163,6 +172,7 @@ class TrunkWorld:
         files: dict[str, str] | None = None,
         *,
         on: str,
+        reviews: dict[str, Review] | None = None,
     ) -> str:
         """A candidate verified green, published, and approved by every required reviewer."""
         candidate = self.publish_attempt(
@@ -177,7 +187,8 @@ class TrunkWorld:
                 tree = self.tmp_path / f"review-{payload['capability'][:8]}"
                 shutil.rmtree(tree, ignore_errors=True)
                 await self.reviews.prepare_review(payload["capability"], tree)
-                await self.reviews.submit_review(payload["capability"], Review())
+                said = (reviews or {}).get(message.envelope["recipient"], Review())
+                await self.reviews.submit_review(payload["capability"], said)
         return candidate
 
     async def integrate(

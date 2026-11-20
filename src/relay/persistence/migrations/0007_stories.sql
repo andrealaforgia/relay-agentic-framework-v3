@@ -48,10 +48,6 @@ CREATE TABLE stories (
 CREATE UNIQUE INDEX one_story_at_a_time ON stories (project_id)
     WHERE state IN ('released', 'changes_requested', 'awaiting_approval');
 
--- Whether a behaviour must wait for the ones before it in its story. The default is the
--- specification's: one piece of implementation work at a time.
-ALTER TABLE projects ADD COLUMN behaviours_in_order boolean NOT NULL DEFAULT true;
-
 -- There is no behaviour without a story, and so none outside a feature's gates.
 ALTER TABLE behaviours ADD COLUMN story_id text NOT NULL;
 ALTER TABLE behaviours ADD COLUMN position integer NOT NULL;

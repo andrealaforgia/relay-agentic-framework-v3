@@ -16,6 +16,7 @@ from relay.domain.story import (
     permits_behaviour_work,
     require_human,
     require_sealable,
+    require_well_formed,
 )
 
 ANDREA = Principal(PrincipalKind.HUMAN, "andrea")
@@ -135,3 +136,41 @@ def test_the_same_request_again_gets_the_receipt_it_already_has() -> None:
 def test_a_request_id_reused_for_something_else_is_a_conflict(reused: HumanAction) -> None:
     with pytest.raises(ActionRefused, match="already used"):
         answer_again(reused, (APPROVE_G1.digest, RECEIPT))
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        HumanAction(ANDREA, "r", "G1", "approve", {}),
+        HumanAction(ANDREA, "r", "G1", "request_changes", {"reason": "split it"}),
+    ],
+)
+def test_an_action_saying_exactly_what_it_has_to_is_well_formed(action: HumanAction) -> None:
+    require_well_formed(action)
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        HumanAction(ANDREA, "r", "G1", "merge", {}),
+        HumanAction(ANDREA, "r", "G1", "approve", {"manifest_digest": "x"}),
+        HumanAction(ANDREA, "r", "G1", "request_changes", {}),
+        HumanAction(ANDREA, "r", "G1", "request_changes", {"reason": ""}),
+        HumanAction(ANDREA, "r", "G1", "request_changes", {"reason": 7}),
+    ],
+    ids=["unknown action", "extra field", "missing reason", "empty reason", "not text"],
+)
+def test_an_action_saying_anything_else_is_refused(action: HumanAction) -> None:
+    with pytest.raises(ActionRefused):
+        require_well_formed(action)
+
+
+def test_what_an_action_carries_cannot_be_changed_after_it_is_made() -> None:
+    said = {"reason": "split it"}
+    action = HumanAction(ANDREA, "r", "G1", "request_changes", said)
+    digest = action.digest
+
+    said["reason"] = "something else"
+
+    assert action.payload == {"reason": "split it"}
+    assert action.digest == digest

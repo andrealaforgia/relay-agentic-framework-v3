@@ -12,10 +12,12 @@ import json
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from relay.domain.evidence import ProcessContract
 from relay.domain.identifiers import require_identifier
 from relay.domain.story import (
     ActionRefused,
@@ -30,6 +32,7 @@ from relay.domain.story import (
     permits_behaviour_work,
     require_human,
     require_sealable,
+    require_well_formed,
 )
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
@@ -37,7 +40,6 @@ from relay.persistence.outbox import enqueue
 from relay.transport.envelope import Envelope, MessageKind
 
 CONTROL_PLANE = "relay/control-plane"
-_HUMAN_ACTIONS = {"approve", "request_changes"}
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,8 @@ class StoryDraft:
             require_identifier("criterion", criterion_id)
             if not text.strip():
                 raise ValueError(f"criterion {criterion_id} says nothing")
+        # A copy of its own: what is stored and what is shown must be the same thing.
+        object.__setattr__(self, "criteria", MappingProxyType(dict(self.criteria)))
 
 
 @dataclass(frozen=True)
@@ -99,9 +103,13 @@ class Stories:
         """The Analyst's proposal. Nothing in it is released until a person approves it
         at the gate this opens."""
         _require_role(principal, "analyst")
+        # Read once, before anything is awaited. The rows inserted and the review shown
+        # are both made from this, so they cannot differ.
+        stories = tuple(stories)
         if not stories:
             raise ValueError("a roadmap needs at least one story")
         async with self._pool.connection() as connection, connection.transaction():
+            await _locked_project(connection, project_id)
             feature = await _locked_feature(connection, project_id, feature_id)
             existing = await (
                 await connection.execute(
@@ -153,13 +161,23 @@ class Stories:
                 manifest=manifest,
             )
 
-    async def seal(self, principal: Principal, project_id: str, story_id: str) -> None:
-        """The Verifier vouches that the behaviours now listed, and no others, show the
-        story's criteria."""
+    async def seal(
+        self,
+        principal: Principal,
+        project_id: str,
+        story_id: str,
+        *,
+        story_revision: int,
+        list_revision: int,
+    ) -> None:
+        """The Verifier vouches that the behaviours of one named list revision, and no
+        others, show the story's criteria. A seal that arrives after the list has moved
+        on vouches for something that is no longer there, and is refused."""
         _require_role(principal, "verifier")
         async with self._pool.connection() as connection, connection.transaction():
             story = await _locked_story(connection, project_id, story_id)
             _require_at_work(story)
+            _require_revisions(story, story_revision, list_revision, story["list_revision"])
             listed = await _behaviours_of(connection, project_id, story_id)
             require_sealable(
                 story["criteria"].keys(),
@@ -183,18 +201,27 @@ class Stories:
             await evaluate_story_gate(connection, project_id, story_id)
 
     async def assess(
-        self, principal: Principal, project_id: str, story_id: str, statement: str
+        self,
+        principal: Principal,
+        project_id: str,
+        story_id: str,
+        statement: str,
+        *,
+        story_revision: int,
+        list_revision: int,
     ) -> None:
-        """The Analyst says whether the sealed behaviours demonstrate the outcome. The
-        statement is shown to the Product Owner as written."""
+        """The Analyst says whether one named sealed list demonstrates the outcome. The
+        statement is shown to the Product Owner as written, so it must be about the list
+        the Analyst read, and is refused if that is no longer the sealed one."""
         _require_role(principal, "analyst")
         if not statement.strip():
             raise ValueError("an assessment says something")
         async with self._pool.connection() as connection, connection.transaction():
             story = await _locked_story(connection, project_id, story_id)
             _require_at_work(story)
-            if story["sealed_revision"] is None or _is_unsealed(story):
+            if _is_unsealed(story):
                 raise ActionRefused("only a sealed list of behaviours can be assessed")
+            _require_revisions(story, story_revision, list_revision, story["sealed_revision"])
             if await _assessment(connection, story) is not None:
                 raise ActionRefused("this sealed list has already been assessed")
             await connection.execute(
@@ -223,10 +250,7 @@ class Stories:
         arrives it is applied once, and what the caller is told is what happened to
         exactly that request."""
         require_human(action.principal)
-        if action.action not in _HUMAN_ACTIONS:
-            raise ActionRefused(f"{action.action!r} is not something that can be done at a gate")
-        if action.action == "request_changes" and not str(action.payload.get("reason", "")).strip():
-            raise ActionRefused("asking for changes needs a stated reason")
+        require_well_formed(action)
         try:
             gate_id = uuid.UUID(action.target)
         except ValueError:
@@ -241,14 +265,16 @@ class Stories:
             if located is None:
                 raise ActionRefused("no such gate")
             project_id = located["project_id"]
-            # Story, then feature, then project: the order every transition uses.
+            # Story, then project, then feature: the order every transition uses. The
+            # project comes before any feature because releasing the next story, under
+            # the project lock, may reach into a feature other than this one.
             story = (
                 await _locked_story(connection, project_id, located["story_id"])
                 if located["story_id"]
                 else None
             )
-            await _locked_feature(connection, project_id, located["feature_id"])
             await _locked_project(connection, project_id)
+            await _locked_feature(connection, project_id, located["feature_id"])
             if (seen := answer_again(action, await _recorded(connection, action))) is not None:
                 return seen
             gate = await (
@@ -282,7 +308,8 @@ class Stories:
                     "by": action.principal.identity,
                     "request_id": action.request_id,
                     "manifest_digest": gate["manifest_digest"],
-                    **dict(action.payload),
+                    # What the person said, kept apart from what Relay records about it.
+                    "said": dict(action.payload),
                 },
             )
             await release_next(connection, project_id)
@@ -302,6 +329,22 @@ class Stories:
                 )
             ).fetchall()
         return [InboxItem(**row) for row in rows]
+
+    async def revisions_of(self, project_id: str, story_id: str) -> tuple[int, int]:
+        """The story revision and the list revision as they stand. A role reads these
+        with what it is about to vouch for, and hands them back with its seal or its
+        assessment."""
+        async with self._pool.connection() as connection:
+            row = await (
+                await connection.execute(
+                    "SELECT revision, list_revision FROM stories "
+                    "WHERE project_id = %s AND story_id = %s",
+                    (project_id, story_id),
+                )
+            ).fetchone()
+        if row is None:
+            raise LookupError(f"unknown story {story_id!r} in project {project_id!r}")
+        return row["revision"], row["list_revision"]
 
     async def state_of(self, project_id: str, story_id: str) -> StoryState:
         async with self._pool.connection() as connection:
@@ -344,14 +387,13 @@ async def require_story_at_work(
     story cannot reach its gate while this transaction is deciding."""
     story = await (
         await connection.execute(
-            "SELECT s.*, p.behaviours_in_order FROM stories s JOIN projects p USING (project_id) "
-            "WHERE s.project_id = %s AND s.story_id = %s FOR SHARE OF s",
+            "SELECT * FROM stories WHERE project_id = %s AND story_id = %s FOR SHARE",
             (project_id, behaviour["story_id"]),
         )
     ).fetchone()
     assert story is not None
     _require_at_work(story)
-    if entering_design and story["behaviours_in_order"]:
+    if entering_design:
         earlier = await (
             await connection.execute(
                 "SELECT behaviour_id FROM behaviours WHERE project_id = %s AND story_id = %s "
@@ -441,6 +483,16 @@ def _require_at_work(story: Mapping[str, Any]) -> None:
         )
 
 
+def _require_revisions(
+    story: Mapping[str, Any], story_revision: int, list_revision: int, current_list: int
+) -> None:
+    if (story_revision, list_revision) != (story["revision"], current_list):
+        raise ActionRefused(
+            f"{story['story_id']} has moved on: this was about story revision "
+            f"{story_revision}, list {list_revision}"
+        )
+
+
 def _is_unsealed(story: Mapping[str, Any]) -> bool:
     return story["sealed_revision"] is None or story["sealed_revision"] != story["list_revision"]
 
@@ -494,7 +546,9 @@ async def _settle_story(connection: Connection, story: Mapping[str, Any], outcom
         return
     # A new revision of the same story: what was integrated and what was reviewed stay.
     await connection.execute(
-        "UPDATE stories SET state = 'changes_requested', revision = revision + 1 "
+        # The seal belonged to the revision that was reviewed; the new one has none.
+        "UPDATE stories SET state = 'changes_requested', revision = revision + 1, "
+        "sealed_revision = NULL "
         "WHERE project_id = %s AND story_id = %s",
         (story["project_id"], story["story_id"]),
     )
@@ -573,8 +627,8 @@ async def _story_review(
     for row in listed:
         evidence = await (
             await connection.execute(
-                "SELECT i.candidate_revision, c.red_execution_id::text, "
-                "c.green_execution_id::text, i.batch_id FROM integration_intents i "
+                "SELECT i.candidate_revision, c.red_execution_id::text, c.blocking_from, "
+                "c.green_execution_id::text, i.batch_id, i.cycle_id FROM integration_intents i "
                 "JOIN review_cycles c USING (cycle_id) WHERE i.project_id = %s "
                 "AND i.behaviour_id = %s AND i.state = 'integrated' "
                 "ORDER BY i.created_at DESC LIMIT 1",
@@ -591,17 +645,23 @@ async def _story_review(
         ).fetchall()
         findings = await (
             await connection.execute(
-                "SELECT finding_id, role, severity, status, claim FROM findings "
-                "WHERE project_id = %s AND behaviour_id = %s ORDER BY finding_id",
-                (project_id, row["behaviour_id"]),
+                "SELECT f.finding_id, f.role, f.severity, f.status, f.claim, f.dispute, "
+                "f.withdrawal_reason, (v.finding_id IS NOT NULL) AS verified_fixed "
+                "FROM findings f LEFT JOIN finding_verifications v "
+                "ON v.finding_id = f.finding_id AND v.cycle_id = %s "
+                "WHERE f.project_id = %s AND f.behaviour_id = %s ORDER BY f.finding_id",
+                (evidence["cycle_id"], project_id, row["behaviour_id"]),
             )
         ).fetchall()
+        for finding in findings:
+            finding["settled"] = _how_settled(finding, evidence["blocking_from"])
         behaviours.append(
             {
                 "behaviour_id": row["behaviour_id"],
                 "summary": row["summary"],
                 "demonstrates": list(row["demonstrates"]),
                 "contract": row["contract"],
+                "contract_digest": ProcessContract.from_dict(row["contract"]).digest,
                 "integrated_revision": evidence["candidate_revision"],
                 "red_execution_id": evidence["red_execution_id"],
                 "green_execution_id": evidence["green_execution_id"],
@@ -622,10 +682,23 @@ async def _story_review(
             "assessment_id": str(assessment["assessment_id"]),
             "statement": assessment["statement"],
         },
-        "decisions": [],
+        # Answers the Product Owner gave to questions about this story. None can exist
+        # yet; the gate decisions themselves are in the ledger, not here.
+        "question_answers": [],
         # Not measured yet. Unknown is not zero, and is never shown as zero.
         "usage": "unknown",
     }
+
+
+def _how_settled(finding: Mapping[str, Any], blocking_from: int) -> str:
+    """Why this finding did not stop the candidate that is now on trunk."""
+    if finding["status"] == "withdrawn":
+        return f"withdrawn by {finding['role']}: {finding['withdrawal_reason']}"
+    if finding["verified_fixed"]:
+        return f"{finding['role']} verified the fix on the integrated candidate"
+    if finding["severity"] < blocking_from:
+        return "below the severity that blocks; left open"
+    return "NOT SETTLED: a blocking finding with no verification on the integrated candidate"
 
 
 def _digest(manifest: dict[str, Any]) -> str:
@@ -645,20 +718,34 @@ async def _recorded(connection: Connection, action: HumanAction) -> tuple[str, R
 
 
 async def _record(connection: Connection, action: HumanAction, receipt: Receipt) -> None:
-    await connection.execute(
-        "INSERT INTO human_actions (principal, request_id, target, action, payload, digest, "
-        "disposition, outcome) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-        (
-            action.principal.identity,
-            action.request_id,
-            action.target,
-            action.action,
-            Jsonb(dict(action.payload)),
-            action.digest,
-            receipt.disposition,
-            receipt.outcome,
-        ),
-    )
+    """Store the receipt. The key decides: if the same principal and request id were
+    recorded meanwhile, by a request in another project say, this one is refused and
+    everything it did is undone with it."""
+    stored = await (
+        await connection.execute(
+            "INSERT INTO human_actions (principal, request_id, target, action, payload, digest, "
+            "disposition, outcome) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (principal, request_id) DO NOTHING RETURNING request_id",
+            (
+                action.principal.identity,
+                action.request_id,
+                action.target,
+                action.action,
+                Jsonb(dict(action.payload)),
+                action.digest,
+                receipt.disposition,
+                receipt.outcome,
+            ),
+        )
+    ).fetchone()
+    if stored is None:
+        raise ActionRefused(
+            f"request id {action.request_id!r} was already used for a different action"
+        )
+
+
+async def lock_story(connection: Connection, project_id: str, story_id: str) -> None:
+    await _locked_story(connection, project_id, story_id)
 
 
 async def _locked_story(connection: Connection, project_id: str, story_id: str) -> dict[str, Any]:

@@ -19,6 +19,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from relay.application.stories import require_story_at_work
 from relay.domain.behaviour import Behaviour, BehaviourState
 from relay.domain.identifiers import require_identifier
 from relay.domain.review import (
@@ -506,6 +507,18 @@ class Reviews:
         if not evidence.strip():
             raise SubmissionRefused("a dispute needs evidence")
         async with self._pool.connection() as connection, connection.transaction():
+            behaviour = await (
+                await connection.execute(
+                    "SELECT b.* FROM behaviours b JOIN findings f USING (project_id, behaviour_id) "
+                    "WHERE f.finding_id = %s AND f.project_id = %s FOR UPDATE OF b",
+                    (finding_id, project_id),
+                )
+            ).fetchone()
+            if behaviour is None:
+                raise SubmissionRefused(f"{finding_id} cannot be disputed")
+            # Once the story is at its gate the Product Owner is looking at a review that
+            # says how each finding stands. It must not change behind that review.
+            await require_story_at_work(connection, project_id, behaviour, entering_design=False)
             row = await (
                 await connection.execute(
                     "UPDATE findings SET status = 'disputed', dispute = %s "

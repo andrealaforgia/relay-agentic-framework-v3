@@ -26,7 +26,7 @@ from relay.application.behaviours import (
     save_behaviour,
 )
 from relay.application.reviews import gate_of
-from relay.application.stories import evaluate_story_gate, require_story_at_work
+from relay.application.stories import evaluate_story_gate, lock_story, require_story_at_work
 from relay.domain.behaviour import Behaviour, BehaviourState
 from relay.domain.evidence import CheckContract, Execution, ProcessContract, is_gate_bearing
 from relay.domain.identifiers import require_identifier
@@ -136,7 +136,10 @@ class Integration:
     ) -> IntegrationReceipt:
         """Check the behaviour's reviewed candidate and, if everything holds, move trunk to
         it. A request repeated with the same id is answered from what the first one did;
-        it never starts the checks again."""
+        it never starts the checks again.
+
+        ActionRefused: the behaviour's story is not being worked on, so nothing may start.
+        IntegrationRefused: the story is open but this candidate is not ready."""
         require_identifier("request", request_id)
         if not is_gate_bearing(self._oracle.isolation.name):
             raise IntegrationRefused(
@@ -685,6 +688,10 @@ class Integration:
             behaviour, row = await _locked_behaviour(
                 connection, located["project_id"], located["behaviour_id"]
             )
+            # The story is locked here, before anything writes to the project row (the
+            # ledger does): behaviour, story, project is the order everyone keeps, and
+            # the gate evaluation below needs the story.
+            await lock_story(connection, located["project_id"], row["story_id"])
             intent = await _locked_intent(connection, intent_id)
             if intent["state"] != "outstanding":
                 return _receipt_of(intent)

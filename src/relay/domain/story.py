@@ -12,6 +12,7 @@ import json
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any
 
 
@@ -128,6 +129,11 @@ class HumanAction:
     action: str
     payload: Mapping[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # Taken once, here: what is validated, hashed, applied and recorded is one thing,
+        # whatever the caller does to its own mapping afterwards.
+        object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
+
     @property
     def digest(self) -> str:
         canonical = json.dumps(
@@ -150,3 +156,18 @@ def answer_again(action: HumanAction, recorded: tuple[str, Receipt] | None) -> R
             f"request id {action.request_id!r} was already used for a different action"
         )
     return receipt
+
+
+_PAYLOAD_OF = {"approve": frozenset[str](), "request_changes": frozenset({"reason"})}
+
+
+def require_well_formed(action: HumanAction) -> None:
+    """An action at a gate says one of a few things, in exactly the fields that thing
+    has. Nothing else a caller sends is carried anywhere."""
+    if action.action not in _PAYLOAD_OF:
+        raise ActionRefused(f"{action.action!r} is not something that can be done at a gate")
+    if set(action.payload) != _PAYLOAD_OF[action.action]:
+        expected = sorted(_PAYLOAD_OF[action.action]) or "nothing"
+        raise ActionRefused(f"{action.action} carries {expected}, and only that")
+    if any(not isinstance(value, str) or not value.strip() for value in action.payload.values()):
+        raise ActionRefused(f"{action.action} needs a stated reason")
