@@ -6,11 +6,11 @@ import asyncio
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from pathlib import Path
-from typing import IO
 from urllib.parse import urlsplit
 
 from relay.domain.identifiers import require_identifier
@@ -251,69 +251,90 @@ async def git_result(
     """Run trusted Git and return its exit status, its output and its diagnostics, with
     the repository address and any URL credentials removed from the diagnostics.
 
-    Three things can go wrong before there is an exit status, and they are kept apart:
-    NotStarted, only when Git is positively known not to have executed; RemoteUnavailable
-    when Git may have run but its outcome is not known, including when it gave no answer
-    within `timeout` and was stopped. In that second case whatever Git had already sent
-    to the other side may still take effect there.
+    Before there is an exit status, two failures are kept apart. NotStarted is raised
+    only for what is established before the launch is attempted: Git cannot be found, or
+    the files for its output cannot be created. From the moment the launch is attempted,
+    every failure is RemoteUnavailable: Git may have run, and whatever it had already
+    sent to the other side may still take effect there. That covers an error from the
+    launch itself, a Git stopped for not answering within `timeout`, an exit status that
+    could not be collected, and output that could not be read back.
 
     Output goes to files, not pipes. A stopped Git can leave children behind that hold
     its output open (a remote hook, say); with files there is nothing to keep reading,
     so nothing here waits on them or is kept alive by them."""
     subcommand = _subcommand(arguments)
+    program = shutil.which(_TRUSTED_GIT[0], path=_GIT_ENVIRONMENT["PATH"])
+    if program is None:
+        raise NotStarted(f"git {subcommand} could not be started: git was not found")
     with ExitStack() as opened:
         try:
             output = opened.enter_context(tempfile.TemporaryFile())
             diagnostics = opened.enter_context(tempfile.TemporaryFile())
         except OSError as failure:
-            # Nothing has been launched yet.
             raise NotStarted(f"git {subcommand} could not be started: {failure}") from None
-        process = _launch(arguments, output, diagnostics)
         try:
-            await _exited(process, timeout, subcommand)
-        finally:
-            if process.poll() is None:
-                # Timed out or cancelled: do not leave it running unobserved.
-                process.kill()
-                process.wait()
-        output.seek(0)
-        diagnostics.seek(0)
-        stdout, detail = output.read(), diagnostics.read().decode(errors="replace").strip()
+            # Blocking on purpose and briefly. No error from here on says whether the
+            # child got as far as running Git, so none is read as "it did not".
+            process = subprocess.Popen(  # noqa: ASYNC220
+                [program, *_TRUSTED_GIT[1:], *arguments],
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=diagnostics,
+                env=_GIT_ENVIRONMENT,
+            )
+        except OSError as failure:
+            raise RemoteUnavailable(
+                f"git {subcommand} may or may not have run: {failure}"
+            ) from None
+        status = await _exit_status(process, timeout, subcommand)
+        try:
+            output.seek(0)
+            diagnostics.seek(0)
+            stdout, detail = output.read(), diagnostics.read().decode(errors="replace").strip()
+        except OSError as failure:
+            raise RemoteUnavailable(
+                f"git {subcommand} ran but its output could not be read: {failure}"
+            ) from None
     if redact:
         # Git echoes the address it was given; a failure must not carry it onwards.
         detail = detail.replace(redact, "<repository>")
-    return process.returncode, stdout, _URL_USERINFO.sub("//", detail)
+    return status, stdout, _URL_USERINFO.sub("//", detail)
 
 
-def _launch(
-    arguments: tuple[str, ...], output: IO[bytes], diagnostics: IO[bytes]
-) -> subprocess.Popen[bytes]:
-    subcommand = _subcommand(arguments)
-    try:
-        # Blocking on purpose and briefly: the launch has to be one step whose failures
-        # can be told apart.
-        return subprocess.Popen(
-            [*_TRUSTED_GIT, *arguments],
-            stdin=subprocess.DEVNULL,
-            stdout=output,
-            stderr=diagnostics,
-            env=_GIT_ENVIRONMENT,
-        )
-    except OSError as failure:
-        if failure.filename is not None:
-            # The child itself reported that the program could not be executed, and
-            # names it. That is the one launch failure that proves Git did not run.
-            raise NotStarted(f"git {subcommand} could not be started: {failure}") from None
-        # Anything else can be raised with the child already running Git.
-        raise RemoteUnavailable(f"git {subcommand} may or may not have run: {failure}") from None
-
-
-async def _exited(process: subprocess.Popen[bytes], timeout: float | None, subcommand: str) -> None:
+async def _exit_status(
+    process: subprocess.Popen[bytes], timeout: float | None, subcommand: str
+) -> int:
+    """Wait for Git and collect its exit status ourselves. Popen reports an exit status
+    of zero when the status was lost to someone else, and a lost status must never be
+    read as success: it is RemoteUnavailable, like any other outcome nobody saw."""
     loop = asyncio.get_running_loop()
     deadline = None if timeout is None else loop.time() + timeout
     pause = 0.001
-    while process.poll() is None:
-        if deadline is not None and loop.time() >= deadline:
-            raise RemoteUnavailable(f"git {subcommand} gave no answer in time")
-        await asyncio.sleep(pause)
-        pause = min(pause * 2, 0.05)
+    collected = False
+    try:
+        while True:
+            try:
+                # Never blocks: it only asks whether the child has finished.
+                pid, status = os.waitpid(process.pid, os.WNOHANG)  # noqa: ASYNC222
+            except ChildProcessError:
+                collected = True
+                raise RemoteUnavailable(
+                    f"git {subcommand} ran but its exit status could not be collected"
+                ) from None
+            if pid:
+                collected = True
+                return os.waitstatus_to_exitcode(status)
+            if deadline is not None and loop.time() >= deadline:
+                raise RemoteUnavailable(f"git {subcommand} gave no answer in time")
+            await asyncio.sleep(pause)
+            pause = min(pause * 2, 0.05)
+    finally:
+        if not collected:
+            # Timed out or cancelled: do not leave it running unobserved.
+            with suppress(ProcessLookupError):
+                os.kill(process.pid, signal.SIGKILL)
+            with suppress(ChildProcessError):
+                # Returns at once: the child has just been killed.
+                os.waitpid(process.pid, 0)  # noqa: ASYNC222
+        # The status has been dealt with here; Popen must not look for it again.
+        process.returncode = 0

@@ -20,7 +20,7 @@ from relay.domain.behaviour import BehaviourState
 from relay.domain.evidence import Launch, RedRejection
 from relay.git import checkout as checkout_module
 from relay.git import mirror as mirror_module
-from relay.git.checkout import CheckoutFailed, RemoteUnavailable
+from relay.git.checkout import CheckoutFailed, NotStarted, RemoteUnavailable
 from relay.git.mirror import Mirror, NotFastForward
 from relay.persistence.outbox import pending_messages
 from relay.testing.oracle import ContainerIsolation, Isolation, NativeIsolation, Run
@@ -1001,15 +1001,15 @@ async def test_a_push_that_could_not_even_be_started_is_not_a_push_to_wait_for(
     world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     base, _ = await ready_to_integrate(world)
-    real = subprocess.Popen
+    real = mirror_module.git_result
 
-    def no_git_for_a_push(command: list[str], **options: Any) -> Any:
-        if "push" in command:
-            raise FileNotFoundError(2, "No such file or directory", "git")
-        return real(command, **options)
+    async def git_is_gone_for_a_push(*arguments: str, **options: Any) -> Any:
+        if "push" in arguments:
+            raise NotStarted("git push could not be started: git was not found")
+        return await real(*arguments, **options)
 
     with monkeypatch.context() as patched:
-        patched.setattr(checkout_module.subprocess, "Popen", no_git_for_a_push)
+        patched.setattr(mirror_module, "git_result", git_is_gone_for_a_push)
         receipt = await world.integrate()
     world.hook_flag("refuse").touch()
     assert receipt.outcome is Outcome.PENDING
@@ -1066,7 +1066,8 @@ async def test_a_launch_that_may_have_run_git_keeps_the_send_unanswered(
 
     def acknowledgement_lost_for_a_push(command: list[str], **options: Any) -> Any:
         if "push" in command:
-            raise OSError(5, "Input/output error")
+            # Raised on this side, after the child may already be running Git.
+            raise FileNotFoundError(2, "No such file or directory", "some-file")
         return real(command, **options)
 
     with monkeypatch.context() as patched:
