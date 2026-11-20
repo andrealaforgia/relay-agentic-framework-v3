@@ -88,7 +88,9 @@ class Mirror:
         """Whether this commit is pinned here, and so safe from pruning. An object that
         merely happens to be present is not held."""
         _require_hash(commit)
-        return self._path.exists() and await git_answers_yes(
+        # A directory can exist without being a repository yet, if creating the mirror
+        # was interrupted. That is a mirror holding nothing, not an error.
+        return self._is_initialised() and await git_answers_yes(
             "-C",
             str(self._path),
             "rev-parse",
@@ -157,8 +159,11 @@ class Mirror:
                 raise RemoteUnavailable(f"git push: {summary.strip()} {detail}".strip())
         raise RemoteUnavailable(f"git push failed: {detail}")
 
+    def _is_initialised(self) -> bool:
+        return (self._path / "HEAD").exists()
+
     async def _ensure_exists(self) -> None:
-        if not (self._path / "HEAD").exists():
+        if not self._is_initialised():
             self._path.parent.mkdir(parents=True, exist_ok=True)
             await git("init", "--quiet", "--bare", str(self._path))
 

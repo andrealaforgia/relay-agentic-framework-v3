@@ -301,8 +301,11 @@ class Reviews:
         commit = orphan["candidate_revision"]
         try:
             recovered = await self._recover(orphan)
-        except RemoteUnavailable:
-            return 0  # nothing is known yet; the next pass will ask again
+        except CheckoutFailed as failure:
+            # Nothing is known yet. Say why, once, and leave this behaviour for the next
+            # pass; other behaviours must not wait on it.
+            await self._adoption_deferred(project_id, behaviour_id, str(failure)[:500])
+            return 0
         async with self._pool.connection() as connection, connection.transaction():
             row = await (
                 await connection.execute(
@@ -358,6 +361,29 @@ class Reviews:
                 },
             )
         return 1
+
+    async def _adoption_deferred(self, project_id: str, behaviour_id: str, reason: str) -> None:
+        async with self._pool.connection() as connection, connection.transaction():
+            latest = await (
+                await connection.execute(
+                    "SELECT event_type, payload FROM events WHERE project_id = %s "
+                    "AND subject_id = %s ORDER BY sequence DESC LIMIT 1",
+                    (project_id, behaviour_id),
+                )
+            ).fetchone()
+            already_said = (
+                latest is not None
+                and latest["event_type"] == "review.adoption_deferred"
+                and latest["payload"].get("reason") == reason
+            )
+            if not already_said:
+                await append_event(
+                    connection,
+                    project_id,
+                    "review.adoption_deferred",
+                    subject_id=behaviour_id,
+                    payload={"reason": reason},
+                )
 
     async def _recover(self, record: Mapping[str, Any]) -> bool:
         """The one way a judged commit is brought back: from the control plane's pin, or

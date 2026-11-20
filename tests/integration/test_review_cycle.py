@@ -913,3 +913,69 @@ async def test_a_push_reported_as_already_there_while_the_ref_is_absent_is_retri
 
     assert await world.cycle_states() == ["open"]
     assert "still absent" in (await cycle_row(world))["deferred_reason"]
+
+
+async def test_a_mirror_directory_left_empty_by_an_interrupted_start_does_not_stop_recovery(
+    world: World,
+) -> None:
+    candidate = await world.green_candidate()
+    shutil.rmtree(world.mirrors)
+    (world.mirrors / f"{PROJECT}.git").mkdir(parents=True)
+
+    assert await world.reviews.publish_candidates() == 1
+
+    assert world.remote_ref(await candidate_ref_of(world)) == candidate
+    assert sorted(await world.capabilities(candidate)) == ["qa", "sentinel"]
+
+
+async def test_one_unreadable_legacy_mirror_does_not_stop_adoption_for_another_project(
+    database: AsyncConnectionPool,
+    tmp_path: Path,
+    runner_image: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = World(database, tmp_path / "first", runner_image)
+    await first.release_to_builder()
+    await first.green_candidate()
+    other_repository = tmp_path / "second" / "subject"
+    other_trunk = commit(other_repository, {"vat.py": VAT_RETURNS_NET})
+    await first.behaviours.open_project("other-project", str(other_repository))
+    await first.behaviours.propose("other-project", "B1", "standard VAT rate is applied")
+    await first.behaviours.begin_test_design("other-project", "B1")
+    await first.behaviours.register_acceptance_test("other-project", "B1", CONTRACT)
+    assert (await first.behaviours.run_red("other-project", "B1")).is_valid
+    publish_attempt(
+        other_repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE},
+        on=other_trunk, project="other-project",
+    )  # fmt: skip
+    assert (await first.behaviours.run_green("other-project", "B1", attempt=1)).is_valid
+    async with database.connection() as connection:
+        await connection.execute("DELETE FROM review_tasks")
+        await connection.execute("DELETE FROM review_cycles")
+    shutil.rmtree(first.mirrors)
+    real = mirror_module.git_answers_yes
+
+    async def first_projects_objects_unreadable(*arguments: str) -> bool:
+        if "merge-base" in arguments and f"{PROJECT}.git" in arguments[1]:
+            raise CheckoutFailed("git merge-base failed: fatal: unable to read object")
+        return await real(*arguments)
+
+    monkeypatch.setattr(mirror_module, "git_answers_yes", first_projects_objects_unreadable)
+    assert await first.reviews.adopt_reviews_without_a_cycle() == 1
+    assert await first.reviews.adopt_reviews_without_a_cycle() == 0
+
+    async def cycles() -> list[str]:
+        async with database.connection() as connection:
+            rows = await (
+                await connection.execute("SELECT project_id FROM review_cycles ORDER BY project_id")
+            ).fetchall()
+        return [row["project_id"] for row in rows]
+
+    assert await cycles() == ["other-project"]
+    assert await first.state() is BehaviourState.REVIEW
+    assert (await first.events()).count("review.adoption_deferred") == 1
+
+    monkeypatch.setattr(mirror_module, "git_answers_yes", real)
+    assert await first.reviews.adopt_reviews_without_a_cycle() == 1
+    assert await first.reviews.adopt_reviews_without_a_cycle() == 0
+    assert await cycles() == ["other-project", PROJECT]
