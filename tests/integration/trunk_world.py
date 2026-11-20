@@ -141,7 +141,9 @@ class TrunkWorld:
         self, behaviour: str = "B1", contract: ProcessContract = CONTRACT, story: str = "S1"
     ) -> str:
         """A behaviour with a verified red on the current trunk. Returns that revision."""
-        await self.behaviours.propose(self.project, story, behaviour, contract.observes, ["AC1"])
+        await self.behaviours.propose(
+            self.project, story, behaviour, contract.observes, ["AC1"], basis=0
+        )
         if self.side_by_side:
             # Relay makes a behaviour wait for the ones before it in its story. The
             # integration tests need candidates competing for trunk, which no caller can
@@ -151,7 +153,7 @@ class TrunkWorld:
                     "UPDATE behaviours SET position = 1 WHERE project_id = %s", (self.project,)
                 )
         await self.behaviours.begin_test_design(self.project, behaviour)
-        await self.behaviours.register_acceptance_test(self.project, behaviour, contract)
+        await self.behaviours.register_acceptance_test(self.project, behaviour, contract, basis=0)
         assert (await self.behaviours.run_red(self.project, behaviour)).is_valid
         return self.trunk()
 

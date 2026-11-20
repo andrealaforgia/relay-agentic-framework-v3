@@ -23,8 +23,11 @@ from relay.application.closure import (
     PAUSED,
     closure_of_feature,
     closure_of_story,
+    feature_basis,
     lock_gate,
+    require_basis,
     require_open,
+    story_basis,
 )
 from relay.domain.evidence import ProcessContract
 from relay.domain.identifiers import require_identifier
@@ -112,10 +115,16 @@ class Stories:
             )
 
     async def publish_roadmap(
-        self, principal: Principal, project_id: str, feature_id: str, stories: Sequence[StoryDraft]
+        self,
+        principal: Principal,
+        project_id: str,
+        feature_id: str,
+        stories: Sequence[StoryDraft],
+        *,
+        basis: int,
     ) -> uuid.UUID:
-        """The Analyst's proposal. Nothing in it is released until a person approves it
-        at the gate this opens."""
+        """The Analyst's proposal, with the decision basis it was written on. Nothing in
+        it is released until a person approves it at the gate this opens."""
         _require_role(principal, "analyst")
         # Read once, before anything is awaited. The rows inserted and the review shown
         # are both made from this, so they cannot differ.
@@ -127,6 +136,7 @@ class Stories:
             await _locked_project(connection, project_id)
             feature = await _locked_feature(connection, project_id, feature_id)
             require_open(await closure_of_feature(connection, project_id, feature_id))
+            require_basis(basis, await feature_basis(connection, project_id, feature_id))
             existing = await (
                 await connection.execute(
                     "SELECT 1 FROM roadmaps WHERE project_id = %s AND feature_id = %s LIMIT 1",
@@ -136,13 +146,15 @@ class Stories:
             if existing is not None:
                 raise ActionRefused(f"{feature['feature_id']} already has a roadmap")
             await connection.execute(
-                "INSERT INTO roadmaps (project_id, feature_id, revision) VALUES (%s, %s, 1)",
-                (project_id, feature_id),
+                "INSERT INTO roadmaps (project_id, feature_id, revision, current_on) "
+                "VALUES (%s, %s, 1, %s)",
+                (project_id, feature_id, basis),
             )
             for position, story in enumerate(stories, start=1):
                 await connection.execute(
                     "INSERT INTO stories (project_id, story_id, feature_id, roadmap_revision, "
-                    "position, title, outcome, criteria) VALUES (%s, %s, %s, 1, %s, %s, %s, %s)",
+                    "position, title, outcome, criteria, current_on) "
+                    "VALUES (%s, %s, %s, 1, %s, %s, %s, %s, %s)",
                     (
                         project_id,
                         story.story_id,
@@ -151,6 +163,7 @@ class Stories:
                         story.title,
                         story.outcome,
                         Jsonb(dict(story.criteria)),
+                        basis,
                     ),
                 )
             manifest = {
@@ -173,7 +186,7 @@ class Stories:
                 feature_id,
                 kind="roadmap",
                 story_id=None,
-                basis={"roadmap_revision": 1},
+                basis={"roadmap_revision": 1, "decisions": basis},
                 manifest=manifest,
             )
 
@@ -185,10 +198,13 @@ class Stories:
         *,
         story_revision: int,
         list_revision: int,
-    ) -> None:
+        basis: int,
+    ) -> uuid.UUID:
         """The Verifier vouches that the behaviours of one named list revision, and no
-        others, show the story's criteria. A seal that arrives after the list has moved
-        on vouches for something that is no longer there, and is refused."""
+        others, show the story's criteria, under the decisions of one named basis. A seal
+        that arrives after the list or the decisions have moved on vouches for something
+        that is no longer there, and is refused. Returns the seal's identity, which an
+        assessment has to name."""
         _require_role(principal, "verifier")
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id)
@@ -196,15 +212,17 @@ class Stories:
             _require_at_work(story)
             require_open(await closure_of_story(connection, project_id, story_id))
             _require_revisions(story, story_revision, list_revision, story["list_revision"])
+            require_basis(basis, await story_basis(connection, project_id, story_id))
             listed = await _behaviours_of(connection, project_id, story_id)
             require_sealable(
                 story["criteria"].keys(),
                 {row["behaviour_id"]: row["demonstrates"] for row in listed},
             )
+            seal_id = uuid.uuid7()
             await connection.execute(
-                "UPDATE stories SET sealed_revision = list_revision "
+                "UPDATE stories SET sealed_revision = list_revision, seal_id = %s "
                 "WHERE project_id = %s AND story_id = %s",
-                (project_id, story_id),
+                (seal_id, project_id, story_id),
             )
             await append_event(
                 connection,
@@ -212,11 +230,13 @@ class Stories:
                 "story.behaviours_sealed",
                 subject_id=story_id,
                 payload={
+                    "seal_id": str(seal_id),
                     "list_revision": story["list_revision"],
                     "behaviours": [row["behaviour_id"] for row in listed],
                 },
             )
             await evaluate_story_gate(connection, project_id, story_id)
+            return seal_id
 
     async def assess(
         self,
@@ -227,10 +247,12 @@ class Stories:
         *,
         story_revision: int,
         list_revision: int,
+        basis: int,
+        seal: uuid.UUID,
     ) -> None:
         """The Analyst says whether one named sealed list demonstrates the outcome. The
-        statement is shown to the Product Owner as written, so it must be about the list
-        the Analyst read, and is refused if that is no longer the sealed one."""
+        statement is shown to the Product Owner as written, so it must be about the seal
+        and the decisions the Analyst read, and is refused if either has moved on."""
         _require_role(principal, "analyst")
         if not statement.strip():
             raise ValueError("an assessment says something")
@@ -242,11 +264,15 @@ class Stories:
             if _is_unsealed(story):
                 raise ActionRefused("only a sealed list of behaviours can be assessed")
             _require_revisions(story, story_revision, list_revision, story["sealed_revision"])
+            require_basis(basis, await story_basis(connection, project_id, story_id))
+            if seal != story["seal_id"]:
+                raise ActionRefused("this assessment is of a seal that is no longer the story's")
             if await _assessment(connection, story) is not None:
                 raise ActionRefused("this sealed list has already been assessed")
             await connection.execute(
                 "INSERT INTO story_assessments (assessment_id, project_id, story_id, "
-                "story_revision, list_revision, statement) VALUES (%s, %s, %s, %s, %s, %s)",
+                "story_revision, list_revision, statement, seal_id, basis) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     uuid.uuid7(),
                     project_id,
@@ -254,6 +280,8 @@ class Stories:
                     story["revision"],
                     story["sealed_revision"],
                     statement,
+                    seal,
+                    basis,
                 ),
             )
             await append_event(
@@ -359,6 +387,20 @@ class Stories:
             ).fetchall()
         return [InboxItem(**row) for row in rows]
 
+    async def seal_of(self, project_id: str, story_id: str) -> uuid.UUID | None:
+        """The story's current seal, which an assessment names."""
+        async with self._pool.connection() as connection:
+            row = await (
+                await connection.execute(
+                    "SELECT seal_id FROM stories WHERE project_id = %s AND story_id = %s",
+                    (project_id, story_id),
+                )
+            ).fetchone()
+        if row is None:
+            raise LookupError(f"unknown story {story_id!r} in project {project_id!r}")
+        seal: uuid.UUID | None = row["seal_id"]
+        return seal
+
     async def revisions_of(self, project_id: str, story_id: str) -> tuple[int, int]:
         """The story revision and the list revision as they stand. A role reads these
         with what it is about to vouch for, and hands them back with its seal or its
@@ -389,7 +431,11 @@ class Stories:
 
 
 async def add_behaviour_to_story(
-    connection: Connection, project_id: str, story_id: str, demonstrates: Sequence[str]
+    connection: Connection,
+    project_id: str,
+    story_id: str,
+    demonstrates: Sequence[str],
+    basis: int,
 ) -> int:
     """Make room for one more behaviour in a story that is being worked on, and return
     its position. Any change to the list makes a new list revision, which the Verifier
@@ -397,6 +443,7 @@ async def add_behaviour_to_story(
     story = await _locked_story(connection, project_id, story_id)
     _require_at_work(story)
     require_open(await closure_of_story(connection, project_id, story_id))
+    require_basis(basis, await story_basis(connection, project_id, story_id))
     if not demonstrates:
         # It could be built and integrated, and then no list containing it could ever
         # be sealed: the story would hold the project and never reach its gate.
@@ -468,7 +515,7 @@ async def evaluate_story_gate(connection: Connection, project_id: str, story_id:
         story["feature_id"],
         kind="story",
         story_id=story_id,
-        basis=_story_basis(story, assessment),
+        basis=_story_basis(story, assessment, await story_basis(connection, project_id, story_id)),
         manifest=manifest,
     )
 
@@ -654,14 +701,18 @@ def _require_revisions(
 
 
 def _is_unsealed(story: Mapping[str, Any]) -> bool:
-    return story["sealed_revision"] is None or story["sealed_revision"] != story["list_revision"]
+    return story["seal_id"] is None or story["sealed_revision"] != story["list_revision"]
 
 
-def _story_basis(story: Mapping[str, Any], assessment: Mapping[str, Any]) -> dict[str, Any]:
+def _story_basis(
+    story: Mapping[str, Any], assessment: Mapping[str, Any], decisions: int
+) -> dict[str, Any]:
     return {
         "story_revision": story["revision"],
         "list_revision": story["sealed_revision"],
         "assessment_id": str(assessment["assessment_id"]),
+        # A decision of the Product Owner's over the story makes the gate stale.
+        "decisions": decisions,
     }
 
 
@@ -677,11 +728,18 @@ async def _basis_now(
                 (gate["project_id"], gate["feature_id"]),
             )
         ).fetchone()
-        return {"roadmap_revision": roadmap["revision"]} if roadmap else None
+        if roadmap is None:
+            return None
+        return {
+            "roadmap_revision": roadmap["revision"],
+            "decisions": await feature_basis(connection, gate["project_id"], gate["feature_id"]),
+        }
     assessment = await _assessment(connection, story)
     if assessment is None or _is_unsealed(story):
         return None
-    return _story_basis(story, assessment)
+    return _story_basis(
+        story, assessment, await story_basis(connection, story["project_id"], story["story_id"])
+    )
 
 
 async def _settle_roadmap(connection: Connection, gate: Mapping[str, Any], outcome: str) -> None:
@@ -955,8 +1013,7 @@ async def _behaviours_of(
 async def _assessment(connection: Connection, story: Mapping[str, Any]) -> dict[str, Any] | None:
     return await (
         await connection.execute(
-            "SELECT assessment_id, statement FROM story_assessments WHERE project_id = %s "
-            "AND story_id = %s AND story_revision = %s AND list_revision = %s",
-            (story["project_id"], story["story_id"], story["revision"], story["sealed_revision"]),
+            "SELECT assessment_id, statement, basis FROM story_assessments WHERE seal_id = %s",
+            (story["seal_id"],),
         )
     ).fetchone()

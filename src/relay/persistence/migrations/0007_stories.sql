@@ -20,6 +20,9 @@ CREATE TABLE roadmaps (
     revision   integer NOT NULL,
     state      text NOT NULL DEFAULT 'proposed'
         CHECK (state IN ('proposed', 'approved', 'superseded')),
+    -- The decision basis this revision is current on: the one its author read when it
+    -- was published, or a later one it was reconfirmed for.
+    current_on integer NOT NULL,
     PRIMARY KEY (project_id, feature_id, revision),
     FOREIGN KEY (project_id, feature_id) REFERENCES features
 );
@@ -42,6 +45,11 @@ CREATE TABLE stories (
     -- seal names the one it vouches for.
     list_revision    integer NOT NULL DEFAULT 0,
     sealed_revision  integer,
+    -- Each seal has an identity, so an assessment can say which seal it was written
+    -- against. A human decision over the story clears the seal.
+    seal_id          uuid,
+    -- The decision basis the story's text and criteria are current on.
+    current_on       integer NOT NULL,
     PRIMARY KEY (project_id, story_id),
     FOREIGN KEY (project_id, feature_id, roadmap_revision) REFERENCES roadmaps
 );
@@ -65,9 +73,11 @@ CREATE TABLE story_assessments (
     story_revision integer NOT NULL,
     list_revision  integer NOT NULL,
     statement      text NOT NULL,
+    -- The seal it assesses, and the decision basis its author read.
+    seal_id        uuid NOT NULL UNIQUE,
+    basis          integer NOT NULL,
     recorded_at    timestamptz NOT NULL DEFAULT now(),
-    FOREIGN KEY (project_id, story_id) REFERENCES stories,
-    UNIQUE (project_id, story_id, story_revision, list_revision)
+    FOREIGN KEY (project_id, story_id) REFERENCES stories
 );
 
 -- A point where only a person may decide. The manifest is exactly what that person is

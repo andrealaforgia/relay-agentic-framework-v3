@@ -61,9 +61,9 @@ async def awaiting_red(
     behaviours = Behaviours(database, repository.parent / "mirrors", ProcessOracle(isolation))
     await behaviours.open_project(PROJECT, str(repository))
     await in_a_story(behaviours, PROJECT)
-    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
+    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0)
     await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", contract)
+    await behaviours.register_acceptance_test(PROJECT, "B1", contract, basis=0)
     return behaviours
 
 
@@ -243,9 +243,9 @@ async def test_a_failed_checkout_is_on_the_ledger_and_the_builder_stays_blocked(
     behaviours = Behaviours(database, tmp_path / "mirrors", ProcessOracle(container))
     await behaviours.open_project(PROJECT, str(tmp_path / "subject"), trunk="no-such-branch")
     await in_a_story(behaviours, PROJECT)
-    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
+    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0)
     await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
+    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
 
     with pytest.raises(CheckoutFailed):
         await behaviours.run_red(PROJECT, "B1")
@@ -417,7 +417,7 @@ async def test_a_behaviour_id_relay_could_never_build_is_refused_when_proposed(
 
     with pytest.raises(ValueError, match="behaviour id"):
         await behaviours.propose(
-            PROJECT, "S1", behaviour_id, "standard VAT rate is applied", ["AC1"]
+            PROJECT, "S1", behaviour_id, "standard VAT rate is applied", ["AC1"], basis=0
         )
 
     assert [event.event_type for event in await read_events(database, PROJECT)] == [

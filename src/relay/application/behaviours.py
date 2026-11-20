@@ -21,7 +21,13 @@ from relay.application.assignments import (
     retire_all_of_behaviour,
     start_green_run,
 )
-from relay.application.closure import CANCELLED, closure_of_behaviour, lock_gate
+from relay.application.closure import (
+    CANCELLED,
+    closure_of_behaviour,
+    lock_gate,
+    require_basis,
+    story_basis,
+)
 from relay.application.reviews import open_cycle
 from relay.application.stories import add_behaviour_to_story, require_story_at_work
 from relay.domain.behaviour import Behaviour, BehaviourState
@@ -86,6 +92,8 @@ class Behaviours:
         behaviour_id: str,
         summary: str,
         demonstrates: Sequence[str],
+        *,
+        basis: int,
     ) -> None:
         """Add a behaviour to a story that is being worked on, naming the acceptance
         criteria it will demonstrate. There is no behaviour without a story."""
@@ -96,7 +104,9 @@ class Behaviours:
         correlation_id = uuid.uuid7()
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id)
-            position = await add_behaviour_to_story(connection, project_id, story_id, demonstrates)
+            position = await add_behaviour_to_story(
+                connection, project_id, story_id, demonstrates, basis
+            )
             await connection.execute(
                 "INSERT INTO behaviours (project_id, behaviour_id, summary, state, "
                 "correlation_id, story_id, position, demonstrates) "
@@ -141,14 +151,21 @@ class Behaviours:
             )
 
     async def register_acceptance_test(
-        self, project_id: str, behaviour_id: str, contract: ProcessContract
+        self, project_id: str, behaviour_id: str, contract: ProcessContract, *, basis: int
     ) -> None:
+        """The Verifier's contract, with the decision basis it was written on."""
         async with self._changing(project_id, behaviour_id, starts="work") as (
             connection,
             behaviour,
             correlation,
         ):
+            story_id = await _story_of(connection, project_id, behaviour_id)
+            require_basis(basis, await story_basis(connection, project_id, story_id))
             behaviour.register_acceptance_test(contract)
+            await connection.execute(
+                "UPDATE behaviours SET current_on = %s WHERE project_id = %s AND behaviour_id = %s",
+                (basis, project_id, behaviour_id),
+            )
             await append_event(
                 connection,
                 project_id,
@@ -530,6 +547,18 @@ async def save_behaviour(connection: Connection, project_id: str, behaviour: Beh
             behaviour.behaviour_id,
         ),
     )
+
+
+async def _story_of(connection: Connection, project_id: str, behaviour_id: str) -> str:
+    row = await (
+        await connection.execute(
+            "SELECT story_id FROM behaviours WHERE project_id = %s AND behaviour_id = %s",
+            (project_id, behaviour_id),
+        )
+    ).fetchone()
+    assert row is not None
+    story_id: str = row["story_id"]
+    return story_id
 
 
 async def source_of(connection: Connection, project_id: str) -> tuple[str, str]:

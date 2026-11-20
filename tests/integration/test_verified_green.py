@@ -47,9 +47,9 @@ async def released_to_builder(
     )
     await behaviours.open_project(PROJECT, str(repository))
     await in_a_story(behaviours, PROJECT)
-    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
+    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0)
     await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
+    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
     return behaviours, trunk
 
@@ -184,9 +184,9 @@ async def test_green_cannot_be_run_before_red(
     )
     await behaviours.open_project(PROJECT, str(repository))
     await in_a_story(behaviours, PROJECT)
-    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
+    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0)
     await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
+    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
     publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=trunk)
 
     with pytest.raises(TransitionRefused):
@@ -253,9 +253,11 @@ async def test_another_projects_candidate_on_the_same_repository_is_not_this_pro
     behaviours, red_revision = await released_to_builder(database, repository, runner_image)
     await behaviours.open_project("other-team", str(repository))
     await in_a_story(behaviours, "other-team")
-    await behaviours.propose("other-team", "S1", "B1", "standard VAT rate is applied", ["AC1"])
+    await behaviours.propose(
+        "other-team", "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0
+    )
     await behaviours.begin_test_design("other-team", "B1")
-    await behaviours.register_acceptance_test("other-team", "B1", CONTRACT)
+    await behaviours.register_acceptance_test("other-team", "B1", CONTRACT, basis=0)
     assert (await behaviours.run_red("other-team", "B1")).is_valid
     publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision)
 
@@ -283,9 +285,9 @@ async def test_a_candidate_that_hangs_is_reported_as_a_timeout(
     )
     await behaviours.open_project(PROJECT, str(repository))
     await in_a_story(behaviours, PROJECT)
-    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
+    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0)
     await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", quick)
+    await behaviours.register_acceptance_test(PROJECT, "B1", quick, basis=0)
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
     publish_attempt(repository, "B1", 1, {"vat.py": "import time\ntime.sleep(60)\n"}, on=trunk)
 
@@ -410,9 +412,9 @@ async def test_a_red_in_flight_when_the_red_is_reopened_cannot_fill_the_new_cycl
     )
     await behaviours.open_project(PROJECT, str(repository))
     await in_a_story(behaviours, PROJECT)
-    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
+    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0)
     await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
+    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
     held = HeldAtABarrier(ContainerIsolation(runner_image))
     late = asyncio.create_task(
         Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)).run_red(PROJECT, "B1")
@@ -499,9 +501,9 @@ async def test_a_red_released_after_the_replacement_red_was_accepted_is_still_re
     )
     await behaviours.open_project(PROJECT, str(repository))
     await in_a_story(behaviours, PROJECT)
-    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
+    await behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0)
     await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
+    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
     held = HeldAtABarrier(ContainerIsolation(runner_image))
     late = asyncio.create_task(
         Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)).run_red(PROJECT, "B1")

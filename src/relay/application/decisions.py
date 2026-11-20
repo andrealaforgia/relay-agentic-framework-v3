@@ -22,7 +22,13 @@ from typing import Any
 from psycopg.types.json import Jsonb
 
 from relay.application.assignments import revoke_unstarted_grants
-from relay.application.closure import CANCELLED, closure_of_feature, lock_gate
+from relay.application.closure import (
+    CANCELLED,
+    closure_of_feature,
+    feature_basis,
+    lock_gate,
+    story_basis,
+)
 from relay.application.features import Features
 from relay.application.stories import _record, _recorded, release_next
 from relay.domain.story import (
@@ -333,7 +339,9 @@ class Decisions:
                 )
             ).fetchall()
             return Context(
-                await basis_of(connection, project_id, feature_id, story_id),
+                await feature_basis(connection, project_id, feature_id)
+                if story_id is None
+                else await story_basis(connection, project_id, story_id),
                 tuple(
                     Decision(
                         row["decision_id"],
@@ -369,23 +377,6 @@ class Decisions:
             )
             for row in rows
         ]
-
-
-async def basis_of(
-    connection: Connection, project_id: str, feature_id: str, story_id: str | None = None
-) -> int:
-    """The number of the latest decision of the Product Owner's in force over the scope:
-    feature-wide ones for a feature, those and its own for a story. Zero if none."""
-    row = await (
-        await connection.execute(
-            "SELECT coalesce(max(number), 0) AS basis FROM decisions WHERE project_id = %s "
-            "AND feature_id = %s AND source = 'product_owner' "
-            "AND (scope_story = '' OR scope_story = %s)",
-            (project_id, feature_id, story_id),
-        )
-    ).fetchone()
-    assert row is not None
-    return int(row["basis"])
 
 
 async def _decide(

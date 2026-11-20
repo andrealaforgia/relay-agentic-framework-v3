@@ -71,9 +71,11 @@ class World:
         self.red_revision = commit(self.repository, {"vat.py": VAT_RETURNS_NET})
         await self.behaviours.open_project(PROJECT, str(self.repository))
         await in_a_story(self.behaviours, PROJECT)
-        await self.behaviours.propose(PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"])
+        await self.behaviours.propose(
+            PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0
+        )
         await self.behaviours.begin_test_design(PROJECT, "B1")
-        await self.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
+        await self.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
         assert (await self.behaviours.run_red(PROJECT, "B1")).is_valid
 
     async def green_candidate(self, note: str = "") -> str:
@@ -795,10 +797,10 @@ async def test_one_projects_unreachable_repository_does_not_hold_up_another(
     await first.behaviours.open_project("other-project", str(second.repository))
     await in_a_story(first.behaviours, "other-project")
     await first.behaviours.propose(
-        "other-project", "S1", "B1", "standard VAT rate is applied", ["AC1"]
+        "other-project", "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0
     )
     await first.behaviours.begin_test_design("other-project", "B1")
-    await first.behaviours.register_acceptance_test("other-project", "B1", CONTRACT)
+    await first.behaviours.register_acceptance_test("other-project", "B1", CONTRACT, basis=0)
     assert (await first.behaviours.run_red("other-project", "B1")).is_valid
     publish_attempt(
         second.repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE},
@@ -952,10 +954,10 @@ async def test_one_unreadable_legacy_mirror_does_not_stop_adoption_for_another_p
     await first.behaviours.open_project("other-project", str(other_repository))
     await in_a_story(first.behaviours, "other-project")
     await first.behaviours.propose(
-        "other-project", "S1", "B1", "standard VAT rate is applied", ["AC1"]
+        "other-project", "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0
     )
     await first.behaviours.begin_test_design("other-project", "B1")
-    await first.behaviours.register_acceptance_test("other-project", "B1", CONTRACT)
+    await first.behaviours.register_acceptance_test("other-project", "B1", CONTRACT, basis=0)
     assert (await first.behaviours.run_red("other-project", "B1")).is_valid
     publish_attempt(
         other_repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE},

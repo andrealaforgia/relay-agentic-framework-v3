@@ -44,15 +44,15 @@ async def world(database: AsyncConnectionPool, tmp_path: Path, runner_image: str
 
 async def test_nothing_new_starts_on_a_paused_feature_by_any_route(world: StoryWorld) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"])
+    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
     revision, listed = await world.stories.revisions_of(PROJECT, "S1")
 
     assert await world.close("pause", reason="budget review") == Receipt("effective", "paused")
 
     for start in (
-        world.behaviours.propose(PROJECT, "S1", "B2", "one more", ["AC1"]),
+        world.behaviours.propose(PROJECT, "S1", "B2", "one more", ["AC1"], basis=0),
         world.behaviours.begin_test_design(PROJECT, "B1"),
-        world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT),
+        world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0),
         world.behaviours.run_red(PROJECT, "B1"),
         run_green(world.behaviours, PROJECT, "B1", 1),
         world.behaviours.reopen_red(PROJECT, "B1", "runner upgraded"),
@@ -60,7 +60,7 @@ async def test_nothing_new_starts_on_a_paused_feature_by_any_route(world: StoryW
         world.integration.retry_integration(PROJECT, "B1", "try again"),
         world.seal(),
         world.assess("looks fine"),
-        world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [GREETS]),
+        world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [GREETS], basis=0),
     ):
         with pytest.raises(ActionRefused, match="paused"):
             await start
@@ -301,7 +301,7 @@ async def test_a_pause_and_the_release_of_a_story_cannot_cross(
     assert (await pausing).disposition == "effective"
     assert (await world.events())[-2:] == ["story.released", "feature.paused"]
     with pytest.raises(ActionRefused, match="paused"):
-        await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"])
+        await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
 
 
 async def test_a_pause_and_the_first_roadmap_cannot_cross(
@@ -319,7 +319,7 @@ async def test_a_pause_and_the_first_roadmap_cannot_cross(
 
     monkeypatch.setattr(stories_module, "_locked_project", held_inside_the_publication)
     publishing = asyncio.create_task(
-        world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [STANDARD_RATE])
+        world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [STANDARD_RATE], basis=0)
     )
     await holding.wait()
     pausing = asyncio.create_task(world.close("pause", reason="stop"))
@@ -332,7 +332,7 @@ async def test_a_pause_and_the_first_roadmap_cannot_cross(
     with pytest.raises(ActionRefused, match="paused"):
         await world.decide(gate)
     with pytest.raises(ActionRefused, match="paused"):
-        await world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [GREETS])
+        await world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [GREETS], basis=0)
 
 
 async def test_a_pause_waits_for_work_that_was_admitted_before_it(
@@ -341,7 +341,7 @@ async def test_a_pause_waits_for_work_that_was_admitted_before_it(
     """A start that has already been told the feature is open must commit before the
     pause does, or it would begin work after the pause was in force."""
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"])
+    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
     admitted, go_on = asyncio.Event(), asyncio.Event()
     real = behaviours_module.require_story_at_work
 
@@ -454,7 +454,7 @@ async def test_a_pause_waits_for_a_retry_that_was_admitted_before_it(
     """Integration's transactions take the gate lock like every other: one that has read
     the feature as open commits, or fails, before the pause can."""
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"])
+    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
     admitted, go_on = asyncio.Event(), asyncio.Event()
     real = integration_module.closure_of_behaviour
 

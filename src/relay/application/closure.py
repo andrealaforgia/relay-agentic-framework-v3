@@ -74,3 +74,32 @@ def require_open(closed_by: str | None) -> None:
     request came."""
     if closed_by is not None:
         raise ActionRefused(f"the feature is {closed_by}: nothing new starts here")
+
+
+async def feature_basis(connection: Connection, project_id: str, feature_id: str) -> int:
+    """The number of the latest feature-wide decision of the Product Owner's; zero if none."""
+    row = await (
+        await connection.execute("SELECT feature_basis(%s, %s) AS basis", (project_id, feature_id))
+    ).fetchone()
+    assert row is not None
+    return int(row["basis"])
+
+
+async def story_basis(connection: Connection, project_id: str, story_id: str) -> int:
+    """The number of the latest decision of the Product Owner's in force over a story,
+    feature-wide or its own; zero if none."""
+    row = await (
+        await connection.execute("SELECT story_basis(%s, %s) AS basis", (project_id, story_id))
+    ).fetchone()
+    assert row is not None
+    return int(row["basis"])
+
+
+def require_basis(read: int, now: int) -> None:
+    """What a role submits says which decisions it was written under. Relay never
+    stamps a submission with whatever is in force when it happens to arrive."""
+    if read != now:
+        raise ActionRefused(
+            f"this was written on decision basis {read}; the basis is now {now}: "
+            "read the context again"
+        )

@@ -78,9 +78,9 @@ async def test_an_open_question_stops_its_story_and_the_answer_becomes_shared_co
     world: Asking,
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"])
+    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
     await world.behaviours.begin_test_design(PROJECT, "B1")
-    await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
+    await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
 
     question = await world.ask("S1")
 
@@ -134,10 +134,13 @@ async def test_a_question_asked_before_any_roadmap_stops_planning_until_it_is_an
     question = await world.ask(story=None)
 
     with pytest.raises(ActionRefused, match="question"):
-        await world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [STANDARD_RATE])
+        await world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [STANDARD_RATE], basis=0)
 
     await world.answer(question)
-    await world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [STANDARD_RATE])
+    with pytest.raises(ActionRefused, match="written on decision basis 0"):
+        # Planned before the answer was known.
+        await world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [STANDARD_RATE], basis=0)
+    await world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [STANDARD_RATE], basis=1)
     context = await world.decisions.context_for(PROJECT, "F1", "S1")
     assert [each.text for each in context.decisions] == ["zero-rated"]
     assert (await world.decisions.context_for(PROJECT, "F1")).basis == 1
@@ -243,7 +246,9 @@ async def test_answering_releases_the_story_that_was_waiting_only_for_the_answer
     assert (await world.events())[-2:] == ["question.answered", "story.released"]
 
 
-async def test_a_gate_is_not_decided_while_a_question_covers_it(world: Asking) -> None:
+async def test_a_gate_is_not_decided_while_a_question_covers_it_and_is_stale_once_answered(
+    world: Asking,
+) -> None:
     gate = await world.roadmap(STANDARD_RATE)
     question = await world.ask(story=None)
 
@@ -251,14 +256,15 @@ async def test_a_gate_is_not_decided_while_a_question_covers_it(world: Asking) -
         await world.decide(gate)
 
     await world.answer(question)
-    assert (await world.decide(gate)).disposition == "effective"
+    # The roadmap that gate showed was written before the answer.
+    assert (await world.decide(gate)).disposition == "stale"
 
 
 async def test_a_pause_and_a_question_each_stop_the_story_until_each_is_cleared(
     world: Asking,
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"])
+    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
     feature_wide = await world.ask(story=None)
     about_the_story = await world.ask("S1")
     await world.close("pause", reason="budget review")
@@ -329,7 +335,7 @@ async def test_a_question_waits_for_work_that_was_admitted_before_it(
     world: Asking, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"])
+    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
     admitted, go_on = asyncio.Event(), asyncio.Event()
     real = behaviours_module.require_story_at_work
 

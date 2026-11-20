@@ -42,7 +42,9 @@ class StoryWorld(TrunkWorld):
 
     async def roadmap(self, *stories: StoryDraft, feature: str = "F1") -> uuid.UUID:
         await self.stories.open_feature(PRODUCT_OWNER, self.project, feature, "prices need VAT")
-        return await self.stories.publish_roadmap(ANALYST, self.project, feature, list(stories))
+        return await self.stories.publish_roadmap(
+            ANALYST, self.project, feature, list(stories), basis=0
+        )
 
     async def decide(self, gate: uuid.UUID, action: str = "approve", **payload: str) -> Receipt:
         self.requests += 1
@@ -68,14 +70,33 @@ class StoryWorld(TrunkWorld):
     async def seal(self, story: str = "S1") -> None:
         revision, listed = await self.stories.revisions_of(self.project, story)
         await self.stories.seal(
-            VERIFIER, self.project, story, story_revision=revision, list_revision=listed
+            VERIFIER,
+            self.project,
+            story,
+            story_revision=revision,
+            list_revision=listed,
+            basis=await self.basis(story),
         )
 
     async def assess(self, statement: str, story: str = "S1") -> None:
         revision, listed = await self.stories.revisions_of(self.project, story)
+        seal = await self.stories.seal_of(self.project, story)
         await self.stories.assess(
-            ANALYST, self.project, story, statement, story_revision=revision, list_revision=listed
+            ANALYST,
+            self.project,
+            story,
+            statement,
+            story_revision=revision,
+            list_revision=listed,
+            basis=await self.basis(story),
+            seal=seal or uuid.uuid7(),
         )
+
+    async def basis(self, story: str = "S1") -> int:
+        """The decision basis a role would read with the story, just before it submits."""
+        [basis] = await self.column(f"SELECT story_basis('{self.project}', '{story}')")
+        assert isinstance(basis, int)
+        return basis
 
     async def story(self, story: str = "S1") -> StoryState:
         return await self.stories.state_of(self.project, story)

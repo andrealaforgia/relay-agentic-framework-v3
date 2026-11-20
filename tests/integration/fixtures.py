@@ -149,7 +149,7 @@ async def in_a_story(behaviours: Behaviours, project: str) -> None:
     stories = Stories(behaviours._pool)
     await stories.open_feature(PRODUCT_OWNER, project, "F1", "prices must include VAT")
     story = StoryDraft("S1", "Standard rate", "a gross price is shown", {"AC1": "120 for 100"})
-    gate = await stories.publish_roadmap(ANALYST, project, "F1", [story])
+    gate = await stories.publish_roadmap(ANALYST, project, "F1", [story], basis=0)
     await stories.decide(HumanAction(PRODUCT_OWNER, f"approve-{gate}", str(gate), "approve"))
     # The notice that the roadmap was waiting has done its job. Tests that count what is
     # still to be sent are counting what their own behaviour caused.
