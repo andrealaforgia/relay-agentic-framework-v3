@@ -19,8 +19,8 @@ from psycopg.types.json import Jsonb
 from relay.application.closure import (
     closure_of_feature,
     lock_gate,
-    require_current,
     require_open,
+    require_startable,
 )
 from relay.domain.story import ActionRefused, Principal, PrincipalKind
 from relay.persistence.database import Connection, Pool
@@ -232,18 +232,20 @@ async def retire_reconfirmations(
 
 
 async def complete_reconfirmation(
-    connection: Connection, grant_id: uuid.UUID, subject: str, subject_id: str
+    connection: Connection, grant_id: uuid.UUID, project_id: str, subject: str, subject_id: str
 ) -> None:
     """A reconfirmation, or the amendment that stands in its place, is done under the
-    grant that holds exactly this work now. Which basis it is for needs no checking
+    grant that holds exactly this work now: this subject, of this project (a behaviour's
+    or a story's name is only its project's own). Which basis it is for needs no checking
     here: a later decision retires the assignment, and a pause or a question takes the
     grant back, so a grant that still holds is for the basis in force."""
     done = await (
         await connection.execute(
             "UPDATE assignments SET state = 'done', first_effect_at = now() "
-            "WHERE grant_id = %s AND state = 'granted' AND kind = 'reconfirm' AND subject = %s "
+            "WHERE grant_id = %s AND state = 'granted' AND kind = 'reconfirm' "
+            "AND project_id = %s AND subject = %s "
             "AND coalesce(behaviour_id, story_id, feature_id) = %s RETURNING assignment_id",
-            (grant_id, subject, subject_id),
+            (grant_id, project_id, subject, subject_id),
         )
     ).fetchone()
     if done is None:
@@ -316,17 +318,19 @@ class Assignments:
             subject_id = (
                 assignment["behaviour_id"] or assignment["story_id"] or assignment["feature_id"]
             )
+            if assignment["kind"] != RECONFIRM:
+                # Ordinary work relies on the story, the contract and the evidence so
+                # far being current. Reconfirming is how they become so.
+                await require_startable(
+                    connection, project_id, assignment["story_id"], assignment["behaviour_id"]
+                )
             require_open(
                 await closure_of_feature(
                     connection, project_id, assignment["feature_id"], assignment["story_id"]
                 )
             )
             if assignment["kind"] != RECONFIRM:
-                # Ordinary work relies on the story, the contract and the evidence so
-                # far being current. Reconfirming is how they become so.
-                await require_current(
-                    connection, project_id, assignment["story_id"], assignment["behaviour_id"]
-                )
+                pass
             elif assignment["behaviour_id"] is not None and await _has_an_unsettled_integration(
                 connection, project_id, assignment["behaviour_id"]
             ):

@@ -219,6 +219,7 @@ class Reviews:
                     "JOIN stories s USING (project_id, story_id) "
                     "WHERE c.publication = 'pending' AND c.state = 'open' "
                     "AND standing(s.project_id, s.feature_id, s.story_id) IS NULL "
+                    "AND not_current(s.project_id, s.story_id, b.behaviour_id) IS NULL "
                     "ORDER BY c.created_at"
                 )
             ).fetchall()
@@ -277,6 +278,12 @@ class Reviews:
             if await closure_of_behaviour(connection, cycle["project_id"], cycle["behaviour_id"]):
                 # Closed while the candidate was on its way to the repository. The ref is
                 # there; announcing it to reviewers waits for the feature to reopen.
+                return 0
+            try:
+                await _require_current(connection, cycle)
+            except ActionRefused:
+                # A decision landed meanwhile. Reviews are not asked for until the
+                # Verifier has said the cycle still stands.
                 return 0
             await connection.execute(
                 "UPDATE review_cycles SET publication = 'published', deferred_reason = NULL "

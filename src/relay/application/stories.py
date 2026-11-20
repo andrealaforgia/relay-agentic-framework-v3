@@ -30,6 +30,7 @@ from relay.application.closure import (
     require_basis,
     require_current,
     require_open,
+    require_startable,
     story_basis,
 )
 from relay.domain.evidence import ProcessContract
@@ -337,20 +338,21 @@ class Stories:
             await _locked_feature(connection, project_id, located["feature_id"])
             if (seen := answer_again(action, await _recorded(connection, action))) is not None:
                 return seen
-            stopped = await closure_of_feature(
-                connection, project_id, located["feature_id"], located["story_id"]
-            )
-            if stopped is not None and stopped != CANCELLED:
-                # Nothing is decided while the feature is paused or a question covers
-                # the gate, and nothing is recorded: the gate is still there to be
-                # decided afterwards.
-                raise ActionRefused(f"the feature is {stopped}: its gates wait")
             gate = await (
                 await connection.execute(
                     "SELECT * FROM gates WHERE gate_id = %s FOR UPDATE", (gate_id,)
                 )
             ).fetchone()
             assert gate is not None
+            stopped = await closure_of_feature(
+                connection, project_id, located["feature_id"], located["story_id"]
+            )
+            if gate["state"] == "open" and stopped is not None and stopped != CANCELLED:
+                # Nothing is decided while the feature is paused or a question covers
+                # the gate, and nothing is recorded: the gate is still there to be
+                # decided afterwards. A gate that is no longer open is another matter:
+                # it will never be decided, and saying it waits would be untrue.
+                raise ActionRefused(f"the feature is {stopped}: its gates wait")
             current = await _basis_now(connection, gate, story)
             if gate["state"] != "open" or gate["basis"] != current:
                 if gate["state"] == "open":
@@ -453,9 +455,8 @@ async def add_behaviour_to_story(
     has not vouched for until it is sealed again."""
     story = await _locked_story(connection, project_id, story_id)
     _require_at_work(story)
-    require_open(await closure_of_story(connection, project_id, story_id))
+    await require_startable(connection, project_id, story_id)
     require_basis(basis, await story_basis(connection, project_id, story_id))
-    await require_current(connection, project_id, story_id)
     if not demonstrates:
         # It could be built and integrated, and then no list containing it could ever
         # be sealed: the story would hold the project and never reach its gate.
@@ -491,10 +492,9 @@ async def require_story_at_work(
     ).fetchone()
     assert story is not None
     _require_at_work(story)
-    require_open(await closure_of_story(connection, project_id, behaviour["story_id"]))
     # Work that runs, reviews or integrates the behaviour relies on its contract and the
     # evidence gathered so far; work before that relies on the story alone.
-    await require_current(
+    await require_startable(
         connection,
         project_id,
         behaviour["story_id"],

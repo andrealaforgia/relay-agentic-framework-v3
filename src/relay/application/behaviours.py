@@ -325,7 +325,7 @@ class Behaviours:
             )
             raise
         return await self._record_green(
-            project_id, behaviour_id, attempt, execution, red, run, descends=descends
+            project_id, behaviour_id, attempt, execution, red, run, contract, descends=descends
         )
 
     async def reopen_red(self, project_id: str, behaviour_id: str, reason: str) -> None:
@@ -388,9 +388,12 @@ class Behaviours:
         execution: Execution,
         red: PairedRed,
         run: GreenRun,
+        observed: ProcessContract,
         *,
         descends: bool,
     ) -> GreenVerdict:
+        """`observed` is the contract the run was launched to observe. The record says
+        that one, whatever the behaviour's contract has become meanwhile."""
         async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
             verdict = behaviour.record_green_run(
                 execution,
@@ -403,8 +406,7 @@ class Behaviours:
                     connection, project_id, await _story_of(connection, project_id, behaviour_id)
                 ),
             )
-            contract = behaviour.contract
-            assert contract is not None
+            contract = observed
             execution_id = await record_execution(
                 connection, project_id, behaviour_id, "green", contract.digest, execution, run.basis
             )

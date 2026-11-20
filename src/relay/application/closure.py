@@ -145,3 +145,25 @@ def as_shown(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         {"number": each["number"], "source": each["source"], "text": each["text"]}
         for each in decisions
     ]
+
+
+async def require_startable(
+    connection: Connection, project_id: str, story_id: str, behaviour_id: str | None = None
+) -> None:
+    """Refuse to start work in a scope that is stopped, saying every reason that applies,
+    the closure first: a caller told only about the question would clear it and then
+    find the reconfirmation that was owed all along."""
+    stopped = await closure_of_story(connection, project_id, story_id)
+    if stopped == CANCELLED:
+        require_open(stopped)
+    row = await (
+        await connection.execute(
+            "SELECT not_current(%s, %s, %s) AS why", (project_id, story_id, behaviour_id)
+        )
+    ).fetchone()
+    assert row is not None
+    reasons = [f"the feature is {stopped}"] if stopped else []
+    if row["why"] is not None:
+        reasons.append(f"{row['why']}, and its owner has yet to reconfirm it")
+    if reasons:
+        raise ActionRefused("; and ".join(reasons) + ": nothing new starts here")

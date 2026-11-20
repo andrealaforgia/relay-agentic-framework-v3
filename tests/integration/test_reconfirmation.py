@@ -190,10 +190,10 @@ async def test_a_roadmap_is_reconfirmed_by_the_analyst_as_it_stands_on_the_basis
     await world.decisions.reconfirm_roadmap(
         ANALYST, PROJECT, "F1", grant=grant, basis=1, revision=1
     )
-    with pytest.raises(ActionRefused, match="not the current one"):
-        await world.decisions.reconfirm_roadmap(
-            ANALYST, PROJECT, "F1", grant=grant, basis=1, revision=1
-        )
+    # Said again, exactly, it is said once: a caller cut off after the commit may repeat it.
+    await world.decisions.reconfirm_roadmap(
+        ANALYST, PROJECT, "F1", grant=grant, basis=1, revision=1
+    )
     assert await world.column("SELECT count(*) FROM reconfirmations WHERE subject = 'roadmap'") == [
         1
     ]
