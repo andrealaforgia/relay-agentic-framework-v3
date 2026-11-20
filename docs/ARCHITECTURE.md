@@ -84,8 +84,8 @@ Each slice is a vertical cut with executable acceptance tests against real Postg
 | 2b | Integration: required checks on the exact candidate, one authorised trunk update, stale base, crash reconciliation | 5 (regression), 11 | Accepted |
 | 3a-i | Stories above behaviours; a roadmap gate and a story gate decided once, by a person, on the stored review; restart with an empty broker | 8, 14 | Accepted |
 | 3a-ii | Questions and changed decisions; corrections; pause and cancel; feature completion | 3 | Step 1 of 4 (pause, resume, cancel) built and reviewed in three rounds, the last fixes unreviewed; steps 2 to 4 not started |
-| 3b | Workers and the Claude adapter driving the canonical agents | 1 (in part) | |
-| 3c | CLI, including `relay watch` (PO-8); the live session; packaging; usage instructions | 1 | |
+| 3b | Workers and the Claude adapter driving the canonical agents; token use captured on every call (PO-9) | 1 (in part) | |
+| 3c | CLI, including `relay watch` (PO-8) and the estimated token cost in `relay costs` and `relay watch --tokens` (PO-9); the live session; packaging; usage instructions | 1 | |
 | 4 | Two providers disagree across machines; round cap escalates | 2, 7 | |
 | 5 | Lost lease, late result, unknown paid call | 10, 11 | |
 | 6 | Bounded autonomy, budgets, pause and cancel | 8, 9 | |
