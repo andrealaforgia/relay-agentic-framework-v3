@@ -37,6 +37,7 @@ from tests.integration.fixtures import (
     prepare_review,
     publish_attempt,
     run_green,
+    submit_review,
 )
 
 PROJECT = "vat-calculator"
@@ -106,7 +107,7 @@ class World:
         tree = self.tmp_path / f"review-{capability[:8]}"
         shutil.rmtree(tree, ignore_errors=True)
         await prepare_review(self.reviews, capability, tree)
-        return await self.reviews.submit_review(capability, review)
+        return await submit_review(self.reviews, capability, review)
 
     async def state(self) -> BehaviourState:
         return await self.behaviours.state_of(PROJECT, "B1")
@@ -191,8 +192,8 @@ async def test_a_blocking_finding_returns_the_work_once_however_often_it_is_subm
     await world.review(capabilities["qa"], APPROVE)
 
     first = await world.review(capabilities["sentinel"], Review(findings=(INJECTION,)))
-    replay = await world.reviews.submit_review(
-        capabilities["sentinel"], Review(findings=(INJECTION,))
+    replay = await submit_review(
+        world.reviews, capabilities["sentinel"], Review(findings=(INJECTION,))
     )
 
     assert await world.state() is BehaviourState.IMPLEMENTING
@@ -223,7 +224,7 @@ async def test_a_retry_that_says_something_different_is_kept_but_changes_nothing
     await world.review(capabilities["qa"], APPROVE)
     first = await world.review(capabilities["sentinel"], Review(findings=(INJECTION,)))
 
-    second_thoughts = await world.reviews.submit_review(capabilities["sentinel"], APPROVE)
+    second_thoughts = await submit_review(world.reviews, capabilities["sentinel"], APPROVE)
 
     assert second_thoughts.disposition == "conflicting"
     assert second_thoughts.submission_id != first.submission_id
@@ -242,7 +243,7 @@ async def test_the_fix_must_be_verified_on_the_successor_by_the_reviewer_who_rai
     successor, second = await world.candidate_under_review("fixed")
     assert second.keys() == first.keys() and not set(second.values()) & set(first.values())
 
-    late = await world.reviews.submit_review(first["qa"], APPROVE)
+    late = await submit_review(world.reviews, first["qa"], APPROVE)
     await world.review(second["qa"], APPROVE)
     assert await world.cycle_states() == ["changes_requested", "open"]
     await world.review(second["sentinel"], Review(carried={finding: Carried.VERIFIED_FIXED}))
@@ -330,7 +331,7 @@ async def test_a_task_id_or_a_guess_grants_nothing(world: World) -> None:
 
     for presented in (str(task["task_id"]), "", "sentinel", "x" * 43):
         with pytest.raises(UnknownCapability):
-            await world.reviews.submit_review(presented, APPROVE)
+            await submit_review(world.reviews, presented, APPROVE)
         with pytest.raises(UnknownCapability):
             await prepare_review(world.reviews, presented, world.tmp_path / "nowhere")
 
@@ -342,7 +343,7 @@ async def test_a_review_of_a_tree_relay_did_not_prepare_is_refused(world: World)
     _, capabilities = await world.candidate_under_review()
 
     with pytest.raises(SubmissionRefused, match="no tree was prepared"):
-        await world.reviews.submit_review(capabilities["qa"], APPROVE)
+        await submit_review(world.reviews, capabilities["qa"], APPROVE)
 
     assert await world.count("review_submissions") == 0
 
@@ -397,7 +398,7 @@ async def test_a_reviewer_is_never_given_a_tree_the_other_did_not_see(world: Wor
         await prepare_review(
             world.reviews, capabilities["sentinel"], world.tmp_path / "sentinel-tree"
         )
-    late = await world.reviews.submit_review(capabilities["qa"], APPROVE)
+    late = await submit_review(world.reviews, capabilities["qa"], APPROVE)
     with pytest.raises(SubmissionRefused):
         await prepare_review(world.reviews, capabilities["sentinel"], world.tmp_path / "again")
 
@@ -569,7 +570,7 @@ async def test_a_review_with_several_findings_gives_each_its_own_lasting_id(worl
     several = Review(findings=(INJECTION, STYLE, INJECTION, STYLE, INJECTION))
 
     first = await world.review(capabilities["sentinel"], several)
-    replay = await world.reviews.submit_review(capabilities["sentinel"], several)
+    replay = await submit_review(world.reviews, capabilities["sentinel"], several)
 
     assert len(set(first.finding_ids)) == 5
     assert replay.finding_ids == first.finding_ids
@@ -583,7 +584,7 @@ async def test_retrying_the_approval_that_satisfied_the_gate_says_the_cycle_is_s
     await world.review(capabilities["qa"], APPROVE)
     last = await world.review(capabilities["sentinel"], APPROVE)
 
-    replay = await world.reviews.submit_review(capabilities["sentinel"], APPROVE)
+    replay = await submit_review(world.reviews, capabilities["sentinel"], APPROVE)
 
     assert (replay.submission_id, replay.disposition) == (last.submission_id, "effective")
     assert replay.cycle_is_current is True
@@ -723,7 +724,7 @@ async def test_a_conflict_seen_while_the_last_review_lands_leaves_one_decision_a
     )
     await asyncio.wait_for(seen.wait(), 30)
 
-    final = await world.reviews.submit_review(capabilities["qa"], APPROVE)
+    final = await submit_review(world.reviews, capabilities["qa"], APPROVE)
     release.set()
     with pytest.raises(SubmissionRefused, match="no longer names"):
         await preparing

@@ -31,6 +31,7 @@ from tests.integration.fixtures import (
     HeldAtABarrier,
     held_at_the_barrier,
     run_green,
+    submit_review,
 )
 from tests.integration.story_world import GREETS, INJECTION, STANDARD_RATE, StoryWorld
 from tests.integration.trunk_world import PROJECT
@@ -416,7 +417,7 @@ async def test_a_review_granted_before_a_pause_is_granted_afresh_after_it_and_do
 
     after = await claims.claim(reviewer("qa"), owed)
     await world.reviews.prepare_review(capability, world.tmp_path / "tree", after)
-    assert (await world.reviews.submit_review(capability, Review())).disposition == "effective"
+    assert (await submit_review(world.reviews, capability, Review())).disposition == "effective"
     assert await assignments(world) == ["build:done", "review:done", "review:wanted"]
     with pytest.raises(ActionRefused, match="no longer wanted"):
         await claims.claim(reviewer("qa"), owed)
@@ -433,7 +434,7 @@ async def test_a_review_checked_out_before_a_pause_may_finish_during_it(world: S
 
     await world.close("pause", reason="budget review")
 
-    assert (await world.reviews.submit_review(capability, Review())).disposition == "effective"
+    assert (await submit_review(world.reviews, capability, Review())).disposition == "effective"
     assert await assignments(world) == ["build:done", "review:done", "review:wanted"]
 
 
@@ -444,10 +445,10 @@ async def test_a_review_of_a_cancelled_feature_is_kept_and_decides_nothing(
     for role, (capability, owed) in reviews.items():
         grant = await Assignments(world.database).claim(reviewer(role), owed)
         await world.reviews.prepare_review(capability, world.tmp_path / f"tree-{role}", grant)
-    await world.reviews.submit_review(reviews["qa"][0], Review())
+    await submit_review(world.reviews, reviews["qa"][0], Review())
 
     await world.close("cancel", reason="no longer wanted")
-    late = await world.reviews.submit_review(reviews["sentinel"][0], Review())
+    late = await submit_review(world.reviews, reviews["sentinel"][0], Review())
 
     assert late.disposition == "stale"
     assert await world.state("B1") is BehaviourState.REVIEW
@@ -468,3 +469,28 @@ async def test_a_cycle_that_can_no_longer_be_trusted_withdraws_its_reviews(
         await world.reviews.prepare_review(capability, world.tmp_path / "tree", grant)
 
     assert await assignments(world) == ["build:done", "review:retired", "review:retired"]
+
+
+async def test_a_worker_whose_grant_was_taken_back_cannot_submit_on_its_successors_checkout(
+    world: StoryWorld,
+) -> None:
+    reviews = await awaiting_review(world)
+    claims = Assignments(world.database)
+    capability, owed = reviews["qa"]
+    first = await claims.claim(reviewer("qa"), owed)
+    await world.close("pause", reason="budget review")
+    await world.close("resume")
+    second_worker = Principal(PrincipalKind.WORKER, "worker-qa-2", role="qa")
+    second = await claims.claim(second_worker, owed)
+    await world.reviews.prepare_review(capability, world.tmp_path / "tree", second)
+
+    for not_the_holder in (first, uuid.uuid7()):
+        with pytest.raises(SubmissionRefused, match="no tree was prepared"):
+            await world.reviews.submit_review(capability, Review(), not_the_holder)
+
+    blocked = await world.reviews.submit_review(capability, Review(findings=(INJECTION,)), second)
+    assert blocked.disposition == "effective"
+    assert await world.column("SELECT count(*) FROM review_submissions") == [1]
+    assert (
+        await world.reviews.submit_review(capability, Review(findings=(INJECTION,)), first)
+    ) == blocked  # an exact replay of what was accepted is answered, whoever asks

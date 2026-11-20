@@ -497,9 +497,11 @@ class Reviews:
             )
         return tree
 
-    async def submit_review(self, capability: str, review: Review) -> Receipt:
+    async def submit_review(self, capability: str, review: Review, grant: uuid.UUID) -> Receipt:
         """Record one reviewer's review. Every request gets exactly one answer however often
-        it is retried, and only the first accepted submission of a task has any effect."""
+        it is retried, and only the first accepted submission of a task has any effect.
+        That first submission has to come under the grant that holds the review now, and
+        that grant has to be the one the tree was handed over to."""
         task_id = (await self._task(capability))["task_id"]
         async with self._pool.connection() as connection, connection.transaction():
             task = await _locked_task(connection, task_id)
@@ -527,8 +529,8 @@ class Reviews:
                 return await _store(connection, task, review, "conflicting", is_current)
             if not accepting:
                 return await _store(connection, task, review, "stale", is_current)
-            if not await _has_checkout(connection, task_id):
-                raise SubmissionRefused("no tree was prepared for this review")
+            if not await _has_checkout(connection, task_id, grant):
+                raise SubmissionRefused("no tree was prepared for this review under this grant")
             return await self._accept(connection, task, review)
 
     async def dispute(self, project_id: str, finding_id: str, evidence: str) -> None:
@@ -837,14 +839,14 @@ async def _locked_task(connection: Connection, task_id: uuid.UUID) -> dict[str, 
     return task
 
 
-async def _has_checkout(connection: Connection, task_id: uuid.UUID) -> bool:
-    """Whether a tree was handed over under the grant that holds this review now."""
+async def _has_checkout(connection: Connection, task_id: uuid.UUID, grant: uuid.UUID) -> bool:
+    """Whether a tree was handed over under this grant, and this grant holds the review now."""
     row = await (
         await connection.execute(
             "SELECT 1 FROM review_checkouts c JOIN review_tasks t USING (task_id) "
             "JOIN assignments a USING (assignment_id) WHERE c.task_id = %s "
-            "AND c.grant_id = a.grant_id LIMIT 1",
-            (task_id,),
+            "AND c.grant_id = %s AND a.grant_id = %s LIMIT 1",
+            (task_id, grant, grant),
         )
     ).fetchone()
     return row is not None

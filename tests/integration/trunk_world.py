@@ -25,6 +25,7 @@ from tests.integration.fixtures import (
     in_a_story,
     prepare_review,
     run_green,
+    submit_review,
 )
 
 PROJECT = "vat-calculator"
@@ -192,7 +193,7 @@ class TrunkWorld:
                 shutil.rmtree(tree, ignore_errors=True)
                 await prepare_review(self.reviews, payload["capability"], tree)
                 said = (reviews or {}).get(message.envelope["recipient"], Review())
-                await self.reviews.submit_review(payload["capability"], said)
+                await submit_review(self.reviews, payload["capability"], said)
         return candidate
 
     async def integrate(

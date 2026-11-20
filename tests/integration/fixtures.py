@@ -11,7 +11,8 @@ from psycopg_pool import AsyncConnectionPool
 
 from relay.application.assignments import Assignments, announce_again
 from relay.application.behaviours import Behaviours
-from relay.application.reviews import Reviews
+from relay.application.reviews import Receipt as SubmissionReceipt
+from relay.application.reviews import Review, Reviews
 from relay.application.stories import Stories, StoryDraft
 from relay.domain.evidence import Baseline, Expected, GreenVerdict, Launch, ProcessContract
 from relay.domain.story import ActionRefused, HumanAction, Principal, PrincipalKind
@@ -218,3 +219,19 @@ async def prepare_review(reviews: Reviews, capability: str, into: Path) -> Path:
 async def announce_wanted_work_again(pool: AsyncConnectionPool, project: str) -> int:
     async with pool.connection() as connection, connection.transaction():
         return await announce_again(connection, project)
+
+
+async def submit_review(reviews: Reviews, capability: str, review: Review) -> SubmissionReceipt:
+    """Submit as the worker that holds the review now would: under its current grant.
+    Where nobody holds it, a grant nobody was given."""
+    async with reviews._pool.connection() as connection:
+        held = await (
+            await connection.execute(
+                "SELECT a.grant_id FROM review_tasks t JOIN assignments a USING (assignment_id) "
+                "WHERE t.capability = %s AND a.grant_id IS NOT NULL",
+                (capability,),
+            )
+        ).fetchone()
+    return await reviews.submit_review(
+        capability, review, held["grant_id"] if held else uuid.uuid7()
+    )

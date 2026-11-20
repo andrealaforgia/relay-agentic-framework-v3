@@ -243,3 +243,18 @@ async def test_a_git_stopped_for_taking_too_long_leaves_nothing_behind(tmp_path:
         "pgrep", "-f", f"ls-remote slow://{tmp_path.name}", stdout=asyncio.subprocess.DEVNULL
     )
     assert await still_running.wait() == 1, "a Git that was given up on is still running"
+
+
+async def test_reading_trunk_gives_up_on_a_repository_that_does_not_answer(tmp_path: Path) -> None:
+    (tmp_path / "git-remote-slow").write_text("#!/bin/sh\nsleep 5 &\nwait\n")
+    (tmp_path / "git-remote-slow").chmod(0o755)
+    environment = dict(checkout._GIT_ENVIRONMENT)
+    environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
+    started = time.monotonic()
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(checkout, "_GIT_ENVIRONMENT", environment)
+        with pytest.raises(RemoteUnavailable, match="no answer in time"):
+            await checkout.trunk_head(f"slow://{tmp_path.name}", "main", timeout=0.3)
+
+    assert time.monotonic() - started < 4

@@ -186,9 +186,16 @@ class Integration:
                     (assignment_id,),
                 )
             ).fetchone()
+            if owed is not None:
+                # Before the repository is asked anything: a closed feature is not worth
+                # a call that may be slow. The transaction that takes the work up looks
+                # again, under the gate lock.
+                require_open(
+                    await closure_of_behaviour(connection, owed["project_id"], owed["behaviour_id"])
+                )
         if owed is None:
             raise LookupError(f"no integration is owed under {assignment_id}")
-        head = await trunk_head(owed["repository"], owed["trunk"])
+        head = await trunk_head(owed["repository"], owed["trunk"], timeout=self._push_timeout)
         return await self._finish(
             await self._start_batch(
                 owed["project_id"],
@@ -218,7 +225,13 @@ class Integration:
         except BaseException:
             await self._abandon(batch_id)
             raise
-        settled = await self._settle_batch(batch_id, executions)
+        try:
+            settled = await self._settle_batch(batch_id, executions)
+        except BaseException:
+            # Nothing was decided if the batch is still running; if an intent was
+            # committed, the batch is no longer running and the intent owns what follows.
+            await self._abandon(batch_id)
+            raise
         if isinstance(settled, IntegrationReceipt):
             return settled
         return await self._drive(settled)
@@ -472,7 +485,7 @@ class Integration:
                 # What came back is not a run of every check on the candidate, so none
                 # of it is taken as evidence of anything.
                 if current["state"] == "running":
-                    await _close_batch(connection, batch, "discarded", incomplete)
+                    await _discard(connection, batch, incomplete)
                 return IntegrationReceipt(Outcome.SUPERSEDED, batch_id, incomplete)
             runs = []
             for check, execution in executions:
@@ -498,7 +511,7 @@ class Integration:
                 return IntegrationReceipt(_OUTCOME_OF_BATCH[state], batch_id, reason)
             stale = await _why_stale(connection, batch, behaviour, row, cycle, project)
             if stale:
-                await _close_batch(connection, batch, "discarded", stale)
+                await _discard(connection, batch, stale)
                 return IntegrationReceipt(Outcome.SUPERSEDED, batch_id, stale)
             assert cycle is not None
             if any(
@@ -981,6 +994,19 @@ async def _close_unfinished(
             payload={"batch_id": str(batch["batch_id"]), "request_id": batch["request_id"]},
         ),
         issued_on={"batch_id": str(batch["batch_id"]), "cycle_id": str(batch["cycle_id"])},
+    )
+
+
+async def _discard(connection: Connection, batch: dict[str, Any], reason: str) -> None:
+    """What these checks saw can no longer decide anything. A first generation was asked
+    for by a caller, who is told why and may ask again. A later one was taken up by the
+    control plane on nobody's request: the integration stays owed, and whether it is
+    still worth doing is judged when it is next taken up."""
+    if batch["generation"] == 1:
+        await _close_batch(connection, batch, "discarded", reason)
+        return
+    await _close_unfinished(
+        connection, batch["project_id"], batch["behaviour_id"], batch["batch_id"], "running"
     )
 
 

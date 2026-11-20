@@ -599,11 +599,14 @@ async def _cancel(connection: Connection, project_id: str, feature_id: str) -> N
     ).fetchall()
     for gate in open_gates:
         await _close_gate(connection, gate, "superseded", "superseded")
-    # Checks a pause was holding will never be taken up now.
+    # Checks a pause was holding, or that were waiting to be run again, never will be
+    # now. A request that asks about them is told so, not that they are still waiting.
     await connection.execute(
-        "UPDATE check_batches SET state = 'abandoned', "
-        "reason = 'the feature was cancelled while these checks were held' "
-        "WHERE project_id = %s AND state = 'held' AND behaviour_id IN "
+        "UPDATE check_batches k SET state = 'abandoned', "
+        "reason = 'the feature was cancelled before these checks could be run again' "
+        "WHERE k.project_id = %s AND (k.state = 'held' OR (k.state = 'interrupted' AND EXISTS "
+        "(SELECT 1 FROM assignments a WHERE a.kind = 'integrate' AND a.state = 'wanted' "
+        "AND a.issued_on->>'batch_id' = k.batch_id::text))) AND k.behaviour_id IN "
         "(SELECT b.behaviour_id FROM behaviours b JOIN stories s USING (project_id, story_id) "
         "WHERE b.project_id = %s AND s.feature_id = %s)",
         (project_id, project_id, feature_id),

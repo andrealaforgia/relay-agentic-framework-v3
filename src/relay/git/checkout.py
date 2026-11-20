@@ -80,11 +80,12 @@ def canonical_repository(repository: str) -> str:
     return str(Path(repository).resolve())
 
 
-async def trunk_head(repository: str, trunk: str) -> str:
-    """The commit the project's trunk points at now, read from the project's own repository."""
+async def trunk_head(repository: str, trunk: str, *, timeout: float | None = None) -> str:
+    """The commit the project's trunk points at now, read from the project's own
+    repository. With a timeout, a repository that does not answer is given up on."""
     if not _BRANCH_NAME.fullmatch(trunk):
         raise CheckoutFailed(f"not a branch name: {trunk!r}")
-    return await _resolve(repository, f"refs/heads/{trunk}", f"branch {trunk!r}")
+    return await _resolve(repository, f"refs/heads/{trunk}", f"branch {trunk!r}", timeout)
 
 
 def attempt_ref(project_id: str, behaviour_id: str, attempt: int) -> str:
@@ -105,19 +106,23 @@ async def attempt_head(repository: str, project_id: str, behaviour_id: str, atte
     return await _resolve(repository, ref, f"candidate for attempt {attempt} of {behaviour_id}")
 
 
-async def _resolve(repository: str, wanted: str, description: str) -> str:
-    revision = await resolve_ref(repository, wanted)
+async def _resolve(
+    repository: str, wanted: str, description: str, timeout: float | None = None
+) -> str:
+    revision = await resolve_ref(repository, wanted, timeout=timeout)
     if revision is None:
         raise CheckoutFailed(f"the repository has no {description}")
     return revision
 
 
-async def resolve_ref(repository: str, wanted: str) -> str | None:
+async def resolve_ref(repository: str, wanted: str, *, timeout: float | None = None) -> str | None:
     """The object the exactly named ref points at now, or None if there is no such ref."""
     # ls-remote matches its pattern against the tail of every ref name, so another ref
     # ending in the same words would be listed too. Only the exact ref counts.
     try:
-        listing = await git("ls-remote", "--", repository, wanted, redact=repository)
+        listing = await git(
+            "ls-remote", "--", repository, wanted, redact=repository, timeout=timeout
+        )
     except CheckoutFailed as failure:
         raise RemoteUnavailable(str(failure)) from None
     revisions = [
@@ -234,13 +239,16 @@ def _subcommand(arguments: tuple[str, ...]) -> str:
     return arguments[2] if arguments[:1] == ("-C",) and len(arguments) > 2 else arguments[0]
 
 
-async def git(*arguments: str, redact: str | None = None) -> str:
-    return (await _git_output(*arguments, redact=redact)).decode(errors="replace").strip()
+async def git(*arguments: str, redact: str | None = None, timeout: float | None = None) -> str:
+    output = await _git_output(*arguments, redact=redact, timeout=timeout)
+    return output.decode(errors="replace").strip()
 
 
-async def _git_output(*arguments: str, redact: str | None = None) -> bytes:
+async def _git_output(
+    *arguments: str, redact: str | None = None, timeout: float | None = None
+) -> bytes:
     """Raw output: Git path names are bytes and need not be valid text."""
-    status, stdout, detail = await git_result(*arguments, redact=redact)
+    status, stdout, detail = await git_result(*arguments, redact=redact, timeout=timeout)
     if status != 0:
         raise CheckoutFailed(f"git {arguments[0]} failed: {detail}")
     return stdout
