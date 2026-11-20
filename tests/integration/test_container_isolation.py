@@ -437,28 +437,38 @@ async def test_the_identity_is_the_engines_even_when_the_first_inspection_fails(
     assert unknown.observation.ineligibility is Ineligibility.NOT_EXECUTED
 
 
-async def test_the_runtime_identity_covers_the_mount_point_and_the_capture_limit(
-    tmp_path: Path, runner_image: str
-) -> None:
+def test_the_runtime_identity_changes_with_the_mount_point_alone(runner_image: str) -> None:
     class MountedElsewhere(ContainerIsolation):
         subject_mount = "/work"
-        settings = tuple(
-            "/work" if setting == "/subject" else setting for setting in ContainerIsolation.settings
-        )
 
+    usual = ContainerIsolation(runner_image)._identity("sha256:image", 1_000_000)
+    elsewhere = MountedElsewhere(runner_image)._identity("sha256:image", 1_000_000)
+
+    assert MountedElsewhere.settings == ContainerIsolation.settings
+    assert usual != elsewhere
+
+
+def test_the_runtime_identity_changes_with_the_capture_limit_alone(runner_image: str) -> None:
+    """Both limits are below the floor at which the engine's log limit starts to grow, so
+    the container is created with identical arguments; only the capture limit differs."""
+    isolation = ContainerIsolation(runner_image)
+
+    assert isolation._identity("sha256:image", 100_000) != isolation._identity(
+        "sha256:image", 200_000
+    )
+
+
+async def test_the_subject_sees_the_mount_point_it_is_given(
+    tmp_path: Path, runner_image: str
+) -> None:
     revision = commit(tmp_path / "subject", {"cwd.py": "import os\nprint(os.getcwd())\n"})
     workdir = await pristine_checkout(str(tmp_path / "subject"), revision, tmp_path / "checkout")
-    launch = Launch(argv=("python3", "cwd.py"), timeout_seconds=30)
 
-    usual = await ContainerIsolation(runner_image).run(workdir, launch, 1_000_000)
-    elsewhere = await MountedElsewhere(runner_image).run(workdir, launch, 1_000_000)
-    smaller_capture = await ContainerIsolation(runner_image).run(workdir, launch, 400_000)
-
-    assert (usual.observation.stdout, elsewhere.observation.stdout) == (b"/subject\n", b"/work\n")
-    assert (
-        len({usual.runtime_identity, elsewhere.runtime_identity, smaller_capture.runtime_identity})
-        == 3
+    observation = await ProcessOracle(ContainerIsolation(runner_image)).observe(
+        workdir, Launch(argv=("python3", "cwd.py"), timeout_seconds=30)
     )
+
+    assert observation.stdout == b"/subject\n"
 
 
 def test_an_unpinned_image_is_refused() -> None:

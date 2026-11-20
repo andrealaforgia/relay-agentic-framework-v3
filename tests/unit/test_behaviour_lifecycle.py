@@ -59,12 +59,12 @@ def test_an_invalid_red_keeps_the_builder_blocked() -> None:
     assert behaviour.state is BehaviourState.VALIDATING_RED
 
 
-def test_the_builder_cannot_start_before_red_validation() -> None:
+def test_a_red_run_cannot_start_before_the_acceptance_test_is_registered() -> None:
     behaviour = Behaviour.propose("B1", "x")
     behaviour.begin_test_design()
 
     with pytest.raises(TransitionRefused) as refusal:
-        behaviour.record_red_run(FAILS_AS_REGISTERED, started_in_cycle=0)
+        behaviour.require_awaiting_red()
 
     assert "test_design" in str(refusal.value)
     assert behaviour.state is BehaviourState.TEST_DESIGN
@@ -108,9 +108,9 @@ def test_a_candidate_that_still_fails_stays_with_the_builder() -> None:
     assert behaviour.state is BehaviourState.IMPLEMENTING
 
 
-def test_green_cannot_be_recorded_before_red() -> None:
+def test_a_green_run_cannot_start_before_red() -> None:
     with pytest.raises(TransitionRefused) as refusal:
-        awaiting_red().record_green_run(PASSES, RED, RED, candidate_descends_from_red=True)
+        awaiting_red().require_awaiting_green()
 
     assert refusal.value.current is BehaviourState.VALIDATING_RED
 
@@ -152,3 +152,32 @@ def test_a_green_that_answered_a_superseded_red_does_not_reach_review() -> None:
     assert replaced.rejection is GreenRejection.RED_SUPERSEDED
     assert removed.rejection is GreenRejection.RED_SUPERSEDED
     assert behaviour.state is BehaviourState.IMPLEMENTING
+
+
+def test_a_green_that_finishes_after_its_red_was_reopened_is_recorded_as_superseded() -> None:
+    behaviour = implementing()
+    behaviour.reopen_red()
+
+    verdict = behaviour.record_green_run(PASSES, RED, None, candidate_descends_from_red=True)
+
+    assert verdict.rejection is GreenRejection.RED_SUPERSEDED
+    assert behaviour.state is BehaviourState.VALIDATING_RED
+
+
+def test_a_red_that_finishes_after_another_was_accepted_is_recorded_as_superseded() -> None:
+    behaviour = implementing()
+
+    same_cycle = behaviour.record_red_run(FAILS_AS_REGISTERED, started_in_cycle=0)
+
+    assert same_cycle.rejection is RedRejection.SUPERSEDED
+    assert behaviour.state is BehaviourState.IMPLEMENTING
+
+
+def test_a_second_green_after_the_first_was_accepted_changes_nothing() -> None:
+    behaviour = implementing()
+    behaviour.record_green_run(PASSES, RED, RED, candidate_descends_from_red=True)
+
+    again = behaviour.record_green_run(PASSES, RED, RED, candidate_descends_from_red=True)
+
+    assert again.rejection is GreenRejection.RED_SUPERSEDED
+    assert behaviour.state is BehaviourState.REVIEW

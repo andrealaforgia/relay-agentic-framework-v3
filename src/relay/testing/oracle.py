@@ -128,10 +128,6 @@ class ContainerIsolation:
             await self._remove(container)
 
     async def _run(self, container: str, workdir: Path, launch: Launch, capture_limit: int) -> Run:
-        # The subject runs as a fixed unprivileged user, the same on every runner host, so
-        # what it may read and execute must not depend on who made the checkout.
-        if workdir.is_dir():
-            await asyncio.to_thread(normalise_permissions, workdir)
         created = await self._docker(
             "create", "--interactive", "--name", container,
             *self.settings,
@@ -250,20 +246,6 @@ def reconcile_container_run(
 
 
 _TRUSTED_DIRECTORY = Path("/")
-
-
-def normalise_permissions(directory: Path) -> None:
-    """Make what the subject may read and execute depend only on what Git recorded: a file
-    is executable by everyone if Git marked it executable, and readable by everyone either
-    way. The host's umask and the account that made the checkout leave no trace."""
-    for root, _, files in os.walk(directory):
-        os.chmod(root, 0o755)
-        for name in files:
-            path = os.path.join(root, name)
-            if os.path.islink(path):
-                continue
-            executable = os.stat(path).st_mode & 0o100
-            os.chmod(path, 0o755 if executable else 0o644)
 
 
 def _trusted_path() -> str:

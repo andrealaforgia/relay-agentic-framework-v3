@@ -3,6 +3,8 @@ The subject's own claims, and any file it writes, carry no weight."""
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -156,3 +158,60 @@ async def test_a_look_alike_branch_does_not_stand_in_for_a_missing_trunk(tmp_pat
 
     with pytest.raises(CheckoutFailed, match="no branch 'release'"):
         await trunk_head(str(repository), "release")
+
+
+def tracked_as_executable(repository: Path, name: str) -> str:
+    subprocess.run(["git", "-C", str(repository), "update-index", "--chmod=+x", name], check=True)
+    subprocess.run(["git", "-C", str(repository), "commit", "-q", "-m", "executable"], check=True)
+    return subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@pytest.mark.parametrize("umask", [0o022, 0o077])
+async def test_permissions_in_a_checkout_come_from_git_not_from_the_host(
+    tmp_path: Path, umask: int
+) -> None:
+    repository = tmp_path / "subject"
+    commit(repository, {"helper.sh": "#!/bin/sh\n", "data.txt": "x"})
+    (repository / "sub").mkdir()
+    commit(repository, {"sub/nested.txt": "y"})
+    revision = tracked_as_executable(repository, "helper.sh")
+    previous = os.umask(umask)
+    try:
+        checkout = await pristine_checkout(str(repository), revision, tmp_path / "checkout")
+    finally:
+        os.umask(previous)
+
+    def mode(name: str) -> int:
+        return (checkout / name).stat().st_mode & 0o777
+
+    assert (mode("helper.sh"), mode("data.txt"), mode("sub"), mode("sub/nested.txt")) == (
+        0o755,
+        0o644,
+        0o755,
+        0o644,
+    )
+    assert mode(".") == 0o755
+
+
+async def test_an_executable_whose_bit_the_filesystem_dropped_is_still_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "subject"
+    commit(repository, {"helper.sh": "#!/bin/sh\n"})
+    revision = tracked_as_executable(repository, "helper.sh")
+    remove_tree = shutil.rmtree
+
+    def on_a_filesystem_without_execute_bits(path: Path) -> None:
+        (path.parent / "helper.sh").chmod(0o600)
+        remove_tree(path)
+
+    monkeypatch.setattr("relay.git.checkout.shutil.rmtree", on_a_filesystem_without_execute_bits)
+
+    checkout = await pristine_checkout(str(repository), revision, tmp_path / "checkout")
+
+    assert (checkout / "helper.sh").stat().st_mode & 0o777 == 0o755

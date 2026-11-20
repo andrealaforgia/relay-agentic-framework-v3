@@ -69,13 +69,17 @@ class Behaviour:
         return self.contract
 
     def record_red_run(self, execution: Execution, *, started_in_cycle: int) -> RedVerdict:
-        contract = self.require_awaiting_red()
-        if started_in_cycle != self.red_cycle:
+        """Judge a red run that has finished. A run is admitted to start only while the
+        behaviour awaits red; by the time it finishes the behaviour may have moved on, and
+        then the run is recorded as superseded and changes nothing."""
+        assert self.contract is not None
+        moved_on = self.state is not BehaviourState.VALIDATING_RED
+        if moved_on or started_in_cycle != self.red_cycle:
             return RedVerdict(
                 RedRejection.SUPERSEDED,
-                f"{contract.contract_id}: this run began before the red was reopened",
+                f"{self.contract.contract_id}: the behaviour moved on while this run was in flight",
             )
-        verdict = judge_red(contract, execution)
+        verdict = judge_red(self.contract, execution)
         if verdict.is_valid:
             self.state = BehaviourState.IMPLEMENTING
         return verdict
@@ -96,11 +100,14 @@ class Behaviour:
     ) -> GreenVerdict:
         """Judge a candidate against the red it was launched to answer, provided that red
         is still the one on record now."""
-        contract = self.require_awaiting_green()
-        if red_now != red_at_launch:
+        assert self.contract is not None
+        contract = self.contract
+        moved_on = self.state is not BehaviourState.IMPLEMENTING
+        if moved_on or red_now != red_at_launch:
             return GreenVerdict(
                 GreenRejection.RED_SUPERSEDED,
-                f"{contract.contract_id}: the red this run answered has since been superseded",
+                f"{contract.contract_id}: the red this run answered is no longer the one on "
+                "record, or the behaviour moved on while this run was in flight",
             )
         verdict = judge_green(
             contract,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shutil
 from pathlib import Path
@@ -108,7 +109,7 @@ async def candidate_checkout(
     await _git("-C", str(into), "checkout", "--quiet", "--detach", revision)
     if await _git("-C", str(into), "rev-parse", "HEAD") != revision:
         raise CheckoutFailed("the checked-out revision is not the candidate")
-    shutil.rmtree(into / ".git")
+    await _leave_only_the_tracked_files(into)
     return into, descends
 
 
@@ -122,8 +123,26 @@ async def pristine_checkout(repository: str, revision: str, into: Path) -> Path:
     head = await _git("-C", str(into), "rev-parse", "HEAD")
     if head != revision:
         raise CheckoutFailed(f"checked out {head}, expected {revision}")
-    shutil.rmtree(into / ".git")
+    await _leave_only_the_tracked_files(into)
     return into
+
+
+async def _leave_only_the_tracked_files(checkout: Path) -> None:
+    """Remove the Git metadata and set permissions from what Git recorded: a file is
+    executable by everyone if it is tracked as executable, readable by everyone either
+    way. The host's umask, its filesystem and the account that made the checkout leave no
+    trace, so every runner shows the subject the same tree."""
+    tracked = await _git("-C", str(checkout), "ls-files", "--stage", "-z")
+    shutil.rmtree(checkout / ".git")
+    for directory, _, _ in os.walk(checkout):
+        os.chmod(directory, 0o755)
+    for entry in filter(None, tracked.split("\0")):
+        details, _, name = entry.partition("\t")
+        mode = details.split()[0]
+        if mode == "100755":
+            os.chmod(checkout / name, 0o755)
+        elif mode == "100644":
+            os.chmod(checkout / name, 0o644)
 
 
 async def _succeeds(*arguments: str) -> bool:

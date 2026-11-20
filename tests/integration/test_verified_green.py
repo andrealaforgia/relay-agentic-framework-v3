@@ -425,3 +425,82 @@ async def test_a_fresh_red_issues_a_build_request_with_a_new_idempotency_key(
 
     assert first.envelope["event_type"] == second.envelope["event_type"] == "build.requested"
     assert first.envelope["idempotency_key"] != second.envelope["idempotency_key"]
+
+
+async def execution_named_by(database: AsyncConnectionPool, event: Any) -> dict[str, Any]:
+    async with database.connection() as connection:
+        row = await (
+            await connection.execute(
+                "SELECT purpose, revision FROM executions WHERE execution_id = %s",
+                (event.payload["execution_id"],),
+            )
+        ).fetchone()
+    assert row is not None, "the rejection must reference a stored execution"
+    return row
+
+
+async def test_a_green_released_after_reopening_but_before_the_new_red_is_still_recorded(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    repository = tmp_path / "subject"
+    behaviours, first_red = await released_to_builder(database, repository, runner_image)
+    candidate = publish_attempt(
+        repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=first_red
+    )
+    held = HeldAtABarrier(ContainerIsolation(runner_image))
+    in_flight = asyncio.create_task(
+        Behaviours(database, ProcessOracle(held)).run_green(PROJECT, "B1", attempt=1)
+    )
+    await held.observed.wait()
+
+    await behaviours.reopen_red(PROJECT, "B1", reason="trunk moved")
+    held.release.set()
+    verdict = await in_flight
+
+    assert verdict.rejection is GreenRejection.RED_SUPERSEDED
+    assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.VALIDATING_RED
+    rejected = await last_event(database)
+    assert rejected.event_type == "behaviour.green_rejected"
+    assert rejected.payload["rejection"] == "red_superseded"
+    assert await execution_named_by(database, rejected) == {
+        "purpose": "green",
+        "revision": candidate,
+    }
+
+
+async def test_a_red_released_after_the_replacement_red_was_accepted_is_still_recorded(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    repository = tmp_path / "subject"
+    old_trunk = commit(repository, {"vat.py": VAT_RETURNS_NET})
+    behaviours = Behaviours(database, ProcessOracle(ContainerIsolation(runner_image)))
+    await behaviours.open_project(PROJECT, str(repository))
+    await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
+    await behaviours.begin_test_design(PROJECT, "B1")
+    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
+    held = HeldAtABarrier(ContainerIsolation(runner_image))
+    late = asyncio.create_task(Behaviours(database, ProcessOracle(held)).run_red(PROJECT, "B1"))
+    await held.observed.wait()
+
+    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    await behaviours.reopen_red(PROJECT, "B1", reason="trunk moved")
+    new_trunk = commit(repository, {"README.md": "trunk moved on"})
+    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    held.release.set()
+    verdict = await late
+
+    assert verdict.rejection is RedRejection.SUPERSEDED
+    assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
+    rejected = await last_event(database)
+    assert rejected.event_type == "behaviour.red_rejected"
+    assert rejected.payload["rejection"] == "superseded"
+    assert await execution_named_by(database, rejected) == {"purpose": "red", "revision": old_trunk}
+    async with database.connection() as connection:
+        paired = await (
+            await connection.execute(
+                "SELECT e.revision FROM behaviours b "
+                "JOIN executions e ON e.execution_id = b.red_execution_id"
+            )
+        ).fetchone()
+    assert paired == {"revision": new_trunk}
+    assert len(await pending_messages(database)) == 2
