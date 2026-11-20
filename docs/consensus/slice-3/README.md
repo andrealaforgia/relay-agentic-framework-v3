@@ -18,6 +18,20 @@ Design v2 with the v2.1 amendments is the basis for 3a-i. Two findings (S3-2.4 h
 | 2 | CHALLENGE, 2 blocking | A behaviour with no criterion reaching trunk and stranding its story; a proposal's row and ledger event disagreeing |
 | 3 | ACCEPT_WITH_RESERVATIONS | The deadlock tests could be released by another test's lock wait (since closed: they now look only at their own connections) |
 
+## Slice 3a-ii, design
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 7 | CHALLENGE, 10 blocking across four steps | Closure recorded on stories deadlocks against release and misses a feature with no stories; pause and cancel not told apart; no boundary between starting work and recording it; a refused delivery lost; an interrupted batch stranded. Five more for the later steps. |
+| 8 | CHALLENGE, 5 blocking | A grant outliving its consumer; an obsolete build command becoming valid again; resume missing work that has no command; an older retry displacing newer checks; "nothing is delivered" undefined |
+| 9 | CHALLENGE, 4 blocking | A review granted before a pause stranded after resume; closure rules dropped by an amendment that "replaced" sections; a late green answering a replacement assignment; re-announcement undefined after Redis is emptied |
+| 10 | CHALLENGE, 3 blocking | Three restart cases with work in flight, for which Astra supplied the wording |
+| 11 | ACCEPT | Nothing new |
+
+The agreed design for step 1 (pause, resume, cancel) is `round-10-claude-3a-ii-step-1-design-v3.md`, which stands alone. Carried to the design rounds of the later steps: S3-4.6 and S3-4.7 (step 2, questions and decisions), S3-4.8 and S3-4.9 (step 3, corrections), S3-4.10 (step 4, feature completion).
+
+What this design round showed: the first two drafts inferred what work was owed from queued messages and behaviour state. Recording it (an assignment with a grant that has an identity) answered five findings at once.
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.
