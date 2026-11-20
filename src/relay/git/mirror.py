@@ -19,8 +19,8 @@ from relay.git.checkout import (
     RemoteRejected,
     RemoteUnavailable,
     git,
+    git_answers_yes,
     git_result,
-    git_succeeds,
     leave_only_the_tracked_files,
 )
 
@@ -50,7 +50,7 @@ class Mirror:
                 raise CheckoutFailed("the candidate is not a commit")
             await self._git("update-ref", f"{_PINS}/{expected}", expected)
         finally:
-            await git_succeeds("-C", str(self._path), "update-ref", "-d", scratch)
+            await self._discard(scratch)
 
     async def recover(self, repository: str, commit: str, refs: Sequence[str]) -> bool:
         """Make sure this exact commit is pinned, fetching it if need be from any of the
@@ -75,14 +75,11 @@ class Mirror:
                 unfinished = failure
                 continue
             try:
-                is_a_commit = await git_succeeds(
-                    "-C", str(self._path), "cat-file", "-e", f"{commit}^{{commit}}"
-                )
-                if is_a_commit and await self.descends(scratch, commit):
+                if await self._is_a_commit(commit) and await self.descends(scratch, commit):
                     await self._git("update-ref", f"{_PINS}/{commit}", commit)
                     return True
             finally:
-                await git_succeeds("-C", str(self._path), "update-ref", "-d", scratch)
+                await self._discard(scratch)
         if unfinished is not None:
             raise RemoteUnavailable(str(unfinished))
         return False
@@ -91,7 +88,7 @@ class Mirror:
         """Whether this commit is pinned here, and so safe from pruning. An object that
         merely happens to be present is not held."""
         _require_hash(commit)
-        return self._path.exists() and await git_succeeds(
+        return self._path.exists() and await git_answers_yes(
             "-C",
             str(self._path),
             "rev-parse",
@@ -101,9 +98,24 @@ class Mirror:
         )
 
     async def descends(self, commit: str, ancestor: str) -> bool:
-        return await git_succeeds(
+        """Whether `ancestor` is in the history of `commit`. A commit this mirror does not
+        have at all cannot be in the history of one it has fetched in full."""
+        if not await self._is_a_commit(ancestor):
+            return False
+        return await git_answers_yes(
             "-C", str(self._path), "merge-base", "--is-ancestor", ancestor, commit
         )
+
+    async def _is_a_commit(self, revision: str) -> bool:
+        # `cat-file -e` on a bare hash exits 1 when the object is absent, which is a real
+        # no. Asking for "<hash>^{commit}" would exit with an error for the same case.
+        if not await git_answers_yes("-C", str(self._path), "cat-file", "-e", revision):
+            return False
+        return await self._git("cat-file", "-t", revision) == "commit"
+
+    async def _discard(self, scratch: str) -> None:
+        """Remove a scratch ref. Failing to tidy up is not a reason to fail the operation."""
+        await git_result("-C", str(self._path), "update-ref", "-d", scratch)
 
     async def export(self, commit: str, into: Path) -> Path:
         """Exactly the tracked tree of a pinned commit, as the oracle and reviewers see it."""
@@ -135,9 +147,14 @@ class Mirror:
             flag, _, rest = line.partition("\t")
             refs, _, summary = rest.partition("\t")
             if flag == "!" and refs.endswith(f":{ref}"):
-                if "[remote rejected]" in summary:
+                if summary.startswith("[remote rejected]"):
                     raise RemoteRejected(f"{summary.strip()} {detail}".strip())
-                raise CheckoutFailed(f"the push was not accepted: {summary.strip()}")
+                if summary.startswith("[rejected]"):
+                    # Refused on this side: the lease found the ref already present.
+                    raise CheckoutFailed(f"the push was not accepted: {summary.strip()}")
+                # Anything else, "[remote failure]" above all, means the remote did not
+                # report what happened. The push may or may not have taken effect.
+                raise RemoteUnavailable(f"git push: {summary.strip()} {detail}".strip())
         raise RemoteUnavailable(f"git push failed: {detail}")
 
     async def _ensure_exists(self) -> None:

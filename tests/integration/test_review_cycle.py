@@ -19,6 +19,7 @@ from relay.application.behaviours import Behaviours
 from relay.application.reviews import NewFinding, Review, Reviews, UnknownCapability
 from relay.domain.behaviour import BehaviourState
 from relay.domain.review import Carried, Severity, SubmissionRefused
+from relay.git import mirror as mirror_module
 from relay.git.checkout import CheckoutFailed, RemoteUnavailable
 from relay.git.mirror import Mirror
 from relay.persistence.ledger import read_events
@@ -828,3 +829,87 @@ async def test_an_unforeseen_git_failure_defers_the_cycle_instead_of_stopping_th
 
     assert await world.cycle_states() == ["open"]
     assert "nobody classified" in (await cycle_row(world))["deferred_reason"]
+
+
+async def test_a_pending_candidate_that_is_truly_gone_is_blocked_once_not_left_pending(
+    world: World,
+) -> None:
+    candidate = await world.green_candidate()
+    shutil.rmtree(world.mirrors)
+    publish_attempt(
+        world.repository, "B1", 1, {"vat.py": "print('moved')\n"}, on=world.red_revision
+    )
+
+    assert await world.reviews.publish_candidates() == 0
+    assert await world.reviews.publish_candidates() == 0
+
+    blocked = await cycle_row(world)
+    assert (blocked["state"], blocked["publication"]) == ("blocked", "pending")
+    assert "can no longer be obtained" in blocked["blocked_reason"]
+    assert await world.state() is BehaviourState.BLOCKED
+    assert (await world.events()).count("review.cycle_blocked") == 1
+    assert await world.capabilities(candidate) == {}
+
+
+async def test_an_ancestry_check_that_fails_defers_instead_of_declaring_the_commit_lost(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = await world.green_candidate()
+    shutil.rmtree(world.mirrors)
+    real = mirror_module.git_answers_yes
+
+    async def object_store_error(*arguments: str) -> bool:
+        if "merge-base" in arguments:
+            raise CheckoutFailed("git merge-base failed: fatal: unable to read object")
+        return await real(*arguments)
+
+    monkeypatch.setattr(mirror_module, "git_answers_yes", object_store_error)
+    assert await world.reviews.publish_candidates() == 0
+
+    assert await world.cycle_states() == ["open"]
+    assert "unable to read object" in (await cycle_row(world))["deferred_reason"]
+
+    monkeypatch.setattr(mirror_module, "git_answers_yes", real)
+    assert await world.reviews.publish_candidates() == 1
+    assert world.remote_ref(await candidate_ref_of(world)) == candidate
+
+
+async def test_a_push_of_unknown_outcome_that_left_no_ref_is_retried_not_blocked(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = await world.green_candidate()
+    real_result = mirror_module.git_result
+
+    async def remote_did_not_report(*arguments: str, **options: Any) -> tuple[int, bytes, str]:
+        if "push" in arguments:
+            destination = arguments[-1]
+            status = f"!\t{destination}\t[remote failure] (remote failed to report status)\n"
+            return 1, status.encode(), "error: failed to push some refs"
+        return await real_result(*arguments, **options)
+
+    monkeypatch.setattr(mirror_module, "git_result", remote_did_not_report)
+    assert await world.reviews.publish_candidates() == 0
+
+    assert await world.cycle_states() == ["open"]
+    assert "remote failure" in (await cycle_row(world))["deferred_reason"]
+    assert await world.capabilities(candidate) == {}
+
+    monkeypatch.setattr(mirror_module, "git_result", real_result)
+    assert await world.reviews.publish_candidates() == 1
+    assert sorted(await world.capabilities(candidate)) == ["qa", "sentinel"]
+
+
+async def test_a_push_reported_as_already_there_while_the_ref_is_absent_is_retried_not_blocked(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await world.green_candidate()
+
+    async def claims_the_ref_exists(self: Mirror, repository: str, commit: str, ref: str) -> None:
+        raise CheckoutFailed("the push was not accepted: [rejected] (stale info)")
+
+    monkeypatch.setattr(Mirror, "publish", claims_the_ref_exists)
+
+    assert await world.reviews.publish_candidates() == 0
+
+    assert await world.cycle_states() == ["open"]
+    assert "still absent" in (await cycle_row(world))["deferred_reason"]

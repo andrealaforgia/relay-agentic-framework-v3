@@ -221,7 +221,10 @@ class Reviews:
                     raise
                 except CheckoutFailed:
                     pass  # the ref appeared meanwhile; what it names is checked next
-            if await resolve_ref(repository, ref) != commit:
+            published_as = await resolve_ref(repository, ref)
+            if published_as is None:
+                raise RemoteUnavailable("the candidate ref is still absent after the push")
+            if published_as != commit:
                 await self._block(cycle["cycle_id"], "the candidate ref names another commit")
                 return 0
         except RemoteUnavailable as unavailable:
@@ -366,7 +369,11 @@ class Reviews:
         attempts = await refs_under(
             record["repository"], f"refs/relay/attempts/{project_id}/{behaviour_id}/"
         )
-        published = [record["candidate_ref"]] if record.get("candidate_ref") else []
+        # The cycle knows the candidate ref's name from the start, but the ref exists only
+        # once published. Searching a ref that is not there would look like an unfinished
+        # search and leave a commit that is truly gone pending for ever.
+        named = record.get("candidate_ref")
+        published = [named] if named and await resolve_ref(record["repository"], named) else []
         return await self._mirror(project_id).recover(
             record["repository"], record["candidate_revision"], [*published, *sorted(attempts)]
         )

@@ -201,12 +201,18 @@ def _entries_on_disk(root: bytes, prefix: bytes, directories: list[bytes]) -> di
     return found
 
 
-async def git_succeeds(*arguments: str) -> bool:
-    try:
-        await git(*arguments)
-    except CheckoutFailed:
-        return False
-    return True
+async def git_answers_yes(*arguments: str) -> bool:
+    """Ask Git a yes-or-no question. True when it exits 0, False when it exits 1, which
+    is how Git says no. Any other exit is Git failing to answer and is raised: "could not
+    find out" must never be mistaken for "no"."""
+    status, _, detail = await git_result(*arguments)
+    if status not in (0, 1):
+        raise CheckoutFailed(f"git {_subcommand(arguments)} failed: {detail}")
+    return status == 0
+
+
+def _subcommand(arguments: tuple[str, ...]) -> str:
+    return arguments[2] if arguments[:1] == ("-C",) and len(arguments) > 2 else arguments[0]
 
 
 async def git(*arguments: str, redact: str | None = None) -> str:
