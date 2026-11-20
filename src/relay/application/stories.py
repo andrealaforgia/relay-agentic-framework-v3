@@ -11,7 +11,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 
@@ -476,6 +476,9 @@ async def close_feature(pool: Pool, project_id: str, action: HumanAction) -> Rec
     require_human(action.principal)
     require_well_formed(action, ON_A_FEATURE)
     feature_id = action.target
+    # A feature's id is its project's own. The receipt is for this project's feature, so
+    # the same request sent to another project is a different action, not a replay.
+    action = replace(action, target=f"{project_id}/{feature_id}")
     async with pool.connection() as connection, connection.transaction():
         await lock_gate(connection, project_id, exclusive=True)
         await _locked_project(connection, project_id)
@@ -596,6 +599,15 @@ async def _cancel(connection: Connection, project_id: str, feature_id: str) -> N
     ).fetchall()
     for gate in open_gates:
         await _close_gate(connection, gate, "superseded", "superseded")
+    # Checks a pause was holding will never be taken up now.
+    await connection.execute(
+        "UPDATE check_batches SET state = 'abandoned', "
+        "reason = 'the feature was cancelled while these checks were held' "
+        "WHERE project_id = %s AND state = 'held' AND behaviour_id IN "
+        "(SELECT b.behaviour_id FROM behaviours b JOIN stories s USING (project_id, story_id) "
+        "WHERE b.project_id = %s AND s.feature_id = %s)",
+        (project_id, project_id, feature_id),
+    )
 
 
 def _require_role(principal: Principal, role: str) -> None:

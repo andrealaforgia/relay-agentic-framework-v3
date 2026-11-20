@@ -13,7 +13,7 @@ from relay.domain.evidence import ProcessContract
 from relay.domain.review import Severity
 from relay.domain.story import HumanAction, Receipt, StoryState
 from tests.integration.fixtures import ANALYST, CONTRACT, PRODUCT_OWNER, VERIFIER
-from tests.integration.trunk_world import PROJECT, TrunkWorld
+from tests.integration.trunk_world import TrunkWorld
 
 STANDARD_RATE = StoryDraft(
     "S1", "Standard rate", "a gross price is shown", {"AC1": "100 net is shown as 120"}
@@ -41,13 +41,15 @@ class StoryWorld(TrunkWorld):
         await self.behaviours.open_project(self.project, address)
 
     async def roadmap(self, *stories: StoryDraft, feature: str = "F1") -> uuid.UUID:
-        await self.stories.open_feature(PRODUCT_OWNER, PROJECT, feature, "prices need VAT")
-        return await self.stories.publish_roadmap(ANALYST, PROJECT, feature, list(stories))
+        await self.stories.open_feature(PRODUCT_OWNER, self.project, feature, "prices need VAT")
+        return await self.stories.publish_roadmap(ANALYST, self.project, feature, list(stories))
 
     async def decide(self, gate: uuid.UUID, action: str = "approve", **payload: str) -> Receipt:
         self.requests += 1
         return await self.stories.decide(
-            HumanAction(PRODUCT_OWNER, f"request-{self.requests}", str(gate), action, payload)
+            HumanAction(
+                PRODUCT_OWNER, f"{self.project}-request-{self.requests}", str(gate), action, payload
+            )
         )
 
     async def deliver(
@@ -64,29 +66,31 @@ class StoryWorld(TrunkWorld):
         return candidate
 
     async def seal(self, story: str = "S1") -> None:
-        revision, listed = await self.stories.revisions_of(PROJECT, story)
+        revision, listed = await self.stories.revisions_of(self.project, story)
         await self.stories.seal(
-            VERIFIER, PROJECT, story, story_revision=revision, list_revision=listed
+            VERIFIER, self.project, story, story_revision=revision, list_revision=listed
         )
 
     async def assess(self, statement: str, story: str = "S1") -> None:
-        revision, listed = await self.stories.revisions_of(PROJECT, story)
+        revision, listed = await self.stories.revisions_of(self.project, story)
         await self.stories.assess(
-            ANALYST, PROJECT, story, statement, story_revision=revision, list_revision=listed
+            ANALYST, self.project, story, statement, story_revision=revision, list_revision=listed
         )
 
     async def story(self, story: str = "S1") -> StoryState:
-        return await self.stories.state_of(PROJECT, story)
+        return await self.stories.state_of(self.project, story)
 
     async def gate(self) -> uuid.UUID:
-        [item] = await self.stories.inbox(PROJECT)
+        [item] = await self.stories.inbox(self.project)
         return item.gate_id
 
     async def close(self, action: str, feature: str = "F1", **payload: str) -> Receipt:
         self.requests += 1
         return await self.features.close(
-            PROJECT,
-            HumanAction(PRODUCT_OWNER, f"request-{self.requests}", feature, action, payload),
+            self.project,
+            HumanAction(
+                PRODUCT_OWNER, f"{self.project}-request-{self.requests}", feature, action, payload
+            ),
         )
 
 

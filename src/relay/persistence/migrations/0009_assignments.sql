@@ -42,3 +42,8 @@ CREATE TABLE green_runs (
 ALTER TABLE review_tasks ADD COLUMN assignment_id uuid REFERENCES assignments;
 
 CREATE INDEX assignments_by_command ON assignments (command_message_id);
+
+-- The grant under which the tree was handed over. A first submission needs a checkout
+-- made under the review's current grant: a tree given to a worker that is gone is
+-- history, not a licence for whoever holds the capability next.
+ALTER TABLE review_checkouts ADD COLUMN grant_id uuid;

@@ -9,10 +9,14 @@ from __future__ import annotations
 
 from relay.application.assignments import announce_again, revoke_every_grant
 from relay.application.closure import lock_gate
-from relay.application.integration import Integration, hand_on_unfinished_batches
+from relay.application.integration import (
+    Integration,
+    IntegrationRefused,
+    hand_on_unfinished_batches,
+)
 from relay.application.reviews import Reviews
 from relay.application.stories import close_feature
-from relay.domain.story import HumanAction, Receipt
+from relay.domain.story import ActionRefused, HumanAction, Receipt
 from relay.git.checkout import CheckoutFailed
 from relay.persistence.database import Pool
 
@@ -64,5 +68,8 @@ class Features:
         for integration in owed:
             try:
                 await self._integration.continue_integration(integration["assignment_id"])
-            except CheckoutFailed:
-                continue  # the repository could not be read; the next pass tries again
+            except CheckoutFailed, ActionRefused, IntegrationRefused:
+                # The repository could not be read, or the feature is closed (it may
+                # have been closed a moment ago), or this process cannot observe checks. The integration stays
+                # owed; the pass, and the other projects, carry on.
+                continue

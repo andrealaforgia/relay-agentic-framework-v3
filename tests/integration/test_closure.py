@@ -474,3 +474,21 @@ async def test_a_pause_waits_for_a_retry_that_was_admitted_before_it(
     with pytest.raises(IntegrationRefused, match="no failed integration"):
         await retrying
     assert (await pausing).disposition == "effective"
+
+
+async def test_a_request_id_used_in_one_project_acknowledges_nothing_in_another(
+    world: StoryWorld, database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    (tmp_path / "other").mkdir()
+    other = StoryWorld(database, tmp_path / "other", runner_image, project="zeta")
+    await other.open()
+    await other.roadmap(STANDARD_RATE)
+    await world.roadmap(STANDARD_RATE)
+    cancel = HumanAction(PRODUCT_OWNER, "c1", "F1", "cancel", {"reason": "dropped"})
+    first = await world.features.close(PROJECT, cancel)
+
+    with pytest.raises(ActionRefused, match="already used"):
+        await other.features.close("zeta", cancel)
+
+    assert await world.features.close(PROJECT, cancel) == first == Receipt("effective", "cancelled")
+    assert await world.column("SELECT closed_by FROM features WHERE project_id = 'zeta'") == [None]

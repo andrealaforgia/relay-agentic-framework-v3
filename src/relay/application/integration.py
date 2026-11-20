@@ -152,11 +152,7 @@ class Integration:
         ActionRefused: the behaviour's story is not being worked on, so nothing may start.
         IntegrationRefused: the story is open but this candidate is not ready."""
         require_identifier("request", request_id)
-        if not is_gate_bearing(self._oracle.isolation.name):
-            raise IntegrationRefused(
-                f"{self._oracle.isolation.name} execution cannot open a gate; "
-                "checks must be observed in a container"
-            )
+        self._require_gate_bearing_checks()
         async with self._pool.connection() as connection:
             earlier = await _batch_of_request(connection, project_id, behaviour_id, request_id)
             source = await (
@@ -178,6 +174,7 @@ class Integration:
         restart: start the next generation of the same request, if what it would
         continue is still the latest batch of the behaviour's live, satisfied cycle.
         Otherwise the assignment is retired and nothing starts."""
+        self._require_gate_bearing_checks()
         async with self._pool.connection() as connection:
             owed = await (
                 await connection.execute(
@@ -201,6 +198,14 @@ class Integration:
                 successor=assignment_id,
             )
         )
+
+    def _require_gate_bearing_checks(self) -> None:
+        """Before anything is taken up or launched, by either way in."""
+        if not is_gate_bearing(self._oracle.isolation.name):
+            raise IntegrationRefused(
+                f"{self._oracle.isolation.name} execution cannot open a gate; "
+                "checks must be observed in a container"
+            )
 
     async def _finish(self, started: dict[str, Any] | IntegrationReceipt) -> IntegrationReceipt:
         if isinstance(started, IntegrationReceipt):
@@ -410,7 +415,23 @@ class Integration:
         return executions
 
     async def _abandon(self, batch_id: uuid.UUID) -> None:
-        async with self._pool.connection() as connection:
+        """The checks could not be completed. A first generation was asked for by a
+        caller, who is told and may ask again. A later generation was taken up by the
+        control plane on nobody's request, so the integration stays owed."""
+        async with self._pool.connection() as connection, connection.transaction():
+            batch = await (
+                await connection.execute(
+                    "SELECT project_id, behaviour_id, generation FROM check_batches "
+                    "WHERE batch_id = %s",
+                    (batch_id,),
+                )
+            ).fetchone()
+            assert batch is not None
+            if batch["generation"] > 1:
+                await _close_unfinished(
+                    connection, batch["project_id"], batch["behaviour_id"], batch_id, "running"
+                )
+                return
             await connection.execute(
                 "UPDATE check_batches SET state = 'abandoned', "
                 "reason = 'the checks could not be completed' "
@@ -908,46 +929,59 @@ async def hand_on_unfinished_batches(
     unfinished = await (
         await connection.execute(
             "SELECT k.batch_id, k.behaviour_id, k.state FROM check_batches k "
-            "WHERE k.project_id = %s AND k.state = ANY(%s) ORDER BY k.created_at, k.batch_id",
+            "WHERE k.project_id = %s AND k.state = ANY(%s) ORDER BY k.registered",
             (project_id, ["held", "running"] if starting else ["held"]),
         )
     ).fetchall()
     for found in unfinished:
-        _, row = await _locked_behaviour(connection, project_id, found["behaviour_id"])
-        batch = await (
-            await connection.execute(
-                "SELECT * FROM check_batches WHERE batch_id = %s AND state = %s FOR UPDATE",
-                (found["batch_id"], found["state"]),
-            )
-        ).fetchone()
-        closed_by = await closure_of_behaviour(connection, project_id, found["behaviour_id"])
-        if batch is None or (closed_by is not None and batch["state"] == "held"):
-            continue
-        if closed_by is not None:
-            state = "abandoned" if closed_by == CANCELLED else "held"
-            await _close_batch(
-                connection, batch, state, f"the process running these checks ended; {closed_by}"
-            )
-            continue
+        await _close_unfinished(
+            connection, project_id, found["behaviour_id"], found["batch_id"], found["state"]
+        )
+
+
+async def _close_unfinished(
+    connection: Connection, project_id: str, behaviour_id: str, batch_id: uuid.UUID, state: str
+) -> None:
+    """Close one batch that will not decide anything, if it is still in `state`, by what
+    its feature now is: open, an integration is owed in its place; paused, it is held;
+    cancelled, it is abandoned."""
+    _, row = await _locked_behaviour(connection, project_id, behaviour_id)
+    batch = await (
+        await connection.execute(
+            "SELECT * FROM check_batches WHERE batch_id = %s AND state = %s FOR UPDATE",
+            (batch_id, state),
+        )
+    ).fetchone()
+    closed_by = await closure_of_behaviour(connection, project_id, behaviour_id)
+    if batch is None or (closed_by is not None and state == "held"):
+        return
+    if closed_by is not None:
         await _close_batch(
-            connection, batch, "interrupted", "these checks did not get to decide; to be run again"
-        )
-        await owe(
             connection,
-            INTEGRATE,
-            Envelope(
-                message_kind=MessageKind.COMMAND,
-                event_type="integration.requested",
-                project_id=project_id,
-                behaviour_id=found["behaviour_id"],
-                sender=CONTROL_PLANE,
-                recipient="integrator",
-                idempotency_key=f"integrate:{batch['batch_id']}",
-                correlation_id=row["correlation_id"],
-                payload={"batch_id": str(batch["batch_id"]), "request_id": batch["request_id"]},
-            ),
-            issued_on={"batch_id": str(batch["batch_id"]), "cycle_id": str(batch["cycle_id"])},
+            batch,
+            "abandoned" if closed_by == CANCELLED else "held",
+            f"these checks did not get to decide, and the feature is {closed_by}",
         )
+        return
+    await _close_batch(
+        connection, batch, "interrupted", "these checks did not get to decide; to be run again"
+    )
+    await owe(
+        connection,
+        INTEGRATE,
+        Envelope(
+            message_kind=MessageKind.COMMAND,
+            event_type="integration.requested",
+            project_id=project_id,
+            behaviour_id=behaviour_id,
+            sender=CONTROL_PLANE,
+            recipient="integrator",
+            idempotency_key=f"integrate:{batch['batch_id']}",
+            correlation_id=row["correlation_id"],
+            payload={"batch_id": str(batch["batch_id"]), "request_id": batch["request_id"]},
+        ),
+        issued_on={"batch_id": str(batch["batch_id"]), "cycle_id": str(batch["cycle_id"])},
+    )
 
 
 async def _parent_to_succeed(
@@ -977,7 +1011,7 @@ async def _parent_to_succeed(
     latest = await (
         await connection.execute(
             "SELECT batch_id FROM check_batches WHERE cycle_id = %s "
-            "ORDER BY created_at DESC, batch_id DESC LIMIT 1",
+            "ORDER BY registered DESC LIMIT 1",
             (cycle["cycle_id"] if cycle else None,),
         )
     ).fetchone()

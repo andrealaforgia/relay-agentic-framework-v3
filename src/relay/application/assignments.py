@@ -238,6 +238,10 @@ class Assignments:
                 )
             ).fetchone()
             assert assignment is not None
+            if assignment["kind"] == INTEGRATE:
+                # Its grant and its first effect are made together, by the control plane.
+                # A grant on its own would leave the checks never started.
+                raise ActionRefused("the control plane takes up integrations itself")
             if principal.kind is not PrincipalKind.WORKER or principal.role != assignment["role"]:
                 raise ActionRefused(f"this work is for a {assignment['role']} to claim")
             project_id, behaviour_id = assignment["project_id"], assignment["behaviour_id"]

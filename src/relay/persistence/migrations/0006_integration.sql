@@ -40,6 +40,10 @@ CREATE TABLE check_batches (
     -- that was held by a pause or cut short by a restart is succeeded by the next
     -- generation of the same request, and the request is answered from the latest.
     generation           integer NOT NULL DEFAULT 1,
+    -- The order in which batches were registered. A batch is inserted under its
+    -- behaviour's lock, so for one behaviour this is the order of the locks, which
+    -- created_at (the start of the transaction) is not.
+    registered           bigserial NOT NULL,
     UNIQUE (project_id, behaviour_id, request_id, generation)
 );
 

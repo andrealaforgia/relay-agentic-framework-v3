@@ -13,23 +13,30 @@ from typing import Any
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
+from relay.application import integration as integration_module
 from relay.application.assignments import Assignments, announce_again
 from relay.application.behaviours import Behaviours
 from relay.application.features import Features
-from relay.application.integration import Integration, Outcome, hand_on_unfinished_batches
-from relay.application.reviews import Review, Reviews
-from relay.application.stories import close_feature
+from relay.application.integration import (
+    Integration,
+    IntegrationRefused,
+    Outcome,
+    hand_on_unfinished_batches,
+)
+from relay.application.reviews import Review, Reviews, SubmissionRefused
+from relay.application.stories import StoryDraft, close_feature
 from relay.domain.behaviour import BehaviourState
 from relay.domain.story import ActionRefused, HumanAction, Principal, PrincipalKind
 from relay.git.checkout import RemoteUnavailable
 from relay.git.mirror import Mirror
 from relay.persistence.outbox import OutboxPublisher
-from relay.testing.oracle import ContainerIsolation, ProcessOracle
+from relay.testing.oracle import ContainerIsolation, NativeIsolation, ProcessOracle
 from relay.transport.streams import Streams
 from tests.integration.fixtures import (
     BUILDER,
     PRODUCT_OWNER,
     VAT_APPLIES_STANDARD_RATE,
+    CountingLaunches,
     HeldAtABarrier,
     held_at_the_barrier,
     run_green,
@@ -155,7 +162,7 @@ async def checks_in_flight(
 async def batches(world: StoryWorld) -> list[object]:
     return await world.column(
         "SELECT request_id || ':' || generation || ':' || state FROM check_batches "
-        "ORDER BY created_at, batch_id"
+        "ORDER BY registered"
     )
 
 
@@ -359,6 +366,9 @@ async def test_a_review_checked_out_by_a_process_that_died_is_granted_afresh_and
 
     await restarted(world).start()
 
+    with pytest.raises(SubmissionRefused, match="no tree was prepared"):
+        # The tree the dead worker was given is nobody's now.
+        await world.reviews.submit_review(task["capability"], Review())
     with pytest.raises(ActionRefused, match="not the current one"):
         await world.reviews.prepare_review(task["capability"], world.tmp_path / "late", before)
     after = await claims.claim(
@@ -442,3 +452,185 @@ async def test_a_command_already_on_its_way_when_a_pause_lands_cannot_be_claimed
 
     await world.close("resume")
     await Assignments(world.database).claim(BUILDER, build)
+
+
+async def integrations_owed(world: StoryWorld) -> list[object]:
+    return await world.column(
+        "SELECT state FROM assignments WHERE kind = 'integrate' AND project_id = "
+        f"'{world.project}' ORDER BY created_at"
+    )
+
+
+async def test_an_integration_is_not_taken_up_where_its_checks_could_open_no_gate(
+    world: StoryWorld,
+) -> None:
+    candidate, owed = await held_then_resumed_without_the_pass(world)
+    native = CountingLaunches(NativeIsolation())
+
+    with pytest.raises(IntegrationRefused, match="container"):
+        await world.integration_with(native).continue_integration(owed)
+
+    await Features(world.database, world.reviews, world.integration_with(native)).reconcile(
+        PROJECT
+    )  # a pass in such a process leaves it owed, and is not stopped by it
+    assert native.launches == 0
+    assert await integrations_owed(world) == ["wanted"]
+    assert await batches(world) == ["first:1:interrupted"]
+    assert (await world.integration.continue_integration(owed)).outcome is Outcome.INTEGRATED
+    assert world.trunk() == candidate
+
+
+async def test_no_worker_can_claim_an_integration_the_control_plane_takes_up_itself(
+    world: StoryWorld,
+) -> None:
+    candidate, owed = await held_then_resumed_without_the_pass(world)
+    integrator = Principal(PrincipalKind.WORKER, "worker-integrator", role="integrator")
+
+    with pytest.raises(ActionRefused, match="control plane"):
+        await Assignments(world.database).claim(integrator, owed)
+
+    await world.features.reconcile(PROJECT)
+    assert await batches(world) == ["first:1:interrupted", "first:2:authorised"]
+    assert world.trunk() == candidate
+
+
+async def test_starting_leaves_a_paused_features_integration_waiting_and_sees_to_the_rest(
+    world: StoryWorld, database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    (tmp_path / "later").mkdir()
+    later = StoryWorld(database, tmp_path / "later", runner_image, project="zeta")
+    await later.open()
+    await later.decide(await later.roadmap(STANDARD_RATE))
+    await later.awaiting_builder("B1")
+    [build] = await world.column("SELECT assignment_id FROM assignments WHERE project_id = 'zeta'")
+    assert isinstance(build, uuid.UUID)
+    await Assignments(database).claim(BUILDER, build)
+    candidate, _ = await held_then_resumed_without_the_pass(world)
+    await world.close("pause", reason="again")
+
+    await restarted(world).start()
+
+    assert await integrations_owed(world) == ["wanted"]
+    assert await world.column("SELECT state FROM assignments WHERE project_id = 'zeta'") == [
+        "wanted"
+    ]
+    await world.close("resume")
+    assert world.trunk() == candidate
+
+
+async def test_a_pause_that_lands_as_the_pass_takes_up_an_integration_does_not_stop_the_pass(
+    world: StoryWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate, _ = await held_then_resumed_without_the_pass(world)
+    real = Integration.continue_integration
+
+    async def paused_first(self: Integration, assignment_id: uuid.UUID) -> Any:
+        await world.close("pause", reason="just now")
+        return await real(self, assignment_id)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Integration, "continue_integration", paused_first)
+        await world.features.reconcile(PROJECT)
+
+    assert await integrations_owed(world) == ["wanted"]
+    await world.close("resume")
+    assert world.trunk() == candidate
+
+
+async def test_an_integration_cut_short_while_it_was_being_taken_up_is_still_owed(
+    world: StoryWorld,
+) -> None:
+    candidate, _ = await held_then_resumed_without_the_pass(world)
+    barrier = HeldAtABarrier(ContainerIsolation(world.image))
+    features = Features(world.database, world.reviews, world.integration_with(barrier))
+    passing = asyncio.create_task(features.reconcile(PROJECT))
+    await held_at_the_barrier(passing, barrier)
+
+    await killed(passing)  # an ordinary cancellation: the tidying up runs
+
+    assert await batches(world) == ["first:1:interrupted", "first:2:interrupted"]
+    assert await integrations_owed(world) == ["done", "wanted"]
+    await world.close("resume")  # changes nothing, and runs the pass
+    assert await batches(world) == [
+        "first:1:interrupted",
+        "first:2:interrupted",
+        "first:3:authorised",
+    ]
+    assert world.trunk() == candidate
+    assert await world.column("SELECT count(*) FROM integration_intents") == [1]
+
+
+async def test_the_latest_checks_are_the_ones_registered_last_not_the_ones_begun_last(
+    world: StoryWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One request opens its transaction first and reaches the behaviour second. It is
+    the later registration, it replaces the other's checks, and it is what a pause holds:
+    its successor must run, though its transaction is the older of the two."""
+    await world.integration.require_check(PROJECT, ZERO_STAYS_ZERO)
+    base = await world.awaiting_builder("B1")
+    candidate = await world.reviewed("B1", on=base)
+    opened, go_on = asyncio.Event(), asyncio.Event()
+    real = integration_module.lock_gate
+
+    async def first_caller_waits(connection: Any, project_id: str, **options: Any) -> None:
+        await real(connection, project_id, **options)
+        if not opened.is_set():
+            opened.set()
+            await go_on.wait()
+
+    monkeypatch.setattr(integration_module, "lock_gate", first_caller_waits)
+    slow_barrier = HeldAtABarrier(ContainerIsolation(world.image))
+    slow = asyncio.create_task(
+        world.integration_with(slow_barrier).integrate(PROJECT, "B1", "slow")
+    )
+    await opened.wait()
+    quick_barrier = HeldAtABarrier(ContainerIsolation(world.image))
+    quick = asyncio.create_task(
+        world.integration_with(quick_barrier).integrate(PROJECT, "B1", "quick")
+    )
+    await held_at_the_barrier(quick, quick_barrier)
+    go_on.set()
+    await held_at_the_barrier(slow, slow_barrier)
+    quick_barrier.release.set()
+    assert (await quick).outcome is Outcome.SUPERSEDED
+    await world.close("pause", reason="budget review")
+    slow_barrier.release.set()
+    assert (await slow).outcome is Outcome.HELD
+
+    await world.close("resume")
+
+    assert await batches(world) == ["quick:1:superseded", "slow:1:interrupted", "slow:2:authorised"]
+    assert world.trunk() == candidate
+
+
+async def test_checks_held_by_a_pause_are_abandoned_when_the_feature_is_then_cancelled(
+    world: StoryWorld,
+) -> None:
+    _, barrier, running = await checks_in_flight(world)
+    await world.close("pause", reason="budget review")
+    barrier.release.set()
+    await running
+
+    await world.close("cancel", reason="dropped after all")
+
+    assert await batches(world) == ["once:1:abandoned"]
+    again = await world.integration.integrate(PROJECT, "B1", "once")
+    assert again.outcome is Outcome.SUPERSEDED
+    assert "cancelled" in again.reason
+
+
+async def test_cancelling_one_feature_leaves_the_held_checks_of_another_alone(
+    world: StoryWorld,
+) -> None:
+    candidate, barrier, running = await checks_in_flight(world)
+    await world.close("pause", reason="budget review")
+    barrier.release.set()
+    await running
+    another = StoryDraft("T1", "Another feature", "something else", {"AC1": "it works"})
+    await world.roadmap(another, feature="F2")
+
+    await world.close("cancel", feature="F2", reason="dropped")
+
+    assert await batches(world) == ["once:1:held"]
+    await world.close("resume")
+    assert world.trunk() == candidate

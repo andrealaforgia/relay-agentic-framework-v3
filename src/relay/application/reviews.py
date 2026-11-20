@@ -491,8 +491,9 @@ class Reviews:
             )
             await start_review(connection, grant, task["assignment_id"])
             await connection.execute(
-                "INSERT INTO review_checkouts (receipt_id, task_id, revision) VALUES (%s, %s, %s)",
-                (uuid.uuid7(), task["task_id"], commit),
+                "INSERT INTO review_checkouts (receipt_id, task_id, revision, grant_id) "
+                "VALUES (%s, %s, %s, %s)",
+                (uuid.uuid7(), task["task_id"], commit, grant),
             )
         return tree
 
@@ -837,9 +838,13 @@ async def _locked_task(connection: Connection, task_id: uuid.UUID) -> dict[str, 
 
 
 async def _has_checkout(connection: Connection, task_id: uuid.UUID) -> bool:
+    """Whether a tree was handed over under the grant that holds this review now."""
     row = await (
         await connection.execute(
-            "SELECT 1 FROM review_checkouts WHERE task_id = %s LIMIT 1", (task_id,)
+            "SELECT 1 FROM review_checkouts c JOIN review_tasks t USING (task_id) "
+            "JOIN assignments a USING (assignment_id) WHERE c.task_id = %s "
+            "AND c.grant_id = a.grant_id LIMIT 1",
+            (task_id,),
         )
     ).fetchone()
     return row is not None
