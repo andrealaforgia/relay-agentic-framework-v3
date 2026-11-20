@@ -29,6 +29,7 @@ Reused only where aligned with the new specification.
 | Dispatcher (1612 lines), projection (1249 lines), state model | Reference only | Mined for transition guards; not ported. State in memory, restart by replay, a different entity model. |
 | Expectation protocol, corrections and repair layers | Discard | Not in the new specification. |
 | Bespoke `roles/*.md` | Discard | Superseded by the canonical `alf-*` definitions. |
+| `relay watch` (live board: liveness and behaviour states; `--events`; `--tokens`) | Port the views and their rendering; rewrite the data source | Required by PO-8: it is how the Product Owner observes the agents. The old one folds a Redis ledger; here the same facts are read from PostgreSQL (the ledger, assignments, the inbox). Arrives with slice 3c. |
 | Interactive interpreter (pty proxy, hooks, inbox, wake) | Discard | Workflow recovery must not depend on a provider session. |
 | Model verdict as the completion gate | Discard | Completion is decided by evidence and current reviews. |
 
@@ -84,7 +85,7 @@ Each slice is a vertical cut with executable acceptance tests against real Postg
 | 3a-i | Stories above behaviours; a roadmap gate and a story gate decided once, by a person, on the stored review; restart with an empty broker | 8, 14 | Accepted |
 | 3a-ii | Questions and changed decisions; corrections; pause and cancel; feature completion | 3 | Step 1 of 4 (pause, resume, cancel) built and reviewed in three rounds, the last fixes unreviewed; steps 2 to 4 not started |
 | 3b | Workers and the Claude adapter driving the canonical agents | 1 (in part) | |
-| 3c | CLI, the live session, packaging, usage instructions | 1 | |
+| 3c | CLI, including `relay watch` (PO-8); the live session; packaging; usage instructions | 1 | |
 | 4 | Two providers disagree across machines; round cap escalates | 2, 7 | |
 | 5 | Lost lease, late result, unknown paid call | 10, 11 | |
 | 6 | Bounded autonomy, budgets, pause and cancel | 8, 9 | |

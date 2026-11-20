@@ -12,6 +12,7 @@ Decisions made by Andrea. Model recommendations are noted where he chose differe
 | PO-5 | 2026-11-20 | **Gate-bearing runs use the local Docker engine.** Confirms M-1 below. | Native execution never opens a gate; every runner host needs a local Docker engine. |
 | PO-6 | 2026-11-20 | **Commit and push frequently to the GitHub remote** (`andrealaforgia/relay-agentic-framework-v3`, public). | Trunk is pushed after each green, committed step. |
 | PO-7 | 2026-11-20 | **Where a decision is the Product Owner's, Relay's build goes with Claude's recommendation.** Andrea's words: "For any decision you depend on me, go with anything you recommend". | Each such decision is recorded below as delegated, with the recommendation that was applied, so he can overturn it. Claude's reading, not his words: this does not cover destructive or irreversible actions, which are still confirmed first. |
+| PO-8 | 2026-11-20 | **`relay watch` is a requirement of slice 3c.** Andrea's words: "I rely on watch as way to observing how relay's agents are behaving, add it to 3c". | The CLI ships with a live board in the shape of the old one: liveness and behaviour states, the event log, and token spend per role. Its presentation is reused from the old Relay where it fits; its data comes from PostgreSQL, not from a Redis ledger. |
 
 Decided under PO-7 on 2026-11-20, each on Claude's recommendation:
 
