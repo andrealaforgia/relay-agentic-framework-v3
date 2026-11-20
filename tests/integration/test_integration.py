@@ -6,10 +6,11 @@ from __future__ import annotations
 import asyncio
 import shutil
 import subprocess
+import tempfile
 import uuid
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import pytest
 from psycopg_pool import AsyncConnectionPool
@@ -1141,9 +1142,11 @@ async def test_which_batch_is_settled_is_not_for_the_check_runner_to_say(
         assert await world.column("SELECT state FROM check_batches") == ["abandoned"]
 
 
-async def test_a_project_whose_candidate_cannot_be_fetched_does_not_hold_up_another(
+async def a_second_project_also_owed_a_push(
     world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
-) -> None:
+) -> tuple[TrunkWorld, str]:
+    """Both projects end with an authorised integration whose push never left, the first
+    project's being the older. Returns the second project and its candidate."""
     await ready_to_integrate(world)
     other = TrunkWorld(
         world.database,
@@ -1156,7 +1159,6 @@ async def test_a_project_whose_candidate_cannot_be_fetched_does_not_hold_up_anot
     other_base = await other.open()
     await other.awaiting_builder()
     other_candidate = await other.reviewed(on=other_base)
-    impatient = world.integration_with(push_timeout=1.0)
 
     async def dies(*_: Any, **__: Any) -> None:
         raise Crash
@@ -1166,6 +1168,14 @@ async def test_a_project_whose_candidate_cannot_be_fetched_does_not_hold_up_anot
         for each in (world, other):
             with pytest.raises(Crash):
                 await each.integrate()
+    return other, other_candidate
+
+
+async def test_a_project_whose_candidate_cannot_be_fetched_does_not_hold_up_another(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    other, other_candidate = await a_second_project_also_owed_a_push(world, monkeypatch)
+    impatient = world.integration_with(push_timeout=1.0)
     [stalled_ref] = await world.column(
         f"SELECT candidate_ref FROM review_cycles WHERE project_id = '{PROJECT}'"
     )
@@ -1201,3 +1211,45 @@ async def pinned_candidate(world: TrunkWorld) -> str:
         f"SELECT candidate_revision FROM integration_intents WHERE project_id = '{PROJECT}'"
     )
     return str(candidate)
+
+
+async def test_a_project_whose_git_output_cannot_be_closed_does_not_hold_up_another(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    other, other_candidate = await a_second_project_also_owed_a_push(world, monkeypatch)
+    real_file, real_launch = tempfile.TemporaryFile, subprocess.Popen
+    failing = {"now": False}
+
+    class ClosesBadlyForTheFirstProject:
+        def __init__(self) -> None:
+            self._file = real_file()
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            self._file.close()
+            if failing["now"]:
+                raise OSError(5, "Input/output error")
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._file, name)
+
+    def launch(command: list[str], **options: Any) -> Any:
+        failing["now"] = "fetch" in command and str(world.remote) in command
+        return real_launch(command, **options)
+
+    monkeypatch.setattr(checkout_module.tempfile, "TemporaryFile", ClosesBadlyForTheFirstProject)
+    monkeypatch.setattr(checkout_module.subprocess, "Popen", launch)
+
+    settled = await world.integration.reconcile()
+
+    assert settled == 1
+    assert other.trunk() == other_candidate
+    assert await world.column("SELECT state FROM integration_intents ORDER BY created_at") == [
+        "outstanding",
+        "integrated",
+    ]
+    assert await world.column(
+        f"SELECT sends_started FROM integration_intents WHERE project_id = '{PROJECT}'"
+    ) == [0]

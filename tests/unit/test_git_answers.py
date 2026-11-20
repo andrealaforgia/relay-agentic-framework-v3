@@ -75,16 +75,63 @@ async def test_no_error_from_the_launch_itself_is_read_as_git_not_having_run(
     assert not isinstance(raised.value, NotStarted)
 
 
-async def test_an_exit_status_nobody_could_collect_is_not_a_success() -> None:
-    """With child signals ignored the status of a finished Git is lost. Git here fails
-    (there is no such subcommand); that must never come back as exit status zero."""
+async def test_git_is_not_launched_where_its_exit_status_would_be_discarded() -> None:
+    """With child signals ignored the system reaps a finished Git by itself. Its status
+    is lost and its process id is free for reuse, so Relay refuses to launch at all."""
     assert (await git_result("no-such-subcommand"))[0] == 1
     previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
     try:
-        with pytest.raises(RemoteUnavailable, match="exit status could not be collected"):
+        with pytest.raises(NotStarted, match="discards its children"):
             await git_result("no-such-subcommand")
     finally:
         signal.signal(signal.SIGCHLD, previous)
+
+
+async def test_an_exit_status_someone_else_collected_is_not_a_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Git here fails (there is no such subcommand). If its status is taken by someone
+    else, that must never come back as exit status zero."""
+    real = os.waitpid
+
+    def taken_by_someone_else(pid: int, options: int) -> tuple[int, int]:
+        real(pid, 0)
+        raise ChildProcessError(10, "No child processes")
+
+    monkeypatch.setattr(checkout.os, "waitpid", taken_by_someone_else)
+
+    with pytest.raises(RemoteUnavailable, match="exit status could not be collected"):
+        await git_result("no-such-subcommand")
+
+
+@pytest.mark.parametrize("reaped_by", ["someone else", "the cleanup itself"])
+async def test_a_git_no_longer_running_when_its_caller_is_cancelled_is_sent_no_signal(
+    monkeypatch: pytest.MonkeyPatch, reaped_by: str
+) -> None:
+    """Once it has been reaped its process id may belong to something else."""
+    real = os.waitpid
+    asked = asyncio.Event()
+    signals: list[int] = []
+
+    def finished_meanwhile(pid: int, options: int) -> tuple[int, int]:
+        if not asked.is_set():
+            asked.set()
+            return 0, 0  # still running, as far as the first look can tell
+        collected = real(pid, 0)
+        if reaped_by == "someone else":
+            raise ChildProcessError(10, "No child processes")
+        return collected
+
+    monkeypatch.setattr(checkout.os, "waitpid", finished_meanwhile)
+    monkeypatch.setattr(checkout.os, "kill", lambda pid, _: signals.append(pid))
+    running = asyncio.create_task(git_result("--version"))
+    await asked.wait()
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    assert signals == []
 
 
 async def test_output_that_cannot_be_read_back_is_an_unknown_outcome(
@@ -135,3 +182,28 @@ async def test_a_git_stopped_for_taking_too_long_leaves_nothing_behind(tmp_path:
         "pgrep", "-f", f"ls-remote slow://{tmp_path.name}", stdout=asyncio.subprocess.DEVNULL
     )
     assert await still_running.wait() == 1, "a Git that was given up on is still running"
+
+
+async def test_output_files_that_cannot_be_closed_are_an_unknown_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = tempfile.TemporaryFile
+
+    class Unclosable:
+        def __init__(self) -> None:
+            self._file = real()
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            self._file.close()
+            raise OSError(5, "Input/output error")
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._file, name)
+
+    monkeypatch.setattr(checkout.tempfile, "TemporaryFile", Unclosable)
+
+    with pytest.raises(RemoteUnavailable, match="may or may not have run"):
+        await git_result("--version")

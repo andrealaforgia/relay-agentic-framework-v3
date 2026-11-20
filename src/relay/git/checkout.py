@@ -266,35 +266,47 @@ async def git_result(
     program = shutil.which(_TRUSTED_GIT[0], path=_GIT_ENVIRONMENT["PATH"])
     if program is None:
         raise NotStarted(f"git {subcommand} could not be started: git was not found")
-    with ExitStack() as opened:
-        try:
-            output = opened.enter_context(tempfile.TemporaryFile())
-            diagnostics = opened.enter_context(tempfile.TemporaryFile())
-        except OSError as failure:
-            raise NotStarted(f"git {subcommand} could not be started: {failure}") from None
-        try:
-            # Blocking on purpose and briefly. No error from here on says whether the
-            # child got as far as running Git, so none is read as "it did not".
-            process = subprocess.Popen(  # noqa: ASYNC220
-                [program, *_TRUSTED_GIT[1:], *arguments],
-                stdin=subprocess.DEVNULL,
-                stdout=output,
-                stderr=diagnostics,
-                env=_GIT_ENVIRONMENT,
-            )
-        except OSError as failure:
-            raise RemoteUnavailable(
-                f"git {subcommand} may or may not have run: {failure}"
-            ) from None
-        status = await _exit_status(process, timeout, subcommand)
-        try:
-            output.seek(0)
-            diagnostics.seek(0)
-            stdout, detail = output.read(), diagnostics.read().decode(errors="replace").strip()
-        except OSError as failure:
-            raise RemoteUnavailable(
-                f"git {subcommand} ran but its output could not be read: {failure}"
-            ) from None
+    if signal.getsignal(signal.SIGCHLD) is signal.SIG_IGN:
+        # A finished child would be discarded by the system at once, and its process id
+        # could then belong to something else. Relay must be the one that collects it.
+        raise NotStarted(
+            f"git {subcommand} was not started: this process discards its children's "
+            "exit statuses, so the outcome of Git could not be known"
+        )
+    try:
+        with ExitStack() as opened:
+            try:
+                output = opened.enter_context(tempfile.TemporaryFile())
+                diagnostics = opened.enter_context(tempfile.TemporaryFile())
+            except OSError as failure:
+                raise NotStarted(f"git {subcommand} could not be started: {failure}") from None
+            try:
+                # Blocking on purpose and briefly. No error from here on says whether the
+                # child got as far as running Git, so none is read as "it did not".
+                process = subprocess.Popen(  # noqa: ASYNC220
+                    [program, *_TRUSTED_GIT[1:], *arguments],
+                    stdin=subprocess.DEVNULL,
+                    stdout=output,
+                    stderr=diagnostics,
+                    env=_GIT_ENVIRONMENT,
+                )
+            except OSError as failure:
+                raise RemoteUnavailable(
+                    f"git {subcommand} may or may not have run: {failure}"
+                ) from None
+            status = await _exit_status(process, timeout, subcommand)
+            try:
+                output.seek(0)
+                diagnostics.seek(0)
+                stdout, detail = output.read(), diagnostics.read().decode(errors="replace").strip()
+            except OSError as failure:
+                raise RemoteUnavailable(
+                    f"git {subcommand} ran but its output could not be read: {failure}"
+                ) from None
+    except OSError as failure:
+        # Every OSError that can arise before the launch has been turned into NotStarted
+        # above. What is left arose after it: closing the output files, at the least.
+        raise RemoteUnavailable(f"git {subcommand} may or may not have run: {failure}") from None
     if redact:
         # Git echoes the address it was given; a failure must not carry it onwards.
         detail = detail.replace(redact, "<repository>")
@@ -330,11 +342,25 @@ async def _exit_status(
             pause = min(pause * 2, 0.05)
     finally:
         if not collected:
-            # Timed out or cancelled: do not leave it running unobserved.
-            with suppress(ProcessLookupError):
-                os.kill(process.pid, signal.SIGKILL)
-            with suppress(ChildProcessError):
-                # Returns at once: the child has just been killed.
-                os.waitpid(process.pid, 0)  # noqa: ASYNC222
+            _stop(process.pid)
         # The status has been dealt with here; Popen must not look for it again.
         process.returncode = 0
+
+
+def _stop(pid: int) -> None:
+    """Stop a Git that was given up on (timed out, or its caller was cancelled).
+
+    A signal goes only to a process this one still owns. An unreaped child keeps its
+    process id, so asking first whether it is still ours and still running is what makes
+    the signal safe: once it has been reaped, by anyone, that id may be someone else's."""
+    try:
+        # Never blocks: it only asks whether the child has finished.
+        finished, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return  # not ours to signal any more
+    if finished:
+        return
+    os.kill(pid, signal.SIGKILL)
+    with suppress(ChildProcessError):
+        # Returns at once: the child has just been killed.
+        os.waitpid(pid, 0)
