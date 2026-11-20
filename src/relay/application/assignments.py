@@ -69,11 +69,19 @@ async def retire_all_of_feature(connection: Connection, project_id: str, feature
     await _retire(connection, f"project_id = %s AND {_IN_FEATURE}", (project_id, feature_id))
 
 
-async def revoke_unstarted_grants(connection: Connection, project_id: str, feature_id: str) -> None:
-    """A pause takes back every grant of the feature that has had no effect yet. Called
-    under the exclusive gate lock, so no first effect is in flight."""
+async def revoke_unstarted_grants(
+    connection: Connection, project_id: str, feature_id: str, story_id: str | None = None
+) -> None:
+    """A pause, or a question, takes back every grant in its scope (the feature, or one
+    story of it) that has had no effect yet. Called under the exclusive gate lock, so no
+    first effect is in flight."""
     await _revoke(
-        connection, project_id, f"first_effect_at IS NULL AND {_IN_FEATURE}", (feature_id,)
+        connection,
+        project_id,
+        f"first_effect_at IS NULL AND {_IN_FEATURE} AND (%s::text IS NULL OR behaviour_id IN "
+        "(SELECT b.behaviour_id FROM behaviours b WHERE b.project_id = assignments.project_id "
+        "AND b.story_id = %s))",
+        (feature_id, story_id, story_id),
     )
 
 
@@ -88,8 +96,8 @@ async def announce_again(connection: Connection, project_id: str) -> int:
             "(SELECT a.command_message_id FROM assignments a "
             "JOIN behaviours b USING (project_id, behaviour_id) "
             "JOIN stories s USING (project_id, story_id) "
-            "JOIN features f USING (project_id, feature_id) "
-            "WHERE a.project_id = %s AND a.state = 'wanted' AND f.closed_by IS NULL) "
+            "WHERE a.project_id = %s AND a.state = 'wanted' "
+            "AND standing(s.project_id, s.feature_id, s.story_id) IS NULL) "
             "RETURNING message_id",
             (project_id,),
         )

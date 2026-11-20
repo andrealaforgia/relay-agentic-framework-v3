@@ -202,9 +202,9 @@ class Reviews:
                     "SELECT c.*, p.repository FROM review_cycles c JOIN projects p USING (project_id) "
                     "JOIN behaviours b USING (project_id, behaviour_id) "
                     "JOIN stories s USING (project_id, story_id) "
-                    "JOIN features f USING (project_id, feature_id) "
                     "WHERE c.publication = 'pending' AND c.state = 'open' "
-                    "AND f.closed_by IS NULL ORDER BY c.created_at"
+                    "AND standing(s.project_id, s.feature_id, s.story_id) IS NULL "
+                    "ORDER BY c.created_at"
                 )
             ).fetchall()
         published = 0

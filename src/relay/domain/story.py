@@ -92,6 +92,9 @@ class Candidate:
     feature_id: str
     story_id: str
     state: StoryState
+    # Its feature is closed, or a question is open over it: it may not start, and the
+    # stories after it in its feature wait behind it.
+    stopped: bool = False
 
 
 def next_story_to_release(
@@ -110,7 +113,7 @@ def next_story_to_release(
         return None
     for roadmap in features:
         for story in roadmap:
-            if story.state is StoryState.PLANNED:
+            if story.state is StoryState.PLANNED and not story.stopped:
                 return story
             if story.state is not StoryState.APPROVED:
                 break  # this feature is stuck behind an earlier story; try the next
@@ -163,6 +166,8 @@ def answer_again(action: HumanAction, recorded: tuple[str, Receipt] | None) -> R
 
 
 AT_A_GATE = {"approve": frozenset[str](), "request_changes": frozenset({"reason"})}
+ON_A_QUESTION = {"answer": frozenset({"text"})}
+ON_A_DECISION = {"replace": frozenset({"text"})}
 ON_A_FEATURE = {
     "pause": frozenset({"reason"}),
     "resume": frozenset[str](),

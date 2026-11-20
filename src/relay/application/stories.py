@@ -21,6 +21,7 @@ from relay.application.assignments import retire_all_of_feature, revoke_unstarte
 from relay.application.closure import (
     CANCELLED,
     PAUSED,
+    closure_of_feature,
     closure_of_story,
     lock_gate,
     require_open,
@@ -125,7 +126,7 @@ class Stories:
             await lock_gate(connection, project_id)
             await _locked_project(connection, project_id)
             feature = await _locked_feature(connection, project_id, feature_id)
-            require_open(feature["closed_by"])
+            require_open(await closure_of_feature(connection, project_id, feature_id))
             existing = await (
                 await connection.execute(
                     "SELECT 1 FROM roadmaps WHERE project_id = %s AND feature_id = %s LIMIT 1",
@@ -294,13 +295,17 @@ class Stories:
                 else None
             )
             await _locked_project(connection, project_id)
-            feature = await _locked_feature(connection, project_id, located["feature_id"])
+            await _locked_feature(connection, project_id, located["feature_id"])
             if (seen := answer_again(action, await _recorded(connection, action))) is not None:
                 return seen
-            if feature["closed_by"] == PAUSED:
-                # Nothing is decided while the feature is paused, and nothing is
-                # recorded: the gate is still there to be decided after resume.
-                raise ActionRefused("the feature is paused: its gates wait for resume")
+            stopped = await closure_of_feature(
+                connection, project_id, located["feature_id"], located["story_id"]
+            )
+            if stopped is not None and stopped != CANCELLED:
+                # Nothing is decided while the feature is paused or a question covers
+                # the gate, and nothing is recorded: the gate is still there to be
+                # decided afterwards.
+                raise ActionRefused(f"the feature is {stopped}: its gates wait")
             gate = await (
                 await connection.execute(
                     "SELECT * FROM gates WHERE gate_id = %s FOR UPDATE", (gate_id,)
@@ -555,11 +560,12 @@ async def release_next(connection: Connection, project_id: str) -> None:
     ).fetchone()
     rows = await (
         await connection.execute(
-            "SELECT s.feature_id, s.story_id, s.state FROM stories s "
-            "JOIN roadmaps r USING (project_id, feature_id) "
+            "SELECT s.feature_id, s.story_id, s.state, "
+            "standing(s.project_id, s.feature_id, s.story_id) IS NOT NULL AS stopped "
+            "FROM stories s JOIN roadmaps r USING (project_id, feature_id) "
             "JOIN features f USING (project_id, feature_id) "
             "WHERE s.project_id = %s AND r.revision = s.roadmap_revision AND r.state = 'approved' "
-            "AND f.state NOT IN ('completed', 'cancelled') AND f.closed_by IS NULL "
+            "AND f.state NOT IN ('completed', 'cancelled') "
             "ORDER BY f.opened, s.position",
             (project_id,),
         )
@@ -567,7 +573,7 @@ async def release_next(connection: Connection, project_id: str) -> None:
     features: dict[str, list[Candidate]] = {}
     for row in rows:
         features.setdefault(row["feature_id"], []).append(
-            Candidate(row["feature_id"], row["story_id"], StoryState(row["state"]))
+            Candidate(row["feature_id"], row["story_id"], StoryState(row["state"]), row["stopped"])
         )
     chosen = next_story_to_release(list(features.values()), slot_taken=holding is not None)
     if chosen is None:
@@ -599,6 +605,18 @@ async def _cancel(connection: Connection, project_id: str, feature_id: str) -> N
     ).fetchall()
     for gate in open_gates:
         await _close_gate(connection, gate, "superseded", "superseded")
+    # Nobody is left to answer for: the questions go, with their place in the inbox.
+    await connection.execute(
+        "UPDATE inbox_items SET state = 'closed' WHERE state = 'open' AND question_id IN "
+        "(SELECT question_id FROM questions WHERE project_id = %s AND feature_id = %s "
+        "AND state = 'open')",
+        (project_id, feature_id),
+    )
+    await connection.execute(
+        "UPDATE questions SET state = 'withdrawn' WHERE project_id = %s AND feature_id = %s "
+        "AND state = 'open'",
+        (project_id, feature_id),
+    )
     # Checks a pause was holding, or that were waiting to be run again, never will be
     # now. A request that asks about them is told so, not that they are still waiting.
     await connection.execute(

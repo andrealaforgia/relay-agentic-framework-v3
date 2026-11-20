@@ -38,13 +38,14 @@ async def pending_messages(pool: Pool) -> list[OutboxMessage]:
     return [OutboxMessage(**row) for row in rows]
 
 
-# A command that announces work on a paused or cancelled feature is held back. One that
+# A command that announces work in a stopped scope (its feature paused or cancelled, or a
+# question open over it) is held back. One that
 # was selected before the closure committed may still go out; it cannot be granted.
 _FOR_A_CLOSED_FEATURE = (
     "SELECT 1 FROM assignments a JOIN behaviours b USING (project_id, behaviour_id) "
     "JOIN stories s USING (project_id, story_id) "
-    "JOIN features f USING (project_id, feature_id) "
-    "WHERE a.command_message_id = o.message_id AND f.closed_by IS NOT NULL"
+    "WHERE a.command_message_id = o.message_id "
+    "AND standing(s.project_id, s.feature_id, s.story_id) IS NOT NULL"
 )
 
 

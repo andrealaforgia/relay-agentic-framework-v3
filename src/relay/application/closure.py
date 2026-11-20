@@ -10,9 +10,6 @@ export or a push.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
-
 from relay.domain.story import ActionRefused
 from relay.persistence.database import Connection
 
@@ -30,16 +27,18 @@ async def lock_gate(connection: Connection, project_id: str, *, exclusive: bool 
 
 
 async def closure_of_story(connection: Connection, project_id: str, story_id: str) -> str | None:
-    """How the feature a story belongs to is closed, if it is. Read under the gate lock,
-    so it cannot change before the reading transaction commits."""
+    """What stops work on a story, if anything: its feature is paused or cancelled, or a
+    question is open over it. Read under the gate lock, so it cannot change before the
+    reading transaction commits. `CANCELLED` is returned exactly; anything else names
+    every reason that applies."""
     row = await (
         await connection.execute(
-            "SELECT f.closed_by FROM stories s JOIN features f USING (project_id, feature_id) "
-            "WHERE s.project_id = %s AND s.story_id = %s",
+            "SELECT standing(s.project_id, s.feature_id, s.story_id) AS standing "
+            "FROM stories s WHERE s.project_id = %s AND s.story_id = %s",
             (project_id, story_id),
         )
     ).fetchone()
-    return row["closed_by"] if row else None
+    return row["standing"] if row else None
 
 
 async def closure_of_behaviour(
@@ -47,21 +46,31 @@ async def closure_of_behaviour(
 ) -> str | None:
     row = await (
         await connection.execute(
-            "SELECT f.closed_by FROM behaviours b JOIN stories s USING (project_id, story_id) "
-            "JOIN features f USING (project_id, feature_id) "
+            "SELECT standing(s.project_id, s.feature_id, s.story_id) AS standing "
+            "FROM behaviours b JOIN stories s USING (project_id, story_id) "
             "WHERE b.project_id = %s AND b.behaviour_id = %s",
             (project_id, behaviour_id),
         )
     ).fetchone()
-    return row["closed_by"] if row else None
+    return row["standing"] if row else None
+
+
+async def closure_of_feature(
+    connection: Connection, project_id: str, feature_id: str, story_id: str | None = None
+) -> str | None:
+    """For work that belongs to the feature as a whole, or to a story named apart."""
+    row = await (
+        await connection.execute(
+            "SELECT standing(%s, %s, %s) AS standing", (project_id, feature_id, story_id)
+        )
+    ).fetchone()
+    assert row is not None
+    standing: str | None = row["standing"]
+    return standing
 
 
 def require_open(closed_by: str | None) -> None:
     """Refuse to start anything on a feature that has been closed, by whatever route the
     request came."""
     if closed_by is not None:
-        raise ActionRefused(f"the feature is {closed_by}: nothing new starts on it")
-
-
-def is_open(feature: Mapping[str, Any]) -> bool:
-    return feature["closed_by"] is None
+        raise ActionRefused(f"the feature is {closed_by}: nothing new starts here")
