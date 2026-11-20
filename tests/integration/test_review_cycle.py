@@ -734,21 +734,21 @@ async def test_a_fetch_cut_short_does_not_declare_an_available_commit_lost(
 ) -> None:
     candidate = await world.green_candidate()
     shutil.rmtree(world.mirrors)
-    real_git = Mirror._git
+    real_result = mirror_module.git_result
 
-    async def connection_drops_during_fetch(self: Mirror, *arguments: str, **options: Any) -> str:
-        if arguments[0] == "fetch":
-            raise CheckoutFailed("git fetch failed: the remote end hung up unexpectedly")
-        return await real_git(self, *arguments, **options)
+    async def connection_drops_during_fetch(*arguments: str, **options: Any) -> Any:
+        if "fetch" in arguments:
+            return 128, b"", "fatal: the remote end hung up unexpectedly"
+        return await real_result(*arguments, **options)
 
-    monkeypatch.setattr(Mirror, "_git", connection_drops_during_fetch)
+    monkeypatch.setattr(mirror_module, "git_result", connection_drops_during_fetch)
     assert await world.reviews.publish_candidates() == 0
 
     assert await world.cycle_states() == ["open"]
     assert await world.state() is BehaviourState.REVIEW
     assert "hung up" in (await cycle_row(world))["deferred_reason"]
 
-    monkeypatch.setattr(Mirror, "_git", real_git)
+    monkeypatch.setattr(mirror_module, "git_result", real_result)
     assert await world.reviews.publish_candidates() == 1
 
     assert world.remote_ref(await candidate_ref_of(world)) == candidate

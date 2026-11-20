@@ -157,12 +157,15 @@ class Integration:
         started = await self._start_batch(project_id, behaviour_id, request_id, head)
         if isinstance(started, IntegrationReceipt):
             return started
+        # Taken before the runner is handed anything: which batch is settled or abandoned
+        # is not for the code that ran the checks to say.
+        batch_id: uuid.UUID = started["batch_id"]
         try:
             executions = await self._run_checks(started)
         except BaseException:
-            await self._abandon(started["batch_id"])
+            await self._abandon(batch_id)
             raise
-        settled = await self._settle_batch(started["batch_id"], executions)
+        settled = await self._settle_batch(batch_id, executions)
         if isinstance(settled, IntegrationReceipt):
             return settled
         return await self._drive(settled)
@@ -585,21 +588,29 @@ class Integration:
             ).fetchone()
         assert cycle is not None
         if not await mirror.recover(
-            intent["repository"], intent["candidate_revision"], [cycle["candidate_ref"]]
+            intent["repository"],
+            intent["candidate_revision"],
+            [cycle["candidate_ref"]],
+            timeout=self._push_timeout,
         ):
             raise CheckoutFailed("the authorised commit can no longer be obtained")
 
     async def _send_never_left(self, intent_id: uuid.UUID, reason: str) -> IntegrationReceipt:
-        """The send was counted and then Git could not even be started. That send is
-        known not to exist, so it is answered: nothing is left waiting for it."""
+        """The send was counted and then Git is known never to have run. That send does
+        not exist, so it is answered. If it was the last one unanswered and a refusal is
+        already on record, the intent is settled by that refusal now."""
         async with self._pool.connection() as connection, connection.transaction():
+            located = await _intent(connection, intent_id)
+            behaviour, row = await _locked_behaviour(
+                connection, located["project_id"], located["behaviour_id"]
+            )
             intent = await _locked_intent(connection, intent_id)
             if intent["state"] != "outstanding":
                 return _receipt_of(intent)
+            answered = intent["sends_resolved"] + 1
             await connection.execute(
-                "UPDATE integration_intents SET sends_resolved = sends_resolved + 1 "
-                "WHERE intent_id = %s",
-                (intent_id,),
+                "UPDATE integration_intents SET sends_resolved = %s WHERE intent_id = %s",
+                (answered, intent_id),
             )
             await append_event(
                 connection,
@@ -608,6 +619,10 @@ class Integration:
                 subject_id=intent["behaviour_id"],
                 payload={"intent_id": str(intent_id), "reason": reason},
             )
+            if intent["refusal"] is not None and a_refusal_settles_the_intent(
+                sends_started=intent["sends_started"], sends_answered=answered
+            ):
+                return await _park(connection, behaviour, row, intent, intent["refusal"])
         return IntegrationReceipt(Outcome.PENDING, intent["batch_id"], reason)
 
     async def _refused_by_the_repository(

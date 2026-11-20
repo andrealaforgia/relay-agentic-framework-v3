@@ -53,13 +53,16 @@ class Mirror:
         finally:
             await self._discard(scratch)
 
-    async def recover(self, repository: str, commit: str, refs: Sequence[str]) -> bool:
+    async def recover(
+        self, repository: str, commit: str, refs: Sequence[str], timeout: float | None = None
+    ) -> bool:
         """Make sure this exact commit is pinned, fetching it if need be from any of the
         given refs whose history still contains it.
 
         True: it is pinned. False: every ref was fetched and none contains it, so it is
-        gone. If a fetch could not be completed the search is unfinished and
-        RemoteUnavailable is raised: "could not look" is never reported as "not there"."""
+        gone. If a fetch could not be completed, or gave no answer within `timeout`, the
+        search is unfinished and RemoteUnavailable is raised: "could not look" is never
+        reported as "not there"."""
         _require_hash(commit)
         if await self.holds(commit):
             return True
@@ -68,10 +71,13 @@ class Mirror:
         for ref in refs:
             scratch = f"{_INCOMING}/{uuid.uuid4().hex}"
             try:
-                await self._git(
-                    "fetch", "--quiet", "--no-tags", "--", repository, f"+{ref}:{scratch}",
-                    redact=repository,
+                status, _, detail = await git_result(
+                    "-C", str(self._path), "fetch", "--quiet", "--no-tags", "--", repository,
+                    f"+{ref}:{scratch}",
+                    redact=repository, timeout=timeout,
                 )  # fmt: skip
+                if status != 0:
+                    raise CheckoutFailed(f"git fetch failed: {detail}")
             except CheckoutFailed as failure:
                 unfinished = failure
                 continue

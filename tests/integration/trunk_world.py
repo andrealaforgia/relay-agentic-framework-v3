@@ -61,12 +61,15 @@ class TrunkWorld:
         tmp_path: Path,
         runner_image: str,
         isolation: Isolation | None = None,
+        project: str = PROJECT,
+        mirrors: Path | None = None,
     ) -> None:
+        self.project = project
         self.database = database
         self.tmp_path = tmp_path
         self.remote = tmp_path / "remote.git"
         self.builder = tmp_path / "builder"
-        self.mirrors = tmp_path / "mirrors"
+        self.mirrors = mirrors or tmp_path / "mirrors"
         self.image = runner_image
         self.oracle = ProcessOracle(isolation or ContainerIsolation(runner_image))
         self.behaviours = Behaviours(database, self.mirrors, self.oracle)
@@ -99,7 +102,7 @@ class TrunkWorld:
         self.git("remote", "add", "origin", str(self.remote))
         self.advance_trunk({"README": "a VAT calculator\n"})
         base = self.advance_trunk({"vat.py": VAT_RETURNS_NET})
-        await self.behaviours.open_project(PROJECT, address or str(self.remote))
+        await self.behaviours.open_project(self.project, address or str(self.remote))
         return base
 
     def advance_trunk(self, files: dict[str, str]) -> str:
@@ -124,10 +127,10 @@ class TrunkWorld:
         self, behaviour: str = "B1", contract: ProcessContract = CONTRACT
     ) -> str:
         """A behaviour with a verified red on the current trunk. Returns that revision."""
-        await self.behaviours.propose(PROJECT, behaviour, contract.observes)
-        await self.behaviours.begin_test_design(PROJECT, behaviour)
-        await self.behaviours.register_acceptance_test(PROJECT, behaviour, contract)
-        assert (await self.behaviours.run_red(PROJECT, behaviour)).is_valid
+        await self.behaviours.propose(self.project, behaviour, contract.observes)
+        await self.behaviours.begin_test_design(self.project, behaviour)
+        await self.behaviours.register_acceptance_test(self.project, behaviour, contract)
+        assert (await self.behaviours.run_red(self.project, behaviour)).is_valid
         return self.trunk()
 
     def publish_attempt(self, behaviour: str, files: dict[str, str], *, on: str) -> str:
@@ -140,7 +143,7 @@ class TrunkWorld:
         self.git("add", "-A")
         self.git("commit", "-q", "--allow-empty", "-m", f"{behaviour} attempt {attempt}")
         candidate = self.git("rev-parse", "HEAD")
-        ref = f"refs/relay/attempts/{PROJECT}/{behaviour}/{attempt}"
+        ref = f"refs/relay/attempts/{self.project}/{behaviour}/{attempt}"
         self.git("push", "-q", "origin", f"HEAD:{ref}")
         return candidate
 
@@ -155,7 +158,7 @@ class TrunkWorld:
         candidate = self.publish_attempt(
             behaviour, files or {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=on
         )
-        verdict = await self.behaviours.run_green(PROJECT, behaviour, self.attempts[behaviour])
+        verdict = await self.behaviours.run_green(self.project, behaviour, self.attempts[behaviour])
         assert verdict.is_valid, verdict.reason
         assert await self.reviews.publish_candidates() == 1
         for message in await pending_messages(self.database):
@@ -173,7 +176,7 @@ class TrunkWorld:
         if request is None:
             self.requests += 1
             request = f"request-{self.requests}"
-        return await self.integration.integrate(PROJECT, behaviour, request)
+        return await self.integration.integrate(self.project, behaviour, request)
 
     def integration_with(
         self, isolation: Isolation | None = None, push_timeout: float = 120.0
@@ -193,10 +196,10 @@ class TrunkWorld:
                 await asyncio.sleep(0.05)
 
     async def state(self, behaviour: str = "B1") -> BehaviourState:
-        return await self.behaviours.state_of(PROJECT, behaviour)
+        return await self.behaviours.state_of(self.project, behaviour)
 
     async def events(self) -> list[str]:
-        return [event.event_type for event in await read_events(self.database, PROJECT)]
+        return [event.event_type for event in await read_events(self.database, self.project)]
 
     async def column(self, query: str) -> list[object]:
         async with self.database.connection() as connection:

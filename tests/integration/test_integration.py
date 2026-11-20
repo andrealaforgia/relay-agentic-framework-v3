@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import subprocess
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,7 @@ from relay.application.integration import IntegrationRefused, Outcome
 from relay.domain.behaviour import BehaviourState
 from relay.domain.evidence import Launch, RedRejection
 from relay.git import checkout as checkout_module
+from relay.git import mirror as mirror_module
 from relay.git.checkout import CheckoutFailed, RemoteUnavailable
 from relay.git.mirror import Mirror, NotFastForward
 from relay.persistence.outbox import pending_messages
@@ -998,17 +1001,15 @@ async def test_a_push_that_could_not_even_be_started_is_not_a_push_to_wait_for(
     world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     base, _ = await ready_to_integrate(world)
-    real = asyncio.create_subprocess_exec
+    real = subprocess.Popen
 
-    async def no_file_descriptors_for_a_push(*arguments: Any, **options: Any) -> Any:
-        if "push" in arguments:
+    def no_file_descriptors_for_a_push(command: list[str], **options: Any) -> Any:
+        if "push" in command:
             raise OSError(24, "Too many open files")
-        return await real(*arguments, **options)
+        return real(command, **options)
 
     with monkeypatch.context() as patched:
-        patched.setattr(
-            checkout_module.asyncio, "create_subprocess_exec", no_file_descriptors_for_a_push
-        )
+        patched.setattr(checkout_module.subprocess, "Popen", no_file_descriptors_for_a_push)
         receipt = await world.integrate()
     world.hook_flag("refuse").touch()
     assert receipt.outcome is Outcome.PENDING
@@ -1053,3 +1054,154 @@ async def test_a_send_whose_error_arrives_after_the_integration_was_settled_says
 
     assert late.outcome is Outcome.INTEGRATED
     assert "integration.push_unanswered" not in await world.events()
+
+
+async def test_a_failure_after_git_was_launched_keeps_the_send_unanswered(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Git may have run and may have pushed. A later refusal must not free the project."""
+    base, _ = await ready_to_integrate(world)
+
+    def fails_after_launch(*_: Any, **__: Any) -> None:
+        raise OSError(11, "Resource temporarily unavailable")
+
+    with monkeypatch.context() as patched:
+        real = checkout_module.subprocess.Popen
+
+        def only_for_a_push(command: list[str], **options: Any) -> Any:
+            process = real(command, **options)
+            if "push" in command:
+                process.kill()  # the test must not really push; Relay cannot know that
+                process.wait()
+                patched.setattr(checkout_module, "_collect", fails_after_launch)
+            return process
+
+        patched.setattr(checkout_module.subprocess, "Popen", only_for_a_push)
+        with pytest.raises(OSError, match="temporarily unavailable"):
+            await world.integrate()
+    world.hook_flag("refuse").touch()
+
+    assert await world.integration.reconcile() == 0
+
+    assert world.trunk() == base
+    assert await world.column("SELECT state FROM integration_intents") == ["outstanding"]
+    assert await world.column("SELECT sends_started - sends_resolved FROM integration_intents") == [
+        1
+    ]
+
+
+async def test_the_last_answer_to_arrive_settles_an_intent_already_refused(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two sends in flight, one refused, the other then known never to have started. The
+    counters are set directly: two sends cannot be put in flight together from outside."""
+    base, _ = await ready_to_integrate(world)
+
+    async def dies(*_: Any, **__: Any) -> None:
+        raise Crash
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Mirror, "advance", dies)
+        with pytest.raises(Crash):
+            await world.integrate()
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "UPDATE integration_intents SET sends_started = 2, sends_resolved = 1, "
+            "refusal = 'pre-receive hook declined'"
+        )
+    [intent_id] = await world.column("SELECT intent_id FROM integration_intents")
+
+    receipt = await world.integration._send_never_left(intent_id, "no descriptors")  # type: ignore[arg-type]
+
+    assert receipt.outcome is Outcome.REJECTED
+    assert receipt.reason == "pre-receive hook declined"
+    assert world.trunk() == base
+    assert await world.column("SELECT state FROM integration_intents") == ["rejected"]
+    assert await world.state() is BehaviourState.BLOCKED
+
+
+@pytest.mark.parametrize("then", ["returns", "raises"])
+async def test_which_batch_is_settled_is_not_for_the_check_runner_to_say(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch, then: str
+) -> None:
+    _, candidate = await ready_to_integrate(world)
+    real = integration_module.Integration._run_checks
+
+    async def renames_its_batch(self: Any, batch: dict[str, Any]) -> Any:
+        runs = await real(self, batch)
+        batch["batch_id"] = uuid.uuid4()
+        if then == "raises":
+            raise CheckoutFailed("the object store is unreadable")
+        return runs
+
+    monkeypatch.setattr(integration_module.Integration, "_run_checks", renames_its_batch)
+
+    if then == "returns":
+        assert (await world.integrate()).outcome is Outcome.INTEGRATED
+        assert world.trunk() == candidate
+    else:
+        with pytest.raises(CheckoutFailed):
+            await world.integrate()
+        assert await world.column("SELECT state FROM check_batches") == ["abandoned"]
+
+
+async def test_a_project_whose_candidate_cannot_be_fetched_does_not_hold_up_another(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await ready_to_integrate(world)
+    other = TrunkWorld(
+        world.database,
+        world.tmp_path / "other",
+        world.image,
+        project="other",
+        mirrors=world.mirrors,
+    )
+    (world.tmp_path / "other").mkdir()
+    other_base = await other.open()
+    await other.awaiting_builder()
+    other_candidate = await other.reviewed(on=other_base)
+    impatient = world.integration_with(push_timeout=1.0)
+
+    async def dies(*_: Any, **__: Any) -> None:
+        raise Crash
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Mirror, "advance", dies)
+        for each in (world, other):
+            with pytest.raises(Crash):
+                await each.integrate()
+    [stalled_ref] = await world.column(
+        f"SELECT candidate_ref FROM review_cycles WHERE project_id = '{PROJECT}'"
+    )
+    world.git(
+        "update-ref", "-d", f"refs/relay/pins/{await pinned_candidate(world)}",
+        at=world.mirrors / f"{PROJECT}.git",
+    )  # fmt: skip
+    real = mirror_module.git_result
+
+    async def candidate_fetch_stalls(*arguments: str, **options: Any) -> Any:
+        if "fetch" in arguments and any(str(stalled_ref) in argument for argument in arguments):
+            await asyncio.sleep(options["timeout"] if options.get("timeout") else 3600)
+            raise RemoteUnavailable("git fetch gave no answer in time")
+        return await real(*arguments, **options)
+
+    monkeypatch.setattr(mirror_module, "git_result", candidate_fetch_stalls)
+
+    async with asyncio.timeout(60):
+        settled = await impatient.reconcile()
+
+    assert settled == 1
+    assert other.trunk() == other_candidate
+    assert await world.column(
+        "SELECT state, sends_started FROM integration_intents ORDER BY created_at"
+    ) == ["outstanding", "integrated"]
+    assert await world.column(
+        f"SELECT sends_started FROM integration_intents WHERE project_id = '{PROJECT}'"
+    ) == [0]
+
+
+async def pinned_candidate(world: TrunkWorld) -> str:
+    [candidate] = await world.column(
+        f"SELECT candidate_revision FROM integration_intents WHERE project_id = '{PROJECT}'"
+    )
+    return str(candidate)

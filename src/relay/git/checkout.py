@@ -6,6 +6,8 @@ import asyncio
 import os
 import re
 import shutil
+import subprocess
+import threading
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -247,30 +249,56 @@ async def git_result(
     """Run trusted Git and return its exit status, its output and its diagnostics, with
     the repository address and any URL credentials removed from the diagnostics.
 
-    With a timeout, a Git that has not answered in time is stopped and RemoteUnavailable
-    is raised. That says only that no answer came: whatever Git had already sent to the
-    other side may still take effect there."""
+    NotStarted is raised only when Git is known not to have executed. With a timeout, a
+    Git that has not answered in time is stopped and RemoteUnavailable is raised. That
+    says only that no answer came: whatever Git had already sent to the other side may
+    still take effect there."""
     try:
-        process = await asyncio.create_subprocess_exec(
-            *_TRUSTED_GIT,
-            *arguments,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        # Popen creates the pipes, forks and waits to learn whether the exec succeeded,
+        # all before it returns. An OSError from it therefore means Git never ran.
+        # Everything after this line can fail with Git already running.
+        # Blocking on purpose and briefly: asyncio's own launcher can fail after the
+        # child has started, and then nobody can say whether Git ran.
+        process = subprocess.Popen(  # noqa: ASYNC220
+            [*_TRUSTED_GIT, *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=_GIT_ENVIRONMENT,
         )
     except OSError as failure:
         raise NotStarted(f"git {_subcommand(arguments)} could not be started: {failure}") from None
+    finished = _collect(process)
     try:
         async with asyncio.timeout(timeout):
-            stdout, stderr = await process.communicate()
+            stdout, stderr = await asyncio.shield(finished)
     except TimeoutError:
         process.kill()
-        await process.wait()
+        process.wait()
         raise RemoteUnavailable(f"git {_subcommand(arguments)} gave no answer in time") from None
     detail = stderr.decode(errors="replace").strip()
     if redact:
         # Git echoes the address it was given; a failure must not carry it onwards.
         detail = detail.replace(redact, "<repository>")
-    assert process.returncode is not None
     return process.returncode, stdout, _URL_USERINFO.sub("//", detail)
+
+
+def _collect(process: subprocess.Popen[bytes]) -> asyncio.Future[tuple[bytes, bytes]]:
+    """Read the process's output on a thread of its own. A killed Git can leave children
+    holding its pipes open (a remote hook, say), and nothing here may wait on those."""
+    loop = asyncio.get_running_loop()
+    finished: asyncio.Future[tuple[bytes, bytes]] = loop.create_future()
+
+    def deliver(output: tuple[bytes, bytes]) -> None:
+        if not finished.done():
+            finished.set_result(output)
+
+    def read() -> None:
+        output = process.communicate()
+        try:
+            loop.call_soon_threadsafe(deliver, output)
+        except RuntimeError:
+            pass  # the loop has gone; nobody is waiting for this any more
+
+    threading.Thread(target=read, daemon=True).start()
+    return finished
