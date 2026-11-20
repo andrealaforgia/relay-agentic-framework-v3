@@ -752,3 +752,28 @@ async def test_checks_that_could_not_be_completed_leave_the_request_answered_and
     assert await world.column("SELECT state FROM check_batches") == ["abandoned"]
     assert (await world.integrate()).outcome is Outcome.INTEGRATED
     assert world.trunk() == candidate
+
+
+async def test_an_integration_seen_twice_to_have_converged_is_recorded_once(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two reconcilers can both find trunk at the candidate before either records it."""
+    await ready_to_integrate(world)
+    real = Mirror.advance
+
+    async def dies_after_sending(self: Mirror, *arguments: Any, **options: Any) -> None:
+        await real(self, *arguments, **options)
+        raise Crash
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Mirror, "advance", dies_after_sending)
+        with pytest.raises(Crash):
+            await world.integrate()
+    [intent_id] = await world.column("SELECT intent_id FROM integration_intents")
+
+    first = await world.integration._converged(intent_id)  # type: ignore[arg-type]
+    second = await world.integration._converged(intent_id)  # type: ignore[arg-type]
+
+    assert first == second
+    assert first.outcome is Outcome.INTEGRATED
+    assert await integrated_events(world) == 1

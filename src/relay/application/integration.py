@@ -771,7 +771,6 @@ async def _why_stale(
         behaviour.state is not BehaviourState.REVIEW
         or cycle is None
         or cycle["cycle_id"] != batch["cycle_id"]
-        or cycle["state"] != "satisfied"
     ):
         return "the review this batch was checking is no longer the current one"
     if (
