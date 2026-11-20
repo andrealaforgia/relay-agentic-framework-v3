@@ -36,7 +36,7 @@ from relay.domain.integration import (
     regression_digest,
 )
 from relay.domain.review import GateState
-from relay.git.checkout import CheckoutFailed, RemoteRejected, trunk_head
+from relay.git.checkout import CheckoutFailed, NotStarted, RemoteRejected, trunk_head
 from relay.git.mirror import Mirror, NotFastForward
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
@@ -96,6 +96,7 @@ class Integration:
         self._pool = pool
         self._mirrors = mirrors
         self._oracle = oracle
+        # How long any one exchange with the repository may take, a read as much as a push.
         self._push_timeout = push_timeout
 
     def _mirror(self, project_id: str) -> Mirror:
@@ -161,7 +162,7 @@ class Integration:
         except BaseException:
             await self._abandon(started["batch_id"])
             raise
-        settled = await self._settle_batch(started, executions)
+        settled = await self._settle_batch(started["batch_id"], executions)
         if isinstance(settled, IntegrationReceipt):
             return settled
         return await self._drive(settled)
@@ -343,25 +344,34 @@ class Integration:
             )
 
     async def _settle_batch(
-        self, batch: dict[str, Any], executions: list[tuple[CheckContract, Execution]]
+        self, batch_id: uuid.UUID, executions: list[tuple[CheckContract, Execution]]
     ) -> uuid.UUID | IntegrationReceipt:
-        """Decide what a finished batch means. Its runs are recorded whatever happens; it
-        may only send work back or authorise an integration if nothing it relied on has
-        changed since it started."""
-        project_id, behaviour_id = batch["project_id"], batch["behaviour_id"]
-        batch_id, cycle_id = batch["batch_id"], batch["cycle_id"]
+        """Decide what a finished batch means. It may only send work back or authorise an
+        integration if nothing it relied on has changed since it started.
+
+        Everything decided here is decided from the batch as recorded and locked, never
+        from what the code that ran the checks was holding: what gets authorised must be
+        what was checked."""
         async with self._pool.connection() as connection, connection.transaction():
-            behaviour, row = await _locked_behaviour(connection, project_id, behaviour_id)
-            project = await _locked_project(connection, project_id)
-            cycle = await _live_cycle(connection, project_id, behaviour_id)
-            current = await (
+            located = await (
                 await connection.execute(
-                    "SELECT state, members, candidate_revision FROM check_batches "
-                    "WHERE batch_id = %s FOR UPDATE",
+                    "SELECT project_id, behaviour_id FROM check_batches WHERE batch_id = %s",
                     (batch_id,),
                 )
             ).fetchone()
-            assert current is not None
+            assert located is not None
+            project_id, behaviour_id = located["project_id"], located["behaviour_id"]
+            behaviour, row = await _locked_behaviour(connection, project_id, behaviour_id)
+            project = await _locked_project(connection, project_id)
+            cycle = await _live_cycle(connection, project_id, behaviour_id)
+            batch = await (
+                await connection.execute(
+                    "SELECT * FROM check_batches WHERE batch_id = %s FOR UPDATE", (batch_id,)
+                )
+            ).fetchone()
+            assert batch is not None
+            current = batch
+            cycle_id = batch["cycle_id"]
             if incomplete := _why_incomplete(current, executions):
                 # What came back is not a run of every check on the candidate, so none
                 # of it is taken as evidence of anything.
@@ -533,6 +543,7 @@ class Integration:
             return True
 
         try:
+            await self._recover_the_pin(intent)
             await self._mirror(intent["project_id"]).advance(
                 intent["repository"],
                 intent["candidate_revision"],
@@ -545,6 +556,10 @@ class Integration:
             return await self._refused(intent_id, str(never_sendable), sent=False)
         except RemoteRejected as refused:
             return await self._refused_by_the_repository(intent, str(refused)[:500])
+        except NotStarted as never_ran:
+            if sent:
+                return await self._send_never_left(intent_id, str(never_ran)[:500])
+            return IntegrationReceipt(Outcome.PENDING, intent["batch_id"], str(never_ran)[:500])
         except CheckoutFailed as failure:
             if sent:
                 return await self._unanswered(intent_id, str(failure)[:500])
@@ -554,6 +569,46 @@ class Integration:
             async with self._pool.connection() as connection:
                 return _receipt_of(await _intent(connection, intent_id))
         return await self._converged(intent_id)
+
+    async def _recover_the_pin(self, intent: dict[str, Any]) -> None:
+        """A mirror can be lost between authorisation and the push. The candidate was
+        published for review under its own ref, and that ref can give it back."""
+        mirror = self._mirror(intent["project_id"])
+        if await mirror.holds(intent["candidate_revision"]):
+            return
+        async with self._pool.connection() as connection:
+            cycle = await (
+                await connection.execute(
+                    "SELECT candidate_ref FROM review_cycles WHERE cycle_id = %s",
+                    (intent["cycle_id"],),
+                )
+            ).fetchone()
+        assert cycle is not None
+        if not await mirror.recover(
+            intent["repository"], intent["candidate_revision"], [cycle["candidate_ref"]]
+        ):
+            raise CheckoutFailed("the authorised commit can no longer be obtained")
+
+    async def _send_never_left(self, intent_id: uuid.UUID, reason: str) -> IntegrationReceipt:
+        """The send was counted and then Git could not even be started. That send is
+        known not to exist, so it is answered: nothing is left waiting for it."""
+        async with self._pool.connection() as connection, connection.transaction():
+            intent = await _locked_intent(connection, intent_id)
+            if intent["state"] != "outstanding":
+                return _receipt_of(intent)
+            await connection.execute(
+                "UPDATE integration_intents SET sends_resolved = sends_resolved + 1 "
+                "WHERE intent_id = %s",
+                (intent_id,),
+            )
+            await append_event(
+                connection,
+                intent["project_id"],
+                "integration.push_not_started",
+                subject_id=intent["behaviour_id"],
+                payload={"intent_id": str(intent_id), "reason": reason},
+            )
+        return IntegrationReceipt(Outcome.PENDING, intent["batch_id"], reason)
 
     async def _refused_by_the_repository(
         self, intent: dict[str, Any], reason: str
@@ -572,7 +627,10 @@ class Integration:
 
     async def _read_trunk(self, intent: dict[str, Any]) -> tuple[TrunkReading, str]:
         seen = await self._mirror(intent["project_id"]).read_ref(
-            intent["repository"], f"refs/heads/{intent['trunk']}", base=intent["expected_trunk"]
+            intent["repository"],
+            f"refs/heads/{intent['trunk']}",
+            base=intent["expected_trunk"],
+            timeout=self._push_timeout,
         )
         reading = read_trunk(
             seen.head,
@@ -675,7 +733,10 @@ class Integration:
 
     async def _unanswered(self, intent_id: uuid.UUID, reason: str) -> IntegrationReceipt:
         async with self._pool.connection() as connection, connection.transaction():
-            intent = await _intent(connection, intent_id)
+            intent = await _locked_intent(connection, intent_id)
+            if intent["state"] != "outstanding":
+                # Settled by someone else while this send was waiting for its answer.
+                return _receipt_of(intent)
             await append_event(
                 connection,
                 intent["project_id"],

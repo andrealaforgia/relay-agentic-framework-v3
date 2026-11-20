@@ -183,21 +183,21 @@ class Mirror:
             raise RemoteRejected(refusal.detail)
         return True
 
-    async def read_ref(self, repository: str, ref: str, *, base: str) -> RefReading:
+    async def read_ref(self, repository: str, ref: str, *, base: str, timeout: float) -> RefReading:
         """What `ref` points at on the remote now, and whether that same commit strictly
         descends from `base`. One fetch answers both, so they cannot describe two
-        different moments."""
+        different moments. A remote that does not answer in time is RemoteUnavailable."""
         _require_hash(base)
         await self._ensure_exists()
         scratch = f"{_INCOMING}/{uuid.uuid4().hex}"
         try:
-            try:
-                await self._git(
-                    "fetch", "--quiet", "--no-tags", "--", repository, f"+{ref}:{scratch}",
-                    redact=repository,
-                )  # fmt: skip
-            except CheckoutFailed as failure:
-                raise RemoteUnavailable(str(failure)) from None
+            status, _, detail = await git_result(
+                "-C", str(self._path), "fetch", "--quiet", "--no-tags", "--", repository,
+                f"+{ref}:{scratch}",
+                redact=repository, timeout=timeout,
+            )  # fmt: skip
+            if status != 0:
+                raise RemoteUnavailable(f"git fetch failed: {detail}")
             head = await self._git("rev-parse", scratch)
             return RefReading(head, head != base and await self.descends(head, base))
         finally:

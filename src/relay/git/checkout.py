@@ -36,6 +36,10 @@ class RemoteUnavailable(CheckoutFailed):
     later. Never grounds for a permanent decision."""
 
 
+class NotStarted(CheckoutFailed):
+    """Git could not be started at all. Nothing ran, so nothing reached anyone."""
+
+
 class RemoteRejected(CheckoutFailed):
     """The repository itself answered no to an update of a named ref."""
 
@@ -246,14 +250,17 @@ async def git_result(
     With a timeout, a Git that has not answered in time is stopped and RemoteUnavailable
     is raised. That says only that no answer came: whatever Git had already sent to the
     other side may still take effect there."""
-    process = await asyncio.create_subprocess_exec(
-        *_TRUSTED_GIT,
-        *arguments,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_GIT_ENVIRONMENT,
-    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *_TRUSTED_GIT,
+            *arguments,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_GIT_ENVIRONMENT,
+        )
+    except OSError as failure:
+        raise NotStarted(f"git {_subcommand(arguments)} could not be started: {failure}") from None
     try:
         async with asyncio.timeout(timeout):
             stdout, stderr = await process.communicate()

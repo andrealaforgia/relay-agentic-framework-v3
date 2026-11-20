@@ -3,6 +3,8 @@ first made it reachable."""
 
 from __future__ import annotations
 
+import asyncio
+import socket
 import subprocess
 from pathlib import Path
 
@@ -329,10 +331,26 @@ async def test_a_ref_is_read_once_for_both_where_it_is_and_whether_it_moved_on(
     mirror = Mirror(tmp_path / "control-plane" / "vat.git")
     await mirror.pin_from(str(repository), ATTEMPT, candidate)
 
-    at_base = await mirror.read_ref(str(repository), ATTEMPT, base=candidate)
-    beyond = await mirror.read_ref(str(repository), ATTEMPT, base=trunk)
-    behind = await mirror.read_ref(str(repository), "refs/heads/main", base=candidate)
+    at_base = await mirror.read_ref(str(repository), ATTEMPT, base=candidate, timeout=30)
+    beyond = await mirror.read_ref(str(repository), ATTEMPT, base=trunk, timeout=30)
+    behind = await mirror.read_ref(str(repository), "refs/heads/main", base=candidate, timeout=30)
 
     assert (at_base.head, at_base.beyond_base) == (candidate, False)
     assert (beyond.head, beyond.beyond_base) == (candidate, True)
     assert (behind.head, behind.beyond_base) == (trunk, False)
+
+
+async def test_a_repository_that_never_answers_a_read_is_given_up_on_in_time(
+    tmp_path: Path,
+) -> None:
+    _, trunk, _ = subject_with_candidate(tmp_path)
+    silent = socket.create_server(("127.0.0.1", 0))
+    address = f"git://127.0.0.1:{silent.getsockname()[1]}/project.git"
+    mirror = Mirror(tmp_path / "control-plane" / "vat.git")
+
+    try:
+        async with asyncio.timeout(3):
+            with pytest.raises(RemoteUnavailable, match="no answer"):
+                await mirror.read_ref(address, "refs/heads/main", base=trunk, timeout=0.5)
+    finally:
+        silent.close()

@@ -4,6 +4,7 @@ observed on that exact commit, and trunk moves once, to that commit, or not at a
 from __future__ import annotations
 
 import asyncio
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from relay.application import integration as integration_module
 from relay.application.integration import IntegrationRefused, Outcome
 from relay.domain.behaviour import BehaviourState
 from relay.domain.evidence import Launch, RedRejection
+from relay.git import checkout as checkout_module
 from relay.git.checkout import CheckoutFailed, RemoteUnavailable
 from relay.git.mirror import Mirror, NotFastForward
 from relay.persistence.outbox import pending_messages
@@ -965,3 +967,89 @@ async def test_an_update_found_locally_to_be_no_fast_forward_is_refused_without_
         0
     ]
     assert await world.state() is BehaviourState.BLOCKED
+
+
+async def test_what_is_authorised_is_the_batch_on_record_not_what_the_runner_was_holding(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base, candidate = await ready_to_integrate(world)
+    another = world.publish_attempt("B1", {"vat.py": VAT_ALWAYS_PRINTS_120}, on=candidate)
+    real = integration_module.Integration._run_checks
+
+    async def tampering(self: Any, batch: dict[str, Any]) -> Any:
+        runs = await real(self, batch)
+        batch["candidate_revision"] = another
+        batch["expected_trunk"] = candidate
+        return runs
+
+    monkeypatch.setattr(integration_module.Integration, "_run_checks", tampering)
+
+    receipt = await world.integrate()
+
+    assert receipt.outcome is Outcome.INTEGRATED
+    assert world.trunk() == candidate
+    assert await world.column(
+        "SELECT candidate_revision, expected_trunk FROM integration_intents"
+    ) == [candidate]
+    assert await world.column("SELECT expected_trunk FROM integration_intents") == [base]
+
+
+async def test_a_push_that_could_not_even_be_started_is_not_a_push_to_wait_for(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base, _ = await ready_to_integrate(world)
+    real = asyncio.create_subprocess_exec
+
+    async def no_file_descriptors_for_a_push(*arguments: Any, **options: Any) -> Any:
+        if "push" in arguments:
+            raise OSError(24, "Too many open files")
+        return await real(*arguments, **options)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            checkout_module.asyncio, "create_subprocess_exec", no_file_descriptors_for_a_push
+        )
+        receipt = await world.integrate()
+    world.hook_flag("refuse").touch()
+    assert receipt.outcome is Outcome.PENDING
+    assert await world.column("SELECT sends_started FROM integration_intents") == [1]
+    assert await world.column("SELECT sends_resolved FROM integration_intents") == [1]
+    assert (await world.events())[-1] == "integration.push_not_started"
+
+    assert await world.integration.reconcile() == 1
+
+    assert world.trunk() == base
+    assert await world.column("SELECT state FROM integration_intents") == ["rejected"]
+
+
+async def test_a_mirror_lost_after_authorisation_is_rebuilt_from_the_published_candidate(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, candidate = await ready_to_integrate(world)
+
+    async def dies(*_: Any, **__: Any) -> None:
+        raise Crash
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Mirror, "advance", dies)
+        with pytest.raises(Crash):
+            await world.integrate()
+    shutil.rmtree(world.mirrors)
+
+    assert await world.integration.reconcile() == 1
+
+    assert world.trunk() == candidate
+    assert await world.state() is BehaviourState.INTEGRATED
+
+
+async def test_a_send_whose_error_arrives_after_the_integration_was_settled_says_integrated(
+    world: TrunkWorld,
+) -> None:
+    await ready_to_integrate(world)
+    await world.integrate()
+    [intent_id] = await world.column("SELECT intent_id FROM integration_intents")
+
+    late = await world.integration._unanswered(intent_id, "connection reset")  # type: ignore[arg-type]
+
+    assert late.outcome is Outcome.INTEGRATED
+    assert "integration.push_unanswered" not in await world.events()
