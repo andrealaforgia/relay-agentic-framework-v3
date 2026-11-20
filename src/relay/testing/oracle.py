@@ -121,6 +121,11 @@ class ContainerIsolation:
             "--cpus", "1",
             "--user", f"{os.getuid()}:{os.getgid()}",
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+            # Bound what the engine stores of the subject's output; a rotated log no longer
+            # matches the attached capture, so such a run is refused rather than trusted.
+            "--log-driver", "json-file",
+            "--log-opt", f"max-size={max(capture_limit * 2, 1024 * 1024)}",
+            "--log-opt", "max-file=1",
             # --mount, unlike --volume, fails when the source is missing instead of
             # creating an empty directory and running against that.
             "--mount", f"type=bind,source={workdir},target=/subject,readonly",

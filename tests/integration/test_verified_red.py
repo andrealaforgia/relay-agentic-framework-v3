@@ -352,18 +352,39 @@ async def test_a_caller_cannot_supply_the_observation_or_the_source(
     assert await builder_is_blocked(behaviours, database)
 
 
-async def test_a_repository_address_carrying_a_credential_is_refused_and_stored_nowhere(
-    database: AsyncConnectionPool,
+@pytest.mark.parametrize(
+    "address",
+    [
+        "https://relay:canary-secret@git.example/vat.git",
+        "https://canary-secret@git.example/vat.git",
+        "https://git.example/vat.git?access_token=canary-secret",
+        "https://git.example/vat.git#canary-secret",
+        "ssh://git:canary-secret@git.example/vat.git",
+        "https://[canary-secret/vat.git",
+        "https://git.example:canary-secret/vat.git",
+    ],
+)
+async def test_a_repository_address_that_may_carry_a_credential_is_refused_and_stored_nowhere(
+    database: AsyncConnectionPool, address: str
 ) -> None:
     behaviours = Behaviours(database, ProcessOracle(NativeIsolation()))
 
-    with pytest.raises(ValueError, match="credentials") as refusal:
-        await behaviours.open_project(PROJECT, "https://relay:canary-secret@git.example/vat.git")
+    with pytest.raises(ValueError, match="repository address") as refusal:
+        await behaviours.open_project(PROJECT, address)
 
     assert "canary-secret" not in str(refusal.value)
     async with database.connection() as connection:
         assert await (await connection.execute("SELECT 1 FROM projects")).fetchone() is None
         assert await (await connection.execute("SELECT 1 FROM events")).fetchone() is None
+
+
+@pytest.mark.parametrize(
+    "address", ["/srv/git/vat.git", "git@git.example:team/vat.git", "ssh://git@git.example/vat.git"]
+)
+async def test_an_ordinary_repository_address_is_accepted(
+    database: AsyncConnectionPool, address: str
+) -> None:
+    await Behaviours(database, ProcessOracle(NativeIsolation())).open_project(PROJECT, address)
 
 
 async def test_a_failure_does_not_copy_the_repository_address_into_the_ledger(

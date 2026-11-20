@@ -27,17 +27,20 @@ class CheckoutFailed(Exception):
 
 
 def require_credential_free(repository: str) -> str:
-    """A repository locator is stored and shown; a secret inside it would be too.
-    Credentials are supplied to Git separately, never as part of the address."""
+    """A repository address is stored and shown; a secret inside it would be too.
+    Credentials are supplied to Git separately, never as part of the address. The
+    refusal never repeats the address, since the address is what may hold the secret."""
+    if "://" not in repository:
+        return repository  # a local path or an scp-style address: no place for a secret
     try:
         address = urlsplit(repository)
-        carries_a_secret = address.password is not None or (
-            address.scheme in {"http", "https"} and address.username is not None
-        )
+        address.port  # noqa: B018 - parsing the authority is what raises on a malformed one
     except ValueError:
-        carries_a_secret = False
-    if carries_a_secret:
-        raise ValueError("a repository address must not contain credentials")
+        raise ValueError("the repository address is malformed") from None
+    if address.password is not None or address.query or address.fragment:
+        raise ValueError("a repository address must not contain credentials or a query")
+    if address.scheme in {"http", "https"} and address.username is not None:
+        raise ValueError("a repository address must not contain credentials or a query")
     return repository
 
 

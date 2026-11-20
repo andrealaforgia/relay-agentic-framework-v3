@@ -47,6 +47,16 @@ print("supervisor credential:", os.environ.get("RELAY_WORKER_TOKEN", "absent"))
 """
 
 
+def containers(name: str) -> list[str]:
+    """Containers with this name in any state; fails loudly if the engine cannot be asked."""
+    return subprocess.run(
+        ["docker", "ps", "--all", "--quiet", "--filter", f"name={name}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+
+
 def running_oracle_containers() -> list[str]:
     return subprocess.run(
         ["docker", "ps", "--quiet", "--filter", "name=relay-oracle-"],
@@ -274,11 +284,16 @@ async def test_a_container_created_just_before_cancellation_is_still_removed(
 ) -> None:
     class CancelledAfterTheEngineCreates(ContainerIsolation):
         created: str = ""
+        existed_when_cancelled: bool = False
 
         async def _docker(self, *arguments: str, **options: Any) -> oracle.Captured:
             captured = await super()._docker(*arguments, **options)
             if arguments[0] == "create":
+                assert captured.exit_code == 0, captured.stderr
                 self.created = arguments[arguments.index("--name") + 1]
+                self.existed_when_cancelled = bool(
+                    await asyncio.to_thread(containers, self.created)
+                )
                 raise asyncio.CancelledError
             return captured
 
@@ -289,14 +304,22 @@ async def test_a_container_created_just_before_cancellation_is_still_removed(
     with pytest.raises(asyncio.CancelledError):
         await ProcessOracle(isolation).observe(workdir, Launch(argv=("python3", "vat.py", "1")))
 
-    assert isolation.created
-    in_any_state = await asyncio.to_thread(
-        subprocess.run,
-        ["docker", "ps", "--all", "--quiet", "--filter", f"name={isolation.created}"],
-        capture_output=True,
-        text=True,
-    )
-    assert in_any_state.stdout.split() == []
+    assert isolation.existed_when_cancelled
+    assert await asyncio.to_thread(containers, isolation.created) == []
+
+
+async def test_output_beyond_the_capture_limit_is_an_overflow_in_a_container_too(
+    tmp_path: Path, runner_image: str
+) -> None:
+    floods = "print('120')\nprint('x' * 5_000_000)\n"
+    revision = commit(tmp_path / "subject", {"vat.py": floods})
+    workdir = await pristine_checkout(str(tmp_path / "subject"), revision, tmp_path / "checkout")
+
+    observation = await ProcessOracle(
+        ContainerIsolation(runner_image), capture_limit_bytes=1_000_000
+    ).observe(workdir, Launch(argv=("python3", "vat.py"), timeout_seconds=30))
+
+    assert observation.ineligibility is Ineligibility.OUTPUT_OVERFLOW
 
 
 def test_an_unpinned_image_is_refused() -> None:

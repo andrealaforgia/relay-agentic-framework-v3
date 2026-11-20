@@ -46,6 +46,9 @@ async def migrate(pool: Pool) -> list[str]:
         rows = await (await connection.execute("SELECT * FROM schema_migrations")).fetchall()
         recorded = {row["version"]: row["checksum"] for row in rows}
         migrations = resources.files("relay.persistence") / "migrations"
+        present = {script.name for script in migrations.iterdir()}
+        if missing := sorted(set(recorded) - present):
+            raise MigrationDrift(f"applied migrations are missing from this build: {missing}")
         for script in sorted(migrations.iterdir(), key=lambda entry: entry.name):
             if not script.name.endswith(".sql"):
                 continue
