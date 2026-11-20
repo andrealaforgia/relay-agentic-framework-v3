@@ -15,6 +15,7 @@ from relay.application.behaviours import Behaviours
 from relay.domain.behaviour import BehaviourState, TransitionRefused
 from relay.domain.evidence import GreenRejection, Launch, ProcessContract, RedRejection
 from relay.git.checkout import CheckoutFailed
+from relay.git.mirror import Mirror
 from relay.persistence.ledger import read_events
 from relay.persistence.outbox import pending_messages
 from relay.testing.oracle import ContainerIsolation, NativeIsolation, ProcessOracle
@@ -37,7 +38,9 @@ async def released_to_builder(
 ) -> tuple[Behaviours, str]:
     """A behaviour with a verified red on trunk; returns the revision the red was observed on."""
     trunk = commit(repository, {"vat.py": VAT_RETURNS_NET})
-    behaviours = Behaviours(database, ProcessOracle(ContainerIsolation(runner_image)))
+    behaviours = Behaviours(
+        database, repository.parent / "mirrors", ProcessOracle(ContainerIsolation(runner_image))
+    )
     await behaviours.open_project(PROJECT, str(repository))
     await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
     await behaviours.begin_test_design(PROJECT, "B1")
@@ -171,7 +174,9 @@ async def test_green_cannot_be_run_before_red(
 ) -> None:
     repository = tmp_path / "subject"
     trunk = commit(repository, {"vat.py": VAT_RETURNS_NET})
-    behaviours = Behaviours(database, ProcessOracle(ContainerIsolation(runner_image)))
+    behaviours = Behaviours(
+        database, tmp_path / "mirrors", ProcessOracle(ContainerIsolation(runner_image))
+    )
     await behaviours.open_project(PROJECT, str(repository))
     await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
     await behaviours.begin_test_design(PROJECT, "B1")
@@ -265,7 +270,9 @@ async def test_a_candidate_that_hangs_is_reported_as_a_timeout(
         CONTRACT.expect,
         CONTRACT.baseline,
     )
-    behaviours = Behaviours(database, ProcessOracle(ContainerIsolation(runner_image)))
+    behaviours = Behaviours(
+        database, tmp_path / "mirrors", ProcessOracle(ContainerIsolation(runner_image))
+    )
     await behaviours.open_project(PROJECT, str(repository))
     await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
     await behaviours.begin_test_design(PROJECT, "B1")
@@ -286,7 +293,7 @@ async def test_native_execution_is_refused_for_green_before_anything_is_launched
     _, red_revision = await released_to_builder(database, repository, runner_image)
     publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision)
     native = CountingLaunches(NativeIsolation())
-    on_a_native_runner = Behaviours(database, ProcessOracle(native))
+    on_a_native_runner = Behaviours(database, tmp_path / "mirrors", ProcessOracle(native))
 
     verdict = await on_a_native_runner.run_green(PROJECT, "B1", attempt=1)
 
@@ -306,7 +313,7 @@ async def test_with_no_red_on_record_green_is_refused_before_anything_is_launche
     _, red_revision = await released_to_builder(database, repository, runner_image)
     publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision)
     container = CountingLaunches(ContainerIsolation(runner_image))
-    behaviours = Behaviours(database, ProcessOracle(container))
+    behaviours = Behaviours(database, tmp_path / "mirrors", ProcessOracle(container))
     async with database.connection() as connection:
         await connection.execute("UPDATE behaviours SET red_execution_id = NULL")
 
@@ -362,7 +369,9 @@ async def test_a_green_in_flight_when_its_red_is_superseded_does_not_reach_revie
     publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=first_red)
     held = HeldAtABarrier(ContainerIsolation(runner_image))
     in_flight = asyncio.create_task(
-        Behaviours(database, ProcessOracle(held)).run_green(PROJECT, "B1", attempt=1)
+        Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)).run_green(
+            PROJECT, "B1", attempt=1
+        )
     )
     await held.observed.wait()
 
@@ -389,13 +398,17 @@ async def test_a_red_in_flight_when_the_red_is_reopened_cannot_fill_the_new_cycl
 ) -> None:
     repository = tmp_path / "subject"
     old_trunk = commit(repository, {"vat.py": VAT_RETURNS_NET})
-    behaviours = Behaviours(database, ProcessOracle(ContainerIsolation(runner_image)))
+    behaviours = Behaviours(
+        database, tmp_path / "mirrors", ProcessOracle(ContainerIsolation(runner_image))
+    )
     await behaviours.open_project(PROJECT, str(repository))
     await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
     await behaviours.begin_test_design(PROJECT, "B1")
     await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
     held = HeldAtABarrier(ContainerIsolation(runner_image))
-    late = asyncio.create_task(Behaviours(database, ProcessOracle(held)).run_red(PROJECT, "B1"))
+    late = asyncio.create_task(
+        Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)).run_red(PROJECT, "B1")
+    )
     await held.observed.wait()
 
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
@@ -449,7 +462,9 @@ async def test_a_green_released_after_reopening_but_before_the_new_red_is_still_
     )
     held = HeldAtABarrier(ContainerIsolation(runner_image))
     in_flight = asyncio.create_task(
-        Behaviours(database, ProcessOracle(held)).run_green(PROJECT, "B1", attempt=1)
+        Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)).run_green(
+            PROJECT, "B1", attempt=1
+        )
     )
     await held.observed.wait()
 
@@ -473,13 +488,17 @@ async def test_a_red_released_after_the_replacement_red_was_accepted_is_still_re
 ) -> None:
     repository = tmp_path / "subject"
     old_trunk = commit(repository, {"vat.py": VAT_RETURNS_NET})
-    behaviours = Behaviours(database, ProcessOracle(ContainerIsolation(runner_image)))
+    behaviours = Behaviours(
+        database, tmp_path / "mirrors", ProcessOracle(ContainerIsolation(runner_image))
+    )
     await behaviours.open_project(PROJECT, str(repository))
     await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
     await behaviours.begin_test_design(PROJECT, "B1")
     await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT)
     held = HeldAtABarrier(ContainerIsolation(runner_image))
-    late = asyncio.create_task(Behaviours(database, ProcessOracle(held)).run_red(PROJECT, "B1"))
+    late = asyncio.create_task(
+        Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)).run_red(PROJECT, "B1")
+    )
     await held.observed.wait()
 
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
@@ -504,3 +523,21 @@ async def test_a_red_released_after_the_replacement_red_was_accepted_is_still_re
         ).fetchone()
     assert paired == {"revision": new_trunk}
     assert len(await pending_messages(database)) == 2
+
+
+async def test_a_candidate_judged_green_stays_pinned_after_the_builder_moves_the_attempt(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    repository = tmp_path / "subject"
+    behaviours, red_revision = await released_to_builder(database, repository, runner_image)
+    candidate = publish_attempt(
+        repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision
+    )
+    assert (await behaviours.run_green(PROJECT, "B1", attempt=1)).is_valid
+
+    publish_attempt(repository, "B1", 1, {"vat.py": "print('moved')\n"}, on=red_revision)
+
+    mirror = Mirror(tmp_path / "mirrors" / f"{PROJECT}.git")
+    assert await mirror.holds(candidate)
+    exported = await mirror.export(candidate, tmp_path / "exported")
+    assert (exported / "vat.py").read_text() == VAT_APPLIES_STANDARD_RATE

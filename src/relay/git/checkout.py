@@ -91,32 +91,6 @@ async def _resolve(repository: str, wanted: str, description: str) -> str:
     return revisions[0]
 
 
-async def candidate_checkout(
-    repository: str, ref: str, revision: str, built_on: str, into: Path
-) -> tuple[Path, bool]:
-    """The files of a candidate published under `ref`, and whether its history contains
-    the revision it claims to be built on."""
-    for pinned in (revision, built_on):
-        if not FULL_COMMIT_HASH.fullmatch(pinned):
-            raise CheckoutFailed("a revision must be a 40-character commit hash")
-    await git("clone", "--quiet", "--no-checkout", "--", repository, str(into), redact=repository)
-    await git("-C", str(into), "fetch", "--quiet", "origin", ref, redact=repository)
-    if await git("-C", str(into), "rev-parse", "FETCH_HEAD") != revision:
-        raise CheckoutFailed("the candidate moved while it was being fetched")
-    # A ref may point at a tag object; checking that out would run the tagged commit
-    # while the evidence named the tag. Only a commit is a candidate.
-    if await git("-C", str(into), "cat-file", "-t", revision) != "commit":
-        raise CheckoutFailed("the candidate is not a commit")
-    descends = await git_succeeds(
-        "-C", str(into), "merge-base", "--is-ancestor", built_on, revision
-    )
-    await git("-C", str(into), "checkout", "--quiet", "--detach", revision)
-    if await git("-C", str(into), "rev-parse", "HEAD") != revision:
-        raise CheckoutFailed("the checked-out revision is not the candidate")
-    await leave_only_the_tracked_files(into)
-    return into, descends
-
-
 async def pristine_checkout(repository: str, revision: str, into: Path) -> Path:
     """The files of one revision and nothing else: no Git metadata, so neither the remote
     address nor any credential embedded in it is exposed to whatever runs there."""

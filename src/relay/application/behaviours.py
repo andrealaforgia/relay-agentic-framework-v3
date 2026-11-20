@@ -28,11 +28,11 @@ from relay.git.checkout import (
     CheckoutFailed,
     attempt_head,
     attempt_ref,
-    candidate_checkout,
     pristine_checkout,
     require_credential_free,
     trunk_head,
 )
+from relay.git.mirror import Mirror
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
 from relay.persistence.outbox import enqueue
@@ -43,9 +43,15 @@ CONTROL_PLANE = "relay/control-plane"
 
 
 class Behaviours:
-    def __init__(self, pool: Pool, oracle: ProcessOracle) -> None:
+    def __init__(self, pool: Pool, mirrors: Path, oracle: ProcessOracle) -> None:
+        """`mirrors` is a directory on the control plane's own disk where every commit
+        Relay judges is kept pinned, one bare repository per project."""
         self._pool = pool
+        self._mirrors = mirrors
         self._oracle = oracle
+
+    def _mirror(self, project_id: str) -> Mirror:
+        return Mirror(self._mirrors / f"{require_identifier('project', project_id)}.git")
 
     async def open_project(self, project_id: str, repository: str, trunk: str = "main") -> None:
         async with self._pool.connection() as connection, connection.transaction():
@@ -202,14 +208,15 @@ class Behaviours:
         assert red is not None
         try:
             candidate = await attempt_head(repository, project_id, behaviour_id, attempt)
+            # Pin the candidate before anything depends on it: the Builder may move the
+            # attempt ref at any time, and this commit is about to become evidence.
+            mirror = self._mirror(project_id)
+            await mirror.pin_from(
+                repository, attempt_ref(project_id, behaviour_id, attempt), candidate
+            )
+            descends = await mirror.descends(candidate, red.revision)
             with tempfile.TemporaryDirectory(prefix="relay-green-") as scratch:
-                workdir, descends = await candidate_checkout(
-                    repository,
-                    attempt_ref(project_id, behaviour_id, attempt),
-                    candidate,
-                    red.revision,
-                    Path(scratch) / "subject",
-                )
+                workdir = await mirror.export(candidate, Path(scratch) / "subject")
                 execution = await self._oracle.execute(candidate, workdir, contract.launch)
         except CheckoutFailed as failure:
             await self._preparation_failed("green", project_id, behaviour_id, contract, failure)

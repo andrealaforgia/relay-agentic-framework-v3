@@ -56,7 +56,7 @@ async def awaiting_red(
     isolation: Isolation,
     contract: ProcessContract = CONTRACT,
 ) -> Behaviours:
-    behaviours = Behaviours(database, ProcessOracle(isolation))
+    behaviours = Behaviours(database, repository.parent / "mirrors", ProcessOracle(isolation))
     await behaviours.open_project(PROJECT, str(repository))
     await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
     await behaviours.begin_test_design(PROJECT, "B1")
@@ -237,7 +237,7 @@ async def test_a_failed_checkout_is_on_the_ledger_and_the_builder_stays_blocked(
 ) -> None:
     commit(tmp_path / "subject", {"vat.py": VAT_RETURNS_NET})
     container = CountingLaunches(ContainerIsolation(runner_image))
-    behaviours = Behaviours(database, ProcessOracle(container))
+    behaviours = Behaviours(database, tmp_path / "mirrors", ProcessOracle(container))
     await behaviours.open_project(PROJECT, str(tmp_path / "subject"), trunk="no-such-branch")
     await behaviours.propose(PROJECT, "B1", "standard VAT rate is applied")
     await behaviours.begin_test_design(PROJECT, "B1")
@@ -356,9 +356,9 @@ async def test_a_caller_cannot_supply_the_observation_or_the_source(
     ],
 )
 async def test_a_repository_address_that_may_carry_a_credential_is_refused_and_stored_nowhere(
-    database: AsyncConnectionPool, address: str
+    database: AsyncConnectionPool, tmp_path: Path, address: str
 ) -> None:
-    behaviours = Behaviours(database, ProcessOracle(NativeIsolation()))
+    behaviours = Behaviours(database, tmp_path / "mirrors", ProcessOracle(NativeIsolation()))
 
     with pytest.raises(ValueError, match="repository address") as refusal:
         await behaviours.open_project(PROJECT, address)
@@ -380,9 +380,11 @@ async def test_a_repository_address_that_may_carry_a_credential_is_refused_and_s
     ],
 )
 async def test_an_ordinary_repository_address_is_accepted(
-    database: AsyncConnectionPool, address: str
+    database: AsyncConnectionPool, tmp_path: Path, address: str
 ) -> None:
-    await Behaviours(database, ProcessOracle(NativeIsolation())).open_project(PROJECT, address)
+    await Behaviours(database, tmp_path / "mirrors", ProcessOracle(NativeIsolation())).open_project(
+        PROJECT, address
+    )
 
 
 async def test_a_failure_does_not_copy_the_repository_address_into_the_ledger(
@@ -404,7 +406,7 @@ async def test_a_failure_does_not_copy_the_repository_address_into_the_ledger(
 async def test_a_behaviour_id_relay_could_never_build_is_refused_when_proposed(
     database: AsyncConnectionPool, tmp_path: Path, behaviour_id: str
 ) -> None:
-    behaviours = Behaviours(database, ProcessOracle(NativeIsolation()))
+    behaviours = Behaviours(database, tmp_path / "mirrors", ProcessOracle(NativeIsolation()))
     await behaviours.open_project(PROJECT, str(tmp_path / "subject"))
 
     with pytest.raises(ValueError, match="behaviour id"):
@@ -418,7 +420,7 @@ async def test_a_behaviour_id_relay_could_never_build_is_refused_when_proposed(
 async def test_a_project_id_that_could_reshape_a_ref_is_refused(
     database: AsyncConnectionPool, tmp_path: Path
 ) -> None:
-    behaviours = Behaviours(database, ProcessOracle(NativeIsolation()))
+    behaviours = Behaviours(database, tmp_path / "mirrors", ProcessOracle(NativeIsolation()))
 
     with pytest.raises(ValueError, match="project id"):
         await behaviours.open_project("vat/../../heads", str(tmp_path / "subject"))
