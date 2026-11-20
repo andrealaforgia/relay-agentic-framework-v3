@@ -22,4 +22,4 @@ Still on recommended defaults, not yet explicitly confirmed: review and security
 
 ## Open questions for the Product Owner
 
-- Should a surviving mutant on changed lines block integration, or only be reported? (Arises from the plan to add mutation testing as a deterministic QA check.)
+- Mutation testing policy. Recommended by Claude, awaiting a decision: no percentage threshold; instead no surviving mutant on changed lines, each survivor a QA finding that is killed or dispositioned as equivalent by QA (never by the Builder); a ratchet on Relay's own domain code; a time box whose expiry is reported, not passed. (Arises from the plan to add mutation testing as a deterministic QA check.)
