@@ -16,10 +16,11 @@ from relay.application.integration import IntegrationRefused, Outcome
 from relay.domain.behaviour import BehaviourState
 from relay.domain.evidence import Launch, RedRejection
 from relay.git.checkout import CheckoutFailed, RemoteUnavailable
-from relay.git.mirror import Mirror
+from relay.git.mirror import Mirror, NotFastForward
 from relay.persistence.outbox import pending_messages
 from relay.testing.oracle import ContainerIsolation, Isolation, NativeIsolation, Run
 from tests.integration.fixtures import (
+    CONTRACT,
     VAT_APPLIES_STANDARD_RATE,
     CountingLaunches,
     HeldAtABarrier,
@@ -490,8 +491,9 @@ async def test_checks_seen_in_another_runtime_than_the_green_reopen_the_red(
 
     receipt = await elsewhere.integrate(PROJECT, "B1", "once")
 
-    assert receipt.outcome is Outcome.BASE_MOVED
+    assert receipt.outcome is Outcome.RUNTIME_CHANGED
     assert "runtime" in receipt.reason
+    assert await elsewhere.integrate(PROJECT, "B1", "once") == receipt
     assert world.trunk() == base
     assert await world.state() is BehaviourState.VALIDATING_RED
     assert await world.column("SELECT count(*) FROM integration_intents") == [0]
@@ -544,31 +546,40 @@ async def test_a_crash_after_the_remote_accepted_the_push_is_recognised_on_resta
     assert await world.column("SELECT sends_started FROM integration_intents") == [1]
 
 
-async def test_work_built_on_top_of_the_candidate_still_counts_as_integrated(
-    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("how", ["built on top", "merged and discarded"])
+async def test_a_later_head_that_contains_the_candidate_is_not_taken_as_its_integration(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch, how: str
 ) -> None:
-    await ready_to_integrate(world)
-    real = Mirror.advance
+    """A commit can be in trunk's history while its change is not in trunk's tree."""
+    base, candidate = await ready_to_integrate(world)
 
-    async def dies_after_sending(self: Mirror, *arguments: Any, **options: Any) -> None:
-        await real(self, *arguments, **options)
+    async def dies(*_: Any, **__: Any) -> None:
         raise Crash
 
     with monkeypatch.context() as patched:
-        patched.setattr(Mirror, "advance", dies_after_sending)
+        patched.setattr(Mirror, "advance", dies)
         with pytest.raises(Crash):
             await world.integrate()
-    world.advance_trunk({"notes.txt": "built on the candidate\n"})
+    if how == "built on top":
+        world.git("push", "-q", "origin", f"{candidate}:refs/heads/main")
+        world.advance_trunk({"notes.txt": "built on the candidate\n"})
+    else:
+        world.git("checkout", "-q", "--detach", base)
+        world.git("merge", "-q", "--no-ff", "-s", "ours", "-m", "keep ours", candidate)
+        world.git("push", "-q", "origin", "HEAD:refs/heads/main")
 
     assert await world.integration.reconcile() == 1
 
-    assert await world.state() is BehaviourState.INTEGRATED
+    assert await world.column("SELECT state FROM integration_intents") == ["conflicted"]
+    assert await world.state() is BehaviourState.VALIDATING_RED
+    assert await integrated_events(world) == 0
 
 
-async def test_trunk_found_elsewhere_after_a_lost_push_is_a_conflict_for_a_person(
+async def test_trunk_found_elsewhere_after_a_lost_push_sends_the_behaviour_for_a_fresh_red(
     world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await ready_to_integrate(world)
+    await world.awaiting_builder("B2", GREETING)
 
     async def dies(*_: Any, **__: Any) -> None:
         raise Crash
@@ -582,11 +593,39 @@ async def test_trunk_found_elsewhere_after_a_lost_push_is_a_conflict_for_a_perso
     assert await world.integration.reconcile() == 1
 
     assert world.trunk() == elsewhere
-    assert await world.state() is BehaviourState.BLOCKED
+    assert await world.state() is BehaviourState.VALIDATING_RED
     assert await world.column("SELECT state FROM integration_intents") == ["conflicted"]
-    assert (await world.events())[-1] == "integration.conflicted"
-    await world.integration.retry_integration(PROJECT, "B1", "the other change was agreed")
-    assert (await world.integrate()).outcome is Outcome.BASE_MOVED
+    assert await world.column("SELECT state FROM review_cycles") == ["superseded"]
+    assert (await world.events())[-2:] == ["integration.conflicted", "integration.red_reopened"]
+    with pytest.raises(IntegrationRefused, match="no failed integration"):
+        await world.integration.retry_integration(PROJECT, "B1", "not needed")
+    second = await world.reviewed("B2", {"greeting.txt": "hello\n"}, on=elsewhere)
+    assert second and (await world.integrate("B2")).outcome is Outcome.BASE_MOVED
+
+
+async def test_a_reading_of_trunk_behind_the_expected_head_settles_nothing(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An old reading does not show that a push still in flight can no longer land."""
+    base, candidate = await ready_to_integrate(world)
+
+    async def dies(*_: Any, **__: Any) -> None:
+        raise Crash
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Mirror, "advance", dies)
+        with pytest.raises(Crash):
+            await world.integrate()
+    world.git("update-ref", "refs/heads/main", f"{base}~1", at=world.remote)
+
+    assert await world.integration.reconcile() == 0
+
+    assert await world.column("SELECT state FROM integration_intents") == ["outstanding"]
+    assert await world.column("SELECT sends_started FROM integration_intents") == [0]
+    assert await world.state() is BehaviourState.REVIEW
+    world.git("update-ref", "refs/heads/main", base, at=world.remote)
+    assert await world.integration.reconcile() == 1
+    assert world.trunk() == candidate
 
 
 async def test_a_repository_that_cannot_be_reached_leaves_the_intent_for_the_next_pass(
@@ -598,20 +637,21 @@ async def test_a_repository_that_cannot_be_reached_leaves_the_intent_for_the_nex
         raise RemoteUnavailable("no route to host")
 
     with monkeypatch.context() as patched:
-        patched.setattr(Mirror, "advance", unreachable)
+        patched.setattr(Mirror, "_push", unreachable)
         receipt = await world.integrate()
-        patched.setattr(integration_module, "trunk_head", unreachable)
+        patched.setattr(Mirror, "read_ref", unreachable)
         assert await world.integration.reconcile() == 0
 
     assert receipt.outcome is Outcome.PENDING
     assert await world.state() is BehaviourState.REVIEW
     assert await world.column("SELECT state FROM integration_intents") == ["outstanding"]
     assert "integration.push_unanswered" in await world.events()
+    assert await world.column("SELECT sends_started FROM integration_intents") == [1]
     assert await world.integration.reconcile() == 1
     assert world.trunk() == candidate
 
 
-async def test_trunk_moved_by_someone_else_during_the_checks_is_refused_by_the_repository(
+async def test_trunk_moved_by_someone_else_during_the_checks_sends_the_behaviour_for_a_fresh_red(
     world: TrunkWorld,
 ) -> None:
     _, candidate = await ready_to_integrate(world)
@@ -623,10 +663,11 @@ async def test_trunk_moved_by_someone_else_during_the_checks_is_refused_by_the_r
     barrier.release.set()
     receipt = await running
 
-    assert receipt.outcome is Outcome.REJECTED
+    assert receipt.outcome is Outcome.CONFLICTED
     assert world.trunk() == elsewhere != candidate
-    assert await world.state() is BehaviourState.BLOCKED
-    assert await world.column("SELECT state FROM integration_intents") == ["rejected"]
+    assert await world.state() is BehaviourState.VALIDATING_RED
+    assert await world.column("SELECT state FROM integration_intents") == ["conflicted"]
+    assert await world.column("SELECT sends_started FROM integration_intents") == [1]
 
 
 async def test_a_hook_that_refuses_the_push_settles_the_intent_and_frees_the_project(
@@ -700,6 +741,8 @@ async def test_a_refusal_does_not_free_the_project_while_an_earlier_push_may_sti
     assert "integration.refusal_left_unsettled" in await world.events()
     assert (await world.integrate("B2")).outcome is Outcome.BUSY
     assert await impatient.reconcile() == 0
+    [intent_id] = await world.column("SELECT intent_id FROM integration_intents")
+    assert (await impatient._drive(intent_id)).outcome is Outcome.PENDING  # type: ignore[arg-type]
     assert await world.column("SELECT sends_started FROM integration_intents") == [2]
 
     world.hook_flag("refuse").unlink()
@@ -777,3 +820,148 @@ async def test_an_integration_seen_twice_to_have_converged_is_recorded_once(
     assert first == second
     assert first.outcome is Outcome.INTEGRATED
     assert await integrated_events(world) == 1
+
+
+@pytest.mark.parametrize("fault", ["one check missing", "run on another commit"])
+async def test_runs_that_are_not_every_check_on_the_candidate_authorise_nothing(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    base, _ = await ready_to_integrate(world)
+    await world.integration.require_check(
+        PROJECT, replace(ZERO_STAYS_ZERO, contract_id="zero-still-stays-zero")
+    )
+    real = integration_module.Integration._run_checks
+
+    async def faulty(self: Any, batch: dict[str, Any]) -> Any:
+        runs = await real(self, batch)
+        if fault == "one check missing":
+            return runs[:1]
+        return [(check, replace(execution, revision=base)) for check, execution in runs]
+
+    monkeypatch.setattr(integration_module.Integration, "_run_checks", faulty)
+
+    receipt = await world.integrate()
+
+    assert receipt.outcome is Outcome.SUPERSEDED
+    assert world.trunk() == base
+    assert await world.column("SELECT count(*) FROM integration_intents") == [0]
+    assert await world.column("SELECT state FROM check_batches") == ["discarded"]
+    assert await world.state() is BehaviourState.REVIEW
+
+
+async def test_a_project_with_no_checks_at_all_still_integrates(world: TrunkWorld) -> None:
+    base = await world.awaiting_builder()
+    candidate = await world.reviewed(on=base)
+
+    assert (await world.integrate()).outcome is Outcome.INTEGRATED
+    assert world.trunk() == candidate
+
+
+async def test_an_obligation_that_arrives_twice_is_one_check_run_once(world: TrunkWorld) -> None:
+    base = await world.awaiting_builder()
+    await world.reviewed(on=base)
+    await world.integrate()
+    await world.integration.require_check(PROJECT, CONTRACT.as_check())
+    trunk = await world.awaiting_builder("B2", GREETING)
+    candidate = await world.reviewed("B2", {"greeting.txt": "hello\n"}, on=trunk)
+
+    receipt = await world.integrate("B2")
+
+    assert receipt.outcome is Outcome.INTEGRATED
+    assert world.trunk() == candidate
+    assert await world.column("SELECT count(*) FROM executions WHERE purpose = 'check'") == [1]
+
+
+async def test_a_repository_enrolled_by_a_relative_path_is_the_one_that_moves(
+    database: AsyncConnectionPool,
+    tmp_path: Path,
+    runner_image: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = TrunkWorld(database, tmp_path, runner_image)
+    monkeypatch.chdir(tmp_path)
+    base = await world.open(address="remote.git")
+    elsewhere = tmp_path / "another-directory"
+    elsewhere.mkdir()
+    world.git("clone", "-q", "--bare", str(world.remote), str(elsewhere / "remote.git"))
+    monkeypatch.chdir(elsewhere)
+    await world.awaiting_builder()
+    candidate = await world.reviewed(on=base)
+
+    assert (await world.integrate()).outcome is Outcome.INTEGRATED
+
+    assert world.trunk() == candidate
+    assert world.git("rev-parse", "refs/heads/main", at=elsewhere / "remote.git") == base
+    assert await world.column("SELECT repository FROM integration_intents") == [
+        str(world.remote.resolve())
+    ]
+
+
+async def test_a_local_failure_before_anything_is_sent_is_not_a_push_to_wait_for(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base, _ = await ready_to_integrate(world)
+
+    async def unreadable(*_: Any, **__: Any) -> bool:
+        raise CheckoutFailed("the object store is unreadable")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Mirror, "holds", unreadable)
+        receipt = await world.integration.integrate(PROJECT, "B1", "once")
+    world.hook_flag("refuse").touch()
+    assert receipt.outcome is Outcome.PENDING
+    assert await world.column("SELECT sends_started FROM integration_intents") == [0]
+    assert "integration.push_unanswered" not in await world.events()
+
+    assert await world.integration.reconcile() == 1
+
+    assert world.trunk() == base
+    assert await world.column("SELECT state FROM integration_intents") == ["rejected"]
+    assert await world.state() is BehaviourState.BLOCKED
+
+
+async def test_a_conflict_seen_under_an_intent_that_is_then_refused_stops_the_cycle_being_reused(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base, _ = await ready_to_integrate(world)
+    real = Mirror.advance
+    world.hook_flag("refuse").touch()
+
+    async def conflict_seen_first(self: Mirror, *arguments: Any, **options: Any) -> bool:
+        [cycle_id] = await world.column("SELECT cycle_id FROM review_cycles")
+        await world.reviews._block(cycle_id, "the candidate ref moved")  # type: ignore[arg-type]
+        return await real(self, *arguments, **options)
+
+    monkeypatch.setattr(Mirror, "advance", conflict_seen_first)
+    receipt = await world.integrate()
+    world.hook_flag("refuse").unlink()
+
+    assert receipt.outcome is Outcome.REJECTED
+    assert await world.column("SELECT state FROM review_cycles") == ["blocked"]
+    assert await world.column("SELECT blocked_reason FROM review_cycles") == [
+        "the candidate ref moved"
+    ]
+    with pytest.raises(IntegrationRefused, match="no failed integration"):
+        await world.integration.retry_integration(PROJECT, "B1", "the hook was fixed")
+    assert world.trunk() == base
+    assert await world.column("SELECT sends_started FROM integration_intents") == [1]
+
+
+async def test_an_update_found_locally_to_be_no_fast_forward_is_refused_without_a_send(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base, _ = await ready_to_integrate(world)
+
+    async def not_a_fast_forward(*_: Any, **__: Any) -> bool:
+        raise NotFastForward("the commit is not a fast-forward of the expected head")
+
+    monkeypatch.setattr(Mirror, "advance", not_a_fast_forward)
+
+    receipt = await world.integrate()
+
+    assert receipt.outcome is Outcome.REJECTED
+    assert world.trunk() == base
+    assert await world.column("SELECT sends_started + sends_resolved FROM integration_intents") == [
+        0
+    ]
+    assert await world.state() is BehaviourState.BLOCKED

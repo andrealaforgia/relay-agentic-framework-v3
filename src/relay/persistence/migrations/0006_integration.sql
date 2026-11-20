@@ -31,7 +31,8 @@ CREATE TABLE check_batches (
     regression_digest    text NOT NULL,
     members              jsonb NOT NULL,
     state                text NOT NULL DEFAULT 'running' CHECK (state IN
-        ('running', 'authorised', 'failed', 'superseded', 'discarded', 'abandoned', 'base_moved')),
+        ('running', 'authorised', 'failed', 'superseded', 'discarded', 'abandoned', 'base_moved',
+         'runtime_changed')),
     reason               text,
     created_at           timestamptz NOT NULL DEFAULT now(),
     FOREIGN KEY (project_id, behaviour_id) REFERENCES behaviours,
@@ -56,6 +57,10 @@ CREATE TABLE integration_intents (
     behaviour_id       text NOT NULL,
     cycle_id           uuid NOT NULL REFERENCES review_cycles,
     batch_id           uuid NOT NULL UNIQUE REFERENCES check_batches,
+    -- Where the update goes, fixed when it is authorised: a later change to the project
+    -- must not redirect a push already owed.
+    repository         text NOT NULL,
+    trunk              text NOT NULL,
     candidate_revision text NOT NULL CHECK (candidate_revision ~ '^[0-9a-f]{40}$'),
     expected_trunk     text NOT NULL CHECK (expected_trunk ~ '^[0-9a-f]{40}$'),
     state              text NOT NULL DEFAULT 'outstanding'
@@ -73,3 +78,7 @@ CREATE TABLE integration_intents (
 
 CREATE UNIQUE INDEX one_outstanding_intent_per_project
     ON integration_intents (project_id) WHERE state = 'outstanding';
+
+-- A conflict on the candidate ref seen while an authorised integration owned the cycle.
+-- It could not stop that integration; it must stop the cycle being used for another.
+ALTER TABLE review_cycles ADD COLUMN conflict_observed text;

@@ -700,6 +700,12 @@ class Reviews:
                     "WHERE project_id = %s AND behaviour_id = %s AND state = 'review'",
                     (project_id, behaviour_id),
                 )
+            else:
+                await connection.execute(
+                    "UPDATE review_cycles SET conflict_observed = %s "
+                    "WHERE cycle_id = %s AND state IN ('open', 'satisfied')",
+                    (reason, cycle_id),
+                )
             await append_event(
                 connection,
                 project_id,

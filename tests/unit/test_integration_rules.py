@@ -16,7 +16,7 @@ from relay.domain.evidence import (
 )
 from relay.domain.integration import (
     TrunkReading,
-    a_rejection_settles_the_intent,
+    a_refusal_settles_the_intent,
     read_trunk,
     regression_digest,
 )
@@ -169,37 +169,42 @@ def test_a_refused_integration_can_be_tried_again_from_blocked() -> None:
     assert behaviour.state is BehaviourState.REVIEW
 
 
-def test_the_first_send_being_rejected_settles_the_intent() -> None:
-    assert a_rejection_settles_the_intent(sends_started=1, sends_resolved=0)
+def test_the_first_send_being_refused_settles_the_intent() -> None:
+    assert a_refusal_settles_the_intent(sends_started=1, sends_answered=1)
 
 
-def test_a_rejection_does_not_settle_while_an_earlier_send_may_still_land() -> None:
-    assert not a_rejection_settles_the_intent(sends_started=2, sends_resolved=0)
+def test_a_refusal_does_not_settle_while_an_earlier_send_may_still_land() -> None:
+    assert not a_refusal_settles_the_intent(sends_started=2, sends_answered=1)
 
 
-def test_a_rejection_settles_once_every_other_send_is_known_to_have_failed() -> None:
-    assert a_rejection_settles_the_intent(sends_started=2, sends_resolved=1)
+def test_a_refusal_settles_once_every_send_is_known_to_have_failed() -> None:
+    assert a_refusal_settles_the_intent(sends_started=2, sends_answered=2)
 
 
-def test_trunk_at_the_candidate_means_the_integration_converged() -> None:
-    reading = read_trunk(CANDIDATE, expected=BASE, candidate=CANDIDATE, contains_candidate=True)
+def test_a_refusal_before_anything_was_sent_settles_only_if_nothing_is_in_flight() -> None:
+    assert a_refusal_settles_the_intent(sends_started=0, sends_answered=0)
+    assert not a_refusal_settles_the_intent(sends_started=1, sends_answered=0)
 
-    assert reading is TrunkReading.CONVERGED
 
-
-def test_trunk_built_on_top_of_the_candidate_also_converged() -> None:
-    reading = read_trunk(ELSEWHERE, expected=BASE, candidate=CANDIDATE, contains_candidate=True)
+def test_only_trunk_at_the_candidate_itself_means_the_integration_converged() -> None:
+    reading = read_trunk(CANDIDATE, expected=BASE, candidate=CANDIDATE, beyond_expected=True)
 
     assert reading is TrunkReading.CONVERGED
 
 
 def test_trunk_still_at_the_expected_head_proves_nothing() -> None:
-    reading = read_trunk(BASE, expected=BASE, candidate=CANDIDATE, contains_candidate=False)
+    reading = read_trunk(BASE, expected=BASE, candidate=CANDIDATE, beyond_expected=False)
 
     assert reading is TrunkReading.UNDECIDED
 
 
-def test_trunk_somewhere_else_without_the_candidate_is_a_conflict() -> None:
-    reading = read_trunk(ELSEWHERE, expected=BASE, candidate=CANDIDATE, contains_candidate=False)
+def test_trunk_moved_on_from_the_expected_head_to_something_else_is_a_conflict() -> None:
+    reading = read_trunk(ELSEWHERE, expected=BASE, candidate=CANDIDATE, beyond_expected=True)
 
     assert reading is TrunkReading.CONFLICT
+
+
+def test_a_head_that_is_older_or_unrelated_settles_nothing() -> None:
+    reading = read_trunk(ELSEWHERE, expected=BASE, candidate=CANDIDATE, beyond_expected=False)
+
+    assert reading is TrunkReading.UNVERIFIABLE

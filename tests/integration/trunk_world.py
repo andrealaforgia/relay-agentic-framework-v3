@@ -83,7 +83,7 @@ class TrunkWorld:
             text=True,
         ).stdout.strip()
 
-    async def open(self) -> str:
+    async def open(self, address: str | None = None) -> str:
         """A bare remote whose trunk holds a calculator that returns the net amount."""
         self.remote.mkdir()
         self.git("init", "-q", "--bare", "-b", "main", at=self.remote)
@@ -97,8 +97,9 @@ class TrunkWorld:
         self.git("config", "user.email", "builder@relay.test")
         self.git("config", "user.name", "Builder")
         self.git("remote", "add", "origin", str(self.remote))
+        self.advance_trunk({"README": "a VAT calculator\n"})
         base = self.advance_trunk({"vat.py": VAT_RETURNS_NET})
-        await self.behaviours.open_project(PROJECT, str(self.remote))
+        await self.behaviours.open_project(PROJECT, address or str(self.remote))
         return base
 
     def advance_trunk(self, files: dict[str, str]) -> str:

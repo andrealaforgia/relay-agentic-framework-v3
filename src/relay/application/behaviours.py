@@ -29,8 +29,8 @@ from relay.git.checkout import (
     CheckoutFailed,
     attempt_head,
     attempt_ref,
+    canonical_repository,
     pristine_checkout,
-    require_credential_free,
     trunk_head,
 )
 from relay.git.mirror import Mirror
@@ -60,7 +60,7 @@ class Behaviours:
                 "INSERT INTO projects (project_id, repository, trunk) VALUES (%s, %s, %s)",
                 (
                     require_identifier("project", project_id),
-                    require_credential_free(repository),
+                    canonical_repository(repository),
                     trunk,
                 ),
             )

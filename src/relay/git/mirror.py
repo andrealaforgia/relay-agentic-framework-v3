@@ -10,7 +10,7 @@ commit from this mirror by its recorded hash, never by resolving a name again.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -148,24 +148,46 @@ class Mirror:
         raise CheckoutFailed(f"the push was not accepted: {refusal.detail}")
 
     async def advance(
-        self, repository: str, commit: str, ref: str, *, expected: str, timeout: float
-    ) -> None:
+        self,
+        repository: str,
+        commit: str,
+        ref: str,
+        *,
+        expected: str,
+        timeout: float,
+        about_to_send: Callable[[], Awaitable[bool]] | None = None,
+    ) -> bool:
         """Move `ref` on the remote from exactly `expected` to a pinned commit that is a
-        fast-forward of it. Returns only when the remote reported the update.
+        fast-forward of it. True once the remote has reported the update.
 
-        RemoteRejected: the update did not happen, and this send cannot make it happen.
-        RemoteUnavailable: no answer. The update may have happened, or may yet."""
+        Everything that can be established locally is established first. Only then is
+        `about_to_send` called, immediately before the one operation that can reach the
+        remote; if it answers no, nothing is sent and the result is False.
+
+        Before sending: NotFastForward, or CheckoutFailed if this mirror cannot say.
+        After sending: RemoteRejected when the update did not happen and this send
+        cannot make it happen; RemoteUnavailable when no answer came, in which case the
+        update may have happened, or may yet."""
         _require_hash(commit)
         _require_hash(expected)
+        if not await self.holds(commit):
+            raise CheckoutFailed("the commit to send is not pinned in this mirror")
+        if not await self._is_a_commit(expected):
+            raise CheckoutFailed("the expected head is not available in this mirror")
         if not await self.descends(commit, expected):
-            raise RemoteRejected("the commit is not a fast-forward of the expected head")
+            raise NotFastForward("the commit is not a fast-forward of the expected head")
+        if about_to_send is not None and not await about_to_send():
+            return False
         refusal = await self._push(repository, commit, ref, expected=expected, timeout=timeout)
         if refusal is not None:
             raise RemoteRejected(refusal.detail)
+        return True
 
-    async def remote_ref_contains(self, repository: str, ref: str, commit: str) -> bool:
-        """Whether the history of `ref`, as the remote has it now, contains this commit."""
-        _require_hash(commit)
+    async def read_ref(self, repository: str, ref: str, *, base: str) -> RefReading:
+        """What `ref` points at on the remote now, and whether that same commit strictly
+        descends from `base`. One fetch answers both, so they cannot describe two
+        different moments."""
+        _require_hash(base)
         await self._ensure_exists()
         scratch = f"{_INCOMING}/{uuid.uuid4().hex}"
         try:
@@ -176,7 +198,8 @@ class Mirror:
                 )  # fmt: skip
             except CheckoutFailed as failure:
                 raise RemoteUnavailable(str(failure)) from None
-            return await self.descends(scratch, commit)
+            head = await self._git("rev-parse", scratch)
+            return RefReading(head, head != base and await self.descends(head, base))
         finally:
             await self._discard(scratch)
 
@@ -224,6 +247,16 @@ class Mirror:
 
     async def _git(self, *arguments: str, redact: str | None = None) -> str:
         return await git("-C", str(self._path), *arguments, redact=redact)
+
+
+class NotFastForward(CheckoutFailed):
+    """Established locally, before anything was sent."""
+
+
+@dataclass(frozen=True)
+class RefReading:
+    head: str
+    beyond_base: bool
 
 
 @dataclass(frozen=True)

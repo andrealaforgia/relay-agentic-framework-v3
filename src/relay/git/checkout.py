@@ -61,6 +61,16 @@ def require_credential_free(repository: str) -> str:
     return repository
 
 
+def canonical_repository(repository: str) -> str:
+    """The one address a project's repository is known by. A local path is made absolute
+    here, once: Git run from another directory would otherwise read it as another place."""
+    require_credential_free(repository)
+    head = repository.split("/", 1)[0]
+    if "://" in repository or ":" in head:
+        return repository  # a URL, or an scp-style host:path address
+    return str(Path(repository).resolve())
+
+
 async def trunk_head(repository: str, trunk: str) -> str:
     """The commit the project's trunk points at now, read from the project's own repository."""
     if not _BRANCH_NAME.fullmatch(trunk):

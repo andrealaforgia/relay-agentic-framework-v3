@@ -15,7 +15,7 @@ from relay.git.checkout import (
     refs_under,
     resolve_ref,
 )
-from relay.git.mirror import Mirror
+from relay.git.mirror import Mirror, NotFastForward
 from tests.integration.fixtures import (
     VAT_APPLIES_STANDARD_RATE,
     VAT_RETURNS_NET,
@@ -245,7 +245,7 @@ async def test_a_ref_is_never_advanced_to_a_commit_that_does_not_build_on_it(
     await mirror.pin_from(str(repository), ATTEMPT, candidate)
     await mirror.pin_from(str(repository), ATTEMPT[:-1] + "2", sibling)
 
-    with pytest.raises(RemoteRejected, match="fast-forward"):
+    with pytest.raises(NotFastForward):
         await mirror.advance(str(repository), candidate, RELEASE, expected=sibling, timeout=30)
 
     assert git(repository, "rev-parse", RELEASE) == sibling
@@ -277,3 +277,62 @@ async def test_a_push_that_gets_no_answer_in_time_is_reported_as_unanswered(
 
     with pytest.raises(RemoteUnavailable, match="no answer"):
         await mirror.advance(str(repository), candidate, RELEASE, expected=trunk, timeout=0.5)
+
+
+async def test_nothing_is_sent_when_the_caller_declines_at_the_last_moment(
+    tmp_path: Path,
+) -> None:
+    repository, trunk, candidate = subject_with_candidate(tmp_path)
+    git(repository, "update-ref", RELEASE, trunk)
+    mirror = Mirror(tmp_path / "control-plane" / "vat.git")
+    await mirror.pin_from(str(repository), ATTEMPT, candidate)
+
+    async def decline() -> bool:
+        return False
+
+    sent = await mirror.advance(
+        str(repository), candidate, RELEASE, expected=trunk, timeout=30, about_to_send=decline
+    )
+
+    assert sent is False
+    assert git(repository, "rev-parse", RELEASE) == trunk
+
+
+async def test_the_caller_is_not_asked_to_send_what_cannot_be_checked_locally(
+    tmp_path: Path,
+) -> None:
+    repository, trunk, candidate = subject_with_candidate(tmp_path)
+    mirror = Mirror(tmp_path / "control-plane" / "vat.git")
+    await mirror.pin_from(str(repository), ATTEMPT, candidate)
+    asked = []
+
+    async def note() -> bool:
+        asked.append(True)
+        return True
+
+    with pytest.raises(CheckoutFailed, match="expected head is not available"):
+        await mirror.advance(
+            str(repository), candidate, RELEASE, expected="0" * 40, timeout=30, about_to_send=note
+        )
+    with pytest.raises(CheckoutFailed, match="not pinned"):
+        await mirror.advance(
+            str(repository), trunk, RELEASE, expected=trunk, timeout=30, about_to_send=note
+        )
+
+    assert asked == []
+
+
+async def test_a_ref_is_read_once_for_both_where_it_is_and_whether_it_moved_on(
+    tmp_path: Path,
+) -> None:
+    repository, trunk, candidate = subject_with_candidate(tmp_path)
+    mirror = Mirror(tmp_path / "control-plane" / "vat.git")
+    await mirror.pin_from(str(repository), ATTEMPT, candidate)
+
+    at_base = await mirror.read_ref(str(repository), ATTEMPT, base=candidate)
+    beyond = await mirror.read_ref(str(repository), ATTEMPT, base=trunk)
+    behind = await mirror.read_ref(str(repository), "refs/heads/main", base=candidate)
+
+    assert (at_base.head, at_base.beyond_base) == (candidate, False)
+    assert (beyond.head, beyond.beyond_base) == (candidate, True)
+    assert (behind.head, behind.beyond_base) == (trunk, False)

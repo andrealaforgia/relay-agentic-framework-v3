@@ -23,7 +23,7 @@ Decided under PO-7 on 2026-11-20, each on Claude's recommendation:
 | D-4 | **Mutation testing has no percentage threshold.** No surviving mutant on changed lines; each survivor is a QA finding that QA kills or dispositions as equivalent, never the Builder; a ratchet on Relay's own domain code; a time box whose expiry is reported, not passed. |
 | D-5 | **Review capabilities stay in plaintext for now**, readable only by trusted database accounts. They are stored as hashes, and redacted from every view, no later than the slice that first exposes them outside the control plane (the API and dashboard). |
 | D-6 | **The recommended defaults stand:** the review and security policy presets, pausing on unknown paid calls, and trusting enrolled worker hosts. |
-| D-7 | **Trunk moved during the checks** blocks the behaviour for a person, who retries, unless Astra's review of slice 2b argues for reopening the red directly. |
+| D-7 | **Trunk moved during the checks** sends the behaviour straight back for a fresh red, with no person in between. Claude had first recommended blocking it for a person; Astra argued for reopening once a fresh reading shows trunk strictly beyond the expected head, and that is what is built. A hook refusal with trunk unmoved still waits for a person. |
 
 ## Consequences drawn by the models, for the Product Owner to confirm or overturn
 

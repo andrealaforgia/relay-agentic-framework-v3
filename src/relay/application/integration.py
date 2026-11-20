@@ -31,13 +31,13 @@ from relay.domain.evidence import CheckContract, Execution, ProcessContract, is_
 from relay.domain.identifiers import require_identifier
 from relay.domain.integration import (
     TrunkReading,
-    a_rejection_settles_the_intent,
+    a_refusal_settles_the_intent,
     read_trunk,
     regression_digest,
 )
 from relay.domain.review import GateState
 from relay.git.checkout import CheckoutFailed, RemoteRejected, trunk_head
-from relay.git.mirror import Mirror
+from relay.git.mirror import Mirror, NotFastForward
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
 from relay.persistence.outbox import enqueue
@@ -53,6 +53,7 @@ class Outcome(StrEnum):
     INTEGRATED = "integrated"
     CHECKS_FAILED = "checks_failed"
     BASE_MOVED = "base_moved"
+    RUNTIME_CHANGED = "runtime_changed"
     # The batch finished but may not decide anything: another request, a change of
     # policy or another integration got there first. Its runs are kept as evidence.
     SUPERSEDED = "superseded"
@@ -78,6 +79,7 @@ _OUTCOME_OF_BATCH = {
     "discarded": Outcome.SUPERSEDED,
     "abandoned": Outcome.SUPERSEDED,
     "base_moved": Outcome.BASE_MOVED,
+    "runtime_changed": Outcome.RUNTIME_CHANGED,
 }
 _OUTCOME_OF_INTENT = {
     "outstanding": Outcome.PENDING,
@@ -184,8 +186,8 @@ class Integration:
         return settled
 
     async def retry_integration(self, project_id: str, behaviour_id: str, reason: str) -> None:
-        """Put a behaviour whose integration the repository refused, or found trunk
-        elsewhere, back where it can be integrated again. A person decides this."""
+        """Put a behaviour whose integration the repository refused back where it can be
+        integrated again. A person decides this, once the cause has been dealt with."""
         if not reason.strip():
             raise ValueError("retrying an integration needs a stated reason")
         async with self._pool.connection() as connection, connection.transaction():
@@ -198,11 +200,7 @@ class Integration:
                     (project_id, behaviour_id),
                 )
             ).fetchone()
-            if (
-                last is None
-                or last["state"] not in ("rejected", "conflicted")
-                or last["cycle_state"] != "satisfied"
-            ):
+            if last is None or last["state"] != "rejected" or last["cycle_state"] != "satisfied":
                 raise IntegrationRefused("this behaviour has no failed integration to retry")
             behaviour.retry_integration()
             await save_behaviour(connection, project_id, behaviour)
@@ -355,6 +353,21 @@ class Integration:
         async with self._pool.connection() as connection, connection.transaction():
             behaviour, row = await _locked_behaviour(connection, project_id, behaviour_id)
             project = await _locked_project(connection, project_id)
+            cycle = await _live_cycle(connection, project_id, behaviour_id)
+            current = await (
+                await connection.execute(
+                    "SELECT state, members, candidate_revision FROM check_batches "
+                    "WHERE batch_id = %s FOR UPDATE",
+                    (batch_id,),
+                )
+            ).fetchone()
+            assert current is not None
+            if incomplete := _why_incomplete(current, executions):
+                # What came back is not a run of every check on the candidate, so none
+                # of it is taken as evidence of anything.
+                if current["state"] == "running":
+                    await _close_batch(connection, batch, "discarded", incomplete)
+                return IntegrationReceipt(Outcome.SUPERSEDED, batch_id, incomplete)
             runs = []
             for check, execution in executions:
                 execution_id = await record_execution(
@@ -367,13 +380,6 @@ class Integration:
                     (batch_id, check.digest, check.contract_id, execution_id, satisfied),
                 )
                 runs.append((check, execution, execution_id, satisfied))
-            cycle = await _live_cycle(connection, project_id, behaviour_id)
-            current = await (
-                await connection.execute(
-                    "SELECT state FROM check_batches WHERE batch_id = %s FOR UPDATE", (batch_id,)
-                )
-            ).fetchone()
-            assert current is not None
             if current["state"] != "running":
                 return IntegrationReceipt(Outcome.SUPERSEDED, batch_id)
             stale = await _why_stale(connection, batch, behaviour, row, cycle, project)
@@ -387,9 +393,9 @@ class Integration:
                 for _, execution, _, _ in runs
             ):
                 reason = "the runtime is no longer the one the green was observed in"
-                await _close_batch(connection, batch, "discarded", reason)
+                await _close_batch(connection, batch, "runtime_changed", reason)
                 await self._reopen(connection, behaviour, cycle, reason, {})
-                return IntegrationReceipt(Outcome.BASE_MOVED, batch_id, reason)
+                return IntegrationReceipt(Outcome.RUNTIME_CHANGED, batch_id, reason)
             failed = [
                 {"contract_id": check.contract_id, "execution_id": str(execution_id)}
                 for check, _, execution_id, satisfied in runs
@@ -401,7 +407,8 @@ class Integration:
             intent_id = uuid.uuid7()
             await connection.execute(
                 "INSERT INTO integration_intents (intent_id, project_id, behaviour_id, cycle_id, "
-                "batch_id, candidate_revision, expected_trunk) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                "batch_id, candidate_revision, expected_trunk, repository, trunk) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     intent_id,
                     project_id,
@@ -410,6 +417,8 @@ class Integration:
                     batch_id,
                     batch["candidate_revision"],
                     batch["expected_trunk"],
+                    project["repository"],
+                    project["trunk"],
                 ),
             )
             await _close_batch(connection, batch, "authorised", None, event=False)
@@ -499,17 +508,30 @@ class Integration:
         )
 
     async def _drive(self, intent_id: uuid.UUID) -> IntegrationReceipt:
-        """Send the authorised update. The send is counted before it leaves: if this
-        process dies now, the record still says a push may be on its way."""
-        async with self._pool.connection() as connection, connection.transaction():
-            intent = await _locked_intent(connection, intent_id)
-            if intent["state"] != "outstanding":
-                return _receipt_of(intent)
-            await connection.execute(
-                "UPDATE integration_intents SET sends_started = sends_started + 1 "
-                "WHERE intent_id = %s",
-                (intent_id,),
-            )
+        """Send the authorised update. Everything that can be settled on this side is
+        settled first; the send is then counted, in its own transaction, immediately
+        before it leaves. If this process dies after that, the record still says a push
+        may be on its way."""
+        async with self._pool.connection() as connection:
+            intent = await _intent(connection, intent_id)
+        sent = False
+
+        async def count_the_send() -> bool:
+            nonlocal sent
+            async with self._pool.connection() as connection, connection.transaction():
+                current = await _locked_intent(connection, intent_id)
+                # Looked at again under the lock: another process may have settled the
+                # intent, or been refused, since this one decided to send.
+                if current["state"] != "outstanding" or current["refusal"] is not None:
+                    return False
+                await connection.execute(
+                    "UPDATE integration_intents SET sends_started = sends_started + 1 "
+                    "WHERE intent_id = %s",
+                    (intent_id,),
+                )
+            sent = True
+            return True
+
         try:
             await self._mirror(intent["project_id"]).advance(
                 intent["repository"],
@@ -517,32 +539,64 @@ class Integration:
                 f"refs/heads/{intent['trunk']}",
                 expected=intent["expected_trunk"],
                 timeout=self._push_timeout,
+                about_to_send=count_the_send,
             )
+        except NotFastForward as never_sendable:
+            return await self._refused(intent_id, str(never_sendable), sent=False)
         except RemoteRejected as refused:
-            return await self._refused(intent_id, str(refused)[:500])
-        except CheckoutFailed as unanswered:
-            return await self._unanswered(intent_id, str(unanswered)[:500])
+            return await self._refused_by_the_repository(intent, str(refused)[:500])
+        except CheckoutFailed as failure:
+            if sent:
+                return await self._unanswered(intent_id, str(failure)[:500])
+            # Nothing left this machine, so there is no send to wait for.
+            return IntegrationReceipt(Outcome.PENDING, intent["batch_id"], str(failure)[:500])
+        if not sent:
+            async with self._pool.connection() as connection:
+                return _receipt_of(await _intent(connection, intent_id))
         return await self._converged(intent_id)
+
+    async def _refused_by_the_repository(
+        self, intent: dict[str, Any], reason: str
+    ) -> IntegrationReceipt:
+        """A refusal may only mean trunk has moved. One fresh reading says whether it has:
+        if so, no push under this intent can land any more, whatever is still in flight."""
+        try:
+            reading, head = await self._read_trunk(intent)
+        except CheckoutFailed:
+            reading, head = TrunkReading.UNVERIFIABLE, ""
+        if reading is TrunkReading.CONVERGED:
+            return await self._converged(intent["intent_id"])
+        if reading is TrunkReading.CONFLICT:
+            return await self._conflicted(intent["intent_id"], head)
+        return await self._refused(intent["intent_id"], reason, sent=True)
+
+    async def _read_trunk(self, intent: dict[str, Any]) -> tuple[TrunkReading, str]:
+        seen = await self._mirror(intent["project_id"]).read_ref(
+            intent["repository"], f"refs/heads/{intent['trunk']}", base=intent["expected_trunk"]
+        )
+        reading = read_trunk(
+            seen.head,
+            expected=intent["expected_trunk"],
+            candidate=intent["candidate_revision"],
+            beyond_expected=seen.beyond_base,
+        )
+        return reading, seen.head
 
     async def _reconcile(self, intent_id: uuid.UUID) -> IntegrationReceipt:
         async with self._pool.connection() as connection:
             intent = await _intent(connection, intent_id)
         if intent["state"] != "outstanding":
             return _receipt_of(intent)
-        candidate, expected = intent["candidate_revision"], intent["expected_trunk"]
-        head = await trunk_head(intent["repository"], intent["trunk"])
-        contains = head not in (candidate, expected) and await self._mirror(
-            intent["project_id"]
-        ).remote_ref_contains(intent["repository"], f"refs/heads/{intent['trunk']}", candidate)
-        reading = read_trunk(
-            head, expected=expected, candidate=candidate, contains_candidate=contains
-        )
+        reading, head = await self._read_trunk(intent)
         if reading is TrunkReading.CONVERGED:
             return await self._converged(intent_id)
         if reading is TrunkReading.CONFLICT:
-            return await self._conflicted(
-                intent_id,
-                f"trunk is at {head}, which is neither the expected head nor the candidate",
+            return await self._conflicted(intent_id, head)
+        if reading is TrunkReading.UNVERIFIABLE:
+            return IntegrationReceipt(
+                Outcome.PENDING,
+                intent["batch_id"],
+                f"trunk was read at {head}, which is not at or beyond the expected head",
             )
         if intent["refusal"] is not None:
             # Refused once already, with an earlier send still unanswered. Sending again
@@ -583,7 +637,9 @@ class Integration:
             )
             return IntegrationReceipt(Outcome.INTEGRATED, intent["batch_id"])
 
-    async def _refused(self, intent_id: uuid.UUID, reason: str) -> IntegrationReceipt:
+    async def _refused(
+        self, intent_id: uuid.UUID, reason: str, *, sent: bool
+    ) -> IntegrationReceipt:
         async with self._pool.connection() as connection, connection.transaction():
             located = await _intent(connection, intent_id)
             behaviour, row = await _locked_behaviour(
@@ -592,22 +648,28 @@ class Integration:
             intent = await _locked_intent(connection, intent_id)
             if intent["state"] != "outstanding":
                 return _receipt_of(intent)
-            settles = a_rejection_settles_the_intent(
-                sends_started=intent["sends_started"], sends_resolved=intent["sends_resolved"]
-            )
+            answered = intent["sends_resolved"] + (1 if sent else 0)
             await connection.execute(
-                "UPDATE integration_intents SET sends_resolved = sends_resolved + 1, "
-                "refusal = %s WHERE intent_id = %s",
-                (reason, intent_id),
+                "UPDATE integration_intents SET sends_resolved = %s, refusal = %s "
+                "WHERE intent_id = %s",
+                (answered, reason, intent_id),
             )
-            if settles:
-                return await _park(connection, behaviour, row, intent, "rejected", reason)
+            if a_refusal_settles_the_intent(
+                sends_started=intent["sends_started"], sends_answered=answered
+            ):
+                return await _park(connection, behaviour, row, intent, reason)
             await append_event(
                 connection,
                 intent["project_id"],
                 "integration.refusal_left_unsettled",
                 subject_id=intent["behaviour_id"],
-                payload={"intent_id": str(intent_id), "reason": reason},
+                payload={
+                    "intent_id": str(intent_id),
+                    "expected_trunk": intent["expected_trunk"],
+                    "candidate_revision": intent["candidate_revision"],
+                    "reason": reason,
+                    "waiting_for": "an earlier push that was never answered and may still land",
+                },
             )
             return IntegrationReceipt(Outcome.PENDING, intent["batch_id"], reason)
 
@@ -623,7 +685,11 @@ class Integration:
             )
         return IntegrationReceipt(Outcome.PENDING, intent["batch_id"], reason)
 
-    async def _conflicted(self, intent_id: uuid.UUID, reason: str) -> IntegrationReceipt:
+    async def _conflicted(self, intent_id: uuid.UUID, head: str) -> IntegrationReceipt:
+        """Trunk has moved on to something that is not the candidate. No push under this
+        intent can land now, so the intent is over, and the candidate must be observed
+        again on what trunk has become."""
+        reason = f"trunk moved on to {head}, which is not the candidate"
         async with self._pool.connection() as connection, connection.transaction():
             located = await _intent(connection, intent_id)
             behaviour, row = await _locked_behaviour(
@@ -632,7 +698,21 @@ class Integration:
             intent = await _locked_intent(connection, intent_id)
             if intent["state"] != "outstanding":
                 return _receipt_of(intent)
-            return await _park(connection, behaviour, row, intent, "conflicted", reason)
+            await connection.execute(
+                "UPDATE integration_intents SET state = 'conflicted', reason = %s "
+                "WHERE intent_id = %s",
+                (reason, intent_id),
+            )
+            await append_event(
+                connection,
+                intent["project_id"],
+                "integration.conflicted",
+                subject_id=intent["behaviour_id"],
+                payload={"intent_id": str(intent_id), "reason": reason, "trunk": head},
+                correlation_id=row["correlation_id"],
+            )
+            await self._reopen(connection, behaviour, intent, reason, {"trunk": head})
+            return IntegrationReceipt(Outcome.CONFLICTED, intent["batch_id"], reason)
 
     async def _answer_again(self, batch: dict[str, Any]) -> IntegrationReceipt:
         """A request seen before gets the answer its first arrival produced, brought up to
@@ -683,7 +763,8 @@ async def _locked_project(connection: Connection, project_id: str) -> dict[str, 
     and the set of integrated behaviours still while a batch is started or settled."""
     row = await (
         await connection.execute(
-            "SELECT check_policy_version FROM projects WHERE project_id = %s FOR NO KEY UPDATE",
+            "SELECT check_policy_version, repository, trunk FROM projects "
+            "WHERE project_id = %s FOR NO KEY UPDATE",
             (project_id,),
         )
     ).fetchone()
@@ -731,9 +812,24 @@ async def _regression_set(connection: Connection, project_id: str) -> list[Check
             (project_id,),
         )
     ).fetchall()
-    return [CheckContract.from_dict(row["contract"]) for row in required] + [
+    checks = [CheckContract.from_dict(row["contract"]) for row in required] + [
         ProcessContract.from_dict(row["contract"]).as_check() for row in integrated
     ]
+    # The same obligation can arrive by both routes. It is one check, run once.
+    return list({check.digest: check for check in checks}.values())
+
+
+def _why_incomplete(
+    batch: dict[str, Any], executions: list[tuple[CheckContract, Execution]]
+) -> str:
+    """Why what the runner returned is not one run of every member of the batch on the
+    batch's candidate, or an empty string if it is exactly that."""
+    wanted = sorted(CheckContract.from_dict(member).digest for member in batch["members"])
+    if sorted(check.digest for check, _ in executions) != wanted:
+        return "the runs returned are not one for each check of the batch"
+    if any(execution.revision != batch["candidate_revision"] for _, execution in executions):
+        return "a run was made on a commit other than the candidate"
+    return ""
 
 
 async def _insert_batch(connection: Connection, batch: dict[str, Any], *, state: str) -> None:
@@ -810,10 +906,7 @@ async def _close_batch(
         )
 
 
-_INTENT_QUERY = (
-    "SELECT i.*, p.repository, p.trunk FROM integration_intents i "
-    "JOIN projects p USING (project_id) WHERE i.intent_id = %s"
-)
+_INTENT_QUERY = "SELECT i.* FROM integration_intents i WHERE i.intent_id = %s"
 
 
 async def _intent(connection: Connection, intent_id: uuid.UUID) -> dict[str, Any]:
@@ -835,29 +928,37 @@ async def _park(
     behaviour: Behaviour,
     row: dict[str, Any],
     intent: dict[str, Any],
-    state: str,
     reason: str,
 ) -> IntegrationReceipt:
-    """The update will not happen through this intent. Park the behaviour for a person
-    and free the project for other integrations."""
+    """The repository will not take the update through this intent. Park the behaviour
+    for a person and free the project for other integrations."""
     behaviour.park()
     await save_behaviour(connection, intent["project_id"], behaviour)
     await connection.execute(
-        "UPDATE integration_intents SET state = %s, reason = %s WHERE intent_id = %s",
-        (state, reason, intent["intent_id"]),
+        "UPDATE integration_intents SET state = 'rejected', reason = %s WHERE intent_id = %s",
+        (reason, intent["intent_id"]),
+    )
+    # A conflict on the candidate ref could not stop this intent while it was owed. The
+    # intent is over, so the conflict now stops the cycle being used for another.
+    await connection.execute(
+        "UPDATE review_cycles SET state = 'blocked', blocked_reason = conflict_observed "
+        "WHERE cycle_id = %s AND conflict_observed IS NOT NULL",
+        (intent["cycle_id"],),
     )
     await append_event(
         connection,
         intent["project_id"],
-        f"integration.{state}",
+        "integration.rejected",
         subject_id=intent["behaviour_id"],
         payload={"intent_id": str(intent["intent_id"]), "reason": reason},
         correlation_id=row["correlation_id"],
     )
-    return IntegrationReceipt(Outcome(state), intent["batch_id"], reason)
+    return IntegrationReceipt(Outcome.REJECTED, intent["batch_id"], reason)
 
 
 def _receipt_of(intent: dict[str, Any]) -> IntegrationReceipt:
     return IntegrationReceipt(
-        _OUTCOME_OF_INTENT[intent["state"]], intent["batch_id"], intent["reason"] or ""
+        _OUTCOME_OF_INTENT[intent["state"]],
+        intent["batch_id"],
+        intent["reason"] or intent["refusal"] or "",
     )
