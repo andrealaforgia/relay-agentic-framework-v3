@@ -33,6 +33,7 @@ from tests.integration.fixtures import (
     VAT_RETURNS_NET,
     commit,
     in_a_story,
+    prepare_review,
     publish_attempt,
     run_green,
 )
@@ -103,7 +104,7 @@ class World:
     async def review(self, capability: str, review: Review) -> Any:
         tree = self.tmp_path / f"review-{capability[:8]}"
         shutil.rmtree(tree, ignore_errors=True)
-        await self.reviews.prepare_review(capability, tree)
+        await prepare_review(self.reviews, capability, tree)
         return await self.reviews.submit_review(capability, review)
 
     async def state(self) -> BehaviourState:
@@ -162,7 +163,7 @@ async def test_both_reviewers_are_sent_the_same_published_commit(world: World) -
     assert capabilities["qa"] != capabilities["sentinel"]
     assert world.remote_ref(await candidate_ref_of(world)) == candidate
     for role, capability in capabilities.items():
-        tree = await world.reviews.prepare_review(capability, world.tmp_path / f"tree-{role}")
+        tree = await prepare_review(world.reviews, capability, world.tmp_path / f"tree-{role}")
         assert (tree / "vat.py").read_text().startswith(VAT_APPLIES_STANDARD_RATE)
         assert sorted(entry.name for entry in tree.iterdir()) == ["vat.py"]
 
@@ -330,7 +331,7 @@ async def test_a_task_id_or_a_guess_grants_nothing(world: World) -> None:
         with pytest.raises(UnknownCapability):
             await world.reviews.submit_review(presented, APPROVE)
         with pytest.raises(UnknownCapability):
-            await world.reviews.prepare_review(presented, world.tmp_path / "nowhere")
+            await prepare_review(world.reviews, presented, world.tmp_path / "nowhere")
 
     assert await world.count("review_submissions") == 0
     assert await world.count("review_checkouts") == 0
@@ -388,16 +389,16 @@ async def test_a_candidate_ref_already_at_another_commit_blocks_the_cycle(world:
 
 async def test_a_reviewer_is_never_given_a_tree_the_other_did_not_see(world: World) -> None:
     _, capabilities = await world.candidate_under_review()
-    await world.reviews.prepare_review(capabilities["qa"], world.tmp_path / "qa-tree")
+    await prepare_review(world.reviews, capabilities["qa"], world.tmp_path / "qa-tree")
     world.move_remote_ref(await candidate_ref_of(world), world.red_revision)
 
     with pytest.raises(SubmissionRefused, match="no longer names"):
-        await world.reviews.prepare_review(
-            capabilities["sentinel"], world.tmp_path / "sentinel-tree"
+        await prepare_review(
+            world.reviews, capabilities["sentinel"], world.tmp_path / "sentinel-tree"
         )
     late = await world.reviews.submit_review(capabilities["qa"], APPROVE)
     with pytest.raises(SubmissionRefused):
-        await world.reviews.prepare_review(capabilities["sentinel"], world.tmp_path / "again")
+        await prepare_review(world.reviews, capabilities["sentinel"], world.tmp_path / "again")
 
     assert not (world.tmp_path / "sentinel-tree").exists()
     assert late.disposition == "stale"
@@ -624,7 +625,7 @@ async def test_a_lost_mirror_is_rebuilt_from_the_published_candidate(world: Worl
         world.repository, "B1", 1, {"vat.py": "print('moved')\n"}, on=world.red_revision
     )
 
-    tree = await world.reviews.prepare_review(capabilities["qa"], world.tmp_path / "qa-tree")
+    tree = await prepare_review(world.reviews, capabilities["qa"], world.tmp_path / "qa-tree")
 
     assert (tree / "vat.py").read_text().startswith(VAT_APPLIES_STANDARD_RATE)
     assert await Mirror(world.mirrors / f"{PROJECT}.git").holds(candidate)
@@ -698,12 +699,13 @@ async def test_a_remote_that_refuses_the_candidate_blocks_with_the_remotes_reaso
 async def test_a_conflict_seen_while_the_last_review_lands_leaves_one_decision_and_both_on_record(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Sentinel has approved; QA has its tree. The candidate ref moves. Someone prepares
-    again and sees the conflict, but before it can act QA's final approval satisfies the
-    gate. Both things happened; the cycle must end blocked, with both on the ledger."""
+    """Sentinel has approved; QA has its tree. The candidate ref moves. QA's worker asks
+    for the tree again and sees the conflict, but before it can act QA's final approval
+    satisfies the gate. Both things happened; the cycle must end blocked, with both on
+    the ledger."""
     _, capabilities = await world.candidate_under_review()
     await world.review(capabilities["sentinel"], APPROVE)
-    await world.reviews.prepare_review(capabilities["qa"], world.tmp_path / "qa-tree")
+    await prepare_review(world.reviews, capabilities["qa"], world.tmp_path / "qa-tree")
     world.move_remote_ref(await candidate_ref_of(world), world.red_revision)
     seen, release = asyncio.Event(), asyncio.Event()
     real_resolve = reviews_module.resolve_ref
@@ -716,7 +718,7 @@ async def test_a_conflict_seen_while_the_last_review_lands_leaves_one_decision_a
 
     monkeypatch.setattr(reviews_module, "resolve_ref", held_after_looking)
     preparing = asyncio.create_task(
-        world.reviews.prepare_review(capabilities["sentinel"], world.tmp_path / "again")
+        prepare_review(world.reviews, capabilities["qa"], world.tmp_path / "again")
     )
     await asyncio.wait_for(seen.wait(), 30)
 

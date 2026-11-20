@@ -37,3 +37,6 @@ CREATE TABLE green_runs (
                   CHECK (state IN ('started', 'finished', 'interrupted')),
     started_at    timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+
+-- Set when the candidate is published, which is when the review becomes owed.
+ALTER TABLE review_tasks ADD COLUMN assignment_id uuid REFERENCES assignments;

@@ -25,6 +25,7 @@ from relay.transport.envelope import Envelope
 
 BUILD = "build"
 REMEDIATE = "remediate"
+REVIEW = "review"
 _LIVE = ("wanted", "granted")
 
 
@@ -115,22 +116,52 @@ async def start_green_run(
     """The first effect of a build or a remediation: a record, committed before anything
     is launched, that this grant began a green run. Refused unless the grant is still the
     current one for this behaviour's build."""
-    assignment = await (
-        await connection.execute(
-            "UPDATE assignments SET first_effect_at = COALESCE(first_effect_at, now()) "
-            "WHERE grant_id = %s AND state = 'granted' AND project_id = %s "
-            "AND behaviour_id = %s AND kind = ANY(%s) RETURNING assignment_id",
-            (grant_id, project_id, behaviour_id, [BUILD, REMEDIATE]),
-        )
-    ).fetchone()
-    if assignment is None:
+    assignment_id = await _first_effect(
+        connection,
+        grant_id,
+        "project_id = %s AND behaviour_id = %s AND kind = ANY(%s)",
+        (project_id, behaviour_id, [BUILD, REMEDIATE]),
+    )
+    if assignment_id is None:
         raise ActionRefused("this grant is not the current one for this behaviour's build")
-    run = GreenRun(uuid.uuid7(), assignment["assignment_id"], grant_id)
+    run = GreenRun(uuid.uuid7(), assignment_id, grant_id)
     await connection.execute(
         "INSERT INTO green_runs (run_id, assignment_id, grant_id, attempt) VALUES (%s, %s, %s, %s)",
         (run.run_id, run.assignment_id, grant_id, attempt),
     )
     return run
+
+
+async def start_review(
+    connection: Connection, grant_id: uuid.UUID, assignment_id: uuid.UUID | None
+) -> None:
+    """Called in the transaction that records a review's checkout receipt, its first
+    effect. Refused unless the grant is still the current one for that review."""
+    if await _first_effect(connection, grant_id, "assignment_id = %s", (assignment_id,)) is None:
+        raise ActionRefused("this grant is not the current one for this review")
+
+
+async def holds(
+    connection: Connection, grant_id: uuid.UUID, assignment_id: uuid.UUID | None
+) -> bool:
+    """Whether the grant is the assignment's current one, read without a lock: enough to
+    turn a stale caller away early, never enough to start anything."""
+    row = await (
+        await connection.execute(
+            "SELECT 1 FROM assignments WHERE grant_id = %s AND assignment_id = %s "
+            "AND state = 'granted'",
+            (grant_id, assignment_id),
+        )
+    ).fetchone()
+    return row is not None
+
+
+async def retire_reviews_of_cycle(connection: Connection, cycle_id: uuid.UUID) -> None:
+    await _retire(
+        connection,
+        "assignment_id IN (SELECT assignment_id FROM review_tasks WHERE cycle_id = %s)",
+        (cycle_id,),
+    )
 
 
 async def finish_green_run(connection: Connection, run: GreenRun) -> bool:
@@ -218,6 +249,19 @@ _IN_FEATURE = (
     "JOIN stories s USING (project_id, story_id) "
     "WHERE b.project_id = assignments.project_id AND s.feature_id = %s)"
 )
+
+
+async def _first_effect(
+    connection: Connection, grant_id: uuid.UUID, where: str, parameters: tuple[Any, ...]
+) -> uuid.UUID | None:
+    row = await (
+        await connection.execute(
+            "UPDATE assignments SET first_effect_at = COALESCE(first_effect_at, now()) "
+            f"WHERE grant_id = %s AND state = 'granted' AND {where} RETURNING assignment_id",
+            (grant_id, *parameters),
+        )
+    ).fetchone()
+    return row["assignment_id"] if row else None
 
 
 async def _retire(connection: Connection, where: str, parameters: tuple[Any, ...]) -> None:

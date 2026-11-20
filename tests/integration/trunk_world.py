@@ -23,6 +23,7 @@ from tests.integration.fixtures import (
     VAT_APPLIES_STANDARD_RATE,
     VAT_RETURNS_NET,
     in_a_story,
+    prepare_review,
     run_green,
 )
 
@@ -189,7 +190,7 @@ class TrunkWorld:
             if payload.get("candidate_revision") == candidate and "capability" in payload:
                 tree = self.tmp_path / f"review-{payload['capability'][:8]}"
                 shutil.rmtree(tree, ignore_errors=True)
-                await self.reviews.prepare_review(payload["capability"], tree)
+                await prepare_review(self.reviews, payload["capability"], tree)
                 said = (reviews or {}).get(message.envelope["recipient"], Review())
                 await self.reviews.submit_review(payload["capability"], said)
         return candidate

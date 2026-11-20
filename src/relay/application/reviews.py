@@ -19,8 +19,16 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from relay.application.assignments import REMEDIATE, owe
-from relay.application.closure import closure_of_behaviour, lock_gate, require_open
+from relay.application.assignments import (
+    REMEDIATE,
+    REVIEW,
+    complete,
+    holds,
+    owe,
+    retire_reviews_of_cycle,
+    start_review,
+)
+from relay.application.closure import CANCELLED, closure_of_behaviour, lock_gate, require_open
 from relay.application.stories import require_story_at_work
 from relay.domain.behaviour import Behaviour, BehaviourState
 from relay.domain.identifiers import require_identifier
@@ -36,6 +44,7 @@ from relay.domain.review import (
     judge_gate,
     require_authority_over,
 )
+from relay.domain.story import ActionRefused
 from relay.git.checkout import (
     CheckoutFailed,
     RemoteRejected,
@@ -46,7 +55,6 @@ from relay.git.checkout import (
 from relay.git.mirror import Mirror
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
-from relay.persistence.outbox import enqueue
 from relay.transport.envelope import Envelope, MessageKind
 
 CONTROL_PLANE = "relay/control-plane"
@@ -279,13 +287,19 @@ class Reviews:
                 command = _review_command(
                     cycle, task["task_id"], task["role"], capability, published.event_id
                 )
-                await connection.execute(
-                    "UPDATE review_tasks SET capability = %s, command_message_id = %s "
-                    "WHERE task_id = %s",
-                    (capability, command.message_id, task["task_id"]),
+                assignment_id = await owe(
+                    connection,
+                    REVIEW,
+                    command,
+                    issued_on={
+                        "cycle_id": str(cycle["cycle_id"]),
+                        "task_id": str(task["task_id"]),
+                    },
                 )
-                await enqueue(
-                    connection, f"relay:{cycle['project_id']}:cmd:{task['role']}", command
+                await connection.execute(
+                    "UPDATE review_tasks SET capability = %s, command_message_id = %s, "
+                    "assignment_id = %s WHERE task_id = %s",
+                    (capability, command.message_id, assignment_id, task["task_id"]),
                 )
         return 1
 
@@ -468,9 +482,11 @@ class Reviews:
             announced += len(again)
         return announced
 
-    async def prepare_review(self, capability: str, into: Path) -> Path:
+    async def prepare_review(self, capability: str, into: Path, grant: uuid.UUID) -> Path:
         """Give a reviewer the tree to review: exactly the cycle's commit, from the control
-        plane's pinned copy, after confirming the published ref still names that commit."""
+        plane's pinned copy, after confirming the published ref still names that commit.
+        The caller names the grant it was given for this review, and the checkout receipt
+        is that grant's first effect."""
         task = await self._task(capability)
         if task["state"] != "open" or task["publication"] != "published":
             raise SubmissionRefused("this review is no longer open")
@@ -478,6 +494,8 @@ class Reviews:
             require_open(
                 await closure_of_behaviour(connection, task["project_id"], task["behaviour_id"])
             )
+            if not await holds(connection, grant, task["assignment_id"]):
+                raise ActionRefused("this grant is not the current one for this review")
         commit = task["candidate_revision"]
         try:
             names_the_commit = (
@@ -502,6 +520,7 @@ class Reviews:
             require_open(
                 await closure_of_behaviour(connection, task["project_id"], task["behaviour_id"])
             )
+            await start_review(connection, grant, task["assignment_id"])
             await connection.execute(
                 "INSERT INTO review_checkouts (receipt_id, task_id, revision) VALUES (%s, %s, %s)",
                 (uuid.uuid7(), task["task_id"], commit),
@@ -514,7 +533,11 @@ class Reviews:
         task_id = (await self._task(capability))["task_id"]
         async with self._pool.connection() as connection, connection.transaction():
             task = await _locked_task(connection, task_id)
-            accepting = task["state"] == "open"
+            closed_by = await closure_of_behaviour(
+                connection, task["project_id"], task["behaviour_id"]
+            )
+            # A review of a cancelled feature is kept, as what was said, and decides nothing.
+            accepting = task["state"] == "open" and closed_by != CANCELLED
             is_current = task["state"] in ("open", "satisfied")
             effective = await (
                 await connection.execute(
@@ -620,6 +643,8 @@ class Reviews:
                     (review.withdrawal_reasons[finding_id], finding_id),
                 )
         receipt = await _store(connection, task, review, "effective", True, tuple(finding_ids))
+        if task["assignment_id"] is not None:
+            await complete(connection, task["assignment_id"])
         submitted = await append_event(
             connection,
             project_id,
@@ -748,6 +773,7 @@ class Reviews:
                 )
             ).fetchone()
             if stopped is not None:
+                await retire_reviews_of_cycle(connection, cycle_id)
                 await connection.execute(
                     "UPDATE behaviours SET state = 'blocked' "
                     "WHERE project_id = %s AND behaviour_id = %s AND state = 'review'",
@@ -816,7 +842,7 @@ async def _accepted_green(
 
 
 _TASK_QUERY = (
-    "SELECT t.task_id, t.role, t.capability, c.cycle_id, c.project_id, c.behaviour_id, c.state, "
+    "SELECT t.task_id, t.role, t.capability, t.assignment_id, c.cycle_id, c.project_id, c.behaviour_id, c.state, "
     "c.publication, c.candidate_revision, c.candidate_ref, c.required_roles, c.blocking_from, "
     "p.repository FROM review_tasks t JOIN review_cycles c USING (cycle_id) "
     "JOIN projects p USING (project_id)"

@@ -27,6 +27,7 @@ from tests.integration.fixtures import (
     VAT_APPLIES_STANDARD_RATE,
     HeldAtABarrier,
     held_at_the_barrier,
+    prepare_review,
     run_green,
 )
 from tests.integration.story_world import GREETS, STANDARD_RATE, StoryWorld, at_the_story_gate
@@ -236,9 +237,9 @@ async def test_a_review_cannot_be_started_on_a_paused_feature_even_with_its_capa
     with monkeypatch.context() as patched:
         patched.setattr(Mirror, "export", paused_during_the_export)
         with pytest.raises(ActionRefused, match="paused"):
-            await world.reviews.prepare_review(str(capability), world.tmp_path / "tree-1")
+            await prepare_review(world.reviews, str(capability), world.tmp_path / "tree-1")
     with pytest.raises(ActionRefused, match="paused"):
-        await world.reviews.prepare_review(str(capability), world.tmp_path / "tree-2")
+        await prepare_review(world.reviews, str(capability), world.tmp_path / "tree-2")
 
     assert await world.column("SELECT count(*) FROM review_checkouts") == [0]
     assert not (world.tmp_path / "tree-2").exists()  # refused before any tree is fetched
@@ -247,7 +248,7 @@ async def test_a_review_cannot_be_started_on_a_paused_feature_even_with_its_capa
     assert await world.reviews.announce_unreviewed_tasks() == 0
     await world.close("resume")
     assert await world.reviews.announce_unreviewed_tasks() == 2
-    await world.reviews.prepare_review(str(capability), world.tmp_path / "tree-3")
+    await prepare_review(world.reviews, str(capability), world.tmp_path / "tree-3")
     assert await world.column("SELECT count(*) FROM review_checkouts") == [1]
 
 

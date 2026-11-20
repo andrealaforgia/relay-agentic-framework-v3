@@ -1,6 +1,7 @@
 """A VAT calculator whose baseline returns the net amount unchanged, in a real Git repository."""
 
 import asyncio
+import contextlib
 import subprocess
 import uuid
 from pathlib import Path
@@ -8,9 +9,10 @@ from typing import Any
 
 from relay.application.assignments import Assignments
 from relay.application.behaviours import Behaviours
+from relay.application.reviews import Reviews
 from relay.application.stories import Stories, StoryDraft
 from relay.domain.evidence import Baseline, Expected, GreenVerdict, Launch, ProcessContract
-from relay.domain.story import HumanAction, Principal, PrincipalKind
+from relay.domain.story import ActionRefused, HumanAction, Principal, PrincipalKind
 from relay.testing.oracle import Isolation, Run
 
 CONTRACT = ProcessContract(
@@ -189,3 +191,23 @@ async def run_green(
     """Claim the build, then ask for the green run under that grant."""
     grant = await build_grant(behaviours, project, behaviour)
     return await behaviours.run_green(project, behaviour, attempt, grant)
+
+
+async def prepare_review(reviews: Reviews, capability: str, into: Path) -> Path:
+    """What a reviewer's worker does on receiving its command: claim the review, then
+    ask for the tree under that grant. Where the review cannot be claimed, a grant
+    nobody was given, as a stray caller would have."""
+    pool = reviews._pool
+    async with pool.connection() as connection:
+        task = await (
+            await connection.execute(
+                "SELECT assignment_id, role FROM review_tasks WHERE capability = %s",
+                (capability,),
+            )
+        ).fetchone()
+    grant = uuid.uuid7()
+    if task is not None:
+        reviewer = Principal(PrincipalKind.WORKER, f"worker-{task['role']}", role=task["role"])
+        with contextlib.suppress(ActionRefused):
+            grant = await Assignments(pool).claim(reviewer, task["assignment_id"])
+    return await reviews.prepare_review(capability, into, grant)
