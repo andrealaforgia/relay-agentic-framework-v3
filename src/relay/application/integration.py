@@ -953,7 +953,12 @@ async def hand_on_unfinished_batches(
 
 
 async def _close_unfinished(
-    connection: Connection, project_id: str, behaviour_id: str, batch_id: uuid.UUID, state: str
+    connection: Connection,
+    project_id: str,
+    behaviour_id: str,
+    batch_id: uuid.UUID,
+    state: str,
+    why: str = "these checks did not get to decide",
 ) -> None:
     """Close one batch that will not decide anything, if it is still in `state`, by what
     its feature now is: open, an integration is owed in its place; paused, it is held;
@@ -973,12 +978,10 @@ async def _close_unfinished(
             connection,
             batch,
             "abandoned" if closed_by == CANCELLED else "held",
-            f"these checks did not get to decide, and the feature is {closed_by}",
+            f"{why}, and the feature is {closed_by}",
         )
         return
-    await _close_batch(
-        connection, batch, "interrupted", "these checks did not get to decide; to be run again"
-    )
+    await _close_batch(connection, batch, "interrupted", f"{why}; to be run again")
     await owe(
         connection,
         INTEGRATE,
@@ -1006,7 +1009,12 @@ async def _discard(connection: Connection, batch: dict[str, Any], reason: str) -
         await _close_batch(connection, batch, "discarded", reason)
         return
     await _close_unfinished(
-        connection, batch["project_id"], batch["behaviour_id"], batch["batch_id"], "running"
+        connection,
+        batch["project_id"],
+        batch["behaviour_id"],
+        batch["batch_id"],
+        "running",
+        why=reason,
     )
 
 

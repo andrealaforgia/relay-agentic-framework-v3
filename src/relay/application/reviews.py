@@ -183,9 +183,12 @@ async def open_cycle(
 
 
 class Reviews:
-    def __init__(self, pool: Pool, mirrors: Path) -> None:
+    def __init__(self, pool: Pool, mirrors: Path, remote_timeout: float = 120.0) -> None:
         self._pool = pool
         self._mirrors = mirrors
+        # Every call to a project's repository made here gives up after this long, so one
+        # repository that does not answer cannot hold up the work of the others.
+        self._remote_timeout = remote_timeout
 
     def _mirror(self, project_id: str) -> Mirror:
         return Mirror(self._mirrors / f"{require_identifier('project', project_id)}.git")
@@ -221,14 +224,14 @@ class Reviews:
             if not await self._recover(cycle):
                 await self._block(cycle["cycle_id"], _COMMIT_LOST)
                 return 0
-            if await resolve_ref(repository, ref) is None:
+            if await resolve_ref(repository, ref, timeout=self._remote_timeout) is None:
                 try:
-                    await mirror.publish(repository, commit, ref)
+                    await mirror.publish(repository, commit, ref, self._remote_timeout)
                 except RemoteRejected as refused:
                     # Two publishers racing for the same ref: the loser is refused, yet
                     # the ref is now exactly right. Only a refusal that leaves the
                     # candidate unpublished is the remote saying no to it.
-                    if await resolve_ref(repository, ref) != commit:
+                    if await resolve_ref(repository, ref, timeout=self._remote_timeout) != commit:
                         reason = f"the remote refused the candidate: {refused}"
                         await self._block(cycle["cycle_id"], reason[:500])
                         return 0
@@ -236,7 +239,7 @@ class Reviews:
                     raise
                 except CheckoutFailed:
                     pass  # the ref appeared meanwhile; what it names is checked next
-            published_as = await resolve_ref(repository, ref)
+            published_as = await resolve_ref(repository, ref, timeout=self._remote_timeout)
             if published_as is None:
                 raise RemoteUnavailable("the candidate ref is still absent after the push")
             if published_as != commit:
@@ -440,15 +443,25 @@ class Reviews:
         if await self._mirror(project_id).holds(record["candidate_revision"]):
             return True
         attempts = await refs_under(
-            record["repository"], f"refs/relay/attempts/{project_id}/{behaviour_id}/"
+            record["repository"],
+            f"refs/relay/attempts/{project_id}/{behaviour_id}/",
+            timeout=self._remote_timeout,
         )
         # The cycle knows the candidate ref's name from the start, but the ref exists only
         # once published. Searching a ref that is not there would look like an unfinished
         # search and leave a commit that is truly gone pending for ever.
         named = record.get("candidate_ref")
-        published = [named] if named and await resolve_ref(record["repository"], named) else []
+        published = (
+            [named]
+            if named
+            and await resolve_ref(record["repository"], named, timeout=self._remote_timeout)
+            else []
+        )
         return await self._mirror(project_id).recover(
-            record["repository"], record["candidate_revision"], [*published, *sorted(attempts)]
+            record["repository"],
+            record["candidate_revision"],
+            [*published, *sorted(attempts)],
+            timeout=self._remote_timeout,
         )
 
     async def prepare_review(self, capability: str, into: Path, grant: uuid.UUID) -> Path:
@@ -468,7 +481,10 @@ class Reviews:
         commit = task["candidate_revision"]
         try:
             names_the_commit = (
-                await resolve_ref(task["repository"], task["candidate_ref"]) == commit
+                await resolve_ref(
+                    task["repository"], task["candidate_ref"], timeout=self._remote_timeout
+                )
+                == commit
             )
             recovered = names_the_commit and await self._recover(task)
         except RemoteUnavailable as unavailable:

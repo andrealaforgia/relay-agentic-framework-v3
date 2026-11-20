@@ -7,6 +7,8 @@ run any number of times, and nobody has to call anything else for work to carry 
 
 from __future__ import annotations
 
+import uuid
+
 from relay.application.assignments import announce_again, revoke_every_grant
 from relay.application.closure import lock_gate
 from relay.application.integration import (
@@ -19,6 +21,8 @@ from relay.application.stories import close_feature
 from relay.domain.story import ActionRefused, HumanAction, Receipt
 from relay.git.checkout import CheckoutFailed
 from relay.persistence.database import Pool
+
+_ROUNDS_OF_TAKING_UP = 3
 
 
 class Features:
@@ -57,19 +61,35 @@ class Features:
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id)
             await announce_again(connection, project_id)
-            owed = await (
+        # In this process the control plane is the integrator: it takes these up itself.
+        # Taking one up can leave another owed (its checks were overtaken by a newly
+        # required one, say), so the pass looks again, a bounded number of times: checks
+        # that keep being overtaken wait for the next pass instead of holding this one.
+        attempted: set[uuid.UUID] = set()
+        for _ in range(_ROUNDS_OF_TAKING_UP):
+            owed = [
+                each for each in await self._integrations_owed(project_id) if each not in attempted
+            ]
+            if not owed:
+                break
+            for assignment_id in owed:
+                attempted.add(assignment_id)
+                try:
+                    await self._integration.continue_integration(assignment_id)
+                except CheckoutFailed, ActionRefused, IntegrationRefused:
+                    # The repository could not be read, or the feature is closed (it may
+                    # have been closed a moment ago), or this process cannot observe
+                    # checks. The integration stays owed; the pass, and the other
+                    # projects, carry on. It is not tried again in this pass.
+                    continue
+
+    async def _integrations_owed(self, project_id: str) -> list[uuid.UUID]:
+        async with self._pool.connection() as connection:
+            rows = await (
                 await connection.execute(
                     "SELECT assignment_id FROM assignments WHERE project_id = %s "
                     "AND kind = 'integrate' AND state = 'wanted' ORDER BY created_at",
                     (project_id,),
                 )
             ).fetchall()
-        # In this process the control plane is the integrator: it takes these up itself.
-        for integration in owed:
-            try:
-                await self._integration.continue_integration(integration["assignment_id"])
-            except CheckoutFailed, ActionRefused, IntegrationRefused:
-                # The repository could not be read, or the feature is closed (it may
-                # have been closed a moment ago), or this process cannot observe checks. The integration stays
-                # owed; the pass, and the other projects, carry on.
-                continue
+        return [row["assignment_id"] for row in rows]

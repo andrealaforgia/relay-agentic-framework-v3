@@ -135,10 +135,14 @@ async def resolve_ref(repository: str, wanted: str, *, timeout: float | None = N
     return revisions[0]
 
 
-async def refs_under(repository: str, prefix: str) -> dict[str, str]:
+async def refs_under(
+    repository: str, prefix: str, *, timeout: float | None = None
+) -> dict[str, str]:
     """Every ref whose full name starts with `prefix`, with the object it points at."""
     try:
-        listing = await git("ls-remote", "--", repository, f"{prefix}*", redact=repository)
+        listing = await git(
+            "ls-remote", "--", repository, f"{prefix}*", redact=repository, timeout=timeout
+        )
     except CheckoutFailed as failure:
         raise RemoteUnavailable(str(failure)) from None
     found = {}

@@ -15,6 +15,7 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from relay.application import integration as integration_module
+from relay.application import reviews as reviews_module
 from relay.application.assignments import Assignments, announce_again
 from relay.application.behaviours import Behaviours
 from relay.application.features import Features
@@ -675,13 +676,15 @@ async def test_checks_taken_up_by_relay_and_overtaken_by_a_new_required_check_ar
         PROJECT, replace(ZERO_STAYS_ZERO, contract_id="zero-still-stays-zero")
     )
     barrier.release.set()
-    await passing
+    await passing  # the one pass sees the new check set through, with nothing else called
 
-    assert await batches(world) == ["first:1:interrupted", "first:2:interrupted"]
-    assert await world.column("SELECT count(*) FROM integration_intents") == [0]
-    assert world.trunk() != candidate
-    await world.features.reconcile(PROJECT)
-    assert (await batches(world))[-1] == "first:3:authorised"
+    assert await batches(world) == [
+        "first:1:interrupted",
+        "first:2:interrupted",
+        "first:3:authorised",
+    ]
+    [why] = await world.column("SELECT reason FROM check_batches WHERE generation = 2")
+    assert "checks required" in str(why)
     assert world.trunk() == candidate
     assert await world.column("SELECT count(*) FROM integration_intents") == [1]
 
@@ -723,3 +726,77 @@ async def test_cancelling_a_feature_ends_the_request_whose_checks_were_waiting_t
     assert await integrations_owed(world) == ["retired"]
     again = await world.integration.integrate(PROJECT, "B1", "first")
     assert again.outcome is Outcome.SUPERSEDED
+
+
+class ChangesTheChecksEveryRun:
+    """Wraps an isolation so that each run is overtaken by a newly required check."""
+
+    def __init__(self, world: StoryWorld) -> None:
+        self._isolation = ContainerIsolation(world.image)
+        self.name = self._isolation.name
+        self._world = world
+        self.runs = 0
+
+    async def run(self, workdir: Path, launch: Any, capture_limit: int) -> Any:
+        run = await self._isolation.run(workdir, launch, capture_limit)
+        self.runs += 1
+        await self._world.integration.require_check(
+            PROJECT, replace(ZERO_STAYS_ZERO, contract_id=f"zero-stays-zero-{self.runs}")
+        )
+        return run
+
+
+async def test_a_pass_does_not_chase_checks_that_keep_being_overtaken_for_ever(
+    world: StoryWorld,
+) -> None:
+    candidate, _ = await held_then_resumed_without_the_pass(world)
+    restless = world.integration_with(ChangesTheChecksEveryRun(world))
+
+    await Features(world.database, world.reviews, restless).reconcile(PROJECT)
+
+    assert world.trunk() != candidate
+    assert len(await batches(world)) == 4, "the held batch, then three attempts in one pass"
+    assert (await integrations_owed(world))[-1] == "wanted"
+
+
+async def test_one_projects_silent_repository_does_not_keep_the_pass_from_another_project(
+    world: StoryWorld,
+    database: AsyncConnectionPool,
+    tmp_path: Path,
+    runner_image: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate, _ = await held_then_resumed_without_the_pass(world)
+    (tmp_path / "silent").mkdir()
+    silent = StoryWorld(
+        database, tmp_path / "silent", runner_image, project="alpha", mirrors=world.mirrors
+    )
+    await silent.open()
+    await silent.decide(await silent.roadmap(STANDARD_RATE))
+    base = await silent.awaiting_builder("B1")
+    silent.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
+    assert (await run_green(silent.behaviours, "alpha", "B1", 1)).is_valid
+    real = reviews_module.resolve_ref
+
+    async def alpha_never_answers(
+        repository: str, wanted: str, *, timeout: float | None = None
+    ) -> str | None:
+        if "silent" not in repository:
+            return await real(repository, wanted, timeout=timeout)
+        await asyncio.sleep(3600 if timeout is None else timeout)
+        raise RemoteUnavailable("no answer in time")
+
+    monkeypatch.setattr(reviews_module, "resolve_ref", alpha_never_answers)
+    impatient = Reviews(world.database, world.mirrors, remote_timeout=0.2)
+
+    async with asyncio.timeout(90):
+        await Features(world.database, impatient, world.integration).reconcile(PROJECT)
+
+    assert world.trunk() == candidate
+    assert await world.column(
+        "SELECT publication FROM review_cycles WHERE project_id = 'alpha'"
+    ) == ["pending"]
+    assert "review.publication_deferred" in [
+        str(kind)
+        for kind in await world.column("SELECT event_type FROM events WHERE project_id = 'alpha'")
+    ]

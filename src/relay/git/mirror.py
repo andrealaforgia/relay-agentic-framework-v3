@@ -137,7 +137,9 @@ class Mirror:
         await leave_only_the_tracked_files(into)
         return into
 
-    async def publish(self, repository: str, commit: str, ref: str) -> None:
+    async def publish(
+        self, repository: str, commit: str, ref: str, timeout: float | None = None
+    ) -> None:
         """Create `ref` at a pinned commit on the remote, only if the ref does not exist.
         Exactly one destination is named; nothing else on the remote can be touched.
 
@@ -145,7 +147,7 @@ class Mirror:
         RemoteRejected when the remote itself refused this ref, CheckoutFailed when the ref
         already exists, RemoteUnavailable when the push never got an answer."""
         _require_hash(commit)
-        refusal = await self._push(repository, commit, ref, expected="")
+        refusal = await self._push(repository, commit, ref, expected="", timeout=timeout)
         if refusal is None:
             return
         if refusal.by_the_remote:

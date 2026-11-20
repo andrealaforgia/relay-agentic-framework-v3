@@ -32,6 +32,30 @@ The agreed design for step 1 (pause, resume, cancel) is `round-10-claude-3a-ii-s
 
 What this design round showed: the first two drafts inferred what work was owed from queued messages and behaviour state. Recording it (an assignment with a grant that has an identity) answered five findings at once.
 
+## Slice 3a-ii, step 1 as built (pause, resume, cancel)
+
+Reviewed under decision D-8: at most three rounds, then whatever is reachable is fixed without a further round.
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 12 | CHALLENGE, 7 blocking of 8 | A successor able to launch a native check; a restarted reviewer's capability approving on a dead worker's checkout; a closure receipt replayed across projects; a worker able to claim an integration and strand it; a pause stopping the whole start-up pass; a successor cut short left with nothing owed; "latest batch" decided by transaction start, not registration; held checks reported as waiting after a cancel |
+| 13 | CHALLENGE, 4 blocking of 5 | A worker whose grant was taken back submitting on its successor's checkout; a successor cancelled during settlement; a successor overtaken by a new required check left with nothing owed; a paused feature's integration reaching a slow repository; interrupted checks reported as waiting after a cancel |
+| 14 | CHALLENGE, 2 blocking of 3 | A check policy change during a resume leaving the work to wait for another call; one project's silent repository holding up the pass for the others; the reason for a re-run not kept |
+
+Every finding in all three rounds was reachable through a real entry point, and every one is fixed, each with a test that fails without the fix. The fixes for round 14 are in `round-15-claude-3a-ii-step-1-closing.md` and were **not reviewed by Astra**: that is what D-8 means, and it is the standing caveat on this step.
+
+Seven departures from the agreed design are listed in `round-12-claude-3a-ii-step-1-submission.md`; Astra accepted all of them once rounds 12 and 13 were fixed.
+
+Reservations carried forward:
+
+- **A pass runs on resume and on start, not on a timer.** Work that becomes owed outside a pass (a successor whose checks keep being overtaken, past three attempts in one pass; a repository that could not be read) waits for the next resume or start. The periodic loop belongs to 3c.
+- **Only the pass's own calls to a repository are bounded** (publication, recovery, the successor's trunk read). A caller's own `integrate`, `run_red` and `run_green` still wait for Git as long as Git takes.
+- **A resume runs the regression checks before it returns**, because the control plane is the only integrator until 3b.
+- **"Restart" in the tests is new service objects over the same database**, with the old task cancelled. No test kills an operating-system process. The publisher cases stand a recording object where Redis would be.
+- The round 14 fixes have had no second pair of eyes.
+
+What this step showed: three rounds, sixteen findings, none of them speculative. Most came from one pattern, an obligation recorded as done at the moment its work started rather than when it finished, so anything that interrupted the work left nothing owed. The design said "an assignment is done when its effect is on record"; taking the successor batch's existence as that effect was my reading, and it was too early.
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.

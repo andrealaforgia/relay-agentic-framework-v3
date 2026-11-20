@@ -659,7 +659,7 @@ async def test_a_remote_that_cannot_be_reached_defers_publication_and_does_not_b
     real = reviews_module.refs_under
     real_resolve = reviews_module.resolve_ref
 
-    async def unreachable(*_: object) -> None:
+    async def unreachable(*_: object, **__: object) -> None:
         raise RemoteUnavailable("git ls-remote failed: could not connect")
 
     monkeypatch.setattr(reviews_module, "resolve_ref", unreachable)
@@ -712,8 +712,8 @@ async def test_a_conflict_seen_while_the_last_review_lands_leaves_one_decision_a
     seen, release = asyncio.Event(), asyncio.Event()
     real_resolve = reviews_module.resolve_ref
 
-    async def held_after_looking(repository: str, ref: str) -> str | None:
-        found = await real_resolve(repository, ref)
+    async def held_after_looking(repository: str, ref: str, **options: Any) -> str | None:
+        found = await real_resolve(repository, ref, **options)
         seen.set()
         await release.wait()
         return found
@@ -768,7 +768,7 @@ async def test_a_push_that_never_reached_the_remote_leaves_the_cycle_pending(
     candidate = await world.green_candidate()
     real_publish = Mirror.publish
 
-    async def cannot_send(self: Mirror, repository: str, commit: str, ref: str) -> None:
+    async def cannot_send(self: Mirror, *_: object) -> None:
         raise RemoteUnavailable("git push failed: Permission denied (publickey)")
 
     monkeypatch.setattr(Mirror, "publish", cannot_send)
@@ -914,7 +914,7 @@ async def test_a_push_reported_as_already_there_while_the_ref_is_absent_is_retri
 ) -> None:
     await world.green_candidate()
 
-    async def claims_the_ref_exists(self: Mirror, repository: str, commit: str, ref: str) -> None:
+    async def claims_the_ref_exists(self: Mirror, *_: object) -> None:
         raise CheckoutFailed("the push was not accepted: [rejected] (stale info)")
 
     monkeypatch.setattr(Mirror, "publish", claims_the_ref_exists)
