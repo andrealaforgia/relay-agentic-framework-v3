@@ -17,6 +17,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from relay.application.assignments import retire_all_of_feature, revoke_unstarted_grants
 from relay.application.closure import (
     CANCELLED,
     PAUSED,
@@ -365,6 +366,9 @@ class Stories:
                 return receipt
             if action.action == "cancel":
                 await _cancel(connection, project_id, feature_id)
+                await retire_all_of_feature(connection, project_id, feature_id)
+            if action.action == "pause":
+                await revoke_unstarted_grants(connection, project_id, feature_id)
             await connection.execute(
                 "UPDATE features SET closed_by = %s, state = %s "
                 "WHERE project_id = %s AND feature_id = %s",

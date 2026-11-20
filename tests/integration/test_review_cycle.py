@@ -34,6 +34,7 @@ from tests.integration.fixtures import (
     commit,
     in_a_story,
     publish_attempt,
+    run_green,
 )
 
 PROJECT = "vat-calculator"
@@ -82,7 +83,7 @@ class World:
             {"vat.py": VAT_APPLIES_STANDARD_RATE + f"# {note} {self.attempts}\n"},
             on=self.red_revision,
         )
-        assert (await self.behaviours.run_green(PROJECT, "B1", attempt=self.attempts)).is_valid
+        assert (await run_green(self.behaviours, PROJECT, "B1", attempt=self.attempts)).is_valid
         return candidate
 
     async def candidate_under_review(self, note: str = "") -> tuple[str, dict[str, str]]:
@@ -799,7 +800,7 @@ async def test_one_projects_unreachable_repository_does_not_hold_up_another(
         second.repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE},
         on=second_trunk, project="other-project",
     )  # fmt: skip
-    assert (await first.behaviours.run_green("other-project", "B1", attempt=1)).is_valid
+    assert (await run_green(first.behaviours, "other-project", "B1", attempt=1)).is_valid
     shutil.rmtree(first.mirrors / f"{PROJECT}.git")
     first.repository.rename(tmp_path / "first" / "unplugged")
 
@@ -956,7 +957,7 @@ async def test_one_unreadable_legacy_mirror_does_not_stop_adoption_for_another_p
         other_repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE},
         on=other_trunk, project="other-project",
     )  # fmt: skip
-    assert (await first.behaviours.run_green("other-project", "B1", attempt=1)).is_valid
+    assert (await run_green(first.behaviours, "other-project", "B1", attempt=1)).is_valid
     async with database.connection() as connection:
         await connection.execute("DELETE FROM review_tasks")
         await connection.execute("DELETE FROM review_cycles")

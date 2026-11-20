@@ -29,6 +29,7 @@ from tests.integration.fixtures import (
     PRODUCT_OWNER,
     VAT_APPLIES_STANDARD_RATE,
     VERIFIER,
+    run_green,
 )
 from tests.integration.story_world import (
     GREETS,
@@ -322,7 +323,7 @@ async def test_nothing_is_started_on_a_behaviour_whose_story_is_not_being_worked
         world.behaviours.begin_test_design(PROJECT, "B1"),
         world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT),
         world.behaviours.run_red(PROJECT, "B1"),
-        world.behaviours.run_green(PROJECT, "B1", 1),
+        run_green(world.behaviours, PROJECT, "B1", 1),
         world.integrate("B1"),
     ):
         with pytest.raises(ActionRefused, match="awaiting approval"):

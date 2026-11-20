@@ -225,6 +225,7 @@ class GreenRejection(StrEnum):
     ISOLATION_NOT_ADMISSIBLE = "isolation_not_admissible"
     NO_PAIRED_RED = "no_paired_red"
     RED_SUPERSEDED = "red_superseded"
+    ASSIGNMENT_SUPERSEDED = "assignment_superseded"
     NOT_BUILT_ON_THE_RED_REVISION = "not_built_on_the_red_revision"
     RUNTIME_CHANGED = "runtime_changed"
     NOT_EXECUTED = "not_executed"

@@ -1,0 +1,39 @@
+-- One row per unit of work Relay wants done. A command announces a wanted assignment and
+-- may arrive any number of times; only a grant lets a worker begin, and the worker's
+-- first effect has to name the grant it was given.
+CREATE TABLE assignments (
+    assignment_id   uuid PRIMARY KEY,
+    project_id      text NOT NULL,
+    behaviour_id    text NOT NULL,
+    kind            text NOT NULL
+                    CHECK (kind IN ('build', 'remediate', 'review', 'publish_candidate', 'integrate')),
+    role            text NOT NULL,
+    issued_on       jsonb NOT NULL,
+    state           text NOT NULL DEFAULT 'wanted'
+                    CHECK (state IN ('wanted', 'granted', 'done', 'retired')),
+    grant_id        uuid UNIQUE,
+    granted_to      text,
+    first_effect_at timestamptz,
+    command_message_id uuid,
+    created_at      timestamptz NOT NULL DEFAULT clock_timestamp(),
+    FOREIGN KEY (project_id, behaviour_id) REFERENCES behaviours,
+    CHECK (state <> 'wanted' OR grant_id IS NULL),
+    CHECK (state <> 'granted' OR grant_id IS NOT NULL),
+    CHECK ((grant_id IS NULL) = (granted_to IS NULL))
+);
+
+-- A behaviour is being built for one reason at a time.
+CREATE UNIQUE INDEX one_build_owed_per_behaviour ON assignments (project_id, behaviour_id)
+    WHERE kind IN ('build', 'remediate') AND state IN ('wanted', 'granted');
+
+-- Committed before the oracle is launched: the first effect of a build or a remediation.
+-- A pause that finds this record leaves the grant alone and lets the run be judged.
+CREATE TABLE green_runs (
+    run_id        uuid PRIMARY KEY,
+    assignment_id uuid NOT NULL REFERENCES assignments,
+    grant_id      uuid NOT NULL,
+    attempt       integer NOT NULL,
+    state         text NOT NULL DEFAULT 'started'
+                  CHECK (state IN ('started', 'finished', 'interrupted')),
+    started_at    timestamptz NOT NULL DEFAULT clock_timestamp()
+);

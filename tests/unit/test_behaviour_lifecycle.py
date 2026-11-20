@@ -93,7 +93,9 @@ def implementing() -> Behaviour:
 def test_a_paired_green_sends_the_behaviour_to_review() -> None:
     behaviour = implementing()
 
-    verdict = behaviour.record_green_run(PASSES, RED, RED, candidate_descends_from_red=True)
+    verdict = behaviour.record_green_run(
+        PASSES, RED, RED, candidate_descends_from_red=True, still_owed=True
+    )
 
     assert verdict.is_valid
     assert behaviour.state is BehaviourState.REVIEW
@@ -102,7 +104,9 @@ def test_a_paired_green_sends_the_behaviour_to_review() -> None:
 def test_a_candidate_that_still_fails_stays_with_the_builder() -> None:
     behaviour = implementing()
 
-    verdict = behaviour.record_green_run(STILL_FAILS, RED, RED, candidate_descends_from_red=True)
+    verdict = behaviour.record_green_run(
+        STILL_FAILS, RED, RED, candidate_descends_from_red=True, still_owed=True
+    )
 
     assert verdict.rejection is GreenRejection.EXPECTATION_NOT_MET
     assert behaviour.state is BehaviourState.IMPLEMENTING
@@ -146,8 +150,12 @@ def test_a_green_that_answered_a_superseded_red_does_not_reach_review() -> None:
     behaviour = implementing()
     newer_red = PairedRed("a-later-red-run", "b" * 40, CONTRACT.digest, "image")
 
-    replaced = behaviour.record_green_run(PASSES, RED, newer_red, candidate_descends_from_red=True)
-    removed = behaviour.record_green_run(PASSES, RED, None, candidate_descends_from_red=True)
+    replaced = behaviour.record_green_run(
+        PASSES, RED, newer_red, candidate_descends_from_red=True, still_owed=True
+    )
+    removed = behaviour.record_green_run(
+        PASSES, RED, None, candidate_descends_from_red=True, still_owed=True
+    )
 
     assert replaced.rejection is GreenRejection.RED_SUPERSEDED
     assert removed.rejection is GreenRejection.RED_SUPERSEDED
@@ -158,7 +166,9 @@ def test_a_green_that_finishes_after_its_red_was_reopened_is_recorded_as_superse
     behaviour = implementing()
     behaviour.reopen_red()
 
-    verdict = behaviour.record_green_run(PASSES, RED, None, candidate_descends_from_red=True)
+    verdict = behaviour.record_green_run(
+        PASSES, RED, None, candidate_descends_from_red=True, still_owed=True
+    )
 
     assert verdict.rejection is GreenRejection.RED_SUPERSEDED
     assert behaviour.state is BehaviourState.VALIDATING_RED
@@ -175,9 +185,31 @@ def test_a_red_that_finishes_after_another_was_accepted_is_recorded_as_supersede
 
 def test_a_second_green_after_the_first_was_accepted_changes_nothing() -> None:
     behaviour = implementing()
-    behaviour.record_green_run(PASSES, RED, RED, candidate_descends_from_red=True)
+    behaviour.record_green_run(PASSES, RED, RED, candidate_descends_from_red=True, still_owed=True)
 
-    again = behaviour.record_green_run(PASSES, RED, RED, candidate_descends_from_red=True)
+    again = behaviour.record_green_run(
+        PASSES, RED, RED, candidate_descends_from_red=True, still_owed=True
+    )
 
     assert again.rejection is GreenRejection.RED_SUPERSEDED
     assert behaviour.state is BehaviourState.REVIEW
+
+
+def test_a_green_that_outlives_the_work_it_answered_changes_nothing() -> None:
+    behaviour = implementing()
+
+    verdict = behaviour.record_green_run(
+        PASSES, RED, RED, candidate_descends_from_red=True, still_owed=False
+    )
+
+    assert verdict.rejection is GreenRejection.ASSIGNMENT_SUPERSEDED
+    assert behaviour.state is BehaviourState.IMPLEMENTING
+
+
+def test_a_red_that_finishes_after_its_feature_was_cancelled_changes_nothing() -> None:
+    behaviour = awaiting_red()
+
+    verdict = behaviour.record_red_run(FAILS_AS_REGISTERED, started_in_cycle=0, withdrawn=True)
+
+    assert verdict.rejection is RedRejection.SUPERSEDED
+    assert behaviour.state is BehaviourState.VALIDATING_RED

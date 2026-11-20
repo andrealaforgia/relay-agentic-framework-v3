@@ -71,13 +71,16 @@ class Behaviour:
         assert self.contract is not None
         return self.contract
 
-    def record_red_run(self, execution: Execution, *, started_in_cycle: int) -> RedVerdict:
+    def record_red_run(
+        self, execution: Execution, *, started_in_cycle: int, withdrawn: bool = False
+    ) -> RedVerdict:
         """Judge a red run that has finished. A run is admitted to start only while the
-        behaviour awaits red; by the time it finishes the behaviour may have moved on, and
-        then the run is recorded as superseded and changes nothing."""
+        behaviour awaits red; by the time it finishes the behaviour may have moved on, or
+        its feature may have been cancelled (`withdrawn`), and then the run is recorded
+        as superseded and changes nothing."""
         assert self.contract is not None
         moved_on = self.state is not BehaviourState.VALIDATING_RED
-        if moved_on or started_in_cycle != self.red_cycle:
+        if withdrawn or moved_on or started_in_cycle != self.red_cycle:
             return RedVerdict(
                 RedRejection.SUPERSEDED,
                 f"{self.contract.contract_id}: the behaviour moved on while this run was in flight",
@@ -105,9 +108,11 @@ class Behaviour:
         red_now: PairedRed | None,
         *,
         candidate_descends_from_red: bool,
+        still_owed: bool,
     ) -> GreenVerdict:
         """Judge a candidate against the red it was launched to answer, provided that red
-        is still the one on record now."""
+        is still the one on record now and the build this run answers is still owed: a
+        run that outlives its assignment is kept as evidence and changes nothing."""
         assert self.contract is not None
         contract = self.contract
         moved_on = self.state is not BehaviourState.IMPLEMENTING
@@ -116,6 +121,12 @@ class Behaviour:
                 GreenRejection.RED_SUPERSEDED,
                 f"{contract.contract_id}: the red this run answered is no longer the one on "
                 "record, or the behaviour moved on while this run was in flight",
+            )
+        if not still_owed:
+            return GreenVerdict(
+                GreenRejection.ASSIGNMENT_SUPERSEDED,
+                f"{contract.contract_id}: the work this run answered was replaced or "
+                "withdrawn while it was in flight",
             )
         verdict = judge_green(
             contract,

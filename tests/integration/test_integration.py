@@ -31,6 +31,7 @@ from tests.integration.fixtures import (
     CountingLaunches,
     HeldAtABarrier,
     held_at_the_barrier,
+    run_green,
 )
 from tests.integration.trunk_world import (
     GREETING,
@@ -105,7 +106,7 @@ async def test_a_candidate_whose_reviews_are_not_all_in_is_refused_before_anythi
     await world.integration.require_check(PROJECT, ZERO_STAYS_ZERO)
     base = await world.awaiting_builder()
     world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
-    assert (await world.behaviours.run_green(PROJECT, "B1", 1)).is_valid
+    assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
     launched = counting.launches
 
     with pytest.raises(IntegrationRefused, match="review"):

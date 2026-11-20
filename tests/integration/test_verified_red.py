@@ -297,7 +297,7 @@ async def test_state_ledger_and_outbox_commit_together_or_not_at_all(
     async def crash(*_: object, **__: object) -> None:
         raise RuntimeError("crash while writing the outbox")
 
-    monkeypatch.setattr("relay.application.behaviours.enqueue", crash)
+    monkeypatch.setattr("relay.application.assignments.enqueue", crash)
     with pytest.raises(RuntimeError):
         await behaviours.run_red(PROJECT, "B1")
 

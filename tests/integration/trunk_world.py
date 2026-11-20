@@ -23,6 +23,7 @@ from tests.integration.fixtures import (
     VAT_APPLIES_STANDARD_RATE,
     VAT_RETURNS_NET,
     in_a_story,
+    run_green,
 )
 
 PROJECT = "vat-calculator"
@@ -178,7 +179,9 @@ class TrunkWorld:
         candidate = self.publish_attempt(
             behaviour, files or {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=on
         )
-        verdict = await self.behaviours.run_green(self.project, behaviour, self.attempts[behaviour])
+        verdict = await run_green(
+            self.behaviours, self.project, behaviour, self.attempts[behaviour]
+        )
         assert verdict.is_valid, verdict.reason
         assert await self.reviews.publish_candidates() == 1
         for message in await pending_messages(self.database):

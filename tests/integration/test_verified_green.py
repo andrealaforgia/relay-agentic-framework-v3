@@ -25,11 +25,13 @@ from tests.integration.fixtures import (
     VAT_RETURNS_NET,
     CountingLaunches,
     HeldAtABarrier,
+    build_grant,
     commit,
     held_at_the_barrier,
     in_a_story,
     publish_attempt,
     publish_tag_as_attempt,
+    run_green,
 )
 
 PROJECT = "vat-calculator"
@@ -65,7 +67,7 @@ async def test_a_candidate_that_meets_the_expectation_goes_to_review_with_its_ev
         repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision
     )
 
-    verdict = await behaviours.run_green(PROJECT, "B1", attempt=1)
+    verdict = await run_green(behaviours, PROJECT, "B1", attempt=1)
 
     assert verdict.is_valid
     assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.REVIEW
@@ -97,7 +99,7 @@ async def test_a_candidate_that_still_fails_stays_with_the_builder_who_may_try_a
     publish_attempt(repository, "B1", 1, {"vat.py": "print(121)\n"}, on=red_revision)
     publish_attempt(repository, "B1", 2, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision)
 
-    first = await behaviours.run_green(PROJECT, "B1", attempt=1)
+    first = await run_green(behaviours, PROJECT, "B1", attempt=1)
 
     assert first.rejection is GreenRejection.EXPECTATION_NOT_MET
     assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
@@ -106,7 +108,7 @@ async def test_a_candidate_that_still_fails_stays_with_the_builder_who_may_try_a
     assert rejected.payload["rejection"] == "expectation_not_met"
     assert rejected.payload["attempt"] == 1
 
-    assert (await behaviours.run_green(PROJECT, "B1", attempt=2)).is_valid
+    assert (await run_green(behaviours, PROJECT, "B1", attempt=2)).is_valid
 
 
 async def test_a_candidate_that_claims_success_without_delivering_it_is_not_green(
@@ -122,7 +124,7 @@ async def test_a_candidate_that_claims_success_without_delivering_it_is_not_gree
     )
     publish_attempt(repository, "B1", 1, {"vat.py": boasts}, on=red_revision)
 
-    verdict = await behaviours.run_green(PROJECT, "B1", attempt=1)
+    verdict = await run_green(behaviours, PROJECT, "B1", attempt=1)
 
     assert verdict.rejection is GreenRejection.EXPECTATION_NOT_MET
     assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
@@ -138,7 +140,7 @@ async def test_a_candidate_not_built_on_the_revision_the_red_was_seen_on_is_refu
         repository, "B1", 1, {"note.txt": "passes, but is older than the red"}, on=unrelated_past
     )
 
-    verdict = await behaviours.run_green(PROJECT, "B1", attempt=1)
+    verdict = await run_green(behaviours, PROJECT, "B1", attempt=1)
 
     assert verdict.rejection is GreenRejection.NOT_BUILT_ON_THE_RED_REVISION
     assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
@@ -153,7 +155,7 @@ async def test_green_in_a_different_runtime_from_the_red_is_refused(
     async with database.connection() as connection:
         await connection.execute("UPDATE executions SET runtime_identity = 'sha256:an-older-image'")
 
-    verdict = await behaviours.run_green(PROJECT, "B1", attempt=1)
+    verdict = await run_green(behaviours, PROJECT, "B1", attempt=1)
 
     assert verdict.rejection is GreenRejection.RUNTIME_CHANGED
     assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
@@ -165,7 +167,7 @@ async def test_an_attempt_that_was_never_published_is_on_the_ledger(
     behaviours, _ = await released_to_builder(database, tmp_path / "subject", runner_image)
 
     with pytest.raises(CheckoutFailed, match="attempt 7"):
-        await behaviours.run_green(PROJECT, "B1", attempt=7)
+        await run_green(behaviours, PROJECT, "B1", attempt=7)
 
     failed = await last_event(database)
     assert failed.event_type == "behaviour.green_preparation_failed"
@@ -188,7 +190,7 @@ async def test_green_cannot_be_run_before_red(
     publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=trunk)
 
     with pytest.raises(TransitionRefused):
-        await behaviours.run_green(PROJECT, "B1", attempt=1)
+        await run_green(behaviours, PROJECT, "B1", attempt=1)
 
     assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.VALIDATING_RED
 
@@ -199,7 +201,8 @@ async def test_a_caller_cannot_supply_the_candidate_or_the_observation(
     repository = tmp_path / "subject"
     behaviours, red_revision = await released_to_builder(database, repository, runner_image)
     before = await read_events(database, PROJECT)
-    run_green: Any = behaviours.run_green
+    grant = await build_grant(behaviours, PROJECT, "B1")
+    directly: Any = behaviours.run_green
 
     for supplied in (
         {"revision": red_revision},
@@ -207,10 +210,10 @@ async def test_a_caller_cannot_supply_the_candidate_or_the_observation(
         {"observation": b"120\n"},
     ):
         with pytest.raises(TypeError):
-            await run_green(PROJECT, "B1", 1, **supplied)
+            await directly(PROJECT, "B1", 1, grant, **supplied)
     for not_an_attempt in ("refs/heads/main", "../../heads/main", 0, -1, True):
         with pytest.raises(CheckoutFailed):
-            await run_green(PROJECT, "B1", not_an_attempt)
+            await directly(PROJECT, "B1", not_an_attempt, grant)
 
     assert [event.event_type for event in await read_events(database, PROJECT)][: len(before)] == [
         event.event_type for event in before
@@ -237,7 +240,7 @@ async def test_an_attempt_ref_pointing_at_a_tag_never_reaches_review(
         publish_tag_as_attempt(repository, "B1", attempt, pointing_at=target)
 
         with pytest.raises(CheckoutFailed, match="not a commit"):
-            await behaviours.run_green(PROJECT, "B1", attempt=attempt)
+            await run_green(behaviours, PROJECT, "B1", attempt=attempt)
 
     assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
     assert await executions(database) == 1
@@ -257,10 +260,10 @@ async def test_another_projects_candidate_on_the_same_repository_is_not_this_pro
     publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision)
 
     with pytest.raises(CheckoutFailed, match="attempt 1"):
-        await behaviours.run_green("other-team", "B1", attempt=1)
+        await run_green(behaviours, "other-team", "B1", attempt=1)
 
     assert await behaviours.state_of("other-team", "B1") is BehaviourState.IMPLEMENTING
-    assert (await behaviours.run_green(PROJECT, "B1", attempt=1)).is_valid
+    assert (await run_green(behaviours, PROJECT, "B1", attempt=1)).is_valid
 
 
 async def test_a_candidate_that_hangs_is_reported_as_a_timeout(
@@ -286,7 +289,7 @@ async def test_a_candidate_that_hangs_is_reported_as_a_timeout(
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
     publish_attempt(repository, "B1", 1, {"vat.py": "import time\ntime.sleep(60)\n"}, on=trunk)
 
-    verdict = await behaviours.run_green(PROJECT, "B1", attempt=1)
+    verdict = await run_green(behaviours, PROJECT, "B1", attempt=1)
 
     assert verdict.rejection is GreenRejection.TIMED_OUT
     assert (await last_event(database)).payload["rejection"] == "timed_out"
@@ -301,7 +304,7 @@ async def test_native_execution_is_refused_for_green_before_anything_is_launched
     native = CountingLaunches(NativeIsolation())
     on_a_native_runner = Behaviours(database, tmp_path / "mirrors", ProcessOracle(native))
 
-    verdict = await on_a_native_runner.run_green(PROJECT, "B1", attempt=1)
+    verdict = await run_green(on_a_native_runner, PROJECT, "B1", attempt=1)
 
     assert verdict.rejection is GreenRejection.ISOLATION_NOT_ADMISSIBLE
     assert native.launches == 0
@@ -323,7 +326,7 @@ async def test_with_no_red_on_record_green_is_refused_before_anything_is_launche
     async with database.connection() as connection:
         await connection.execute("UPDATE behaviours SET red_execution_id = NULL")
 
-    verdict = await behaviours.run_green(PROJECT, "B1", attempt=1)
+    verdict = await run_green(behaviours, PROJECT, "B1", attempt=1)
 
     assert verdict.rejection is GreenRejection.NO_PAIRED_RED
     assert container.launches == 0
@@ -339,7 +342,7 @@ async def test_after_a_runtime_change_the_red_can_be_reopened_and_the_work_compl
     publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision)
     async with database.connection() as connection:
         await connection.execute("UPDATE executions SET runtime_identity = 'sha256:an-older-image'")
-    stuck = await behaviours.run_green(PROJECT, "B1", attempt=1)
+    stuck = await run_green(behaviours, PROJECT, "B1", attempt=1)
     assert stuck.rejection is GreenRejection.RUNTIME_CHANGED
 
     await behaviours.reopen_red(PROJECT, "B1", reason="runner image upgraded")
@@ -352,7 +355,7 @@ async def test_after_a_runtime_change_the_red_can_be_reopened_and_the_work_compl
         row = await (await connection.execute("SELECT red_execution_id FROM behaviours")).fetchone()
     assert row == {"red_execution_id": None}, "the superseded red must no longer be paired"
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
-    assert (await behaviours.run_green(PROJECT, "B1", attempt=1)).is_valid
+    assert (await run_green(behaviours, PROJECT, "B1", attempt=1)).is_valid
     assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.REVIEW
 
 
@@ -375,9 +378,7 @@ async def test_a_green_in_flight_when_its_red_is_superseded_does_not_reach_revie
     publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=first_red)
     held = HeldAtABarrier(ContainerIsolation(runner_image))
     in_flight = asyncio.create_task(
-        Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)).run_green(
-            PROJECT, "B1", attempt=1
-        )
+        run_green(Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)), PROJECT, "B1", 1)
     )
     await held_at_the_barrier(in_flight, held)
 
@@ -469,9 +470,7 @@ async def test_a_green_released_after_reopening_but_before_the_new_red_is_still_
     )
     held = HeldAtABarrier(ContainerIsolation(runner_image))
     in_flight = asyncio.create_task(
-        Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)).run_green(
-            PROJECT, "B1", attempt=1
-        )
+        run_green(Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)), PROJECT, "B1", 1)
     )
     await held_at_the_barrier(in_flight, held)
 
@@ -541,7 +540,7 @@ async def test_a_candidate_judged_green_stays_pinned_after_the_builder_moves_the
     candidate = publish_attempt(
         repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision
     )
-    assert (await behaviours.run_green(PROJECT, "B1", attempt=1)).is_valid
+    assert (await run_green(behaviours, PROJECT, "B1", attempt=1)).is_valid
 
     publish_attempt(repository, "B1", 1, {"vat.py": "print('moved')\n"}, on=red_revision)
 

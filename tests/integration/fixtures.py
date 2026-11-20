@@ -2,12 +2,14 @@
 
 import asyncio
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any
 
+from relay.application.assignments import Assignments
 from relay.application.behaviours import Behaviours
 from relay.application.stories import Stories, StoryDraft
-from relay.domain.evidence import Baseline, Expected, Launch, ProcessContract
+from relay.domain.evidence import Baseline, Expected, GreenVerdict, Launch, ProcessContract
 from relay.domain.story import HumanAction, Principal, PrincipalKind
 from relay.testing.oracle import Isolation, Run
 
@@ -158,3 +160,32 @@ STORY_SET_UP = [
     "gate.approved",
     "story.released",
 ]
+
+
+BUILDER = Principal(PrincipalKind.WORKER, "worker-builder", role="builder")
+
+
+async def build_grant(behaviours: Behaviours, project: str, behaviour: str) -> uuid.UUID:
+    """What a Builder's worker does on receiving its command: claim the build. Where
+    nothing is owed, a grant nobody was given, as a stray caller would have."""
+    pool = behaviours._pool
+    async with pool.connection() as connection:
+        owed = await (
+            await connection.execute(
+                "SELECT assignment_id FROM assignments WHERE project_id = %s "
+                "AND behaviour_id = %s AND kind IN ('build', 'remediate') "
+                "AND state IN ('wanted', 'granted')",
+                (project, behaviour),
+            )
+        ).fetchone()
+    if owed is None:
+        return uuid.uuid7()
+    return await Assignments(pool).claim(BUILDER, owed["assignment_id"])
+
+
+async def run_green(
+    behaviours: Behaviours, project: str, behaviour: str, attempt: int
+) -> GreenVerdict:
+    """Claim the build, then ask for the green run under that grant."""
+    grant = await build_grant(behaviours, project, behaviour)
+    return await behaviours.run_green(project, behaviour, attempt, grant)

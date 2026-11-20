@@ -27,6 +27,7 @@ from tests.integration.fixtures import (
     VAT_APPLIES_STANDARD_RATE,
     HeldAtABarrier,
     held_at_the_barrier,
+    run_green,
 )
 from tests.integration.story_world import GREETS, STANDARD_RATE, StoryWorld, at_the_story_gate
 from tests.integration.trunk_world import PROJECT, ZERO_STAYS_ZERO
@@ -51,7 +52,7 @@ async def test_nothing_new_starts_on_a_paused_feature_by_any_route(world: StoryW
         world.behaviours.begin_test_design(PROJECT, "B1"),
         world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT),
         world.behaviours.run_red(PROJECT, "B1"),
-        world.behaviours.run_green(PROJECT, "B1", 1),
+        run_green(world.behaviours, PROJECT, "B1", 1),
         world.behaviours.reopen_red(PROJECT, "B1", "runner upgraded"),
         world.integrate("B1"),
         world.integration.retry_integration(PROJECT, "B1", "try again"),
@@ -219,7 +220,7 @@ async def test_a_review_cannot_be_started_on_a_paused_feature_even_with_its_capa
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     base = await world.awaiting_builder("B1")
     world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
-    assert (await world.behaviours.run_green(PROJECT, "B1", 1)).is_valid
+    assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
     assert await world.reviews.publish_candidates() == 1
     [capability, _] = await world.column(
         "SELECT envelope->'payload'->>'capability' FROM outbox "
@@ -256,7 +257,7 @@ async def test_a_candidate_verified_just_before_a_pause_is_not_announced_until_r
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     base = await world.awaiting_builder("B1")
     world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
-    assert (await world.behaviours.run_green(PROJECT, "B1", 1)).is_valid
+    assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
     await world.close("pause", reason="stop")
 
     assert await world.reviews.publish_candidates() == 0
@@ -396,7 +397,7 @@ async def test_a_pause_that_lands_while_a_candidate_is_being_published_holds_its
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     base = await world.awaiting_builder("B1")
     world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
-    assert (await world.behaviours.run_green(PROJECT, "B1", 1)).is_valid
+    assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
     real = Mirror.publish
 
     async def paused_during_the_push(self: Mirror, *arguments: Any) -> None:
@@ -421,7 +422,7 @@ async def test_a_candidate_stays_off_the_repository_while_its_feature_is_paused(
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     base = await world.awaiting_builder("B1")
     world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
-    assert (await world.behaviours.run_green(PROJECT, "B1", 1)).is_valid
+    assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
     [ref] = await world.column("SELECT candidate_ref FROM review_cycles")
     await world.close("pause", reason="stop")
 

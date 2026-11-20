@@ -19,6 +19,7 @@ from typing import Any
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
+from relay.application.assignments import REMEDIATE, owe
 from relay.application.behaviours import (
     CONTROL_PLANE,
     load_behaviour,
@@ -47,7 +48,6 @@ from relay.git.checkout import CheckoutFailed, NotStarted, RemoteRejected, trunk
 from relay.git.mirror import Mirror, NotFastForward
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
-from relay.persistence.outbox import enqueue
 from relay.testing.oracle import ProcessOracle
 from relay.transport.envelope import Envelope, MessageKind
 
@@ -525,9 +525,9 @@ class Integration:
             },
             correlation_id=row["correlation_id"],
         )
-        await enqueue(
+        await owe(
             connection,
-            f"relay:{project_id}:cmd:builder",
+            REMEDIATE,
             Envelope(
                 message_kind=MessageKind.COMMAND,
                 event_type="build.requested",
@@ -543,6 +543,7 @@ class Integration:
                     "failed_checks": [check["contract_id"] for check in failed],
                 },
             ),
+            issued_on={"cycle_id": str(cycle_id)},
         )
 
     async def _drive(self, intent_id: uuid.UUID) -> IntegrationReceipt:

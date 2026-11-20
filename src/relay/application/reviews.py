@@ -19,6 +19,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from relay.application.assignments import REMEDIATE, owe
 from relay.application.closure import closure_of_behaviour, lock_gate, require_open
 from relay.application.stories import require_story_at_work
 from relay.domain.behaviour import Behaviour, BehaviourState
@@ -687,9 +688,9 @@ class Reviews:
             causation_id=cause,
         )
         if gate.state is GateState.CHANGES_REQUESTED:
-            await enqueue(
+            await owe(
                 connection,
-                f"relay:{project_id}:cmd:builder",
+                REMEDIATE,
                 Envelope(
                     message_kind=MessageKind.COMMAND,
                     event_type="build.requested",
@@ -705,6 +706,7 @@ class Reviews:
                         "remediate_findings": list(gate.blocking),
                     },
                 ),
+                issued_on={"cycle_id": str(cycle_id)},
             )
 
     async def _task(self, capability: str) -> dict[str, Any]:
