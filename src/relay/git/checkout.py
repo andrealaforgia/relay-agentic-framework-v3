@@ -6,7 +6,6 @@ import asyncio
 import os
 import re
 import shutil
-import stat
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -129,49 +128,61 @@ async def pristine_checkout(repository: str, revision: str, into: Path) -> Path:
 
 
 async def _leave_only_the_tracked_files(checkout: Path) -> None:
-    """Remove the Git metadata and set permissions from what Git recorded: a file is
-    executable by everyone if it is tracked as executable, readable by everyone either
-    way. The host's umask, its filesystem and the account that made the checkout leave no
-    trace, so every runner shows the subject the same tree.
+    """Remove the Git metadata, confirm the tree is exactly the tracked tree, and set
+    permissions from what Git recorded: a file is executable by everyone if it is tracked
+    as executable, readable by everyone either way. The host's umask, its filesystem and
+    the account that made the checkout leave no trace, so every runner shows the subject
+    the same tree.
 
-    This runs with the supervisor's authority over a tree an untrusted repository shaped,
-    so it never follows a symbolic link and refuses a tree that does not hold every
-    tracked file as its own regular file (as happens when two names collide on a
-    case-insensitive filesystem)."""
-    tracked = await _git_output("-C", str(checkout), "ls-files", "--stage", "-z")
+    This runs with the supervisor's authority over a tree an untrusted repository shaped.
+    A filesystem can fold two tracked names into one (by letter case, for instance),
+    merging files or whole directories, and a tracked file can end up replaced by a link.
+    So nothing is changed until the entries on disk match the tracked entries exactly, by
+    name and by kind, and no link is ever followed."""
+    listing = await _git_output("-C", str(checkout), "ls-files", "--stage", "-z")
     shutil.rmtree(checkout / ".git")
     root = os.fsencode(checkout)
-    modes: dict[bytes, int] = {}
-    for entry in filter(None, tracked.split(b"\0")):
+    tracked: dict[bytes, str] = {}
+    permissions: dict[bytes, int] = {}
+    for entry in filter(None, listing.split(b"\0")):
         details, _, name = entry.partition(b"\t")
         mode = details.split()[0]
-        if mode in (b"100755", b"100644"):
-            modes[os.path.join(root, name)] = 0o755 if mode == b"100755" else 0o644
-    seen: set[tuple[int, int]] = set()
-    for path in modes:
-        found = _regular_file_inside(root, path)
-        if found is None or found in seen:
-            raise CheckoutFailed("the checkout does not hold every tracked file as its own file")
-        seen.add(found)
-    for directory, _, _ in os.walk(root):
+        tracked[name] = _KIND_OF_GIT_MODE.get(mode, "other")
+        if tracked[name] == "file":
+            permissions[name] = 0o755 if mode == b"100755" else 0o644
+    directories: list[bytes] = []
+    if _entries_on_disk(root, b"", directories) != tracked:
+        raise CheckoutFailed("the checkout on this host is not exactly the tracked tree")
+    for directory in directories:
         os.chmod(directory, 0o755)
-    for path, permissions in modes.items():
-        # Each path was just verified to be a regular file reached through no link.
-        os.chmod(path, permissions)
+    for name, mode_bits in permissions.items():
+        # Verified above to be a regular file reached through real directories only.
+        os.chmod(os.path.join(root, name), mode_bits)
 
 
-def _regular_file_inside(root: bytes, path: bytes) -> tuple[int, int] | None:
-    """The identity of a regular file reached without passing through any symbolic link,
-    or None if the path is anything else."""
-    parent = os.path.dirname(path)
-    expected = os.path.normpath(os.path.join(os.path.realpath(root), os.path.relpath(parent, root)))
-    if os.path.realpath(parent) != expected:
-        return None  # some directory on the way is a symbolic link
-    try:
-        status = os.lstat(path)
-    except OSError:
-        return None
-    return (status.st_dev, status.st_ino) if stat.S_ISREG(status.st_mode) else None
+_KIND_OF_GIT_MODE = {b"100644": "file", b"100755": "file", b"120000": "link", b"160000": "module"}
+
+
+def _entries_on_disk(root: bytes, prefix: bytes, directories: list[bytes]) -> dict[bytes, str]:
+    """Every file and link under the checkout by its exact name, without following links.
+    Directories are collected for the caller; an empty directory stands for a submodule."""
+    here = os.path.join(root, prefix) if prefix else root
+    directories.append(here)
+    found: dict[bytes, str] = {}
+    with os.scandir(here) as scan:
+        children = sorted(scan, key=lambda child: child.name)
+    for child in children:
+        name = prefix + b"/" + child.name if prefix else child.name
+        if child.is_symlink():
+            found[name] = "link"
+        elif child.is_file(follow_symlinks=False):
+            found[name] = "file"
+        elif child.is_dir(follow_symlinks=False):
+            below = _entries_on_disk(root, name, directories)
+            found |= below or {name: "module"}
+        else:
+            found[name] = "other"
+    return found
 
 
 async def _succeeds(*arguments: str) -> bool:

@@ -1,0 +1,11 @@
+> Provenance: `gpt-6.2-astra`, reasoning effort high, same Codex session. Reviewed commit `f8252ea`.
+
+**One blocker remains in `f8252ea`.** The checkout now rejects a tracked regular file that resolves to a symlink or shares an inode with another tracked regular file. It can still accept a checkout whose directory structure differs from the pinned commit. [checkout.py:148](/Users/andrealaforgia/dev/relay-v3/src/relay/git/checkout.py:148)
+
+**C2.2b.1 · BLOCKING · Directory-name collisions can produce a false green.** Suppose trunk contains `rates/standard`, and the contract observes which rates the product discovers in `rates`. A candidate adds `Rates/reduced`. On a case-sensitive checkout, `rates` still contains only `standard`. On a case-insensitive checkout, both files can appear in the same directory. The two files have distinct inodes, so the current check can admit the candidate and certify `reduced` as available. Validate that distinct Git directory prefixes resolve to distinct directories, including prefixes whose children have different names. Also include tracked symlinks in the entry-type and collision checks, without following their targets. The acceptance test should exercise the merged-directory case and assert `CheckoutFailed` before the oracle launches. The existing collision fixture covers two filenames resolving to one file. [checkout.py:150](/Users/andrealaforgia/dev/relay-v3/src/relay/git/checkout.py:150) · [collision test](/Users/andrealaforgia/dev/relay-v3/tests/integration/test_process_oracle.py:268)
+
+**C2.2c is closed.** The Git listing stays in bytes through parsing and filesystem lookup. One **NON-BLOCKING** test gap remains. On successful checkout, the regression test inspects `vat.py`; it would still pass if the non-UTF-8 entry were silently dropped. Assert the original byte pathname exists and contains the fixture byte `x`. [checkout.py:141](/Users/andrealaforgia/dev/relay-v3/src/relay/git/checkout.py:141) · [non-UTF-8 test](/Users/andrealaforgia/dev/relay-v3/tests/integration/test_process_oracle.py:331)
+
+I independently ran all 100 unit tests. I reviewed the new filesystem tests from source in the read-only workspace. The full 215-test pass is the Builder’s reported result.
+
+DISPOSITION: CHALLENGE

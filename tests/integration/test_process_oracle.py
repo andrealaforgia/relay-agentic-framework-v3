@@ -234,7 +234,7 @@ async def test_a_tracked_file_that_turned_into_a_link_fails_the_checkout_and_tou
 
     monkeypatch.setattr("relay.git.checkout.shutil.rmtree", as_after_a_name_collision)
 
-    with pytest.raises(CheckoutFailed, match="every tracked file"):
+    with pytest.raises(CheckoutFailed, match="not exactly the tracked tree"):
         await pristine_checkout(str(repository), revision, tmp_path / "checkout")
 
     assert outside.stat().st_mode & 0o777 == 0o600
@@ -259,27 +259,26 @@ async def test_a_tracked_file_reached_through_a_linked_directory_fails_the_check
 
     monkeypatch.setattr("relay.git.checkout.shutil.rmtree", with_the_directory_replaced_by_a_link)
 
-    with pytest.raises(CheckoutFailed, match="every tracked file"):
+    with pytest.raises(CheckoutFailed, match="not exactly the tracked tree"):
         await pristine_checkout(str(repository), revision, tmp_path / "checkout")
 
     assert (outside / "tool.sh").stat().st_mode & 0o777 == 0o600
 
 
-async def test_two_tracked_names_that_are_one_file_on_this_host_fail_the_checkout(
+async def test_two_tracked_names_folded_into_one_file_fail_the_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository = tmp_path / "subject"
     revision = commit(repository, {"a.txt": "one", "b.txt": "two"})
     remove_tree = shutil.rmtree
 
-    def as_if_both_names_resolved_to_one_file(path: Path) -> None:
+    def as_if_one_name_overwrote_the_other(path: Path) -> None:
         (path.parent / "b.txt").unlink()
-        os.link(path.parent / "a.txt", path.parent / "b.txt")
         remove_tree(path)
 
-    monkeypatch.setattr("relay.git.checkout.shutil.rmtree", as_if_both_names_resolved_to_one_file)
+    monkeypatch.setattr("relay.git.checkout.shutil.rmtree", as_if_one_name_overwrote_the_other)
 
-    with pytest.raises(CheckoutFailed, match="every tracked file"):
+    with pytest.raises(CheckoutFailed, match="not exactly the tracked tree"):
         await pristine_checkout(str(repository), revision, tmp_path / "checkout")
 
 
@@ -340,3 +339,112 @@ async def test_a_file_name_that_is_not_valid_text_is_checked_out_or_refused_expl
     except CheckoutFailed:
         return  # a filesystem that cannot hold the name: an explicit, recorded failure
     assert (checkout / "vat.py").stat().st_mode & 0o777 == 0o644
+    assert content_of(os.path.join(os.fsencode(checkout), b"caf\xe9.txt")) == b"x"
+
+
+def content_of(path: bytes) -> bytes:
+    with open(path, "rb") as file:
+        return file.read()
+
+
+def add_to_the_index(repository: Path, name: str, content: bytes) -> None:
+    """Track a file without creating it in the worktree, as a commit made on another
+    kind of filesystem could."""
+    blob = (
+        subprocess.run(
+            ["git", "-C", str(repository), "hash-object", "-w", "--stdin"],
+            input=content,
+            check=True,
+            capture_output=True,
+        )
+        .stdout.strip()
+        .decode()
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"100644,{blob},{name}",
+        ],
+        check=True,
+    )
+
+
+def commit_the_index(repository: Path) -> str:
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-q", "-m", "from another host"], check=True
+    )
+    return subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def two_directories_differing_only_by_case(repository: Path) -> str:
+    (repository / "rates").mkdir(parents=True)
+    commit(repository, {"rates/standard": "20"})
+    add_to_the_index(repository, "Rates/reduced", b"5")
+    return commit_the_index(repository)
+
+
+async def test_two_tracked_directories_folded_into_one_fail_the_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "subject"
+    revision = two_directories_differing_only_by_case(repository)
+    remove_tree = shutil.rmtree
+
+    def as_on_a_filesystem_that_ignores_case(path: Path) -> None:
+        checkout = path.parent
+        names = {entry.name for entry in checkout.iterdir()}
+        if {"rates", "Rates"} <= names:  # this host kept them apart; fold them
+            (checkout / "Rates" / "reduced").rename(checkout / "rates" / "reduced")
+            (checkout / "Rates").rmdir()
+        remove_tree(path)
+
+    monkeypatch.setattr("relay.git.checkout.shutil.rmtree", as_on_a_filesystem_that_ignores_case)
+
+    with pytest.raises(CheckoutFailed, match="not exactly the tracked tree"):
+        await pristine_checkout(str(repository), revision, tmp_path / "checkout")
+
+
+async def test_a_file_that_is_not_tracked_fails_the_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "subject"
+    revision = commit(repository, {"vat.py": VAT_RETURNS_NET})
+    remove_tree = shutil.rmtree
+
+    def with_a_stray_file(path: Path) -> None:
+        (path.parent / "stray.py").write_text("not in the commit")
+        remove_tree(path)
+
+    monkeypatch.setattr("relay.git.checkout.shutil.rmtree", with_a_stray_file)
+
+    with pytest.raises(CheckoutFailed, match="not exactly the tracked tree"):
+        await pristine_checkout(str(repository), revision, tmp_path / "checkout")
+
+
+async def test_a_tracked_link_that_became_a_file_fails_the_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path / "host-file"
+    outside.write_text("x")
+    revision = repository_with_a_tracked_link(tmp_path / "subject", outside)
+    remove_tree = shutil.rmtree
+
+    def with_the_link_replaced_by_a_file(path: Path) -> None:
+        (path.parent / "link").unlink()
+        (path.parent / "link").write_text("a regular file now")
+        remove_tree(path)
+
+    monkeypatch.setattr("relay.git.checkout.shutil.rmtree", with_the_link_replaced_by_a_file)
+
+    with pytest.raises(CheckoutFailed, match="not exactly the tracked tree"):
+        await pristine_checkout(str(tmp_path / "subject"), revision, tmp_path / "checkout")
