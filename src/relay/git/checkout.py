@@ -36,6 +36,10 @@ class RemoteUnavailable(CheckoutFailed):
     later. Never grounds for a permanent decision."""
 
 
+class RemoteRejected(CheckoutFailed):
+    """The repository itself answered no to an update of a named ref."""
+
+
 def require_credential_free(repository: str) -> str:
     """A repository address is stored and shown; a secret inside it would be too.
     Credentials are supplied to Git separately, never as part of the address. The
@@ -109,7 +113,10 @@ async def resolve_ref(repository: str, wanted: str) -> str | None:
 
 async def refs_under(repository: str, prefix: str) -> dict[str, str]:
     """Every ref whose full name starts with `prefix`, with the object it points at."""
-    listing = await git("ls-remote", "--", repository, f"{prefix}*", redact=repository)
+    try:
+        listing = await git("ls-remote", "--", repository, f"{prefix}*", redact=repository)
+    except CheckoutFailed as failure:
+        raise RemoteUnavailable(str(failure)) from None
     found = {}
     for line in listing.splitlines():
         revision, _, ref = line.partition("\t")
@@ -208,6 +215,15 @@ async def git(*arguments: str, redact: str | None = None) -> str:
 
 async def _git_output(*arguments: str, redact: str | None = None) -> bytes:
     """Raw output: Git path names are bytes and need not be valid text."""
+    status, stdout, detail = await git_result(*arguments, redact=redact)
+    if status != 0:
+        raise CheckoutFailed(f"git {arguments[0]} failed: {detail}")
+    return stdout
+
+
+async def git_result(*arguments: str, redact: str | None = None) -> tuple[int, bytes, str]:
+    """Run trusted Git and return its exit status, its output and its diagnostics, with
+    the repository address and any URL credentials removed from the diagnostics."""
     process = await asyncio.create_subprocess_exec(
         *_TRUSTED_GIT,
         *arguments,
@@ -217,10 +233,9 @@ async def _git_output(*arguments: str, redact: str | None = None) -> bytes:
         env=_GIT_ENVIRONMENT,
     )
     stdout, stderr = await process.communicate()
-    if process.returncode != 0:
-        detail = stderr.decode(errors="replace").strip()
-        if redact:
-            # Git echoes the address it was given; a failure must not carry it onwards.
-            detail = detail.replace(redact, "<repository>")
-        raise CheckoutFailed(f"git {arguments[0]} failed: {_URL_USERINFO.sub('//', detail)}")
-    return stdout
+    detail = stderr.decode(errors="replace").strip()
+    if redact:
+        # Git echoes the address it was given; a failure must not carry it onwards.
+        detail = detail.replace(redact, "<repository>")
+    assert process.returncode is not None
+    return process.returncode, stdout, _URL_USERINFO.sub("//", detail)

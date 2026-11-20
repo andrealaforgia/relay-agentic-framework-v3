@@ -33,7 +33,13 @@ from relay.domain.review import (
     judge_gate,
     require_authority_over,
 )
-from relay.git.checkout import CheckoutFailed, RemoteUnavailable, refs_under, resolve_ref
+from relay.git.checkout import (
+    CheckoutFailed,
+    RemoteRejected,
+    RemoteUnavailable,
+    refs_under,
+    resolve_ref,
+)
 from relay.git.mirror import Mirror
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
@@ -185,7 +191,11 @@ class Reviews:
             ).fetchall()
         published = 0
         for cycle in pending:
-            published += await self._publish(cycle)
+            try:
+                published += await self._publish(cycle)
+            except CheckoutFailed as failure:
+                # One project's Git trouble must not hold up the others.
+                await self._defer(cycle, str(failure)[:500])
         return published
 
     async def _publish(self, cycle: dict[str, Any]) -> int:
@@ -199,16 +209,18 @@ class Reviews:
             if await resolve_ref(repository, ref) is None:
                 try:
                     await mirror.publish(repository, commit, ref)
-                except CheckoutFailed as refused:
-                    # Another publisher may have just created it, the remote may have said
-                    # no, or the push may not have arrived. Look again before deciding.
-                    now = await resolve_ref(repository, ref)
-                    if now is None and _is_a_definite_refusal(refused):
+                except RemoteRejected as refused:
+                    # Two publishers racing for the same ref: the loser is refused, yet
+                    # the ref is now exactly right. Only a refusal that leaves the
+                    # candidate unpublished is the remote saying no to it.
+                    if await resolve_ref(repository, ref) != commit:
                         reason = f"the remote refused the candidate: {refused}"
                         await self._block(cycle["cycle_id"], reason[:500])
                         return 0
-                    if now is None:
-                        raise RemoteUnavailable(str(refused)) from None
+                except RemoteUnavailable:
+                    raise
+                except CheckoutFailed:
+                    pass  # the ref appeared meanwhile; what it names is checked next
             if await resolve_ref(repository, ref) != commit:
                 await self._block(cycle["cycle_id"], "the candidate ref names another commit")
                 return 0
@@ -664,11 +676,6 @@ class Reviews:
 
 _COMMIT_LOST = "the commit that was judged green can no longer be obtained"
 _NO_ACCEPTED_GREEN = "no accepted green is on record for the commit in review"
-
-
-def _is_a_definite_refusal(failure: CheckoutFailed) -> bool:
-    """Whether the remote itself answered no, as opposed to not answering."""
-    return any(sign in str(failure) for sign in ("remote rejected", "hook declined", "denied"))
 
 
 async def _accepted_green(

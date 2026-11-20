@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from relay.git.checkout import CheckoutFailed
+from relay.git.checkout import (
+    CheckoutFailed,
+    RemoteRejected,
+    RemoteUnavailable,
+    refs_under,
+    resolve_ref,
+)
 from relay.git.mirror import Mirror
 from tests.integration.fixtures import (
     VAT_APPLIES_STANDARD_RATE,
@@ -152,3 +158,61 @@ async def test_ancestry_is_answered_from_the_mirror(tmp_path: Path) -> None:
 
     assert await mirror.descends(candidate, trunk)
     assert not await mirror.descends(trunk, candidate)
+
+
+async def test_a_push_to_a_repository_that_is_not_there_is_unavailable_not_refused(
+    tmp_path: Path,
+) -> None:
+    repository, _, candidate = subject_with_candidate(tmp_path)
+    mirror = Mirror(tmp_path / "control-plane" / "vat.git")
+    await mirror.pin_from(str(repository), ATTEMPT, candidate)
+
+    with pytest.raises(RemoteUnavailable):
+        await mirror.publish(str(tmp_path / "nowhere"), candidate, "refs/relay/candidates/x/B1/1")
+
+
+async def test_a_hook_that_declines_is_a_refusal_by_the_remote_with_its_reason(
+    tmp_path: Path,
+) -> None:
+    repository, _, candidate = subject_with_candidate(tmp_path)
+    hook = repository / ".git" / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\necho 'not here' >&2\nexit 1\n")
+    hook.chmod(0o755)
+    mirror = Mirror(tmp_path / "control-plane" / "vat.git")
+    await mirror.pin_from(str(repository), ATTEMPT, candidate)
+
+    with pytest.raises(RemoteRejected, match="hook declined"):
+        await mirror.publish(str(repository), candidate, "refs/relay/candidates/x/B1/1")
+
+
+async def test_an_existing_ref_is_neither_a_refusal_nor_an_outage(tmp_path: Path) -> None:
+    repository, trunk, candidate = subject_with_candidate(tmp_path)
+    git(repository, "update-ref", "refs/relay/candidates/x/B1/1", trunk)
+    mirror = Mirror(tmp_path / "control-plane" / "vat.git")
+    await mirror.pin_from(str(repository), ATTEMPT, candidate)
+
+    with pytest.raises(CheckoutFailed) as failure:
+        await mirror.publish(str(repository), candidate, "refs/relay/candidates/x/B1/1")
+
+    assert type(failure.value) is CheckoutFailed
+
+
+async def test_recovery_that_could_not_finish_looking_does_not_say_the_commit_is_gone(
+    tmp_path: Path,
+) -> None:
+    repository, _, candidate = subject_with_candidate(tmp_path)
+    mirror = Mirror(tmp_path / "control-plane" / "vat.git")
+
+    with pytest.raises(RemoteUnavailable):
+        await mirror.recover(
+            str(repository), candidate, ["refs/relay/attempts/gone/B1/1", ATTEMPT + "-x"]
+        )
+    assert await mirror.recover(str(repository), candidate, ["refs/heads/main"]) is False
+    assert await mirror.recover(str(repository), candidate, [ATTEMPT]) is True
+
+
+async def test_a_repository_that_cannot_be_listed_is_unavailable(tmp_path: Path) -> None:
+    with pytest.raises(RemoteUnavailable):
+        await refs_under(str(tmp_path / "nowhere"), "refs/relay/attempts/")
+    with pytest.raises(RemoteUnavailable):
+        await resolve_ref(str(tmp_path / "nowhere"), "refs/heads/main")

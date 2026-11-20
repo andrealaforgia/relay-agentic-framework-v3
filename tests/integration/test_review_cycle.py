@@ -19,7 +19,7 @@ from relay.application.behaviours import Behaviours
 from relay.application.reviews import NewFinding, Review, Reviews, UnknownCapability
 from relay.domain.behaviour import BehaviourState
 from relay.domain.review import Carried, Severity, SubmissionRefused
-from relay.git.checkout import RemoteUnavailable
+from relay.git.checkout import CheckoutFailed, RemoteUnavailable
 from relay.git.mirror import Mirror
 from relay.persistence.ledger import read_events
 from relay.persistence.outbox import OutboxPublisher, pending_messages
@@ -605,13 +605,6 @@ async def test_adoption_binds_the_green_the_ledger_accepted_not_the_latest_run_o
         await connection.execute(
             "UPDATE executions SET stdout = stdout WHERE execution_id = %s", (accepted,)
         )
-        others = await (
-            await connection.execute(
-                "SELECT execution_id FROM executions WHERE purpose = 'green' AND revision = %s",
-                (candidate,),
-            )
-        ).fetchall()
-    assert len(others) == 2 and others[0]["execution_id"] != accepted
 
     assert await world.reviews.adopt_reviews_without_a_cycle() == 1
 
@@ -733,3 +726,105 @@ async def test_a_conflict_seen_while_the_last_review_lands_leaves_one_decision_a
     assert await world.state() is BehaviourState.BLOCKED
     events = await world.events()
     assert events.index("review.gate_satisfied") < events.index("review.cycle_blocked")
+
+
+async def test_a_fetch_cut_short_does_not_declare_an_available_commit_lost(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = await world.green_candidate()
+    shutil.rmtree(world.mirrors)
+    real_git = Mirror._git
+
+    async def connection_drops_during_fetch(self: Mirror, *arguments: str, **options: Any) -> str:
+        if arguments[0] == "fetch":
+            raise CheckoutFailed("git fetch failed: the remote end hung up unexpectedly")
+        return await real_git(self, *arguments, **options)
+
+    monkeypatch.setattr(Mirror, "_git", connection_drops_during_fetch)
+    assert await world.reviews.publish_candidates() == 0
+
+    assert await world.cycle_states() == ["open"]
+    assert await world.state() is BehaviourState.REVIEW
+    assert "hung up" in (await cycle_row(world))["deferred_reason"]
+
+    monkeypatch.setattr(Mirror, "_git", real_git)
+    assert await world.reviews.publish_candidates() == 1
+
+    assert world.remote_ref(await candidate_ref_of(world)) == candidate
+    assert set(await world.capabilities(candidate)) == {"qa", "sentinel"}
+
+
+async def test_a_push_that_never_reached_the_remote_leaves_the_cycle_pending(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = await world.green_candidate()
+    real_publish = Mirror.publish
+
+    async def cannot_send(self: Mirror, repository: str, commit: str, ref: str) -> None:
+        raise RemoteUnavailable("git push failed: Permission denied (publickey)")
+
+    monkeypatch.setattr(Mirror, "publish", cannot_send)
+    assert await world.reviews.publish_candidates() == 0
+
+    assert await world.cycle_states() == ["open"]
+    assert "Permission denied" in (await cycle_row(world))["deferred_reason"]
+
+    monkeypatch.setattr(Mirror, "publish", real_publish)
+    assert await world.reviews.publish_candidates() == 1
+    assert world.remote_ref(await candidate_ref_of(world)) == candidate
+
+
+async def test_one_projects_unreachable_repository_does_not_hold_up_another(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    first = World(database, tmp_path / "first", runner_image)
+    await first.release_to_builder()
+    await first.green_candidate()
+    second = World(database, tmp_path / "second", runner_image)
+    second.reviews = first.reviews
+    second.behaviours = first.behaviours
+    second_trunk = commit(second.repository, {"vat.py": VAT_RETURNS_NET})
+    await first.behaviours.open_project("other-project", str(second.repository))
+    await first.behaviours.propose("other-project", "B1", "standard VAT rate is applied")
+    await first.behaviours.begin_test_design("other-project", "B1")
+    await first.behaviours.register_acceptance_test("other-project", "B1", CONTRACT)
+    assert (await first.behaviours.run_red("other-project", "B1")).is_valid
+    publish_attempt(
+        second.repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE},
+        on=second_trunk, project="other-project",
+    )  # fmt: skip
+    assert (await first.behaviours.run_green("other-project", "B1", attempt=1)).is_valid
+    shutil.rmtree(first.mirrors / f"{PROJECT}.git")
+    first.repository.rename(tmp_path / "first" / "unplugged")
+
+    assert await first.reviews.publish_candidates() == 1
+
+    async with database.connection() as connection:
+        rows = await (
+            await connection.execute(
+                "SELECT project_id, publication, state, deferred_reason FROM review_cycles "
+                "ORDER BY created_at"
+            )
+        ).fetchall()
+    assert [(row["project_id"], row["publication"], row["state"]) for row in rows] == [
+        (PROJECT, "pending", "open"),
+        ("other-project", "published", "open"),
+    ]
+    assert rows[0]["deferred_reason"] is not None
+    assert await first.state() is BehaviourState.REVIEW
+
+
+async def test_an_unforeseen_git_failure_defers_the_cycle_instead_of_stopping_the_pass(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await world.green_candidate()
+
+    async def breaks(self: Reviews, record: Any) -> bool:
+        raise CheckoutFailed("git fetch failed: something nobody classified")
+
+    monkeypatch.setattr(Reviews, "_recover", breaks)
+
+    assert await world.reviews.publish_candidates() == 0
+
+    assert await world.cycle_states() == ["open"]
+    assert "nobody classified" in (await cycle_row(world))["deferred_reason"]

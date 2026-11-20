@@ -16,7 +16,10 @@ from pathlib import Path
 from relay.git.checkout import (
     FULL_COMMIT_HASH,
     CheckoutFailed,
+    RemoteRejected,
+    RemoteUnavailable,
     git,
+    git_result,
     git_succeeds,
     leave_only_the_tracked_files,
 )
@@ -51,11 +54,16 @@ class Mirror:
 
     async def recover(self, repository: str, commit: str, refs: Sequence[str]) -> bool:
         """Make sure this exact commit is pinned, fetching it if need be from any of the
-        given refs whose history still contains it. True if it is pinned afterwards."""
+        given refs whose history still contains it.
+
+        True: it is pinned. False: every ref was fetched and none contains it, so it is
+        gone. If a fetch could not be completed the search is unfinished and
+        RemoteUnavailable is raised: "could not look" is never reported as "not there"."""
         _require_hash(commit)
         if await self.holds(commit):
             return True
         await self._ensure_exists()
+        unfinished: CheckoutFailed | None = None
         for ref in refs:
             scratch = f"{_INCOMING}/{uuid.uuid4().hex}"
             try:
@@ -63,16 +71,20 @@ class Mirror:
                     "fetch", "--quiet", "--no-tags", "--", repository, f"+{ref}:{scratch}",
                     redact=repository,
                 )  # fmt: skip
+            except CheckoutFailed as failure:
+                unfinished = failure
+                continue
+            try:
                 is_a_commit = await git_succeeds(
                     "-C", str(self._path), "cat-file", "-e", f"{commit}^{{commit}}"
                 )
                 if is_a_commit and await self.descends(scratch, commit):
                     await self._git("update-ref", f"{_PINS}/{commit}", commit)
                     return True
-            except CheckoutFailed:
-                continue  # this ref is gone or unreachable; another may still do
             finally:
                 await git_succeeds("-C", str(self._path), "update-ref", "-d", scratch)
+        if unfinished is not None:
+            raise RemoteUnavailable(str(unfinished))
         return False
 
     async def holds(self, commit: str) -> bool:
@@ -106,12 +118,27 @@ class Mirror:
 
     async def publish(self, repository: str, commit: str, ref: str) -> None:
         """Create `ref` at a pinned commit on the remote, only if the ref does not exist.
-        Exactly one destination is named; nothing else on the remote can be touched."""
+        Exactly one destination is named; nothing else on the remote can be touched.
+
+        The outcome is read from Git's per-ref push status, not guessed from its messages:
+        RemoteRejected when the remote itself refused this ref, CheckoutFailed when the ref
+        already exists, RemoteUnavailable when the push never got an answer."""
         _require_hash(commit)
-        await self._git(
-            "push", "--quiet", f"--force-with-lease={ref}:", "--", repository, f"{commit}:{ref}",
+        status, output, detail = await git_result(
+            "-C", str(self._path), "push", "--porcelain", f"--force-with-lease={ref}:", "--",
+            repository, f"{commit}:{ref}",
             redact=repository,
         )  # fmt: skip
+        if status == 0:
+            return
+        for line in output.decode(errors="replace").splitlines():
+            flag, _, rest = line.partition("\t")
+            refs, _, summary = rest.partition("\t")
+            if flag == "!" and refs.endswith(f":{ref}"):
+                if "[remote rejected]" in summary:
+                    raise RemoteRejected(f"{summary.strip()} {detail}".strip())
+                raise CheckoutFailed(f"the push was not accepted: {summary.strip()}")
+        raise RemoteUnavailable(f"git push failed: {detail}")
 
     async def _ensure_exists(self) -> None:
         if not (self._path / "HEAD").exists():
