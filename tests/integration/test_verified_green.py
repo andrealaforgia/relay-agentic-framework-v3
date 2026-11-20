@@ -26,6 +26,7 @@ from tests.integration.fixtures import (
     CountingLaunches,
     HeldAtABarrier,
     commit,
+    held_at_the_barrier,
     publish_attempt,
     publish_tag_as_attempt,
 )
@@ -373,7 +374,7 @@ async def test_a_green_in_flight_when_its_red_is_superseded_does_not_reach_revie
             PROJECT, "B1", attempt=1
         )
     )
-    await held.observed.wait()
+    await held_at_the_barrier(in_flight, held)
 
     await behaviours.reopen_red(PROJECT, "B1", reason="trunk moved")
     second_red = commit(repository, {"README.md": "trunk moved on; VAT still wrong"})
@@ -409,7 +410,7 @@ async def test_a_red_in_flight_when_the_red_is_reopened_cannot_fill_the_new_cycl
     late = asyncio.create_task(
         Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)).run_red(PROJECT, "B1")
     )
-    await held.observed.wait()
+    await held_at_the_barrier(late, held)
 
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
     await behaviours.reopen_red(PROJECT, "B1", reason="trunk moved")
@@ -466,7 +467,7 @@ async def test_a_green_released_after_reopening_but_before_the_new_red_is_still_
             PROJECT, "B1", attempt=1
         )
     )
-    await held.observed.wait()
+    await held_at_the_barrier(in_flight, held)
 
     await behaviours.reopen_red(PROJECT, "B1", reason="trunk moved")
     held.release.set()
@@ -499,7 +500,7 @@ async def test_a_red_released_after_the_replacement_red_was_accepted_is_still_re
     late = asyncio.create_task(
         Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)).run_red(PROJECT, "B1")
     )
-    await held.observed.wait()
+    await held_at_the_barrier(late, held)
 
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
     await behaviours.reopen_red(PROJECT, "B1", reason="trunk moved")

@@ -3,6 +3,7 @@
 import asyncio
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from relay.domain.evidence import Baseline, Expected, Launch, ProcessContract
 from relay.testing.oracle import Isolation, Run
@@ -114,3 +115,14 @@ class HeldAtABarrier:
         self.observed.set()
         await self.release.wait()
         return run
+
+
+async def held_at_the_barrier(run: asyncio.Task[Any], barrier: HeldAtABarrier) -> None:
+    """Wait until the run is held. If it ends first, fail at once with its own error
+    instead of waiting for a barrier it will never reach."""
+    reached = asyncio.create_task(barrier.observed.wait())
+    async with asyncio.timeout(120):
+        await asyncio.wait({run, reached}, return_when=asyncio.FIRST_COMPLETED)
+    if not reached.done():
+        reached.cancel()
+        raise AssertionError("the run ended before reaching the barrier") from run.exception()
