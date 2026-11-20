@@ -24,18 +24,20 @@ ALTER TABLE behaviours ADD COLUMN current_on integer;
 
 -- Why work on a story, or on one of its behaviours, may not start: something it relies
 -- on was made under decisions that have since changed, and its owner has not
--- reconfirmed it. Null if everything is current.
+-- reconfirmed it. Every such reason, the story's first. Null if everything is current.
 CREATE FUNCTION not_current(project text, story text, behaviour text) RETURNS text
 LANGUAGE sql STABLE AS $$
-    SELECT CASE
-        WHEN s.current_on <> story_basis(s.project_id, s.story_id) THEN
+    SELECT nullif(concat_ws('; and ',
+        CASE WHEN s.current_on <> story_basis(s.project_id, s.story_id) THEN
             s.story_id || ' is not current: it was confirmed on decision basis '
             || s.current_on || ' and the basis is now ' || story_basis(s.project_id, s.story_id)
-        WHEN b.contract IS NOT NULL AND b.current_on <> story_basis(s.project_id, s.story_id) THEN
+        END,
+        CASE WHEN b.contract IS NOT NULL
+                  AND b.current_on <> story_basis(s.project_id, s.story_id) THEN
             'the contract of ' || b.behaviour_id || ' is not current: it was confirmed on '
             || 'decision basis ' || b.current_on || ' and the basis is now '
             || story_basis(s.project_id, s.story_id)
-    END
+        END), '')
     FROM stories s LEFT JOIN behaviours b
       ON b.project_id = s.project_id AND b.story_id = s.story_id AND b.behaviour_id = behaviour
     WHERE s.project_id = project AND s.story_id = story
@@ -58,7 +60,8 @@ CREATE TABLE reconfirmations (
     subject_id        text NOT NULL,
     basis             integer NOT NULL,
     by                text NOT NULL,
-    grant_id          uuid NOT NULL,
+    -- A grant completes one thing, once. Asked again, exactly, it is acknowledged.
+    grant_id          uuid NOT NULL UNIQUE,
     -- What was vouched for: a revision, or a contract digest with the evidence kept.
     statement         jsonb NOT NULL,
     recorded_at       timestamptz NOT NULL DEFAULT clock_timestamp()

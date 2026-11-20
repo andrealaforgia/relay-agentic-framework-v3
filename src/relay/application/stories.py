@@ -215,7 +215,7 @@ class Stories:
             await lock_gate(connection, project_id)
             story = await _locked_story(connection, project_id, story_id)
             _require_at_work(story)
-            require_open(await closure_of_story(connection, project_id, story_id))
+            await require_startable(connection, project_id, story_id)
             _require_revisions(story, story_revision, list_revision, story["list_revision"])
             require_basis(basis, await story_basis(connection, project_id, story_id))
             listed = await _behaviours_of(connection, project_id, story_id)
@@ -266,7 +266,7 @@ class Stories:
             await lock_gate(connection, project_id)
             story = await _locked_story(connection, project_id, story_id)
             _require_at_work(story)
-            require_open(await closure_of_story(connection, project_id, story_id))
+            await require_startable(connection, project_id, story_id)
             if _is_unsealed(story):
                 raise ActionRefused("only a sealed list of behaviours can be assessed")
             _require_revisions(story, story_revision, list_revision, story["sealed_revision"])

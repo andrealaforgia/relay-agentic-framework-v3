@@ -110,13 +110,16 @@ class Behaviour:
         candidate_descends_from_red: bool,
         still_owed: bool,
         basis_moved: bool = False,
+        observed: ProcessContract | None = None,
     ) -> GreenVerdict:
         """Judge a candidate against the red it was launched to answer, provided that red
         is still the one on record now and the build this run answers is still owed: a
         run that outlives its assignment is kept as evidence and changes nothing."""
         assert self.contract is not None
-        contract = self.contract
-        moved_on = self.state is not BehaviourState.IMPLEMENTING
+        # What is said about the run names the contract it was launched to observe,
+        # which an amendment may since have replaced.
+        contract = observed or self.contract
+        moved_on = self.state is not BehaviourState.IMPLEMENTING or contract != self.contract
         if moved_on or red_now != red_at_launch:
             return GreenVerdict(
                 GreenRejection.RED_SUPERSEDED,

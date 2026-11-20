@@ -33,7 +33,7 @@ from relay.application.closure import (
     closure_of_behaviour,
     lock_gate,
     require_current,
-    require_open,
+    require_startable,
 )
 from relay.application.stories import require_story_at_work
 from relay.domain.behaviour import Behaviour, BehaviourState
@@ -238,7 +238,7 @@ class Reviews:
         repository = cycle["repository"]
         try:
             if not await self._recover(cycle):
-                await self._block(cycle["cycle_id"], _COMMIT_LOST)
+                await self._stop_publication(cycle, _COMMIT_LOST)
                 return 0
             if await resolve_ref(repository, ref, timeout=self._remote_timeout) is None:
                 try:
@@ -249,7 +249,7 @@ class Reviews:
                     # candidate unpublished is the remote saying no to it.
                     if await resolve_ref(repository, ref, timeout=self._remote_timeout) != commit:
                         reason = f"the remote refused the candidate: {refused}"
-                        await self._block(cycle["cycle_id"], reason[:500])
+                        await self._stop_publication(cycle, reason[:500])
                         return 0
                 except RemoteUnavailable:
                     raise
@@ -259,7 +259,7 @@ class Reviews:
             if published_as is None:
                 raise RemoteUnavailable("the candidate ref is still absent after the push")
             if published_as != commit:
-                await self._block(cycle["cycle_id"], "the candidate ref names another commit")
+                await self._stop_publication(cycle, "the candidate ref names another commit")
                 return 0
         except RemoteUnavailable as unavailable:
             await self._defer(cycle, str(unavailable)[:500])
@@ -495,12 +495,9 @@ class Reviews:
         if task["state"] != "open" or task["publication"] != "published":
             raise SubmissionRefused("this review is no longer open")
         async with self._pool.connection() as connection:
-            require_open(
-                await closure_of_behaviour(connection, task["project_id"], task["behaviour_id"])
-            )
+            await _require_startable(connection, task)
             if not await holds(connection, grant, task["assignment_id"]):
                 raise ActionRefused("this grant is not the current one for this review")
-            await _require_current(connection, task)
         commit = task["candidate_revision"]
         try:
             names_the_commit = (
@@ -525,10 +522,7 @@ class Reviews:
             # The receipt is what starts a review. A closure that committed while the
             # tree was being exported is seen here, and then no review has started.
             await lock_gate(connection, task["project_id"])
-            require_open(
-                await closure_of_behaviour(connection, task["project_id"], task["behaviour_id"])
-            )
-            story_id = await _require_current(connection, task)
+            story_id = await _require_startable(connection, task)
             await start_review(connection, grant, task["assignment_id"])
             receipt = uuid.uuid7()
             await connection.execute(
@@ -758,10 +752,18 @@ class Reviews:
             raise UnknownCapability("no review task answers to that capability")
         return row
 
-    async def _block(self, cycle_id: uuid.UUID, reason: str) -> None:
+    async def _stop_publication(self, cycle: dict[str, Any], reason: str) -> None:
+        """Publication failed for good. That blocks the cycle, unless a decision of the
+        Product Owner's has meanwhile made it stale: then the cycle is the Verifier's to
+        keep or replace, and the failure is recorded and left for the next attempt."""
+        if not await self._block(cycle["cycle_id"], reason, unless_stale=True):
+            await self._defer(cycle, f"{reason}; left as it is until the cycle is reconfirmed")
+
+    async def _block(self, cycle_id: uuid.UUID, reason: str, *, unless_stale: bool = False) -> bool:
         """Stop a cycle that can no longer be trusted. Locks are taken in the same order
         as a submission takes them (behaviour, then cycle), and the cycle's state is read
-        again under them, so the two cannot deadlock or overwrite each other."""
+        again under them, so the two cannot deadlock or overwrite each other. Returns
+        False, having changed nothing, if asked to leave a stale cycle alone and it is."""
         async with self._pool.connection() as connection, connection.transaction():
             located = await (
                 await connection.execute(
@@ -776,6 +778,13 @@ class Reviews:
                 "SELECT 1 FROM behaviours WHERE project_id = %s AND behaviour_id = %s FOR UPDATE",
                 (project_id, behaviour_id),
             )
+            if unless_stale:
+                try:
+                    await _require_current(
+                        connection, {"project_id": project_id, "behaviour_id": behaviour_id}
+                    )
+                except ActionRefused:
+                    return False
             stopped = await (
                 await connection.execute(
                     # A cycle whose integration has been authorised is no longer this
@@ -807,6 +816,7 @@ class Reviews:
                 subject_id=behaviour_id,
                 payload={"cycle_id": str(cycle_id), "reason": reason},
             )
+        return True
 
     async def _defer(self, cycle: dict[str, Any], reason: str) -> None:
         """Publication could not be attempted or confirmed. The cycle stays pending and
@@ -897,6 +907,21 @@ async def _has_checkout(
         )
     ).fetchone()
     return row is not None
+
+
+async def _require_startable(connection: Connection, task: Mapping[str, Any]) -> str:
+    """A review may start only in a scope that is open and current. Says every reason
+    it may not, the closure first. Returns the story."""
+    row = await (
+        await connection.execute(
+            "SELECT story_id FROM behaviours WHERE project_id = %s AND behaviour_id = %s",
+            (task["project_id"], task["behaviour_id"]),
+        )
+    ).fetchone()
+    assert row is not None
+    story_id: str = row["story_id"]
+    await require_startable(connection, task["project_id"], story_id, task["behaviour_id"])
+    return story_id
 
 
 async def _require_current(connection: Connection, task: Mapping[str, Any]) -> str:

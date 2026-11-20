@@ -332,9 +332,11 @@ class Decisions:
             raise ActionRefused("an assumption needs its text")
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id)
-            await _require_scope(connection, project_id, feature_id, story_id)
             # The project before the feature: the order every other transaction keeps.
+            # And before the story is looked at: an approval holds this lock, and what
+            # was true of the story before it commits is not what is true after.
             await _locked_project(connection, project_id)
+            await _require_scope(connection, project_id, feature_id, story_id)
             scope = {
                 "project_id": project_id,
                 "feature_id": feature_id,
@@ -373,7 +375,8 @@ class Decisions:
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id)
             await _locked_project(connection, project_id)
-            if not await _said_already(connection, project_id, grant, "roadmap", feature_id, basis):
+            statement = {"roadmap": feature_id, "basis": basis, "revision": revision}
+            if not await _said_already(connection, project_id, grant, statement):
                 require_basis(basis, await feature_basis(connection, project_id, feature_id))
                 roadmap = await (
                     await connection.execute(
@@ -392,7 +395,7 @@ class Decisions:
                 )
                 await _reconfirmed(
                     connection, project_id, principal, grant, "roadmap", feature_id, basis,
-                    {"revision": revision},
+                    statement,
                 )  # fmt: skip
                 await reopen_roadmap_gate(connection, project_id, feature_id)
                 await release_next(connection, project_id)
@@ -415,7 +418,8 @@ class Decisions:
             await lock_gate(connection, project_id)
             await lock_story(connection, project_id, story_id)
             await _locked_project(connection, project_id)
-            if not await _said_already(connection, project_id, grant, "story", story_id, basis):
+            statement = {"story": story_id, "basis": basis, "revision": revision}
+            if not await _said_already(connection, project_id, grant, statement):
                 require_basis(basis, await story_basis(connection, project_id, story_id))
                 stood = await (
                     await connection.execute(
@@ -429,7 +433,7 @@ class Decisions:
                 await complete_reconfirmation(connection, grant, project_id, "story", story_id)
                 await _reconfirmed(
                     connection, project_id, principal, grant, "story", story_id, basis,
-                    {"revision": revision},
+                    statement,
                 )  # fmt: skip
                 await release_next(connection, project_id)
         await self._features.reconcile(project_id)
@@ -454,9 +458,13 @@ class Decisions:
             row = await _locked_behaviour_row(connection, project_id, behaviour_id)
             await lock_story(connection, project_id, row["story_id"])
             await _locked_project(connection, project_id)
-            if not await _said_already(
-                connection, project_id, grant, "behaviour", behaviour_id, basis
-            ):
+            statement = {
+                "behaviour": behaviour_id,
+                "basis": basis,
+                "contract_digest": contract_digest,
+                "retains": asdict(evidence),
+            }
+            if not await _said_already(connection, project_id, grant, statement):
                 require_basis(basis, await story_basis(connection, project_id, row["story_id"]))
                 behaviour = load_behaviour(row)
                 if behaviour.contract is None or behaviour.contract.digest != contract_digest:
@@ -475,7 +483,7 @@ class Decisions:
                 )
                 await _reconfirmed(
                     connection, project_id, principal, grant, "behaviour", behaviour_id, basis,
-                    {"contract_digest": contract_digest, "retains": asdict(evidence)},
+                    statement,
                 )  # fmt: skip
         await self._features.reconcile(project_id)
 
@@ -498,14 +506,13 @@ class Decisions:
             await lock_gate(connection, project_id)
             row = await _locked_behaviour_row(connection, project_id, behaviour_id)
             behaviour = load_behaviour(row)
-            amended_already = (
-                behaviour.contract is not None
-                and behaviour.contract.digest == contract.digest
-                and await _said_already(
-                    connection, project_id, grant, "behaviour", behaviour_id, basis
-                )
-            )
-            if not amended_already:
+            statement = {
+                "behaviour": behaviour_id,
+                "basis": basis,
+                "amends": replaces,
+                "contract_digest": contract.digest,
+            }
+            if not await _said_already(connection, project_id, grant, statement):
                 require_basis(basis, await story_basis(connection, project_id, row["story_id"]))
                 await require_current(connection, project_id, row["story_id"])
                 if behaviour.contract is None or behaviour.contract.digest != replaces:
@@ -541,6 +548,10 @@ class Decisions:
                     },
                     correlation_id=row["correlation_id"],
                 )
+                await _reconfirmed(
+                    connection, project_id, principal, grant, "behaviour", behaviour_id, basis,
+                    statement, announce=False,
+                )  # fmt: skip
         await self._features.reconcile(project_id)
 
     async def context_for(
@@ -748,23 +759,22 @@ async def _said_already(
     connection: Connection,
     project_id: str,
     grant: uuid.UUID,
-    subject: str,
-    subject_id: str,
-    basis: int,
+    statement: dict[str, Any],
 ) -> bool:
-    """Whether this grant has already completed exactly this reconfirmation. The caller
-    may have been cut off after the commit and before the follow-up; asked again, there
-    is nothing to record twice, and the follow-up is run again."""
-    row = await (
+    """Whether this grant has already completed exactly this, in this project. A caller
+    cut off after the commit may ask again and is acknowledged; the follow-up is then run
+    again. A grant that completed anything else acknowledges nothing: it is refused."""
+    done = await (
         await connection.execute(
-            "SELECT 1 FROM assignments WHERE grant_id = %s AND state = 'done' "
-            "AND kind = 'reconfirm' AND project_id = %s AND subject = %s "
-            "AND coalesce(behaviour_id, story_id, feature_id) = %s "
-            "AND (issued_on->>'basis')::integer = %s",
-            (grant, project_id, subject, subject_id, basis),
+            "SELECT statement FROM reconfirmations WHERE grant_id = %s AND project_id = %s",
+            (grant, project_id),
         )
     ).fetchone()
-    return row is not None
+    if done is None:
+        return False
+    if done["statement"] != statement:
+        raise ActionRefused("this grant was used for something else, and for that only")
+    return True
 
 
 async def _how_it_ended(connection: Connection, question: dict[str, Any]) -> str:
@@ -810,7 +820,11 @@ async def _reconfirmed(
     subject_id: str,
     basis: int,
     statement: dict[str, Any],
+    *,
+    announce: bool = True,
 ) -> None:
+    """Record what a grant completed, exactly as it was submitted. An amendment is
+    recorded here too, with its own event already in the ledger."""
     await connection.execute(
         "INSERT INTO reconfirmations (reconfirmation_id, project_id, subject, subject_id, basis, "
         "by, grant_id, statement) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
@@ -825,6 +839,8 @@ async def _reconfirmed(
             Jsonb(statement),
         ),
     )
+    if not announce:
+        return
     await append_event(
         connection,
         project_id,

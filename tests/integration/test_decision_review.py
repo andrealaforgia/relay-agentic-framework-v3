@@ -6,6 +6,7 @@ reconfirmation whose follow-up was cut short."""
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,8 @@ from relay.application.reviews import Reviews
 from relay.application.stories import StoryDraft
 from relay.domain.behaviour import BehaviourState
 from relay.domain.story import ActionRefused, StoryState
+from relay.git.checkout import RemoteRejected
+from relay.git.mirror import Mirror
 from relay.testing.oracle import ContainerIsolation, ProcessOracle
 from tests.integration.decision_world import DecisionWorld
 from tests.integration.fixtures import (
@@ -145,6 +148,10 @@ async def test_a_green_is_recorded_under_the_contract_it_was_observed_against(
         "SELECT payload->>'contract_digest' FROM events "
         "WHERE event_type = 'behaviour.green_rejected'"
     ) == [CONTRACT.digest]
+    [reason] = await world.column(
+        "SELECT payload->>'reason' FROM events WHERE event_type = 'behaviour.green_rejected'"
+    )
+    assert CONTRACT.contract_id in str(reason) and REDUCED_RATE.contract_id not in str(reason)
 
 
 async def test_an_assumption_and_the_first_roadmap_do_not_deadlock(
@@ -390,7 +397,7 @@ async def test_a_contract_reconfirmed_or_amended_twice_under_its_grant_is_done_o
     assert await world.column(
         "SELECT count(*) FROM reconfirmations WHERE subject = 'behaviour'"
     ) == [1]
-    with pytest.raises(ActionRefused, match="not the current one"):
+    with pytest.raises(ActionRefused, match="something else"):
         # Reconfirmed, not amended: the grant is spent, and this is not what it did.
         await world.decisions.amend_contract(
             VERIFIER, PROJECT, "B1", REDUCED_RATE, grant=grant, basis=1, replaces=CONTRACT.digest
@@ -408,3 +415,139 @@ async def test_a_contract_reconfirmed_or_amended_twice_under_its_grant_is_done_o
 
     assert (await world.events()).count("behaviour.contract_amended") == 1
     assert await world.column("SELECT red_cycle FROM behaviours") == [1]
+
+
+async def test_a_grant_that_has_been_used_acknowledges_only_exactly_what_it_did(
+    world: DecisionWorld,
+) -> None:
+    await world.awaiting_builder("B1")
+    await decided(world)
+    story = await owed_for(world, "story")
+    analyst = await world.claims.claim(ANALYST, story["assignment_id"])
+    await world.decisions.reconfirm_story(
+        ANALYST, PROJECT, "S1", grant=analyst, basis=1, revision=1
+    )
+    with pytest.raises(ActionRefused, match="something else"):
+        await world.decisions.reconfirm_story(
+            ANALYST, PROJECT, "S1", grant=analyst, basis=1, revision=999
+        )
+    first = await world.claims.claim(
+        VERIFIER, (await owed_for(world, "behaviour"))["assignment_id"]
+    )
+    await world.decisions.amend_contract(
+        VERIFIER, PROJECT, "B1", REDUCED_RATE, grant=first, basis=1, replaces=CONTRACT.digest
+    )
+
+    with pytest.raises(ActionRefused, match="something else"):
+        # It amended. It did not vouch for any evidence, and cannot be said to have.
+        await world.decisions.reconfirm_contract(
+            VERIFIER, PROJECT, "B1", grant=first, basis=1,
+            contract_digest=REDUCED_RATE.digest,
+            evidence=await world.decisions.evidence_of(PROJECT, "B1"),
+        )  # fmt: skip
+    with pytest.raises(ActionRefused, match="something else"):
+        await world.decisions.amend_contract(
+            VERIFIER, PROJECT, "B1", CONTRACT, grant=first, basis=1, replaces=CONTRACT.digest
+        )
+
+    await decided(world)
+    await world.reconfirm(await owed_for(world, "story"))
+    second = await world.claims.claim(
+        VERIFIER, (await owed_for(world, "behaviour"))["assignment_id"]
+    )
+    third_contract = replace(CONTRACT, contract_id="B1-zero-rate")
+    await world.decisions.amend_contract(
+        VERIFIER, PROJECT, "B1", third_contract, grant=second, basis=2,
+        replaces=REDUCED_RATE.digest,
+    )  # fmt: skip
+
+    # The first amendment, repeated exactly after a later one: acknowledged, nothing changed.
+    await world.decisions.amend_contract(
+        VERIFIER, PROJECT, "B1", REDUCED_RATE, grant=first, basis=1, replaces=CONTRACT.digest
+    )
+    assert await world.contract_digest("B1") == third_contract.digest
+    assert (await world.events()).count("behaviour.contract_amended") == 2
+
+
+async def test_a_refused_publication_does_not_block_a_cycle_a_decision_has_made_stale(
+    world: DecisionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = await world.awaiting_builder("B1")
+    world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
+    assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
+    assumed = await world.decisions.assume(ANALYST, PROJECT, "F1", story_id="S1", text="pounds")
+
+    async def decided_while_the_push_is_on_its_way(self: Mirror, *arguments: Any) -> None:
+        await world.replace(assumed, "pence")
+        raise RemoteRejected("[remote rejected] declined by a hook")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Mirror, "publish", decided_while_the_push_is_on_its_way)
+        assert await world.reviews.publish_candidates() == 0
+
+    assert await world.column("SELECT publication || ':' || state FROM review_cycles") == [
+        "pending:open"
+    ]
+    assert await world.state("B1") is BehaviourState.REVIEW
+    await world.reconfirm_everything()  # the repository accepts it now
+    assert await world.column("SELECT publication FROM review_cycles") == ["published"]
+
+
+async def test_an_assumption_about_a_story_approved_a_moment_ago_is_refused(
+    world: DecisionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await world.deliver("B1")
+    await world.seal()
+    await world.assess("B1 shows it")
+    gate = await world.gate()
+    holding, go_on = asyncio.Event(), asyncio.Event()
+    real = stories_module._locked_project
+
+    async def held_with_the_project(*arguments: Any) -> None:
+        await real(*arguments)
+        if not holding.is_set():
+            holding.set()
+            await go_on.wait()
+
+    monkeypatch.setattr(stories_module, "_locked_project", held_with_the_project)
+    approving = asyncio.create_task(world.decide(gate))
+    await holding.wait()
+    assuming = asyncio.create_task(
+        world.decisions.assume(ANALYST, PROJECT, "F1", story_id="S1", text="whole pounds")
+    )
+    await world.until_someone_waits_for_a_lock()
+    go_on.set()
+
+    assert (await approving).disposition == "effective"
+    with pytest.raises(ActionRefused, match="correction"):
+        await assuming
+    assert "decision.assumed" not in await world.events()
+
+
+async def test_a_refusal_names_the_question_the_story_and_the_contract_together(
+    world: DecisionWorld,
+) -> None:
+    base = await world.awaiting_builder("B1")
+    world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
+    assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
+    assert await world.reviews.publish_candidates() == 1
+    [capability] = await world.column("SELECT capability FROM review_tasks WHERE role = 'qa'")
+    await decided(world)
+    again = await world.ask("S1")
+    revision, listed = await world.stories.revisions_of(PROJECT, "S1")
+
+    for refused_start in (
+        world.behaviours.reopen_red(PROJECT, "B1", "the answer changes it"),
+        world.reviews.prepare_review(str(capability), world.tmp_path / "tree", uuid.uuid7()),
+    ):
+        with pytest.raises(ActionRefused) as refused:
+            await refused_start
+        said = str(refused.value)
+        assert f"question {again}" in said, said
+        assert "S1 is not current" in said and "the contract of B1 is not current" in said
+        assert said.index("question") < said.index("S1 is not current")
+    with pytest.raises(ActionRefused) as refused:
+        await world.stories.seal(
+            VERIFIER, PROJECT, "S1", story_revision=revision, list_revision=listed, basis=1
+        )
+    assert f"question {again}" in str(refused.value) and "S1 is not current" in str(refused.value)

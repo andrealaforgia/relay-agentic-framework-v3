@@ -145,7 +145,7 @@ async def test_reconfirming_is_the_owners_and_is_about_what_stands_now(
             VERIFIER, PROJECT, "B1", grant=theirs, basis=1, contract_digest=digest,
             evidence=Evidence(red=str(uuid.uuid7())),
         )  # fmt: skip
-    with pytest.raises(ActionRefused, match="not the current one"):
+    with pytest.raises(ActionRefused, match="something else"):  # the Analyst's, spent on the story
         await world.decisions.reconfirm_contract(
             VERIFIER, PROJECT, "B1", grant=grant, basis=1, contract_digest=digest,
             evidence=Evidence(),

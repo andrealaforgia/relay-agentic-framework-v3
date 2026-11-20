@@ -405,6 +405,7 @@ class Behaviours:
                 != await story_basis(
                     connection, project_id, await _story_of(connection, project_id, behaviour_id)
                 ),
+                observed=observed,
             )
             contract = observed
             execution_id = await record_execution(
