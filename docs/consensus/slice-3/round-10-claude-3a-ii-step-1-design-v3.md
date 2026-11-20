@@ -68,6 +68,18 @@ One idempotent pass per project, run on start and as part of every resume, with 
 
 Re-arming and publishing do not undo each other: a command row carries a count of announcements requested and a count published, and the publisher's mark-sent records the count it read. A publish that overlaps the pass leaves the new request standing.
 
+## 6a. Restart with work in flight (added in round 11, in Astra's words)
+
+These three rules were accepted from the round 10 review and are part of this design.
+
+- **A review checked out by a consumer that is gone (S3-7.1).** At startup, for each still-required review with no effective submission, Relay revokes the dead consumer's grant even if a checkout receipt exists, retains that receipt as history, and returns the assignment to `wanted` for a fresh grant and checkout when the feature is open.
+- **A batch left running across a restart, whatever the feature's state (S3-7.2).** Before dispatch at startup, Relay marks each dead consumer's still-current `running` batch `interrupted` for an open feature, `held` for a paused feature, or `abandoned` for a cancelled feature, preserving its runs and allowing a held batch to produce one successor on resume.
+- **When a green run has started (S3-7.3).** Before launching the oracle, `run_green` commits a run-start record naming the attempt, assignment and grant under the gate lock; this is the first effect for pause, and startup marks any such unfinished run interrupted and makes still-required work eligible for a fresh grant when open.
+
+Consequences for the rules above: in section 4, rule 5's first effect for a build or remediation is the run-start record, not the finished green; in section 6, step 1 and step 2 at startup cover paused and cancelled features too, as these sentences say, while steps 3 to 6 remain for open features only.
+
+Tests added: a review checked out, the process killed, restart: the receipt is kept, the review is granted afresh and done once. A pause with a check running, the process killed before the batch settles, restart while paused, then resume: one successor, one integration. A pause after the run-start record is committed lets that green finish and be judged; a pause before it revokes the grant.
+
 ## 7. What "nothing is delivered" means
 
 No grant after a closure commits. A publisher that selects after the closure skips the commands of a paused feature. A row selected before may still reach Redis, and an entry already there may still reach a worker; neither can be granted.
