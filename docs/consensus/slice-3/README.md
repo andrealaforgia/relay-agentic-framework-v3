@@ -56,6 +56,18 @@ Reservations carried forward:
 
 What this step showed: three rounds, sixteen findings, none of them speculative. Most came from one pattern, an obligation recorded as done at the moment its work started rather than when it finished, so anything that interrupted the work left nothing owed. The design said "an assignment is done when its effect is on record"; taking the successor batch's existence as that effect was my reading, and it was too early.
 
+## Slice 3a-ii, step 2, design (questions, answers and changed decisions)
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 16 | CHALLENGE, 7 blocking of 8 | A submission stamped with the basis current when it arrives, not the one its author read; an old result arriving after reconfirmation; a story awaiting approval with no way back; amendment routes that do not exist; assignments that need a behaviour; blockers not composing; no rule for one answer per question |
+| 17 | CHALLENGE, 6 blocking of 7 | Red run on a stale contract; an amendment needing no grant; an old checkout indistinguishable from a new one; an outstanding push at reconfirmation; nothing waking held work when the last blocker clears; context and basis read apart |
+| 18 | CHALLENGE, 4 blocking of 5 | A roadmap compared with the wrong scope's basis; a refused reconfirmation left granted to one worker; an old seal surviving an answer; reopening a red removing the reconfirmation it needs |
+
+The build contract is `round-19-claude-3a-ii-step-2-design-v4.md`: design v3 with round 18's five findings folded in. **Astra has not reviewed v4.** It kept the core of the design (one decision number per story, scope looked up and never copied) through all three rounds, and said the last amendments could be folded in without another design round.
+
+What step 2 will not do, by design: change anything already in review, integrated or approved, or change a story's text or a roadmap's content. Those are corrections, step 3. Until step 3 exists, a scope stopped for such a reason stays stopped and says why.
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.
