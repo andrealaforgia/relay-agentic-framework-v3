@@ -36,8 +36,11 @@ CREATE TABLE check_batches (
     reason               text,
     created_at           timestamptz NOT NULL DEFAULT now(),
     FOREIGN KEY (project_id, behaviour_id) REFERENCES behaviours,
-    -- A request repeated gets the batch it already has, never a second one.
-    UNIQUE (project_id, behaviour_id, request_id)
+    -- A request repeated gets the batch it already has, never a second one. A batch
+    -- that was held by a pause or cut short by a restart is succeeded by the next
+    -- generation of the same request, and the request is answered from the latest.
+    generation           integer NOT NULL DEFAULT 1,
+    UNIQUE (project_id, behaviour_id, request_id, generation)
 );
 
 CREATE TABLE check_runs (

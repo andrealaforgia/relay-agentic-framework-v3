@@ -38,6 +38,16 @@ async def pending_messages(pool: Pool) -> list[OutboxMessage]:
     return [OutboxMessage(**row) for row in rows]
 
 
+# A command that announces work on a paused or cancelled feature is held back. One that
+# was selected before the closure committed may still go out; it cannot be granted.
+_FOR_A_CLOSED_FEATURE = (
+    "SELECT 1 FROM assignments a JOIN behaviours b USING (project_id, behaviour_id) "
+    "JOIN stories s USING (project_id, story_id) "
+    "JOIN features f USING (project_id, feature_id) "
+    "WHERE a.command_message_id = o.message_id AND f.closed_by IS NOT NULL"
+)
+
+
 class OutboxPublisher:
     """Publishes then marks sent. A crash in between republishes the same message id."""
 
@@ -55,9 +65,9 @@ class OutboxPublisher:
         async with self._pool.connection() as connection, connection.transaction():
             row = await (
                 await connection.execute(
-                    "SELECT position, message_id, stream, envelope FROM outbox "
-                    "WHERE published_at IS NULL ORDER BY position "
-                    "LIMIT 1 FOR UPDATE SKIP LOCKED"
+                    "SELECT position, message_id, stream, envelope FROM outbox o "
+                    f"WHERE published_at IS NULL AND NOT EXISTS ({_FOR_A_CLOSED_FEATURE}) "
+                    "ORDER BY position LIMIT 1 FOR UPDATE OF o SKIP LOCKED"
                 )
             ).fetchone()
             if row is None:

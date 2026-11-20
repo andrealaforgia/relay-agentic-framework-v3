@@ -7,7 +7,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from relay.application.assignments import Assignments
+from psycopg_pool import AsyncConnectionPool
+
+from relay.application.assignments import Assignments, announce_again
 from relay.application.behaviours import Behaviours
 from relay.application.reviews import Reviews
 from relay.application.stories import Stories, StoryDraft
@@ -211,3 +213,8 @@ async def prepare_review(reviews: Reviews, capability: str, into: Path) -> Path:
         with contextlib.suppress(ActionRefused):
             grant = await Assignments(pool).claim(reviewer, task["assignment_id"])
     return await reviews.prepare_review(capability, into, grant)
+
+
+async def announce_wanted_work_again(pool: AsyncConnectionPool, project: str) -> int:
+    async with pool.connection() as connection, connection.transaction():
+        return await announce_again(connection, project)

@@ -19,7 +19,7 @@ from typing import Any
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
-from relay.application.assignments import REMEDIATE, owe
+from relay.application.assignments import INTEGRATE, REMEDIATE, owe, retire, take_up
 from relay.application.behaviours import (
     CONTROL_PLANE,
     load_behaviour,
@@ -169,7 +169,40 @@ class Integration:
         if source is None:
             raise LookupError(f"unknown project {project_id!r}")
         head = await trunk_head(source["repository"], source["trunk"])
-        started = await self._start_batch(project_id, behaviour_id, request_id, head)
+        return await self._finish(
+            await self._start_batch(project_id, behaviour_id, request_id, head)
+        )
+
+    async def continue_integration(self, assignment_id: uuid.UUID) -> IntegrationReceipt:
+        """Take up an integration whose checks were held by a pause or cut short by a
+        restart: start the next generation of the same request, if what it would
+        continue is still the latest batch of the behaviour's live, satisfied cycle.
+        Otherwise the assignment is retired and nothing starts."""
+        async with self._pool.connection() as connection:
+            owed = await (
+                await connection.execute(
+                    "SELECT a.project_id, a.behaviour_id, b.request_id, p.repository, p.trunk "
+                    "FROM assignments a JOIN check_batches b "
+                    "ON b.batch_id = (a.issued_on->>'batch_id')::uuid "
+                    "JOIN projects p ON p.project_id = a.project_id "
+                    "WHERE a.assignment_id = %s AND a.kind = 'integrate'",
+                    (assignment_id,),
+                )
+            ).fetchone()
+        if owed is None:
+            raise LookupError(f"no integration is owed under {assignment_id}")
+        head = await trunk_head(owed["repository"], owed["trunk"])
+        return await self._finish(
+            await self._start_batch(
+                owed["project_id"],
+                owed["behaviour_id"],
+                owed["request_id"],
+                head,
+                successor=assignment_id,
+            )
+        )
+
+    async def _finish(self, started: dict[str, Any] | IntegrationReceipt) -> IntegrationReceipt:
         if isinstance(started, IntegrationReceipt):
             return started
         # Taken before the runner is handed anything: which batch is settled or abandoned
@@ -233,13 +266,32 @@ class Integration:
             )
 
     async def _start_batch(
-        self, project_id: str, behaviour_id: str, request_id: str, head: str
+        self,
+        project_id: str,
+        behaviour_id: str,
+        request_id: str,
+        head: str,
+        successor: uuid.UUID | None = None,
     ) -> dict[str, Any] | IntegrationReceipt:
         answer_again: dict[str, Any] | None = None
         reconcile: uuid.UUID | None = None
+        generation = 1
         async with self._pool.connection() as connection, connection.transaction():
             behaviour, row = await _locked_behaviour(connection, project_id, behaviour_id)
-            answer_again = await _batch_of_request(connection, project_id, behaviour_id, request_id)
+            if successor is None:
+                answer_again = await _batch_of_request(
+                    connection, project_id, behaviour_id, request_id
+                )
+            else:
+                parent = await _parent_to_succeed(connection, successor)
+                if isinstance(parent, IntegrationReceipt):
+                    return parent
+                if parent is None:  # taken up already: the request has its answer
+                    answer_again = await _batch_of_request(
+                        connection, project_id, behaviour_id, request_id
+                    )
+                else:
+                    generation = parent["generation"] + 1
             if answer_again is None:
                 await require_story_at_work(connection, project_id, row, entering_design=False)
                 cycle = await _live_cycle(connection, project_id, behaviour_id)
@@ -267,6 +319,7 @@ class Integration:
                         "project_id": project_id,
                         "behaviour_id": behaviour_id,
                         "request_id": request_id,
+                        "generation": generation,
                         "cycle_id": cycle["cycle_id"],
                         "candidate_revision": cycle["candidate_revision"],
                         "expected_trunk": head,
@@ -276,6 +329,8 @@ class Integration:
                         ),
                         "members": checks,
                     }
+                    if successor is not None:
+                        await take_up(connection, successor, CONTROL_PLANE)
                     if head != cycle["red_revision"]:
                         await _insert_batch(connection, batch, state="base_moved")
                         await self._reopen(
@@ -843,13 +898,110 @@ class Integration:
         return await self._reconcile(intent["intent_id"])
 
 
+async def hand_on_unfinished_batches(
+    connection: Connection, project_id: str, *, starting: bool
+) -> None:
+    """Checks that a pause held, or that a process which is gone left running, decide
+    nothing. On an open feature each such batch is closed as interrupted and an
+    integration is owed in its place. On start, a batch left running on a closed feature
+    is held (paused) or abandoned (cancelled). Called under the project's gate lock."""
+    unfinished = await (
+        await connection.execute(
+            "SELECT k.batch_id, k.behaviour_id, k.state FROM check_batches k "
+            "WHERE k.project_id = %s AND k.state = ANY(%s) ORDER BY k.created_at, k.batch_id",
+            (project_id, ["held", "running"] if starting else ["held"]),
+        )
+    ).fetchall()
+    for found in unfinished:
+        _, row = await _locked_behaviour(connection, project_id, found["behaviour_id"])
+        batch = await (
+            await connection.execute(
+                "SELECT * FROM check_batches WHERE batch_id = %s AND state = %s FOR UPDATE",
+                (found["batch_id"], found["state"]),
+            )
+        ).fetchone()
+        closed_by = await closure_of_behaviour(connection, project_id, found["behaviour_id"])
+        if batch is None or (closed_by is not None and batch["state"] == "held"):
+            continue
+        if closed_by is not None:
+            state = "abandoned" if closed_by == CANCELLED else "held"
+            await _close_batch(
+                connection, batch, state, f"the process running these checks ended; {closed_by}"
+            )
+            continue
+        await _close_batch(
+            connection, batch, "interrupted", "these checks did not get to decide; to be run again"
+        )
+        await owe(
+            connection,
+            INTEGRATE,
+            Envelope(
+                message_kind=MessageKind.COMMAND,
+                event_type="integration.requested",
+                project_id=project_id,
+                behaviour_id=found["behaviour_id"],
+                sender=CONTROL_PLANE,
+                recipient="integrator",
+                idempotency_key=f"integrate:{batch['batch_id']}",
+                correlation_id=row["correlation_id"],
+                payload={"batch_id": str(batch["batch_id"]), "request_id": batch["request_id"]},
+            ),
+            issued_on={"batch_id": str(batch["batch_id"]), "cycle_id": str(batch["cycle_id"])},
+        )
+
+
+async def _parent_to_succeed(
+    connection: Connection, assignment_id: uuid.UUID
+) -> dict[str, Any] | IntegrationReceipt | None:
+    """The batch this assignment would continue, if it is still worth continuing; None
+    if the assignment has been taken up already; a receipt if it has gone stale, in which
+    case it is retired here. Called under the behaviour's lock."""
+    assignment = await (
+        await connection.execute(
+            "SELECT * FROM assignments WHERE assignment_id = %s FOR UPDATE", (assignment_id,)
+        )
+    ).fetchone()
+    assert assignment is not None
+    if assignment["state"] != "wanted":
+        return None
+    parent = await (
+        await connection.execute(
+            "SELECT * FROM check_batches WHERE batch_id = %s",
+            (assignment["issued_on"]["batch_id"],),
+        )
+    ).fetchone()
+    assert parent is not None
+    cycle = await _live_cycle(connection, parent["project_id"], parent["behaviour_id"])
+    # The latest batch of the behaviour's live cycle, whichever cycle that now is: if the
+    # cycle was replaced, or newer checks were started on it, that batch is not the parent.
+    latest = await (
+        await connection.execute(
+            "SELECT batch_id FROM check_batches WHERE cycle_id = %s "
+            "ORDER BY created_at DESC, batch_id DESC LIMIT 1",
+            (cycle["cycle_id"] if cycle else None,),
+        )
+    ).fetchone()
+    if latest is not None and latest["batch_id"] == parent["batch_id"]:
+        return parent
+    reason = "what these checks would have continued has since been replaced"
+    await retire(connection, assignment_id)
+    await append_event(
+        connection,
+        parent["project_id"],
+        "integration.successor_stale",
+        subject_id=parent["behaviour_id"],
+        payload={"batch_id": str(parent["batch_id"]), "assignment_id": str(assignment_id)},
+    )
+    return IntegrationReceipt(Outcome.SUPERSEDED, parent["batch_id"], reason)
+
+
 async def _batch_of_request(
     connection: Connection, project_id: str, behaviour_id: str, request_id: str
 ) -> dict[str, Any] | None:
     return await (
         await connection.execute(
             "SELECT batch_id, state, reason FROM check_batches WHERE project_id = %s "
-            "AND behaviour_id = %s AND request_id = %s",
+            "AND behaviour_id = %s AND request_id = %s ORDER BY generation DESC LIMIT 1",
             (project_id, behaviour_id, request_id),
         )
     ).fetchone()
@@ -949,7 +1101,7 @@ async def _insert_batch(connection: Connection, batch: dict[str, Any], *, state:
     await connection.execute(
         "INSERT INTO check_batches (batch_id, project_id, behaviour_id, request_id, cycle_id, "
         "candidate_revision, expected_trunk, check_policy_version, regression_digest, members, "
-        "state) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        "state, generation) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (
             batch["batch_id"],
             batch["project_id"],
@@ -962,6 +1114,7 @@ async def _insert_batch(connection: Connection, batch: dict[str, Any], *, state:
             batch["regression_digest"],
             Jsonb([check.to_dict() for check in batch["members"]]),
             state,
+            batch["generation"],
         ),
     )
 

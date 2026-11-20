@@ -6,7 +6,7 @@ CREATE TABLE assignments (
     project_id      text NOT NULL,
     behaviour_id    text NOT NULL,
     kind            text NOT NULL
-                    CHECK (kind IN ('build', 'remediate', 'review', 'publish_candidate', 'integrate')),
+                    CHECK (kind IN ('build', 'remediate', 'review', 'integrate')),
     role            text NOT NULL,
     issued_on       jsonb NOT NULL,
     state           text NOT NULL DEFAULT 'wanted'
@@ -40,3 +40,5 @@ CREATE TABLE green_runs (
 
 -- Set when the candidate is published, which is when the review becomes owed.
 ALTER TABLE review_tasks ADD COLUMN assignment_id uuid REFERENCES assignments;
+
+CREATE INDEX assignments_by_command ON assignments (command_message_id);

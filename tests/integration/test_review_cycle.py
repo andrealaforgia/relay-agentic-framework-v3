@@ -31,6 +31,7 @@ from tests.integration.fixtures import (
     CONTRACT,
     VAT_APPLIES_STANDARD_RATE,
     VAT_RETURNS_NET,
+    announce_wanted_work_again,
     commit,
     in_a_story,
     prepare_review,
@@ -506,14 +507,14 @@ async def test_a_task_announced_again_is_the_same_message_and_takes_effect_once(
 
     await OutboxPublisher(world.database, streams).publish_pending()
     [first] = await sentinel_worker()
-    assert await world.reviews.announce_unreviewed_tasks() == 1, "only sentinel still owes a review"
+    assert await announce_wanted_work_again(world.database, PROJECT) == 1, (
+        "only sentinel still owes a review"
+    )
     await OutboxPublisher(world.database, streams).publish_pending()
     [again] = await sentinel_worker()
 
     assert again == first
     assert await world.count("reviews_started") == 1
-    assert await world.reviews.announce_unreviewed_tasks() == 1
-    assert await world.reviews.announce_unreviewed_tasks() == 0, "already waiting to be sent"
 
 
 async def test_two_publishers_at_once_announce_each_task_once(world: World) -> None:

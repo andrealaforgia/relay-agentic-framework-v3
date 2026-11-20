@@ -26,6 +26,7 @@ from relay.transport.envelope import Envelope
 BUILD = "build"
 REMEDIATE = "remediate"
 REVIEW = "review"
+INTEGRATE = "integrate"
 _LIVE = ("wanted", "granted")
 
 
@@ -71,31 +72,29 @@ async def retire_all_of_feature(connection: Connection, project_id: str, feature
 async def revoke_unstarted_grants(connection: Connection, project_id: str, feature_id: str) -> None:
     """A pause takes back every grant of the feature that has had no effect yet. Called
     under the exclusive gate lock, so no first effect is in flight."""
-    revoked = await (
+    await _revoke(
+        connection, project_id, f"first_effect_at IS NULL AND {_IN_FEATURE}", (feature_id,)
+    )
+
+
+async def announce_again(connection: Connection, project_id: str) -> int:
+    """Have the command of every wanted assignment of an open feature sent again, as the
+    same message. A consumer that has already been granted it does nothing new. The
+    update waits for a publisher that is sending the same command at this moment, so the
+    request stands even if that send is then lost."""
+    again = await (
         await connection.execute(
-            "SELECT assignment_id, behaviour_id, grant_id, granted_to FROM assignments "
-            "WHERE project_id = %s AND state = 'granted' AND first_effect_at IS NULL "
-            f"AND {_IN_FEATURE} ORDER BY assignment_id FOR UPDATE",
-            (project_id, feature_id),
+            "UPDATE outbox SET published_at = NULL WHERE message_id IN "
+            "(SELECT a.command_message_id FROM assignments a "
+            "JOIN behaviours b USING (project_id, behaviour_id) "
+            "JOIN stories s USING (project_id, story_id) "
+            "JOIN features f USING (project_id, feature_id) "
+            "WHERE a.project_id = %s AND a.state = 'wanted' AND f.closed_by IS NULL) "
+            "RETURNING message_id",
+            (project_id,),
         )
     ).fetchall()
-    await connection.execute(
-        "UPDATE assignments SET state = 'wanted', grant_id = NULL, granted_to = NULL "
-        "WHERE assignment_id = ANY(%s)",
-        ([grant["assignment_id"] for grant in revoked],),
-    )
-    for grant in revoked:
-        await append_event(
-            connection,
-            project_id,
-            "assignment.grant_revoked",
-            subject_id=grant["behaviour_id"],
-            payload={
-                "assignment_id": str(grant["assignment_id"]),
-                "grant_id": str(grant["grant_id"]),
-                "worker": grant["granted_to"],
-            },
-        )
+    return len(again)
 
 
 @dataclass(frozen=True)
@@ -154,6 +153,33 @@ async def holds(
         )
     ).fetchone()
     return row is not None
+
+
+async def take_up(connection: Connection, assignment_id: uuid.UUID, consumer: str) -> None:
+    """The control plane grants itself work of its own and records its effect, all in the
+    transaction that makes the effect: there is no moment at which the grant exists and
+    the effect does not."""
+    await connection.execute(
+        "UPDATE assignments SET state = 'done', grant_id = %s, granted_to = %s, "
+        "first_effect_at = now() WHERE assignment_id = %s",
+        (uuid.uuid7(), consumer, assignment_id),
+    )
+
+
+async def retire(connection: Connection, assignment_id: uuid.UUID) -> None:
+    await _retire(connection, "assignment_id = %s", (assignment_id,))
+
+
+async def revoke_every_grant(connection: Connection, project_id: str) -> None:
+    """On start: whoever held a grant was in a process that is gone. Every grant is taken
+    back, with or without a first effect, and a green run left unfinished is marked so.
+    What those workers recorded stays as history."""
+    await connection.execute(
+        "UPDATE green_runs SET state = 'interrupted' WHERE state = 'started' AND assignment_id "
+        "IN (SELECT assignment_id FROM assignments WHERE project_id = %s)",
+        (project_id,),
+    )
+    await _revoke(connection, project_id, "TRUE", ())
 
 
 async def retire_reviews_of_cycle(connection: Connection, cycle_id: uuid.UUID) -> None:
@@ -249,6 +275,36 @@ _IN_FEATURE = (
     "JOIN stories s USING (project_id, story_id) "
     "WHERE b.project_id = assignments.project_id AND s.feature_id = %s)"
 )
+
+
+async def _revoke(
+    connection: Connection, project_id: str, where: str, parameters: tuple[Any, ...]
+) -> None:
+    revoked = await (
+        await connection.execute(
+            "SELECT assignment_id, behaviour_id, grant_id, granted_to FROM assignments "
+            f"WHERE project_id = %s AND state = 'granted' AND {where} "
+            "ORDER BY assignment_id FOR UPDATE",
+            (project_id, *parameters),
+        )
+    ).fetchall()
+    await connection.execute(
+        "UPDATE assignments SET state = 'wanted', grant_id = NULL, granted_to = NULL, "
+        "first_effect_at = NULL WHERE assignment_id = ANY(%s)",
+        ([grant["assignment_id"] for grant in revoked],),
+    )
+    for grant in revoked:
+        await append_event(
+            connection,
+            project_id,
+            "assignment.grant_revoked",
+            subject_id=grant["behaviour_id"],
+            payload={
+                "assignment_id": str(grant["assignment_id"]),
+                "grant_id": str(grant["grant_id"]),
+                "worker": grant["granted_to"],
+            },
+        )
 
 
 async def _first_effect(

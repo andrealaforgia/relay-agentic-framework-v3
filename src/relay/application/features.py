@@ -1,0 +1,68 @@
+"""Closing and reopening a feature, and what Relay then does without being asked.
+
+One pass per project puts right whatever a pause, or a process that ended, left
+unfinished. It runs after every resume and when the control plane starts, it is safe to
+run any number of times, and nobody has to call anything else for work to carry on.
+"""
+
+from __future__ import annotations
+
+from relay.application.assignments import announce_again, revoke_every_grant
+from relay.application.closure import lock_gate
+from relay.application.integration import Integration, hand_on_unfinished_batches
+from relay.application.reviews import Reviews
+from relay.application.stories import close_feature
+from relay.domain.story import HumanAction, Receipt
+from relay.git.checkout import CheckoutFailed
+from relay.persistence.database import Pool
+
+
+class Features:
+    def __init__(self, pool: Pool, reviews: Reviews, integration: Integration) -> None:
+        self._pool = pool
+        self._reviews = reviews
+        self._integration = integration
+
+    async def close(self, project_id: str, action: HumanAction) -> Receipt:
+        """Pause, resume or cancel the feature the action names. A resume, even one
+        that changed nothing or is being repeated, is followed by the pass that takes up
+        what a pause held: the pass is safe to run again."""
+        receipt = await close_feature(self._pool, project_id, action)
+        if action.action == "resume":
+            await self.reconcile(project_id)
+        return receipt
+
+    async def start(self) -> None:
+        """Run when the control plane starts. Every worker of the process that ended is
+        gone: grants are taken back and checks left running are closed, on every feature."""
+        async with self._pool.connection() as connection:
+            projects = await (
+                await connection.execute("SELECT project_id FROM projects ORDER BY project_id")
+            ).fetchall()
+        for project in projects:
+            await self.reconcile(project["project_id"], starting=True)
+
+    async def reconcile(self, project_id: str, *, starting: bool = False) -> None:
+        async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
+            if starting:
+                await revoke_every_grant(connection, project_id)
+            await hand_on_unfinished_batches(connection, project_id, starting=starting)
+        await self._integration.reconcile()
+        await self._reviews.publish_candidates()
+        async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
+            await announce_again(connection, project_id)
+            owed = await (
+                await connection.execute(
+                    "SELECT assignment_id FROM assignments WHERE project_id = %s "
+                    "AND kind = 'integrate' AND state = 'wanted' ORDER BY created_at",
+                    (project_id,),
+                )
+            ).fetchall()
+        # In this process the control plane is the integrator: it takes these up itself.
+        for integration in owed:
+            try:
+                await self._integration.continue_integration(integration["assignment_id"])
+            except CheckoutFailed:
+                continue  # the repository could not be read; the next pass tries again

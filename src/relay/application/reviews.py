@@ -451,37 +451,6 @@ class Reviews:
             record["repository"], record["candidate_revision"], [*published, *sorted(attempts)]
         )
 
-    async def announce_unreviewed_tasks(self) -> int:
-        """Send again the command of every task still waiting for its review. It is the
-        same message with the same identity, so a consumer that has already acted on it
-        does nothing new."""
-        async with self._pool.connection() as connection:
-            projects = await (
-                await connection.execute("SELECT project_id FROM projects ORDER BY project_id")
-            ).fetchall()
-        announced = 0
-        for project in projects:
-            async with self._pool.connection() as connection, connection.transaction():
-                await lock_gate(connection, project["project_id"])
-                again = await (
-                    await connection.execute(
-                        "UPDATE outbox SET published_at = NULL WHERE published_at IS NOT NULL "
-                        "AND message_id IN (SELECT t.command_message_id FROM review_tasks t "
-                        "JOIN review_cycles c USING (cycle_id) "
-                        "JOIN behaviours b USING (project_id, behaviour_id) "
-                        "JOIN stories st USING (project_id, story_id) "
-                        "JOIN features f USING (project_id, feature_id) "
-                        "WHERE c.project_id = %s AND c.state = 'open' "
-                        "AND c.publication = 'published' AND f.closed_by IS NULL "
-                        "AND NOT EXISTS (SELECT 1 FROM review_submissions s "
-                        "WHERE s.task_id = t.task_id AND s.disposition = 'effective')) "
-                        "RETURNING message_id",
-                        (project["project_id"],),
-                    )
-                ).fetchall()
-            announced += len(again)
-        return announced
-
     async def prepare_review(self, capability: str, into: Path, grant: uuid.UUID) -> Path:
         """Give a reviewer the tree to review: exactly the cycle's commit, from the control
         plane's pinned copy, after confirming the published ref still names that commit.

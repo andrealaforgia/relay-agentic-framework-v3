@@ -26,6 +26,7 @@ from tests.integration.fixtures import (
     PRODUCT_OWNER,
     VAT_APPLIES_STANDARD_RATE,
     HeldAtABarrier,
+    announce_wanted_work_again,
     held_at_the_barrier,
     prepare_review,
     run_green,
@@ -136,20 +137,20 @@ async def test_closing_and_reopening_are_a_persons_exact_and_repeatable(world: S
     pause = HumanAction(PRODUCT_OWNER, "p1", "F1", "pause", {"reason": "thinking"})
 
     with pytest.raises(ActionRefused, match="human"):
-        await world.stories.close(
+        await world.features.close(
             PROJECT, HumanAction(ANALYST, "x", "F1", "pause", {"reason": "r"})
         )
     with pytest.raises(ActionRefused, match="only that"):
-        await world.stories.close(PROJECT, HumanAction(PRODUCT_OWNER, "x", "F1", "pause", {}))
+        await world.features.close(PROJECT, HumanAction(PRODUCT_OWNER, "x", "F1", "pause", {}))
     with pytest.raises(ActionRefused, match="not something"):
-        await world.stories.close(PROJECT, HumanAction(PRODUCT_OWNER, "x", "F1", "approve", {}))
+        await world.features.close(PROJECT, HumanAction(PRODUCT_OWNER, "x", "F1", "approve", {}))
     assert (await world.close("resume")).disposition == "stale"
-    first = await world.stories.close(PROJECT, pause)
+    first = await world.features.close(PROJECT, pause)
 
-    assert first == await world.stories.close(PROJECT, pause) == Receipt("effective", "paused")
+    assert first == await world.features.close(PROJECT, pause) == Receipt("effective", "paused")
     assert (await world.close("pause", reason="again")).disposition == "stale"
     with pytest.raises(ActionRefused, match="already used"):
-        await world.stories.close(PROJECT, HumanAction(PRODUCT_OWNER, "p1", "F1", "resume", {}))
+        await world.features.close(PROJECT, HumanAction(PRODUCT_OWNER, "p1", "F1", "resume", {}))
     assert (await world.events()).count("feature.paused") == 1
     [paused] = await world.column("SELECT payload FROM events WHERE event_type = 'feature.paused'")
     assert isinstance(paused, dict)
@@ -245,9 +246,9 @@ async def test_a_review_cannot_be_started_on_a_paused_feature_even_with_its_capa
     assert not (world.tmp_path / "tree-2").exists()  # refused before any tree is fetched
     async with world.database.connection() as connection:
         await connection.execute("UPDATE outbox SET published_at = now()")
-    assert await world.reviews.announce_unreviewed_tasks() == 0
+    assert await announce_wanted_work_again(world.database, PROJECT) == 0
     await world.close("resume")
-    assert await world.reviews.announce_unreviewed_tasks() == 2
+    assert await announce_wanted_work_again(world.database, PROJECT) == 2
     await prepare_review(world.reviews, str(capability), world.tmp_path / "tree-3")
     assert await world.column("SELECT count(*) FROM review_checkouts") == [1]
 
@@ -262,11 +263,11 @@ async def test_a_candidate_verified_just_before_a_pause_is_not_announced_until_r
     await world.close("pause", reason="stop")
 
     assert await world.reviews.publish_candidates() == 0
-    assert await world.reviews.announce_unreviewed_tasks() == 0
+    assert await announce_wanted_work_again(world.database, PROJECT) == 0
 
     assert await world.column("SELECT publication FROM review_cycles") == ["pending"]
-    await world.close("resume")
-    assert await world.reviews.publish_candidates() == 1
+    await world.close("resume")  # the pass that follows a resume publishes it
+    assert await world.column("SELECT publication FROM review_cycles") == ["published"]
 
 
 @pytest.mark.parametrize("first", ["the approval", "the pause"])
@@ -413,8 +414,8 @@ async def test_a_pause_that_lands_while_a_candidate_is_being_published_holds_its
     assert await world.column(
         "SELECT count(*) FROM outbox WHERE envelope->>'event_type' = 'review.requested'"
     ) == [0]
-    await world.close("resume")
-    assert await world.reviews.publish_candidates() == 1
+    await world.close("resume")  # the pass that follows a resume publishes it
+    assert await world.column("SELECT publication FROM review_cycles") == ["published"]
 
 
 async def test_a_candidate_stays_off_the_repository_while_its_feature_is_paused(
@@ -430,8 +431,8 @@ async def test_a_candidate_stays_off_the_repository_while_its_feature_is_paused(
     assert await world.reviews.publish_candidates() == 0
 
     assert world.git("for-each-ref", str(ref), at=world.remote) == ""
-    await world.close("resume")
-    assert await world.reviews.publish_candidates() == 1
+    await world.close("resume")  # the pass that follows a resume publishes it
+    assert await world.column("SELECT publication FROM review_cycles") == ["published"]
     assert world.git("for-each-ref", str(ref), at=world.remote) != ""
 
 

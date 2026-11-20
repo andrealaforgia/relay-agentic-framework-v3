@@ -341,73 +341,6 @@ class Stories:
             await _record(connection, action, receipt)
             return receipt
 
-    async def close(self, project_id: str, action: HumanAction) -> Receipt:
-        """Pause, resume or cancel the feature the action names. The transaction holds
-        the project's gate lock exclusively, so by the time it commits no transaction
-        that authorises work is in flight, and every later one sees the closure."""
-        require_human(action.principal)
-        require_well_formed(action, ON_A_FEATURE)
-        feature_id = action.target
-        async with self._pool.connection() as connection, connection.transaction():
-            await lock_gate(connection, project_id, exclusive=True)
-            await _locked_project(connection, project_id)
-            feature = await _locked_feature(connection, project_id, feature_id)
-            if (seen := answer_again(action, await _recorded(connection, action))) is not None:
-                return seen
-            closed_by = feature["closed_by"]
-            pointless = (action.action == "pause" and closed_by == PAUSED) or (
-                action.action == "resume" and closed_by != PAUSED
-            )
-            if closed_by == CANCELLED or pointless:
-                # Cancelled for good; or pausing what is paused; or resuming what is not.
-                # A paused feature can still be cancelled.
-                receipt = Receipt("stale", f"nothing changed: the feature is {closed_by or 'open'}")
-                await _record(connection, action, receipt)
-                return receipt
-            if action.action == "cancel":
-                await _cancel(connection, project_id, feature_id)
-                await retire_all_of_feature(connection, project_id, feature_id)
-            if action.action == "pause":
-                await revoke_unstarted_grants(connection, project_id, feature_id)
-            await connection.execute(
-                "UPDATE features SET closed_by = %s, state = %s "
-                "WHERE project_id = %s AND feature_id = %s",
-                (
-                    {"pause": PAUSED, "cancel": CANCELLED, "resume": None}[action.action],
-                    CANCELLED if action.action == "cancel" else feature["state"],
-                    project_id,
-                    feature_id,
-                ),
-            )
-            outcome = {"pause": "paused", "cancel": "cancelled", "resume": "resumed"}[action.action]
-            await append_event(
-                connection,
-                project_id,
-                f"feature.{outcome}",
-                subject_id=feature_id,
-                payload={
-                    "by": action.principal.identity,
-                    "request_id": action.request_id,
-                    "said": dict(action.payload),
-                },
-            )
-            if action.action == "resume":
-                # Whatever became ready while the feature was closed is owed now, with
-                # no event left to cause it.
-                working = await (
-                    await connection.execute(
-                        "SELECT story_id FROM stories WHERE project_id = %s AND feature_id = %s "
-                        "AND state IN ('released', 'changes_requested') ORDER BY story_id",
-                        (project_id, feature_id),
-                    )
-                ).fetchall()
-                for story in working:
-                    await evaluate_story_gate(connection, project_id, story["story_id"])
-            await release_next(connection, project_id)
-            receipt = Receipt("effective", outcome)
-            await _record(connection, action, receipt)
-            return receipt
-
     async def inbox(self, project_id: str) -> list[InboxItem]:
         """What is waiting for the Product Owner, read from the durable record."""
         async with self._pool.connection() as connection:
@@ -533,6 +466,75 @@ async def evaluate_story_gate(connection: Connection, project_id: str, story_id:
         basis=_story_basis(story, assessment),
         manifest=manifest,
     )
+
+
+async def close_feature(pool: Pool, project_id: str, action: HumanAction) -> Receipt:
+    """Pause, resume or cancel the feature the action names: the transaction only. The
+    entry point is `Features.close`, which also does what a resume leaves owed. The transaction holds
+    the project's gate lock exclusively, so by the time it commits no transaction
+    that authorises work is in flight, and every later one sees the closure."""
+    require_human(action.principal)
+    require_well_formed(action, ON_A_FEATURE)
+    feature_id = action.target
+    async with pool.connection() as connection, connection.transaction():
+        await lock_gate(connection, project_id, exclusive=True)
+        await _locked_project(connection, project_id)
+        feature = await _locked_feature(connection, project_id, feature_id)
+        if (seen := answer_again(action, await _recorded(connection, action))) is not None:
+            return seen
+        closed_by = feature["closed_by"]
+        pointless = (action.action == "pause" and closed_by == PAUSED) or (
+            action.action == "resume" and closed_by != PAUSED
+        )
+        if closed_by == CANCELLED or pointless:
+            # Cancelled for good; or pausing what is paused; or resuming what is not.
+            # A paused feature can still be cancelled.
+            receipt = Receipt("stale", f"nothing changed: the feature is {closed_by or 'open'}")
+            await _record(connection, action, receipt)
+            return receipt
+        if action.action == "cancel":
+            await _cancel(connection, project_id, feature_id)
+            await retire_all_of_feature(connection, project_id, feature_id)
+        if action.action == "pause":
+            await revoke_unstarted_grants(connection, project_id, feature_id)
+        await connection.execute(
+            "UPDATE features SET closed_by = %s, state = %s "
+            "WHERE project_id = %s AND feature_id = %s",
+            (
+                {"pause": PAUSED, "cancel": CANCELLED, "resume": None}[action.action],
+                CANCELLED if action.action == "cancel" else feature["state"],
+                project_id,
+                feature_id,
+            ),
+        )
+        outcome = {"pause": "paused", "cancel": "cancelled", "resume": "resumed"}[action.action]
+        await append_event(
+            connection,
+            project_id,
+            f"feature.{outcome}",
+            subject_id=feature_id,
+            payload={
+                "by": action.principal.identity,
+                "request_id": action.request_id,
+                "said": dict(action.payload),
+            },
+        )
+        if action.action == "resume":
+            # Whatever became ready while the feature was closed is owed now, with
+            # no event left to cause it.
+            working = await (
+                await connection.execute(
+                    "SELECT story_id FROM stories WHERE project_id = %s AND feature_id = %s "
+                    "AND state IN ('released', 'changes_requested') ORDER BY story_id",
+                    (project_id, feature_id),
+                )
+            ).fetchall()
+            for story in working:
+                await evaluate_story_gate(connection, project_id, story["story_id"])
+        await release_next(connection, project_id)
+        receipt = Receipt("effective", outcome)
+        await _record(connection, action, receipt)
+        return receipt
 
 
 async def release_next(connection: Connection, project_id: str) -> None:

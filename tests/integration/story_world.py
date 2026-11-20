@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from relay.application.features import Features
 from relay.application.integration import Outcome
 from relay.application.reviews import NewFinding
 from relay.application.stories import Stories, StoryDraft
@@ -32,6 +33,7 @@ class StoryWorld(TrunkWorld):
     def __init__(self, *arguments: Any, **options: Any) -> None:
         super().__init__(*arguments, **options)
         self.stories = Stories(self.database)
+        self.features = Features(self.database, self.reviews, self.integration)
         self.base = ""
         self.requests = 0
 
@@ -82,7 +84,7 @@ class StoryWorld(TrunkWorld):
 
     async def close(self, action: str, feature: str = "F1", **payload: str) -> Receipt:
         self.requests += 1
-        return await self.stories.close(
+        return await self.features.close(
             PROJECT,
             HumanAction(PRODUCT_OWNER, f"request-{self.requests}", feature, action, payload),
         )
