@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 import shutil
+import stat
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -131,18 +132,46 @@ async def _leave_only_the_tracked_files(checkout: Path) -> None:
     """Remove the Git metadata and set permissions from what Git recorded: a file is
     executable by everyone if it is tracked as executable, readable by everyone either
     way. The host's umask, its filesystem and the account that made the checkout leave no
-    trace, so every runner shows the subject the same tree."""
-    tracked = await _git("-C", str(checkout), "ls-files", "--stage", "-z")
+    trace, so every runner shows the subject the same tree.
+
+    This runs with the supervisor's authority over a tree an untrusted repository shaped,
+    so it never follows a symbolic link and refuses a tree that does not hold every
+    tracked file as its own regular file (as happens when two names collide on a
+    case-insensitive filesystem)."""
+    tracked = await _git_output("-C", str(checkout), "ls-files", "--stage", "-z")
     shutil.rmtree(checkout / ".git")
-    for directory, _, _ in os.walk(checkout):
-        os.chmod(directory, 0o755)
-    for entry in filter(None, tracked.split("\0")):
-        details, _, name = entry.partition("\t")
+    root = os.fsencode(checkout)
+    modes: dict[bytes, int] = {}
+    for entry in filter(None, tracked.split(b"\0")):
+        details, _, name = entry.partition(b"\t")
         mode = details.split()[0]
-        if mode == "100755":
-            os.chmod(checkout / name, 0o755)
-        elif mode == "100644":
-            os.chmod(checkout / name, 0o644)
+        if mode in (b"100755", b"100644"):
+            modes[os.path.join(root, name)] = 0o755 if mode == b"100755" else 0o644
+    seen: set[tuple[int, int]] = set()
+    for path in modes:
+        found = _regular_file_inside(root, path)
+        if found is None or found in seen:
+            raise CheckoutFailed("the checkout does not hold every tracked file as its own file")
+        seen.add(found)
+    for directory, _, _ in os.walk(root):
+        os.chmod(directory, 0o755)
+    for path, permissions in modes.items():
+        # Each path was just verified to be a regular file reached through no link.
+        os.chmod(path, permissions)
+
+
+def _regular_file_inside(root: bytes, path: bytes) -> tuple[int, int] | None:
+    """The identity of a regular file reached without passing through any symbolic link,
+    or None if the path is anything else."""
+    parent = os.path.dirname(path)
+    expected = os.path.normpath(os.path.join(os.path.realpath(root), os.path.relpath(parent, root)))
+    if os.path.realpath(parent) != expected:
+        return None  # some directory on the way is a symbolic link
+    try:
+        status = os.lstat(path)
+    except OSError:
+        return None
+    return (status.st_dev, status.st_ino) if stat.S_ISREG(status.st_mode) else None
 
 
 async def _succeeds(*arguments: str) -> bool:
@@ -154,6 +183,11 @@ async def _succeeds(*arguments: str) -> bool:
 
 
 async def _git(*arguments: str, redact: str | None = None) -> str:
+    return (await _git_output(*arguments, redact=redact)).decode(errors="replace").strip()
+
+
+async def _git_output(*arguments: str, redact: str | None = None) -> bytes:
+    """Raw output: Git path names are bytes and need not be valid text."""
     process = await asyncio.create_subprocess_exec(
         *_TRUSTED_GIT,
         *arguments,
@@ -169,4 +203,4 @@ async def _git(*arguments: str, redact: str | None = None) -> str:
             # Git echoes the address it was given; a failure must not carry it onwards.
             detail = detail.replace(redact, "<repository>")
         raise CheckoutFailed(f"git {arguments[0]} failed: {_URL_USERINFO.sub('//', detail)}")
-    return stdout.decode().strip()
+    return stdout

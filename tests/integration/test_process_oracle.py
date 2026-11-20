@@ -215,3 +215,128 @@ async def test_an_executable_whose_bit_the_filesystem_dropped_is_still_executabl
     checkout = await pristine_checkout(str(repository), revision, tmp_path / "checkout")
 
     assert (checkout / "helper.sh").stat().st_mode & 0o777 == 0o755
+
+
+async def test_a_tracked_file_that_turned_into_a_link_fails_the_checkout_and_touches_nothing_outside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path / "host-file"
+    outside.write_text("not the subject's")
+    outside.chmod(0o600)
+    repository = tmp_path / "subject"
+    revision = commit(repository, {"vat.py": VAT_RETURNS_NET, "tool.sh": "#!/bin/sh\n"})
+    remove_tree = shutil.rmtree
+
+    def as_after_a_name_collision(path: Path) -> None:
+        (path.parent / "tool.sh").unlink()
+        os.symlink(outside, path.parent / "tool.sh")
+        remove_tree(path)
+
+    monkeypatch.setattr("relay.git.checkout.shutil.rmtree", as_after_a_name_collision)
+
+    with pytest.raises(CheckoutFailed, match="every tracked file"):
+        await pristine_checkout(str(repository), revision, tmp_path / "checkout")
+
+    assert outside.stat().st_mode & 0o777 == 0o600
+
+
+async def test_a_tracked_file_reached_through_a_linked_directory_fails_the_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path / "host-dir"
+    outside.mkdir()
+    (outside / "tool.sh").write_text("host's own")
+    (outside / "tool.sh").chmod(0o600)
+    repository = tmp_path / "subject"
+    (repository / "bin").mkdir(parents=True)
+    revision = commit(repository, {"bin/tool.sh": "#!/bin/sh\n"})
+    remove_tree = shutil.rmtree
+
+    def with_the_directory_replaced_by_a_link(path: Path) -> None:
+        remove_tree(path.parent / "bin")
+        os.symlink(outside, path.parent / "bin")
+        remove_tree(path)
+
+    monkeypatch.setattr("relay.git.checkout.shutil.rmtree", with_the_directory_replaced_by_a_link)
+
+    with pytest.raises(CheckoutFailed, match="every tracked file"):
+        await pristine_checkout(str(repository), revision, tmp_path / "checkout")
+
+    assert (outside / "tool.sh").stat().st_mode & 0o777 == 0o600
+
+
+async def test_two_tracked_names_that_are_one_file_on_this_host_fail_the_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "subject"
+    revision = commit(repository, {"a.txt": "one", "b.txt": "two"})
+    remove_tree = shutil.rmtree
+
+    def as_if_both_names_resolved_to_one_file(path: Path) -> None:
+        (path.parent / "b.txt").unlink()
+        os.link(path.parent / "a.txt", path.parent / "b.txt")
+        remove_tree(path)
+
+    monkeypatch.setattr("relay.git.checkout.shutil.rmtree", as_if_both_names_resolved_to_one_file)
+
+    with pytest.raises(CheckoutFailed, match="every tracked file"):
+        await pristine_checkout(str(repository), revision, tmp_path / "checkout")
+
+
+def repository_with_a_tracked_link(repository: Path, target: Path) -> str:
+    repository.mkdir()
+    subprocess.run(["git", "-C", str(repository), "init", "-q", "-b", "main"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "v@relay.test"], check=True
+    )
+    subprocess.run(["git", "-C", str(repository), "config", "user.name", "Verifier"], check=True)
+    os.symlink(target, repository / "link")
+    return commit(repository, {"vat.py": VAT_RETURNS_NET})
+
+
+def commit_a_file_whose_name_is_not_valid_text(repository: Path) -> str:
+    commit(repository, {"vat.py": VAT_RETURNS_NET})
+    blob = subprocess.run(
+        ["git", "-C", str(repository), "hash-object", "-w", "--stdin"],
+        input=b"x",
+        check=True,
+        capture_output=True,
+    ).stdout.strip()
+    subprocess.run(
+        [b"git", b"-C", os.fsencode(repository), b"update-index", b"--add", b"--cacheinfo",
+         b"100644," + blob + b",caf\xe9.txt"],
+        check=True,
+    )  # fmt: skip
+    subprocess.run(["git", "-C", str(repository), "commit", "-q", "-m", "odd name"], check=True)
+    return subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+async def test_a_tracked_link_is_left_as_a_link_and_its_target_untouched(tmp_path: Path) -> None:
+    outside = tmp_path / "host-file"
+    outside.write_text("x")
+    outside.chmod(0o600)
+    revision = repository_with_a_tracked_link(tmp_path / "subject", outside)
+
+    checkout = await pristine_checkout(str(tmp_path / "subject"), revision, tmp_path / "checkout")
+
+    assert (checkout / "link").is_symlink()
+    assert outside.stat().st_mode & 0o777 == 0o600
+
+
+async def test_a_file_name_that_is_not_valid_text_is_checked_out_or_refused_explicitly(
+    tmp_path: Path,
+) -> None:
+    revision = commit_a_file_whose_name_is_not_valid_text(tmp_path / "subject")
+
+    try:
+        checkout = await pristine_checkout(
+            str(tmp_path / "subject"), revision, tmp_path / "checkout"
+        )
+    except CheckoutFailed:
+        return  # a filesystem that cannot hold the name: an explicit, recorded failure
+    assert (checkout / "vat.py").stat().st_mode & 0o777 == 0o644
