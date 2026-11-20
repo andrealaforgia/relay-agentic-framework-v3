@@ -10,7 +10,7 @@ import tempfile
 import uuid
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Self
+from typing import Any
 
 import pytest
 from psycopg_pool import AsyncConnectionPool
@@ -1224,10 +1224,7 @@ async def test_a_project_whose_git_output_cannot_be_closed_does_not_hold_up_anot
         def __init__(self) -> None:
             self._file = real_file()
 
-        def __enter__(self) -> Self:
-            return self
-
-        def __exit__(self, *_: object) -> None:
+        def close(self) -> None:
             self._file.close()
             if failing["now"]:
                 raise OSError(5, "Input/output error")

@@ -9,8 +9,9 @@ import shutil
 import signal
 import subprocess
 import tempfile
-from contextlib import ExitStack, suppress
+from contextlib import suppress
 from pathlib import Path
+from typing import IO
 from urllib.parse import urlsplit
 
 from relay.domain.identifiers import require_identifier
@@ -273,44 +274,81 @@ async def git_result(
             f"git {subcommand} was not started: this process discards its children's "
             "exit statuses, so the outcome of Git could not be known"
         )
+    # Not `with`: a context manager that fails to close replaces whatever was already
+    # being raised, and here that can be a cancellation or a proven "never started".
     try:
-        with ExitStack() as opened:
-            try:
-                output = opened.enter_context(tempfile.TemporaryFile())
-                diagnostics = opened.enter_context(tempfile.TemporaryFile())
-            except OSError as failure:
-                raise NotStarted(f"git {subcommand} could not be started: {failure}") from None
-            try:
-                # Blocking on purpose and briefly. No error from here on says whether the
-                # child got as far as running Git, so none is read as "it did not".
-                process = subprocess.Popen(  # noqa: ASYNC220
-                    [program, *_TRUSTED_GIT[1:], *arguments],
-                    stdin=subprocess.DEVNULL,
-                    stdout=output,
-                    stderr=diagnostics,
-                    env=_GIT_ENVIRONMENT,
-                )
-            except OSError as failure:
-                raise RemoteUnavailable(
-                    f"git {subcommand} may or may not have run: {failure}"
-                ) from None
-            status = await _exit_status(process, timeout, subcommand)
-            try:
-                output.seek(0)
-                diagnostics.seek(0)
-                stdout, detail = output.read(), diagnostics.read().decode(errors="replace").strip()
-            except OSError as failure:
-                raise RemoteUnavailable(
-                    f"git {subcommand} ran but its output could not be read: {failure}"
-                ) from None
+        output = tempfile.TemporaryFile()  # noqa: SIM115
     except OSError as failure:
-        # Every OSError that can arise before the launch has been turned into NotStarted
-        # above. What is left arose after it: closing the output files, at the least.
-        raise RemoteUnavailable(f"git {subcommand} may or may not have run: {failure}") from None
+        raise NotStarted(f"git {subcommand} could not be started: {failure}") from None
+    try:
+        try:
+            diagnostics = tempfile.TemporaryFile()  # noqa: SIM115
+        except OSError as failure:
+            raise NotStarted(f"git {subcommand} could not be started: {failure}") from None
+        try:
+            status, stdout, detail = await _run(program, arguments, output, diagnostics, timeout)
+        except BaseException as outcome:
+            _close_without_replacing(outcome, diagnostics)
+            raise
+    except BaseException as outcome:
+        # Whatever is already on its way out, a cancellation and a proven "never
+        # started" above all, is what the caller must receive. A failure to tidy up is
+        # attached to it, never substituted for it.
+        _close_without_replacing(outcome, output)
+        raise
+    unclosed = []
+    for file in (diagnostics, output):
+        try:
+            file.close()
+        except OSError as failure:
+            unclosed.append(str(failure))
+    if unclosed:
+        # Git ran and was heard, but this side could not finish cleanly: not an answer.
+        raise RemoteUnavailable(
+            f"git {subcommand} ran but its output files could not be closed: {unclosed[0]}"
+        )
     if redact:
         # Git echoes the address it was given; a failure must not carry it onwards.
         detail = detail.replace(redact, "<repository>")
     return status, stdout, _URL_USERINFO.sub("//", detail)
+
+
+async def _run(
+    program: str,
+    arguments: tuple[str, ...],
+    output: IO[bytes],
+    diagnostics: IO[bytes],
+    timeout: float | None,
+) -> tuple[int, bytes, str]:
+    subcommand = _subcommand(arguments)
+    try:
+        # Blocking on purpose and briefly. No error from here on says whether the
+        # child got as far as running Git, so none is read as "it did not".
+        process = subprocess.Popen(  # noqa: ASYNC220
+            [program, *_TRUSTED_GIT[1:], *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=diagnostics,
+            env=_GIT_ENVIRONMENT,
+        )
+    except OSError as failure:
+        raise RemoteUnavailable(f"git {subcommand} may or may not have run: {failure}") from None
+    status = await _exit_status(process, timeout, subcommand)
+    try:
+        output.seek(0)
+        diagnostics.seek(0)
+        return status, output.read(), diagnostics.read().decode(errors="replace").strip()
+    except OSError as failure:
+        raise RemoteUnavailable(
+            f"git {subcommand} ran but its output could not be read: {failure}"
+        ) from None
+
+
+def _close_without_replacing(outcome: BaseException, file: IO[bytes]) -> None:
+    try:
+        file.close()
+    except OSError as failure:
+        outcome.add_note(f"closing a file of Git's output also failed: {failure}")
 
 
 async def _exit_status(
@@ -352,7 +390,11 @@ def _stop(pid: int) -> None:
 
     A signal goes only to a process this one still owns. An unreaped child keeps its
     process id, so asking first whether it is still ours and still running is what makes
-    the signal safe: once it has been reaped, by anyone, that id may be someone else's."""
+    the signal safe: once it has been reaped, by anyone, that id may be someone else's.
+
+    This rests on one rule for the whole process: nothing else here may reap a child it
+    did not start. Between the question and the signal there is no way, short of a
+    process handle macOS does not offer, to hold the id against such a reaper."""
     try:
         # Never blocks: it only asks whether the child has finished.
         finished, _ = os.waitpid(pid, os.WNOHANG)

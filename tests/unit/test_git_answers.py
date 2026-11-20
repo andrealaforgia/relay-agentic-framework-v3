@@ -8,7 +8,6 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Self
 
 import pytest
 
@@ -134,31 +133,93 @@ async def test_a_git_no_longer_running_when_its_caller_is_cancelled_is_sent_no_s
     assert signals == []
 
 
+_A_REAL_FILE = tempfile.TemporaryFile
+
+
+class Capture:
+    """A real capture file that can be told to fail when read back or when closed."""
+
+    def __init__(self, *, unreadable: bool = False, unclosable: bool = False) -> None:
+        self._file = _A_REAL_FILE()
+        self._unreadable = unreadable
+        self._unclosable = unclosable
+
+    def fileno(self) -> int:
+        return self._file.fileno()
+
+    def seek(self, position: int) -> None:
+        if self._unreadable:
+            raise OSError(5, "Input/output error")
+        self._file.seek(position)
+
+    def read(self) -> bytes:
+        return self._file.read()
+
+    def close(self) -> None:
+        self._file.close()
+        if self._unclosable:
+            raise OSError(5, "Input/output error")
+
+
 async def test_output_that_cannot_be_read_back_is_an_unknown_outcome(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    real = tempfile.TemporaryFile
-
-    class Unreadable:
-        def __init__(self) -> None:
-            self._file = real()
-
-        def __enter__(self) -> Self:
-            return self
-
-        def __exit__(self, *_: object) -> None:
-            self._file.close()
-
-        def fileno(self) -> int:
-            return self._file.fileno()
-
-        def seek(self, _: int) -> None:
-            raise OSError(5, "Input/output error")
-
-    monkeypatch.setattr(checkout.tempfile, "TemporaryFile", Unreadable)
+    monkeypatch.setattr(checkout.tempfile, "TemporaryFile", lambda: Capture(unreadable=True))
 
     with pytest.raises(RemoteUnavailable, match="output could not be read"):
         await git_result("--version")
+
+
+async def test_output_files_that_cannot_be_closed_after_a_clean_run_are_an_unknown_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(checkout.tempfile, "TemporaryFile", lambda: Capture(unclosable=True))
+
+    with pytest.raises(RemoteUnavailable, match="could not be closed"):
+        await git_result("--version")
+
+
+async def test_a_cancellation_is_still_a_cancellation_when_tidying_up_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "git-remote-slow").write_text("#!/bin/sh\nsleep 5\n")
+    (tmp_path / "git-remote-slow").chmod(0o755)
+    environment = dict(checkout._GIT_ENVIRONMENT)
+    environment["PATH"] = f"{tmp_path}:{environment['PATH']}"
+    monkeypatch.setattr(checkout, "_GIT_ENVIRONMENT", environment)
+    monkeypatch.setattr(checkout.tempfile, "TemporaryFile", lambda: Capture(unclosable=True))
+    running = asyncio.create_task(git_result("ls-remote", "slow://nowhere"))
+    await asyncio.sleep(0.3)
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await running
+
+    assert running.cancelled()
+    assert any("also failed" in note for note in cancelled.value.__notes__)
+
+
+async def test_a_git_proven_not_to_have_started_stays_so_when_tidying_up_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second output file cannot be made, and then the first cannot be closed."""
+    made: list[Capture] = []
+    launches: list[object] = []
+
+    def first_only() -> Capture:
+        if made:
+            raise OSError(24, "Too many open files")
+        made.append(Capture(unclosable=True))
+        return made[0]
+
+    monkeypatch.setattr(checkout.tempfile, "TemporaryFile", first_only)
+    monkeypatch.setattr(checkout.subprocess, "Popen", lambda *_, **__: launches.append(1))
+
+    with pytest.raises(NotStarted) as never_started:
+        await git_result("push", "somewhere")
+
+    assert launches == []
+    assert any("also failed" in note for note in never_started.value.__notes__)
 
 
 async def test_a_git_stopped_for_taking_too_long_leaves_nothing_behind(tmp_path: Path) -> None:
@@ -182,28 +243,3 @@ async def test_a_git_stopped_for_taking_too_long_leaves_nothing_behind(tmp_path:
         "pgrep", "-f", f"ls-remote slow://{tmp_path.name}", stdout=asyncio.subprocess.DEVNULL
     )
     assert await still_running.wait() == 1, "a Git that was given up on is still running"
-
-
-async def test_output_files_that_cannot_be_closed_are_an_unknown_outcome(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    real = tempfile.TemporaryFile
-
-    class Unclosable:
-        def __init__(self) -> None:
-            self._file = real()
-
-        def __enter__(self) -> Self:
-            return self
-
-        def __exit__(self, *_: object) -> None:
-            self._file.close()
-            raise OSError(5, "Input/output error")
-
-        def __getattr__(self, name: str) -> object:
-            return getattr(self._file, name)
-
-    monkeypatch.setattr(checkout.tempfile, "TemporaryFile", Unclosable)
-
-    with pytest.raises(RemoteUnavailable, match="may or may not have run"):
-        await git_result("--version")
