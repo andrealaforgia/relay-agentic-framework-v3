@@ -19,6 +19,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from relay.application.closure import closure_of_behaviour, lock_gate, require_open
 from relay.application.stories import require_story_at_work
 from relay.domain.behaviour import Behaviour, BehaviourState
 from relay.domain.identifiers import require_identifier
@@ -187,7 +188,11 @@ class Reviews:
             pending = await (
                 await connection.execute(
                     "SELECT c.*, p.repository FROM review_cycles c JOIN projects p USING (project_id) "
-                    "WHERE c.publication = 'pending' AND c.state = 'open' ORDER BY c.created_at"
+                    "JOIN behaviours b USING (project_id, behaviour_id) "
+                    "JOIN stories s USING (project_id, story_id) "
+                    "JOIN features f USING (project_id, feature_id) "
+                    "WHERE c.publication = 'pending' AND c.state = 'open' "
+                    "AND f.closed_by IS NULL ORDER BY c.created_at"
                 )
             ).fetchall()
         published = 0
@@ -232,6 +237,7 @@ class Reviews:
             await self._defer(cycle, str(unavailable)[:500])
             return 0
         async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, cycle["project_id"])
             current = await (
                 await connection.execute(
                     "SELECT publication, state FROM review_cycles WHERE cycle_id = %s FOR UPDATE",
@@ -240,6 +246,10 @@ class Reviews:
             ).fetchone()
             assert current is not None
             if current["publication"] != "pending" or current["state"] != "open":
+                return 0
+            if await closure_of_behaviour(connection, cycle["project_id"], cycle["behaviour_id"]):
+                # Closed while the candidate was on its way to the repository. The ref is
+                # there; announcing it to reviewers waits for the feature to reopen.
                 return 0
             await connection.execute(
                 "UPDATE review_cycles SET publication = 'published', deferred_reason = NULL "
@@ -308,6 +318,7 @@ class Reviews:
             await self._adoption_deferred(project_id, behaviour_id, str(failure)[:500])
             return 0
         async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
             row = await (
                 await connection.execute(
                     "SELECT state FROM behaviours WHERE project_id = %s "
@@ -368,6 +379,7 @@ class Reviews:
         only if it still needs adopting: another reconciler may have adopted it meanwhile,
         and the ledger must not then end on "still pending"."""
         async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
             behaviour = await (
                 await connection.execute(
                     "SELECT state FROM behaviours WHERE project_id = %s AND behaviour_id = %s "
@@ -428,18 +440,32 @@ class Reviews:
         """Send again the command of every task still waiting for its review. It is the
         same message with the same identity, so a consumer that has already acted on it
         does nothing new."""
-        async with self._pool.connection() as connection, connection.transaction():
-            again = await (
-                await connection.execute(
-                    "UPDATE outbox SET published_at = NULL WHERE published_at IS NOT NULL "
-                    "AND message_id IN (SELECT t.command_message_id FROM review_tasks t "
-                    "JOIN review_cycles c USING (cycle_id) WHERE c.state = 'open' "
-                    "AND c.publication = 'published' AND NOT EXISTS (SELECT 1 FROM "
-                    "review_submissions s WHERE s.task_id = t.task_id "
-                    "AND s.disposition = 'effective')) RETURNING message_id"
-                )
+        async with self._pool.connection() as connection:
+            projects = await (
+                await connection.execute("SELECT project_id FROM projects ORDER BY project_id")
             ).fetchall()
-        return len(again)
+        announced = 0
+        for project in projects:
+            async with self._pool.connection() as connection, connection.transaction():
+                await lock_gate(connection, project["project_id"])
+                again = await (
+                    await connection.execute(
+                        "UPDATE outbox SET published_at = NULL WHERE published_at IS NOT NULL "
+                        "AND message_id IN (SELECT t.command_message_id FROM review_tasks t "
+                        "JOIN review_cycles c USING (cycle_id) "
+                        "JOIN behaviours b USING (project_id, behaviour_id) "
+                        "JOIN stories st USING (project_id, story_id) "
+                        "JOIN features f USING (project_id, feature_id) "
+                        "WHERE c.project_id = %s AND c.state = 'open' "
+                        "AND c.publication = 'published' AND f.closed_by IS NULL "
+                        "AND NOT EXISTS (SELECT 1 FROM review_submissions s "
+                        "WHERE s.task_id = t.task_id AND s.disposition = 'effective')) "
+                        "RETURNING message_id",
+                        (project["project_id"],),
+                    )
+                ).fetchall()
+            announced += len(again)
+        return announced
 
     async def prepare_review(self, capability: str, into: Path) -> Path:
         """Give a reviewer the tree to review: exactly the cycle's commit, from the control
@@ -447,6 +473,10 @@ class Reviews:
         task = await self._task(capability)
         if task["state"] != "open" or task["publication"] != "published":
             raise SubmissionRefused("this review is no longer open")
+        async with self._pool.connection() as connection:
+            require_open(
+                await closure_of_behaviour(connection, task["project_id"], task["behaviour_id"])
+            )
         commit = task["candidate_revision"]
         try:
             names_the_commit = (
@@ -464,7 +494,13 @@ class Reviews:
             await self._block(task["cycle_id"], _COMMIT_LOST)
             raise SubmissionRefused(_COMMIT_LOST)
         tree = await self._mirror(task["project_id"]).export(commit, into)
-        async with self._pool.connection() as connection:
+        async with self._pool.connection() as connection, connection.transaction():
+            # The receipt is what starts a review. A closure that committed while the
+            # tree was being exported is seen here, and then no review has started.
+            await lock_gate(connection, task["project_id"])
+            require_open(
+                await closure_of_behaviour(connection, task["project_id"], task["behaviour_id"])
+            )
             await connection.execute(
                 "INSERT INTO review_checkouts (receipt_id, task_id, revision) VALUES (%s, %s, %s)",
                 (uuid.uuid7(), task["task_id"], commit),
@@ -507,6 +543,7 @@ class Reviews:
         if not evidence.strip():
             raise SubmissionRefused("a dispute needs evidence")
         async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
             behaviour = await (
                 await connection.execute(
                     "SELECT b.* FROM behaviours b JOIN findings f USING (project_id, behaviour_id) "
@@ -692,6 +729,7 @@ class Reviews:
             ).fetchone()
             assert located is not None
             project_id, behaviour_id = located["project_id"], located["behaviour_id"]
+            await lock_gate(connection, project_id)
             await connection.execute(
                 "SELECT 1 FROM behaviours WHERE project_id = %s AND behaviour_id = %s FOR UPDATE",
                 (project_id, behaviour_id),
@@ -731,6 +769,7 @@ class Reviews:
         """Publication could not be attempted or confirmed. The cycle stays pending and
         the reason is recorded once, not on every retry."""
         async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, cycle["project_id"])
             changed = await (
                 await connection.execute(
                     "UPDATE review_cycles SET deferred_reason = %s WHERE cycle_id = %s "
@@ -788,6 +827,7 @@ async def _locked_task(connection: Connection, task_id: uuid.UUID) -> dict[str, 
         await connection.execute(_TASK_QUERY + " WHERE t.task_id = %s", (task_id,))
     ).fetchone()
     assert task is not None
+    await lock_gate(connection, task["project_id"])
     await connection.execute(
         "SELECT 1 FROM behaviours WHERE project_id = %s AND behaviour_id = %s FOR UPDATE",
         (task["project_id"], task["behaviour_id"]),

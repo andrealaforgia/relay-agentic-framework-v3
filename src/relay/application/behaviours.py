@@ -12,6 +12,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from relay.application.closure import lock_gate
 from relay.application.reviews import open_cycle
 from relay.application.stories import add_behaviour_to_story, require_story_at_work
 from relay.domain.behaviour import Behaviour, BehaviourState
@@ -65,6 +66,9 @@ class Behaviours:
                     trunk,
                 ),
             )
+            await connection.execute(
+                "INSERT INTO project_gates (project_id) VALUES (%s)", (project_id,)
+            )
             await append_event(connection, project_id, "project.opened", payload={"trunk": trunk})
 
     async def propose(
@@ -83,6 +87,7 @@ class Behaviours:
         demonstrates = tuple(demonstrates)
         correlation_id = uuid.uuid7()
         async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
             position = await add_behaviour_to_story(connection, project_id, story_id, demonstrates)
             await connection.execute(
                 "INSERT INTO behaviours (project_id, behaviour_id, summary, state, "
@@ -274,7 +279,11 @@ class Behaviours:
         """Send a behaviour back for a fresh red and drop the old pairing, on the record."""
         if not reason.strip():
             raise ValueError("reopening a red needs a stated reason")
-        async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
+        async with self._changing(project_id, behaviour_id, starts="work") as (
+            connection,
+            behaviour,
+            correlation,
+        ):
             behaviour.reopen_red()
             await connection.execute(
                 "UPDATE behaviours SET red_execution_id = NULL "
@@ -441,6 +450,7 @@ class Behaviours:
         behaviour's story is being worked on. Recording what an operation already in
         flight observed is never refused."""
         async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
             row = await (
                 await connection.execute(
                     "SELECT * FROM behaviours WHERE project_id = %s AND behaviour_id = %s "

@@ -51,6 +51,7 @@ class StoryState(StrEnum):
     AWAITING_APPROVAL = "awaiting_approval"
     APPROVED = "approved"
     REJECTED = "rejected"
+    CANCELLED = "cancelled"
 
 
 _WORKING = frozenset({StoryState.RELEASED, StoryState.CHANGES_REQUESTED})
@@ -93,16 +94,19 @@ class Candidate:
     state: StoryState
 
 
-def next_story_to_release(features: Sequence[Sequence[Candidate]]) -> Candidate | None:
+def next_story_to_release(
+    features: Sequence[Sequence[Candidate]], *, slot_taken: bool = False
+) -> Candidate | None:
     """The one story of a project that may start now, if any. `features` are the
-    project's features in the order they were opened, each with the stories of its
-    approved roadmap in order.
+    project's features that are open to work, in the order they were opened, each with
+    the stories of its approved roadmap in order. `slot_taken` says that some story of
+    the project, in any feature, a paused one included, already holds its place.
 
     One story at a time per project. Within a feature a story waits for every earlier
     one to be approved; a feature waits its turn behind the features opened before it
     only for as long as they have something to release."""
     stories = [story for roadmap in features for story in roadmap]
-    if any(story.state in HOLDING_THE_SLOT for story in stories):
+    if slot_taken or any(story.state in HOLDING_THE_SLOT for story in stories):
         return None
     for roadmap in features:
         for story in roadmap:
@@ -158,16 +162,23 @@ def answer_again(action: HumanAction, recorded: tuple[str, Receipt] | None) -> R
     return receipt
 
 
-_PAYLOAD_OF = {"approve": frozenset[str](), "request_changes": frozenset({"reason"})}
+AT_A_GATE = {"approve": frozenset[str](), "request_changes": frozenset({"reason"})}
+ON_A_FEATURE = {
+    "pause": frozenset({"reason"}),
+    "resume": frozenset[str](),
+    "cancel": frozenset({"reason"}),
+}
 
 
-def require_well_formed(action: HumanAction) -> None:
-    """An action at a gate says one of a few things, in exactly the fields that thing
-    has. Nothing else a caller sends is carried anywhere."""
-    if action.action not in _PAYLOAD_OF:
-        raise ActionRefused(f"{action.action!r} is not something that can be done at a gate")
-    if set(action.payload) != _PAYLOAD_OF[action.action]:
-        expected = sorted(_PAYLOAD_OF[action.action]) or "nothing"
+def require_well_formed(
+    action: HumanAction, allowed: Mapping[str, frozenset[str]] = AT_A_GATE
+) -> None:
+    """An action says one of a few things, in exactly the fields that thing has. Nothing
+    else a caller sends is carried anywhere."""
+    if action.action not in allowed:
+        raise ActionRefused(f"{action.action!r} is not something that can be done here")
+    if set(action.payload) != allowed[action.action]:
+        expected = sorted(allowed[action.action]) or "nothing"
         raise ActionRefused(f"{action.action} carries {expected}, and only that")
     if any(not isinstance(value, str) or not value.strip() for value in action.payload.values()):
         raise ActionRefused(f"{action.action} needs a stated reason")

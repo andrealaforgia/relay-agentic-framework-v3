@@ -32,7 +32,7 @@ CREATE TABLE check_batches (
     members              jsonb NOT NULL,
     state                text NOT NULL DEFAULT 'running' CHECK (state IN
         ('running', 'authorised', 'failed', 'superseded', 'discarded', 'abandoned', 'base_moved',
-         'runtime_changed')),
+         'runtime_changed', 'held', 'interrupted')),
     reason               text,
     created_at           timestamptz NOT NULL DEFAULT now(),
     FOREIGN KEY (project_id, behaviour_id) REFERENCES behaviours,

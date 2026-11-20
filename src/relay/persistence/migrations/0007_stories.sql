@@ -5,7 +5,8 @@ CREATE TABLE features (
     problem    text NOT NULL,
     state      text NOT NULL DEFAULT 'planning'
         CHECK (state IN ('discovery', 'planning', 'delivering', 'completed', 'cancelled')),
-    paused     boolean NOT NULL DEFAULT false,
+    -- Closed to new work by the Product Owner: null, 'paused' or 'cancelled'.
+    closed_by  text CHECK (closed_by IN ('paused', 'cancelled')),
     -- Features of a project take their turn in the order they were opened.
     opened     bigserial,
     PRIMARY KEY (project_id, feature_id)
@@ -34,7 +35,8 @@ CREATE TABLE stories (
     -- Acceptance criteria by stable id: {"AC1": "text", ...}
     criteria         jsonb NOT NULL,
     state            text NOT NULL DEFAULT 'planned' CHECK (state IN
-        ('planned', 'released', 'changes_requested', 'awaiting_approval', 'approved', 'rejected')),
+        ('planned', 'released', 'changes_requested', 'awaiting_approval', 'approved', 'rejected',
+         'cancelled')),
     revision         integer NOT NULL DEFAULT 1,
     -- Every change to the list of behaviours makes a new list revision; the Verifier's
     -- seal names the one it vouches for.

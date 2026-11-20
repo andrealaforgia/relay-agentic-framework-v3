@@ -25,6 +25,12 @@ from relay.application.behaviours import (
     record_execution,
     save_behaviour,
 )
+from relay.application.closure import (
+    CANCELLED,
+    closure_of_behaviour,
+    lock_gate,
+    require_open,
+)
 from relay.application.reviews import gate_of
 from relay.application.stories import evaluate_story_gate, lock_story, require_story_at_work
 from relay.domain.behaviour import Behaviour, BehaviourState
@@ -60,6 +66,8 @@ class Outcome(StrEnum):
     SUPERSEDED = "superseded"
     IN_PROGRESS = "in_progress"
     BUSY = "busy"
+    # The checks ran, and the feature was paused before they could decide anything.
+    HELD = "held"
     # Authorised, and trunk has not yet been seen to hold the candidate.
     PENDING = "pending"
     REJECTED = "rejected"
@@ -80,6 +88,8 @@ _OUTCOME_OF_BATCH = {
     "discarded": Outcome.SUPERSEDED,
     "abandoned": Outcome.SUPERSEDED,
     "base_moved": Outcome.BASE_MOVED,
+    "held": Outcome.HELD,
+    "interrupted": Outcome.HELD,
     "runtime_changed": Outcome.RUNTIME_CHANGED,
 }
 _OUTCOME_OF_INTENT = {
@@ -108,6 +118,7 @@ class Integration:
         reach trunk. A batch already running was started under the old set and will not
         be allowed to decide anything."""
         async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
             try:
                 async with connection.transaction():
                     await connection.execute(
@@ -200,6 +211,7 @@ class Integration:
             raise ValueError("retrying an integration needs a stated reason")
         async with self._pool.connection() as connection, connection.transaction():
             behaviour, _ = await _locked_behaviour(connection, project_id, behaviour_id)
+            require_open(await closure_of_behaviour(connection, project_id, behaviour_id))
             last = await (
                 await connection.execute(
                     "SELECT i.state, c.state AS cycle_state FROM integration_intents i "
@@ -400,6 +412,14 @@ class Integration:
                 runs.append((check, execution, execution_id, satisfied))
             if current["state"] != "running":
                 return IntegrationReceipt(Outcome.SUPERSEDED, batch_id)
+            closed_by = await closure_of_behaviour(connection, project_id, behaviour_id)
+            if closed_by is not None:
+                # The one boundary for trunk: a closure that committed before this
+                # transaction means no intent. What the checks saw is kept.
+                state = "abandoned" if closed_by == CANCELLED else "held"
+                reason = f"the feature was {closed_by} before these checks could decide"
+                await _close_batch(connection, batch, state, reason)
+                return IntegrationReceipt(_OUTCOME_OF_BATCH[state], batch_id, reason)
             stale = await _why_stale(connection, batch, behaviour, row, cycle, project)
             if stale:
                 await _close_batch(connection, batch, "discarded", stale)
@@ -537,6 +557,7 @@ class Integration:
         async def count_the_send() -> bool:
             nonlocal sent
             async with self._pool.connection() as connection, connection.transaction():
+                await lock_gate(connection, intent["project_id"])
                 current = await _locked_intent(connection, intent_id)
                 # Looked at again under the lock: another process may have settled the
                 # intent, or been refused, since this one decided to send.
@@ -760,6 +781,7 @@ class Integration:
 
     async def _unanswered(self, intent_id: uuid.UUID, reason: str) -> IntegrationReceipt:
         async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, (await _intent(connection, intent_id))["project_id"])
             intent = await _locked_intent(connection, intent_id)
             if intent["state"] != "outstanding":
                 # Settled by someone else while this send was waiting for its answer.
@@ -835,6 +857,8 @@ async def _batch_of_request(
 async def _locked_behaviour(
     connection: Connection, project_id: str, behaviour_id: str
 ) -> tuple[Behaviour, dict[str, Any]]:
+    """The gate lock, then the behaviour: the first two locks of every transaction here."""
+    await lock_gate(connection, project_id)
     row = await (
         await connection.execute(
             "SELECT * FROM behaviours WHERE project_id = %s AND behaviour_id = %s FOR UPDATE",

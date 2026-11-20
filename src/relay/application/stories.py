@@ -17,9 +17,18 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from relay.application.closure import (
+    CANCELLED,
+    PAUSED,
+    closure_of_story,
+    lock_gate,
+    require_open,
+)
 from relay.domain.evidence import ProcessContract
 from relay.domain.identifiers import require_identifier
 from relay.domain.story import (
+    HOLDING_THE_SLOT,
+    ON_A_FEATURE,
     ActionRefused,
     Candidate,
     HumanAction,
@@ -87,6 +96,7 @@ class Stories:
         if not problem.strip():
             raise ValueError("a feature starts from a stated problem")
         async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
             await connection.execute(
                 "INSERT INTO features (project_id, feature_id, problem) VALUES (%s, %s, %s)",
                 (project_id, require_identifier("feature", feature_id), problem),
@@ -111,8 +121,10 @@ class Stories:
         if not stories:
             raise ValueError("a roadmap needs at least one story")
         async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
             await _locked_project(connection, project_id)
             feature = await _locked_feature(connection, project_id, feature_id)
+            require_open(feature["closed_by"])
             existing = await (
                 await connection.execute(
                     "SELECT 1 FROM roadmaps WHERE project_id = %s AND feature_id = %s LIMIT 1",
@@ -177,8 +189,10 @@ class Stories:
         on vouches for something that is no longer there, and is refused."""
         _require_role(principal, "verifier")
         async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
             story = await _locked_story(connection, project_id, story_id)
             _require_at_work(story)
+            require_open(await closure_of_story(connection, project_id, story_id))
             _require_revisions(story, story_revision, list_revision, story["list_revision"])
             listed = await _behaviours_of(connection, project_id, story_id)
             require_sealable(
@@ -219,8 +233,10 @@ class Stories:
         if not statement.strip():
             raise ValueError("an assessment says something")
         async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
             story = await _locked_story(connection, project_id, story_id)
             _require_at_work(story)
+            require_open(await closure_of_story(connection, project_id, story_id))
             if _is_unsealed(story):
                 raise ActionRefused("only a sealed list of behaviours can be assessed")
             _require_revisions(story, story_revision, list_revision, story["sealed_revision"])
@@ -267,6 +283,7 @@ class Stories:
             if located is None:
                 raise ActionRefused("no such gate")
             project_id = located["project_id"]
+            await lock_gate(connection, project_id)
             # Story, then project, then feature: the order every transition uses. The
             # project comes before any feature because releasing the next story, under
             # the project lock, may reach into a feature other than this one.
@@ -276,9 +293,13 @@ class Stories:
                 else None
             )
             await _locked_project(connection, project_id)
-            await _locked_feature(connection, project_id, located["feature_id"])
+            feature = await _locked_feature(connection, project_id, located["feature_id"])
             if (seen := answer_again(action, await _recorded(connection, action))) is not None:
                 return seen
+            if feature["closed_by"] == PAUSED:
+                # Nothing is decided while the feature is paused, and nothing is
+                # recorded: the gate is still there to be decided after resume.
+                raise ActionRefused("the feature is paused: its gates wait for resume")
             gate = await (
                 await connection.execute(
                     "SELECT * FROM gates WHERE gate_id = %s FOR UPDATE", (gate_id,)
@@ -314,6 +335,70 @@ class Stories:
                     "said": dict(action.payload),
                 },
             )
+            await release_next(connection, project_id)
+            receipt = Receipt("effective", outcome)
+            await _record(connection, action, receipt)
+            return receipt
+
+    async def close(self, project_id: str, action: HumanAction) -> Receipt:
+        """Pause, resume or cancel the feature the action names. The transaction holds
+        the project's gate lock exclusively, so by the time it commits no transaction
+        that authorises work is in flight, and every later one sees the closure."""
+        require_human(action.principal)
+        require_well_formed(action, ON_A_FEATURE)
+        feature_id = action.target
+        async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id, exclusive=True)
+            await _locked_project(connection, project_id)
+            feature = await _locked_feature(connection, project_id, feature_id)
+            if (seen := answer_again(action, await _recorded(connection, action))) is not None:
+                return seen
+            closed_by = feature["closed_by"]
+            pointless = (action.action == "pause" and closed_by == PAUSED) or (
+                action.action == "resume" and closed_by != PAUSED
+            )
+            if closed_by == CANCELLED or pointless:
+                # Cancelled for good; or pausing what is paused; or resuming what is not.
+                # A paused feature can still be cancelled.
+                receipt = Receipt("stale", f"nothing changed: the feature is {closed_by or 'open'}")
+                await _record(connection, action, receipt)
+                return receipt
+            if action.action == "cancel":
+                await _cancel(connection, project_id, feature_id)
+            await connection.execute(
+                "UPDATE features SET closed_by = %s, state = %s "
+                "WHERE project_id = %s AND feature_id = %s",
+                (
+                    {"pause": PAUSED, "cancel": CANCELLED, "resume": None}[action.action],
+                    CANCELLED if action.action == "cancel" else feature["state"],
+                    project_id,
+                    feature_id,
+                ),
+            )
+            outcome = {"pause": "paused", "cancel": "cancelled", "resume": "resumed"}[action.action]
+            await append_event(
+                connection,
+                project_id,
+                f"feature.{outcome}",
+                subject_id=feature_id,
+                payload={
+                    "by": action.principal.identity,
+                    "request_id": action.request_id,
+                    "said": dict(action.payload),
+                },
+            )
+            if action.action == "resume":
+                # Whatever became ready while the feature was closed is owed now, with
+                # no event left to cause it.
+                working = await (
+                    await connection.execute(
+                        "SELECT story_id FROM stories WHERE project_id = %s AND feature_id = %s "
+                        "AND state IN ('released', 'changes_requested') ORDER BY story_id",
+                        (project_id, feature_id),
+                    )
+                ).fetchall()
+                for story in working:
+                    await evaluate_story_gate(connection, project_id, story["story_id"])
             await release_next(connection, project_id)
             receipt = Receipt("effective", outcome)
             await _record(connection, action, receipt)
@@ -369,6 +454,7 @@ async def add_behaviour_to_story(
     has not vouched for until it is sealed again."""
     story = await _locked_story(connection, project_id, story_id)
     _require_at_work(story)
+    require_open(await closure_of_story(connection, project_id, story_id))
     if not demonstrates:
         # It could be built and integrated, and then no list containing it could ever
         # be sealed: the story would hold the project and never reach its gate.
@@ -399,6 +485,7 @@ async def require_story_at_work(
     ).fetchone()
     assert story is not None
     _require_at_work(story)
+    require_open(await closure_of_story(connection, project_id, behaviour["story_id"]))
     if entering_design:
         earlier = await (
             await connection.execute(
@@ -422,6 +509,8 @@ async def evaluate_story_gate(connection: Connection, project_id: str, story_id:
     story = await _locked_story(connection, project_id, story_id)
     if not permits_behaviour_work(StoryState(story["state"])) or _is_unsealed(story):
         return
+    if await closure_of_story(connection, project_id, story_id) is not None:
+        return  # a closed feature opens no gate; resume looks again
     listed = await _behaviours_of(connection, project_id, story_id)
     assessment = await _assessment(connection, story)
     if assessment is None or any(row["state"] != "integrated" for row in listed):
@@ -447,13 +536,21 @@ async def release_next(connection: Connection, project_id: str) -> None:
     the transaction of every event that can free the project's place or add a story to
     choose from, so a feature that had to wait is looked at again without a restart."""
     await _locked_project(connection, project_id)
+    # The place is counted across every feature of the project, a paused one included,
+    # before any feature is left out of the choice.
+    holding = await (
+        await connection.execute(
+            "SELECT 1 FROM stories WHERE project_id = %s AND state = ANY(%s) LIMIT 1",
+            (project_id, [state.value for state in HOLDING_THE_SLOT]),
+        )
+    ).fetchone()
     rows = await (
         await connection.execute(
             "SELECT s.feature_id, s.story_id, s.state FROM stories s "
             "JOIN roadmaps r USING (project_id, feature_id) "
             "JOIN features f USING (project_id, feature_id) "
             "WHERE s.project_id = %s AND r.revision = s.roadmap_revision AND r.state = 'approved' "
-            "AND f.state NOT IN ('completed', 'cancelled') AND NOT f.paused "
+            "AND f.state NOT IN ('completed', 'cancelled') AND f.closed_by IS NULL "
             "ORDER BY f.opened, s.position",
             (project_id,),
         )
@@ -463,7 +560,7 @@ async def release_next(connection: Connection, project_id: str) -> None:
         features.setdefault(row["feature_id"], []).append(
             Candidate(row["feature_id"], row["story_id"], StoryState(row["state"]))
         )
-    chosen = next_story_to_release(list(features.values()))
+    chosen = next_story_to_release(list(features.values()), slot_taken=holding is not None)
     if chosen is None:
         return
     await connection.execute(
@@ -475,6 +572,24 @@ async def release_next(connection: Connection, project_id: str) -> None:
         (project_id, chosen.feature_id),
     )
     await append_event(connection, project_id, "story.released", subject_id=chosen.story_id)
+
+
+async def _cancel(connection: Connection, project_id: str, feature_id: str) -> None:
+    """Free the project's place and withdraw everything still waiting for a person."""
+    await connection.execute(
+        "UPDATE stories SET state = 'cancelled' WHERE project_id = %s AND feature_id = %s "
+        "AND state NOT IN ('approved', 'rejected')",
+        (project_id, feature_id),
+    )
+    open_gates = await (
+        await connection.execute(
+            "SELECT * FROM gates WHERE project_id = %s AND feature_id = %s AND state = 'open' "
+            "FOR UPDATE",
+            (project_id, feature_id),
+        )
+    ).fetchall()
+    for gate in open_gates:
+        await _close_gate(connection, gate, "superseded", "superseded")
 
 
 def _require_role(principal: Principal, role: str) -> None:

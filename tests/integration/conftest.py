@@ -38,6 +38,13 @@ async def database(namespace: str) -> AsyncIterator[AsyncConnectionPool]:
         await migrate(pool)
         yield pool
     async with open_pool(DATABASE_URL) as admin, admin.connection() as connection:
+        # A test that fails halfway through a choreography of held transactions leaves
+        # a session holding locks, and dropping the schema would wait for it for ever.
+        await connection.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE application_name = %s AND pid <> pg_backend_pid()",
+            (f"relay:{namespace}",),
+        )
         await connection.execute(f'DROP SCHEMA "{namespace}" CASCADE')
 
 

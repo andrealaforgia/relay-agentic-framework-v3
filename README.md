@@ -1,5 +1,7 @@
 # Relay
 
+[![CI](https://github.com/andrealaforgia/relay-agentic-framework-v3/actions/workflows/ci.yml/badge.svg)](https://github.com/andrealaforgia/relay-agentic-framework-v3/actions/workflows/ci.yml)
+
 Version 3 of a distributed, multi-provider agentic software development framework. Agents negotiate and perform work; deterministic code validates evidence and controls every workflow transition.
 
 **Status: early. Relay cannot yet be used to build software.** Three slices exist, all without any model in the loop:
@@ -26,3 +28,5 @@ make check
 ```
 
 This starts PostgreSQL and Redis from `compose.yaml` (bound to loopback, on ports 55432 and 56379), then runs lint, strict type checking and the tests. The tests use real PostgreSQL, Redis, Git and Docker, and pull `python:3.14-alpine` once. No model is called and nothing costs money.
+
+GitHub Actions runs the same `make check` on every push to `main` and on every pull request (`.github/workflows/ci.yml`). No test may run longer than 180 seconds.
