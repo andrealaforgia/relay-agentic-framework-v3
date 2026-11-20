@@ -4,7 +4,7 @@ CREATE TABLE executions (
     execution_id     uuid PRIMARY KEY,
     project_id       text NOT NULL,
     behaviour_id     text NOT NULL,
-    purpose          text NOT NULL CHECK (purpose IN ('red', 'green')),
+    purpose          text NOT NULL CHECK (purpose IN ('red', 'green', 'check')),
     revision         text NOT NULL CHECK (revision ~ '^[0-9a-f]{40}$'),
     contract_digest  text NOT NULL,
     isolation        text NOT NULL,

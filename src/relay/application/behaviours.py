@@ -126,7 +126,7 @@ class Behaviours:
                     connection, project_id, behaviour_id, correlation, refusal, contract
                 )
                 return refusal
-            repository, trunk = await _source(connection, project_id)
+            repository, trunk = await source_of(connection, project_id)
 
         try:
             revision = await trunk_head(repository, trunk)
@@ -139,7 +139,7 @@ class Behaviours:
 
         async with self._changing(project_id, behaviour_id) as (connection, behaviour, correlation):
             verdict = behaviour.record_red_run(execution, started_in_cycle=cycle)
-            execution_id = await _record_execution(
+            execution_id = await record_execution(
                 connection, project_id, behaviour_id, "red", contract.digest, execution
             )
             evidence = {
@@ -200,7 +200,7 @@ class Behaviours:
         async with self._changing(project_id, behaviour_id) as (connection, behaviour, _):
             contract = behaviour.require_awaiting_green()
             isolation = self._oracle.isolation
-            repository, _ = await _source(connection, project_id)
+            repository, _ = await source_of(connection, project_id)
             red = await _paired_red(connection, project_id, behaviour_id)
 
         if refusal := refuse_green_before_launch(contract, isolation.name, red):
@@ -290,7 +290,7 @@ class Behaviours:
             )
             contract = behaviour.contract
             assert contract is not None
-            execution_id = await _record_execution(
+            execution_id = await record_execution(
                 connection, project_id, behaviour_id, "green", contract.digest, execution
             )
             evidence: dict[str, Any] = {
@@ -401,29 +401,39 @@ class Behaviours:
             ).fetchone()
             if row is None:
                 raise LookupError(f"unknown behaviour {behaviour_id!r} in project {project_id!r}")
-            contract = row["contract"]
-            behaviour = Behaviour(
-                behaviour_id=row["behaviour_id"],
-                summary=row["summary"],
-                state=BehaviourState(row["state"]),
-                contract=ProcessContract.from_dict(contract) if contract else None,
-                red_cycle=row["red_cycle"],
-            )
+            behaviour = load_behaviour(row)
             yield connection, behaviour, row["correlation_id"]
-            await connection.execute(
-                "UPDATE behaviours SET state = %s, contract = %s, red_cycle = %s "
-                "WHERE project_id = %s AND behaviour_id = %s",
-                (
-                    behaviour.state.value,
-                    Jsonb(behaviour.contract.to_dict()) if behaviour.contract else None,
-                    behaviour.red_cycle,
-                    project_id,
-                    behaviour_id,
-                ),
-            )
+            await save_behaviour(connection, project_id, behaviour)
 
 
-async def _source(connection: Connection, project_id: str) -> tuple[str, str]:
+def load_behaviour(row: dict[str, Any]) -> Behaviour:
+    contract = row["contract"]
+    return Behaviour(
+        behaviour_id=row["behaviour_id"],
+        summary=row["summary"],
+        state=BehaviourState(row["state"]),
+        contract=ProcessContract.from_dict(contract) if contract else None,
+        red_cycle=row["red_cycle"],
+        reopened_from_review=row["reopened_from_review"],
+    )
+
+
+async def save_behaviour(connection: Connection, project_id: str, behaviour: Behaviour) -> None:
+    await connection.execute(
+        "UPDATE behaviours SET state = %s, contract = %s, red_cycle = %s, "
+        "reopened_from_review = %s WHERE project_id = %s AND behaviour_id = %s",
+        (
+            behaviour.state.value,
+            Jsonb(behaviour.contract.to_dict()) if behaviour.contract else None,
+            behaviour.red_cycle,
+            behaviour.reopened_from_review,
+            project_id,
+            behaviour.behaviour_id,
+        ),
+    )
+
+
+async def source_of(connection: Connection, project_id: str) -> tuple[str, str]:
     row = await (
         await connection.execute(
             "SELECT repository, trunk FROM projects WHERE project_id = %s", (project_id,)
@@ -447,7 +457,7 @@ async def _paired_red(
     return PairedRed(**row) if row else None
 
 
-async def _record_execution(
+async def record_execution(
     connection: Connection,
     project_id: str,
     behaviour_id: str,

@@ -83,6 +83,65 @@ class ProcessObservation:
 
 
 @dataclass(frozen=True)
+class Execution:
+    """One run by the oracle: which revision, in which runtime, and what was seen."""
+
+    revision: str
+    isolation: str
+    runtime_identity: str
+    observation: ProcessObservation
+
+
+def is_gate_bearing(isolation: str) -> bool:
+    return isolation in GATE_BEARING_ISOLATIONS
+
+
+@dataclass(frozen=True)
+class CheckContract:
+    """Something that must hold on every candidate before it reaches trunk: a launch and
+    what it must produce. Registered on the project, outside any candidate's reach."""
+
+    contract_id: str
+    observes: str
+    launch: Launch
+    expect: Expected
+
+    def __post_init__(self) -> None:
+        if not self.observes.strip():
+            raise ValueError("a check states the public behaviour it observes")
+
+    def is_satisfied_by(self, execution: Execution) -> bool:
+        observation = execution.observation
+        return (
+            is_gate_bearing(execution.isolation)
+            and observation.is_eligible
+            and observation.exit_code == self.expect.exit_code
+            and observation.stdout == self.expect.stdout.encode()
+        )
+
+    @property
+    def digest(self) -> str:
+        canonical = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+
+    def to_dict(self) -> dict[str, Any]:
+        document = asdict(self)
+        document["launch"]["argv"] = list(self.launch.argv)
+        return document
+
+    @classmethod
+    def from_dict(cls, document: dict[str, Any]) -> CheckContract:
+        launch = dict(document["launch"])
+        launch["argv"] = tuple(launch["argv"])
+        return cls(
+            contract_id=document["contract_id"],
+            observes=document["observes"],
+            launch=Launch(**launch),
+            expect=Expected(**document["expect"]),
+        )
+
+
+@dataclass(frozen=True)
 class ProcessContract:
     contract_id: str
     observes: str
@@ -113,6 +172,11 @@ class ProcessContract:
         assert self.baseline.stderr is not None
         return observation.stderr == self.baseline.stderr.encode()
 
+    def as_check(self) -> CheckContract:
+        """Once a behaviour is integrated its expectation must go on holding: the same
+        launch and expectation, as a check on every later candidate."""
+        return CheckContract(self.contract_id, self.observes, self.launch, self.expect)
+
     @property
     def digest(self) -> str:
         canonical = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
@@ -134,20 +198,6 @@ class ProcessContract:
             expect=Expected(**document["expect"]),
             baseline=Baseline(**document["baseline"]),
         )
-
-
-@dataclass(frozen=True)
-class Execution:
-    """One run by the oracle: which revision, in which runtime, and what was seen."""
-
-    revision: str
-    isolation: str
-    runtime_identity: str
-    observation: ProcessObservation
-
-
-def is_gate_bearing(isolation: str) -> bool:
-    return isolation in GATE_BEARING_ISOLATIONS
 
 
 class RedRejection(StrEnum):

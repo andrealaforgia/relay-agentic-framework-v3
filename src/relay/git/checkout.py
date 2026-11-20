@@ -227,9 +227,15 @@ async def _git_output(*arguments: str, redact: str | None = None) -> bytes:
     return stdout
 
 
-async def git_result(*arguments: str, redact: str | None = None) -> tuple[int, bytes, str]:
+async def git_result(
+    *arguments: str, redact: str | None = None, timeout: float | None = None
+) -> tuple[int, bytes, str]:
     """Run trusted Git and return its exit status, its output and its diagnostics, with
-    the repository address and any URL credentials removed from the diagnostics."""
+    the repository address and any URL credentials removed from the diagnostics.
+
+    With a timeout, a Git that has not answered in time is stopped and RemoteUnavailable
+    is raised. That says only that no answer came: whatever Git had already sent to the
+    other side may still take effect there."""
     process = await asyncio.create_subprocess_exec(
         *_TRUSTED_GIT,
         *arguments,
@@ -238,7 +244,13 @@ async def git_result(*arguments: str, redact: str | None = None) -> tuple[int, b
         stderr=asyncio.subprocess.PIPE,
         env=_GIT_ENVIRONMENT,
     )
-    stdout, stderr = await process.communicate()
+    try:
+        async with asyncio.timeout(timeout):
+            stdout, stderr = await process.communicate()
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+        raise RemoteUnavailable(f"git {_subcommand(arguments)} gave no answer in time") from None
     detail = stderr.decode(errors="replace").strip()
     if redact:
         # Git echoes the address it was given; a failure must not carry it onwards.

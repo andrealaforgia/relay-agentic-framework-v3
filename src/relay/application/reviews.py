@@ -593,7 +593,7 @@ class Reviews:
             task["behaviour_id"],
             task["cycle_id"],
         )
-        gate = await _gate(connection, task)
+        gate = await gate_of(connection, task)
         if gate.state is GateState.AWAITING_REVIEWS:
             return
         behaviour_row = await (
@@ -685,9 +685,13 @@ class Reviews:
             )
             stopped = await (
                 await connection.execute(
+                    # A cycle whose integration has been authorised is no longer this
+                    # code's to stop: the intent owns what happens to it now.
                     "UPDATE review_cycles SET state = 'blocked', blocked_reason = %s "
-                    "WHERE cycle_id = %s AND state IN ('open', 'satisfied') RETURNING cycle_id",
-                    (reason, cycle_id),
+                    "WHERE cycle_id = %s AND state IN ('open', 'satisfied') AND NOT EXISTS "
+                    "(SELECT 1 FROM integration_intents i WHERE i.cycle_id = %s "
+                    "AND i.state = 'outstanding') RETURNING cycle_id",
+                    (reason, cycle_id, cycle_id),
                 )
             ).fetchone()
             if stopped is not None:
@@ -837,7 +841,9 @@ async def _findings(connection: Connection, project_id: str, behaviour_id: str) 
     ]
 
 
-async def _gate(connection: Connection, task: dict[str, Any]) -> Gate:
+async def gate_of(connection: Connection, task: Mapping[str, Any]) -> Gate:
+    """The gate of one cycle as it stands now. `task` is any row carrying the cycle's
+    id, policy, project and behaviour."""
     submitted = await (
         await connection.execute(
             "SELECT t.role FROM review_submissions s JOIN review_tasks t USING (task_id) "

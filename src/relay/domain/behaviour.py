@@ -28,6 +28,7 @@ class BehaviourState(StrEnum):
     INTEGRATED = "integrated"
     COMPLETED = "completed"
     BLOCKED = "blocked"
+    NEEDS_DECISION = "needs_decision"
 
 
 class TransitionRefused(Exception):
@@ -48,6 +49,8 @@ class Behaviour:
     state: BehaviourState = BehaviourState.PROPOSED
     contract: ProcessContract | None = None
     red_cycle: int = 0
+    # A reviewed candidate lost its footing and the contract is being observed again.
+    reopened_from_review: bool = False
 
     @classmethod
     def propose(cls, behaviour_id: str, summary: str) -> Behaviour:
@@ -82,6 +85,11 @@ class Behaviour:
         verdict = judge_red(self.contract, execution)
         if verdict.is_valid:
             self.state = BehaviourState.IMPLEMENTING
+            self.reopened_from_review = False
+        elif self.reopened_from_review and verdict.rejection is RedRejection.ALREADY_PASSES:
+            # Not a bad test: the behaviour arrived on trunk by another route while this
+            # one was in review. Whether anything is left to build is not Relay's call.
+            self.state = BehaviourState.NEEDS_DECISION
         return verdict
 
     def require_awaiting_green(self) -> ProcessContract:
@@ -135,6 +143,24 @@ class Behaviour:
         """Nothing a Builder or reviewer can do will move this; a person must decide."""
         self._require("park", BehaviourState.REVIEW)
         self.state = BehaviourState.BLOCKED
+
+    def reopen_from_review(self) -> None:
+        """What the red and the green were observed on is no longer what integration would
+        build on (trunk moved, or the runtime changed), so both must be observed again."""
+        self._require("reopen_from_review", BehaviourState.REVIEW)
+        self.state = BehaviourState.VALIDATING_RED
+        self.red_cycle += 1
+        self.reopened_from_review = True
+
+    def integrate(self) -> None:
+        """Trunk now holds the reviewed candidate."""
+        self._require("integrate", BehaviourState.REVIEW)
+        self.state = BehaviourState.INTEGRATED
+
+    def retry_integration(self) -> None:
+        """The repository refused the update; someone has dealt with why."""
+        self._require("retry_integration", BehaviourState.BLOCKED)
+        self.state = BehaviourState.REVIEW
 
     def _require(self, attempted: str, *required: BehaviourState) -> None:
         if self.state not in required:

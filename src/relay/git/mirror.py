@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from relay.git.checkout import (
@@ -138,22 +139,76 @@ class Mirror:
         RemoteRejected when the remote itself refused this ref, CheckoutFailed when the ref
         already exists, RemoteUnavailable when the push never got an answer."""
         _require_hash(commit)
+        refusal = await self._push(repository, commit, ref, expected="")
+        if refusal is None:
+            return
+        if refusal.by_the_remote:
+            raise RemoteRejected(refusal.detail)
+        # Refused on this side: the lease found the ref already present.
+        raise CheckoutFailed(f"the push was not accepted: {refusal.detail}")
+
+    async def advance(
+        self, repository: str, commit: str, ref: str, *, expected: str, timeout: float
+    ) -> None:
+        """Move `ref` on the remote from exactly `expected` to a pinned commit that is a
+        fast-forward of it. Returns only when the remote reported the update.
+
+        RemoteRejected: the update did not happen, and this send cannot make it happen.
+        RemoteUnavailable: no answer. The update may have happened, or may yet."""
+        _require_hash(commit)
+        _require_hash(expected)
+        if not await self.descends(commit, expected):
+            raise RemoteRejected("the commit is not a fast-forward of the expected head")
+        refusal = await self._push(repository, commit, ref, expected=expected, timeout=timeout)
+        if refusal is not None:
+            raise RemoteRejected(refusal.detail)
+
+    async def remote_ref_contains(self, repository: str, ref: str, commit: str) -> bool:
+        """Whether the history of `ref`, as the remote has it now, contains this commit."""
+        _require_hash(commit)
+        await self._ensure_exists()
+        scratch = f"{_INCOMING}/{uuid.uuid4().hex}"
+        try:
+            try:
+                await self._git(
+                    "fetch", "--quiet", "--no-tags", "--", repository, f"+{ref}:{scratch}",
+                    redact=repository,
+                )  # fmt: skip
+            except CheckoutFailed as failure:
+                raise RemoteUnavailable(str(failure)) from None
+            return await self.descends(scratch, commit)
+        finally:
+            await self._discard(scratch)
+
+    async def _push(
+        self,
+        repository: str,
+        commit: str,
+        ref: str,
+        *,
+        expected: str,
+        timeout: float | None = None,
+    ) -> _Refusal | None:
+        """Push one commit to one ref, on condition that the ref is at `expected` (empty:
+        absent). None when the remote accepted it; a refusal when this ref was definitely
+        not updated. RemoteUnavailable when the outcome is not known.
+
+        The outcome is read from Git's per-ref status, never guessed from its messages."""
         status, output, detail = await git_result(
-            "-C", str(self._path), "push", "--porcelain", f"--force-with-lease={ref}:", "--",
-            repository, f"{commit}:{ref}",
-            redact=repository,
+            "-C", str(self._path), "push", "--porcelain",
+            f"--force-with-lease={ref}:{expected}", "--", repository, f"{commit}:{ref}",
+            redact=repository, timeout=timeout,
         )  # fmt: skip
         if status == 0:
-            return
+            return None
         for line in output.decode(errors="replace").splitlines():
             flag, _, rest = line.partition("\t")
             refs, _, summary = rest.partition("\t")
             if flag == "!" and refs.endswith(f":{ref}"):
                 if summary.startswith("[remote rejected]"):
-                    raise RemoteRejected(f"{summary.strip()} {detail}".strip())
+                    return _Refusal(f"{summary.strip()} {detail}".strip(), by_the_remote=True)
                 if summary.startswith("[rejected]"):
-                    # Refused on this side: the lease found the ref already present.
-                    raise CheckoutFailed(f"the push was not accepted: {summary.strip()}")
+                    return _Refusal(summary.strip(), by_the_remote=False)
                 # Anything else, "[remote failure]" above all, means the remote did not
                 # report what happened. The push may or may not have taken effect.
                 raise RemoteUnavailable(f"git push: {summary.strip()} {detail}".strip())
@@ -169,6 +224,12 @@ class Mirror:
 
     async def _git(self, *arguments: str, redact: str | None = None) -> str:
         return await git("-C", str(self._path), *arguments, redact=redact)
+
+
+@dataclass(frozen=True)
+class _Refusal:
+    detail: str
+    by_the_remote: bool
 
 
 def _require_hash(commit: str) -> None:

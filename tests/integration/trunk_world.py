@@ -1,0 +1,185 @@
+"""A project whose repository is a bare remote, as a real one is: trunk can be pushed to,
+hooks can refuse, and a Builder works in a clone of its own."""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+from pathlib import Path
+
+from psycopg_pool import AsyncConnectionPool
+
+from relay.application.behaviours import Behaviours
+from relay.application.integration import Integration, IntegrationReceipt
+from relay.application.reviews import Review, Reviews
+from relay.domain.behaviour import BehaviourState
+from relay.domain.evidence import Baseline, CheckContract, Expected, Launch, ProcessContract
+from relay.persistence.ledger import read_events
+from relay.persistence.outbox import pending_messages
+from relay.testing.oracle import ContainerIsolation, Isolation, ProcessOracle
+from tests.integration.fixtures import CONTRACT, VAT_APPLIES_STANDARD_RATE, VAT_RETURNS_NET
+
+PROJECT = "vat-calculator"
+TRUNK = "refs/heads/main"
+ZERO_STAYS_ZERO = CheckContract(
+    contract_id="zero-stays-zero",
+    observes="the gross amount printed for a net amount of zero",
+    launch=Launch(argv=("python3", "vat.py", "0"), timeout_seconds=30),
+    expect=Expected(exit_code=0, stdout="0\n"),
+)
+# Satisfies the standard-rate contract and nothing else.
+VAT_ALWAYS_PRINTS_120 = "print(120)\n"
+GREETING = ProcessContract(
+    contract_id="B2-greeting",
+    observes="the greeting the product prints",
+    launch=Launch(
+        argv=("sh", "-c", "cat greeting.txt 2>/dev/null || echo none"), timeout_seconds=30
+    ),
+    expect=Expected(exit_code=0, stdout="hello\n"),
+    baseline=Baseline(exit_code=0, stdout="none\n"),
+)
+# Refuses any update of trunk while `refuse` exists beside the hook, and holds one while
+# `hold` exists. Other refs pass untouched, so candidates can still be published.
+_PRE_RECEIVE = """#!/bin/sh
+here="$(dirname "$0")"
+while read old new ref; do
+  if [ "$ref" = "refs/heads/main" ]; then
+    if [ -e "$here/refuse" ]; then echo "trunk is closed" >&2; exit 1; fi
+    touch "$here/reached"
+    while [ -e "$here/hold" ]; do sleep 0.05; done
+  fi
+done
+exit 0
+"""
+
+
+class TrunkWorld:
+    def __init__(
+        self,
+        database: AsyncConnectionPool,
+        tmp_path: Path,
+        runner_image: str,
+        isolation: Isolation | None = None,
+    ) -> None:
+        self.database = database
+        self.tmp_path = tmp_path
+        self.remote = tmp_path / "remote.git"
+        self.builder = tmp_path / "builder"
+        self.mirrors = tmp_path / "mirrors"
+        self.image = runner_image
+        self.oracle = ProcessOracle(isolation or ContainerIsolation(runner_image))
+        self.behaviours = Behaviours(database, self.mirrors, self.oracle)
+        self.reviews = Reviews(database, self.mirrors)
+        self.integration = Integration(database, self.mirrors, self.oracle)
+        self.attempts: dict[str, int] = {}
+        self.requests = 0
+
+    def git(self, *arguments: str, at: Path | None = None) -> str:
+        return subprocess.run(
+            ["git", "-C", str(at or self.builder), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    async def open(self) -> str:
+        """A bare remote whose trunk holds a calculator that returns the net amount."""
+        self.remote.mkdir()
+        self.git("init", "-q", "--bare", "-b", "main", at=self.remote)
+        # No keep-alive traffic: a push whose client has gone must be able to finish.
+        self.git("config", "receive.keepAlive", "0", at=self.remote)
+        hook = self.remote / "hooks" / "pre-receive"
+        hook.write_text(_PRE_RECEIVE)
+        hook.chmod(0o755)
+        self.builder.mkdir()
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "builder@relay.test")
+        self.git("config", "user.name", "Builder")
+        self.git("remote", "add", "origin", str(self.remote))
+        base = self.advance_trunk({"vat.py": VAT_RETURNS_NET})
+        await self.behaviours.open_project(PROJECT, str(self.remote))
+        return base
+
+    def advance_trunk(self, files: dict[str, str]) -> str:
+        """Another writer moves trunk, outside Relay."""
+        self.git("fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+        if self.git("branch", "--list", "-r", "origin/main"):
+            self.git("checkout", "-q", "-B", "main", "origin/main")
+        for name, content in files.items():
+            (self.builder / name).write_text(content)
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", "trunk moves")
+        self.git("push", "-q", "origin", "HEAD:refs/heads/main")
+        return self.git("rev-parse", "HEAD")
+
+    def trunk(self) -> str:
+        return self.git("rev-parse", TRUNK, at=self.remote)
+
+    def hook_flag(self, name: str) -> Path:
+        return self.remote / "hooks" / name
+
+    async def awaiting_builder(
+        self, behaviour: str = "B1", contract: ProcessContract = CONTRACT
+    ) -> str:
+        """A behaviour with a verified red on the current trunk. Returns that revision."""
+        await self.behaviours.propose(PROJECT, behaviour, contract.observes)
+        await self.behaviours.begin_test_design(PROJECT, behaviour)
+        await self.behaviours.register_acceptance_test(PROJECT, behaviour, contract)
+        assert (await self.behaviours.run_red(PROJECT, behaviour)).is_valid
+        return self.trunk()
+
+    def publish_attempt(self, behaviour: str, files: dict[str, str], *, on: str) -> str:
+        """What a Builder does: commit on top of `on` and publish under the attempt ref."""
+        attempt = self.attempts[behaviour] = self.attempts.get(behaviour, 0) + 1
+        self.git("fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+        self.git("checkout", "-q", "--detach", on)
+        for name, content in files.items():
+            (self.builder / name).write_text(content)
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", f"{behaviour} attempt {attempt}")
+        candidate = self.git("rev-parse", "HEAD")
+        ref = f"refs/relay/attempts/{PROJECT}/{behaviour}/{attempt}"
+        self.git("push", "-q", "origin", f"HEAD:{ref}")
+        return candidate
+
+    async def reviewed(
+        self,
+        behaviour: str = "B1",
+        files: dict[str, str] | None = None,
+        *,
+        on: str,
+    ) -> str:
+        """A candidate verified green, published, and approved by every required reviewer."""
+        candidate = self.publish_attempt(
+            behaviour, files or {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=on
+        )
+        verdict = await self.behaviours.run_green(PROJECT, behaviour, self.attempts[behaviour])
+        assert verdict.is_valid, verdict.reason
+        assert await self.reviews.publish_candidates() == 1
+        for message in await pending_messages(self.database):
+            payload = message.envelope["payload"]
+            if payload.get("candidate_revision") == candidate and "capability" in payload:
+                tree = self.tmp_path / f"review-{payload['capability'][:8]}"
+                shutil.rmtree(tree, ignore_errors=True)
+                await self.reviews.prepare_review(payload["capability"], tree)
+                await self.reviews.submit_review(payload["capability"], Review())
+        return candidate
+
+    async def integrate(
+        self, behaviour: str = "B1", request: str | None = None
+    ) -> IntegrationReceipt:
+        if request is None:
+            self.requests += 1
+            request = f"request-{self.requests}"
+        return await self.integration.integrate(PROJECT, behaviour, request)
+
+    async def state(self, behaviour: str = "B1") -> BehaviourState:
+        return await self.behaviours.state_of(PROJECT, behaviour)
+
+    async def events(self) -> list[str]:
+        return [event.event_type for event in await read_events(self.database, PROJECT)]
+
+    async def column(self, query: str) -> list[object]:
+        async with self.database.connection() as connection:
+            rows = await (await connection.execute(query)).fetchall()
+        return [next(iter(row.values())) for row in rows]

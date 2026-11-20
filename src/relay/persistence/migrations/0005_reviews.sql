@@ -18,7 +18,8 @@ CREATE TABLE review_cycles (
     publication        text NOT NULL DEFAULT 'pending'
         CHECK (publication IN ('pending', 'published')),
     state              text NOT NULL DEFAULT 'open'
-        CHECK (state IN ('open', 'satisfied', 'changes_requested', 'parked', 'blocked', 'superseded')),
+        CHECK (state IN ('open', 'satisfied', 'changes_requested', 'parked', 'blocked',
+                         'superseded', 'integrated')),
     blocked_reason     text,
     -- Why publication has not happened yet, when the cause may pass (the remote was
     -- unreachable, say). A cycle with this set is still pending and will be retried.
