@@ -112,18 +112,36 @@ async def test_a_tag_is_not_pinned_as_a_candidate(tmp_path: Path) -> None:
     assert git(tmp_path / "control-plane" / "vat.git", "for-each-ref") == ""
 
 
-async def test_a_replacement_object_cannot_change_what_a_pinned_hash_exports(
+def replace_with_a_commit_that_has_no_history(mirror_path: Path, commit: str) -> None:
+    tree = git(mirror_path, "rev-parse", f"{commit}^{{tree}}")
+    rootless = subprocess.run(
+        ["git", "-C", str(mirror_path), "commit-tree", tree, "-m", "no parents"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "GIT_AUTHOR_NAME": "x",
+            "GIT_AUTHOR_EMAIL": "x@relay.test",
+            "GIT_COMMITTER_NAME": "x",
+            "GIT_COMMITTER_EMAIL": "x@relay.test",
+            "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+        },
+    ).stdout.strip()
+    git(mirror_path, "replace", commit, rootless)
+
+
+async def test_a_replacement_object_cannot_change_what_a_recorded_hash_means(
     tmp_path: Path,
 ) -> None:
     repository, trunk, candidate = subject_with_candidate(tmp_path)
     mirror_path = tmp_path / "control-plane" / "vat.git"
     mirror = Mirror(mirror_path)
     await mirror.pin_from(str(repository), ATTEMPT, candidate)
-    await mirror.pin_from(str(repository), "refs/heads/main", trunk)
-    git(mirror_path, "replace", candidate, trunk)
+    replace_with_a_commit_that_has_no_history(mirror_path, candidate)
+    assert git(mirror_path, "rev-list", "--count", candidate) == "1", "the replacement is in force"
 
+    assert await mirror.descends(candidate, trunk)
     exported = await mirror.export(candidate, tmp_path / "exported")
-
     assert (exported / "vat.py").read_text() == VAT_APPLIES_STANDARD_RATE
 
 
