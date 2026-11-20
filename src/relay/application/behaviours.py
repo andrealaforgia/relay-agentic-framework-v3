@@ -12,6 +12,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from relay.application.reviews import open_cycle
 from relay.domain.behaviour import Behaviour, BehaviourState
 from relay.domain.evidence import (
     Execution,
@@ -310,6 +311,15 @@ class Behaviours:
                     "WHERE project_id = %s AND behaviour_id = %s",
                     (execution.revision, project_id, behaviour_id),
                 )
+                cycle_id = await open_cycle(
+                    connection,
+                    project_id,
+                    behaviour_id,
+                    green_execution_id=execution_id,
+                    red_execution_id=red.execution_id,
+                    candidate=execution.revision,
+                )
+                evidence["review_cycle_id"] = str(cycle_id)
             await append_event(
                 connection,
                 project_id,

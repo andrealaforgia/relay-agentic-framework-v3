@@ -78,6 +78,14 @@ async def attempt_head(repository: str, project_id: str, behaviour_id: str, atte
 
 
 async def _resolve(repository: str, wanted: str, description: str) -> str:
+    revision = await resolve_ref(repository, wanted)
+    if revision is None:
+        raise CheckoutFailed(f"the repository has no {description}")
+    return revision
+
+
+async def resolve_ref(repository: str, wanted: str) -> str | None:
+    """The object the exactly named ref points at now, or None if there is no such ref."""
     # ls-remote matches its pattern against the tail of every ref name, so another ref
     # ending in the same words would be listed too. Only the exact ref counts.
     listing = await git("ls-remote", "--", repository, wanted, redact=repository)
@@ -87,8 +95,19 @@ async def _resolve(repository: str, wanted: str, description: str) -> str:
         if ref == wanted
     ]
     if len(revisions) != 1 or not FULL_COMMIT_HASH.fullmatch(revisions[0]):
-        raise CheckoutFailed(f"the repository has no {description}")
+        return None
     return revisions[0]
+
+
+async def refs_under(repository: str, prefix: str) -> dict[str, str]:
+    """Every ref whose full name starts with `prefix`, with the object it points at."""
+    listing = await git("ls-remote", "--", repository, f"{prefix}*", redact=repository)
+    found = {}
+    for line in listing.splitlines():
+        revision, _, ref = line.partition("\t")
+        if ref.startswith(prefix) and FULL_COMMIT_HASH.fullmatch(revision):
+            found[ref] = revision
+    return found
 
 
 async def pristine_checkout(repository: str, revision: str, into: Path) -> Path:

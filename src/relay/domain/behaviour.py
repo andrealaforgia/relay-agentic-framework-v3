@@ -126,6 +126,16 @@ class Behaviour:
         self.state = BehaviourState.VALIDATING_RED
         self.red_cycle += 1
 
+    def request_changes(self) -> None:
+        """Reviewers found something that blocks: the work goes back to the Builder."""
+        self._require("request_changes", BehaviourState.REVIEW)
+        self.state = BehaviourState.IMPLEMENTING
+
+    def park(self) -> None:
+        """Nothing a Builder or reviewer can do will move this; a person must decide."""
+        self._require("park", BehaviourState.REVIEW)
+        self.state = BehaviourState.BLOCKED
+
     def _require(self, attempted: str, *required: BehaviourState) -> None:
         if self.state not in required:
             raise TransitionRefused(attempted, self.state, required)
