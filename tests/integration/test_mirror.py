@@ -216,3 +216,64 @@ async def test_a_repository_that_cannot_be_listed_is_unavailable(tmp_path: Path)
         await refs_under(str(tmp_path / "nowhere"), "refs/relay/attempts/")
     with pytest.raises(RemoteUnavailable):
         await resolve_ref(str(tmp_path / "nowhere"), "refs/heads/main")
+
+
+RELEASE = "refs/heads/release"
+
+
+async def test_a_ref_is_advanced_from_the_expected_commit_to_a_pinned_descendant(
+    tmp_path: Path,
+) -> None:
+    repository, trunk, candidate = subject_with_candidate(tmp_path)
+    git(repository, "update-ref", RELEASE, trunk)
+    mirror = Mirror(tmp_path / "control-plane" / "vat.git")
+    await mirror.pin_from(str(repository), ATTEMPT, candidate)
+
+    await mirror.advance(str(repository), candidate, RELEASE, expected=trunk, timeout=30)
+
+    assert git(repository, "rev-parse", RELEASE) == candidate
+
+
+async def test_a_ref_is_never_advanced_to_a_commit_that_does_not_build_on_it(
+    tmp_path: Path,
+) -> None:
+    """The lease alone would let Git replace the ref with unrelated history."""
+    repository, trunk, candidate = subject_with_candidate(tmp_path)
+    sibling = publish_attempt(repository, "B1", 2, {"vat.py": "print('sibling')\n"}, on=trunk)
+    git(repository, "update-ref", RELEASE, sibling)
+    mirror = Mirror(tmp_path / "control-plane" / "vat.git")
+    await mirror.pin_from(str(repository), ATTEMPT, candidate)
+    await mirror.pin_from(str(repository), ATTEMPT[:-1] + "2", sibling)
+
+    with pytest.raises(RemoteRejected, match="fast-forward"):
+        await mirror.advance(str(repository), candidate, RELEASE, expected=sibling, timeout=30)
+
+    assert git(repository, "rev-parse", RELEASE) == sibling
+
+
+async def test_a_ref_that_is_not_where_it_was_expected_is_left_alone(tmp_path: Path) -> None:
+    repository, trunk, candidate = subject_with_candidate(tmp_path)
+    sibling = publish_attempt(repository, "B1", 2, {"vat.py": "print('sibling')\n"}, on=trunk)
+    git(repository, "update-ref", RELEASE, sibling)
+    mirror = Mirror(tmp_path / "control-plane" / "vat.git")
+    await mirror.pin_from(str(repository), ATTEMPT, candidate)
+
+    with pytest.raises(RemoteRejected):
+        await mirror.advance(str(repository), candidate, RELEASE, expected=trunk, timeout=30)
+
+    assert git(repository, "rev-parse", RELEASE) == sibling
+
+
+async def test_a_push_that_gets_no_answer_in_time_is_reported_as_unanswered(
+    tmp_path: Path,
+) -> None:
+    repository, trunk, candidate = subject_with_candidate(tmp_path)
+    git(repository, "update-ref", RELEASE, trunk)
+    hook = repository / ".git" / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\nsleep 5\n")
+    hook.chmod(0o755)
+    mirror = Mirror(tmp_path / "control-plane" / "vat.git")
+    await mirror.pin_from(str(repository), ATTEMPT, candidate)
+
+    with pytest.raises(RemoteUnavailable, match="no answer"):
+        await mirror.advance(str(repository), candidate, RELEASE, expected=trunk, timeout=0.5)

@@ -3,6 +3,7 @@ hooks can refuse, and a Builder works in a clone of its own."""
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import subprocess
 from pathlib import Path
@@ -172,6 +173,23 @@ class TrunkWorld:
             self.requests += 1
             request = f"request-{self.requests}"
         return await self.integration.integrate(PROJECT, behaviour, request)
+
+    def integration_with(
+        self, isolation: Isolation | None = None, push_timeout: float = 120.0
+    ) -> Integration:
+        """Another control-plane process over the same database, mirrors and remote."""
+        oracle = ProcessOracle(isolation) if isolation else self.oracle
+        return Integration(self.database, self.mirrors, oracle, push_timeout)
+
+    async def until_trunk_is(self, revision: str) -> None:
+        async with asyncio.timeout(30):
+            while self.trunk() != revision:
+                await asyncio.sleep(0.05)
+
+    async def until_exists(self, flag: Path) -> None:
+        async with asyncio.timeout(30):
+            while not flag.exists():
+                await asyncio.sleep(0.05)
 
     async def state(self, behaviour: str = "B1") -> BehaviourState:
         return await self.behaviours.state_of(PROJECT, behaviour)
