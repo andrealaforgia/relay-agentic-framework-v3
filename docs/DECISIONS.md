@@ -9,6 +9,9 @@ Decisions made by Andrea. Model recommendations are noted where he chose differe
 | PO-3 | 2026-11-19 | **The Product Owner talks to Relay through a live conversational Claude session.** Both models had recommended a CLI inbox with a thin skill. | The Interpreter is an interactive Claude Code session. To keep specification section 24 ("do not require provider-native session resumability for workflow recovery"), the session is an interface, not a store: every question, answer, decision and analysis version is written to the control plane as it happens, and a lost session is replaced by a new one briefed from those durable records. `relay answer` and `relay approve` remain available without the session (section 25). |
 | PO-4 | 2026-11-19 | **First release integrates into a plain Git remote; Relay runs the checks.** | No hosted CI or branch-protection integration in v1. A project that requires checks Relay cannot run or verify is visibly blocked at integration. |
 
+| PO-5 | 2026-11-20 | **Gate-bearing runs use the local Docker engine.** Confirms M-1 below. | Native execution never opens a gate; every runner host needs a local Docker engine. |
+| PO-6 | 2026-11-20 | **Commit and push frequently to the GitHub remote** (`andrealaforgia/relay-agentic-framework-v3`, public). | Trunk is pushed after each green, committed step. |
+
 Still on recommended defaults, not yet explicitly confirmed: review and security policy presets; pause on unknown paid calls; trust in enrolled worker hosts.
 
 ## Consequences drawn by the models, for the Product Owner to confirm or overturn

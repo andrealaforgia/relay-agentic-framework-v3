@@ -362,6 +362,8 @@ async def test_a_caller_cannot_supply_the_observation_or_the_source(
         "ssh://git:canary-secret@git.example/vat.git",
         "https://[canary-secret/vat.git",
         "https://git.example:canary-secret/vat.git",
+        "https:///relay:canary-secret@git.example/vat.git",
+        "ssh:///git:canary-secret@git.example/vat.git",
     ],
 )
 async def test_a_repository_address_that_may_carry_a_credential_is_refused_and_stored_nowhere(
@@ -379,7 +381,14 @@ async def test_a_repository_address_that_may_carry_a_credential_is_refused_and_s
 
 
 @pytest.mark.parametrize(
-    "address", ["/srv/git/vat.git", "git@git.example:team/vat.git", "ssh://git@git.example/vat.git"]
+    "address",
+    [
+        "/srv/git/vat.git",
+        "file:///srv/git/vat.git",
+        "git@git.example:team/vat.git",
+        "ssh://git@git.example/vat.git",
+        "https://git.example/team/vat.git",
+    ],
 )
 async def test_an_ordinary_repository_address_is_accepted(
     database: AsyncConnectionPool, address: str

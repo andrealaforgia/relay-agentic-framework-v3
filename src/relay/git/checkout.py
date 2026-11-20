@@ -37,6 +37,9 @@ def require_credential_free(repository: str) -> str:
         address.port  # noqa: B018 - parsing the authority is what raises on a malformed one
     except ValueError:
         raise ValueError("the repository address is malformed") from None
+    if address.scheme != "file" and not address.hostname:
+        # Without a host, whatever was meant as userinfo has been read as part of the path.
+        raise ValueError("the repository address is malformed")
     if address.password is not None or address.query or address.fragment:
         raise ValueError("a repository address must not contain credentials or a query")
     if address.scheme in {"http", "https"} and address.username is not None:
