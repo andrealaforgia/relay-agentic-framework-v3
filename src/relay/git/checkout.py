@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 from relay.domain.identifiers import require_identifier
 
-_FULL_COMMIT_HASH = re.compile(r"[0-9a-f]{40}")
+FULL_COMMIT_HASH = re.compile(r"[0-9a-f]{40}")
 _BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 _URL_USERINFO = re.compile(r"//[^/@\s]+@")
 # No hooks, no user or system configuration, no credential prompts: this runs with
@@ -21,6 +21,8 @@ _GIT_ENVIRONMENT = {
     "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_TERMINAL_PROMPT": "0",
+    # A replacement object would let a recorded hash name one tree and export another.
+    "GIT_NO_REPLACE_OBJECTS": "1",
     "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
 }
 
@@ -78,13 +80,13 @@ async def attempt_head(repository: str, project_id: str, behaviour_id: str, atte
 async def _resolve(repository: str, wanted: str, description: str) -> str:
     # ls-remote matches its pattern against the tail of every ref name, so another ref
     # ending in the same words would be listed too. Only the exact ref counts.
-    listing = await _git("ls-remote", "--", repository, wanted, redact=repository)
+    listing = await git("ls-remote", "--", repository, wanted, redact=repository)
     revisions = [
         revision
         for revision, _, ref in (line.partition("\t") for line in listing.splitlines())
         if ref == wanted
     ]
-    if len(revisions) != 1 or not _FULL_COMMIT_HASH.fullmatch(revisions[0]):
+    if len(revisions) != 1 or not FULL_COMMIT_HASH.fullmatch(revisions[0]):
         raise CheckoutFailed(f"the repository has no {description}")
     return revisions[0]
 
@@ -95,39 +97,41 @@ async def candidate_checkout(
     """The files of a candidate published under `ref`, and whether its history contains
     the revision it claims to be built on."""
     for pinned in (revision, built_on):
-        if not _FULL_COMMIT_HASH.fullmatch(pinned):
+        if not FULL_COMMIT_HASH.fullmatch(pinned):
             raise CheckoutFailed("a revision must be a 40-character commit hash")
-    await _git("clone", "--quiet", "--no-checkout", "--", repository, str(into), redact=repository)
-    await _git("-C", str(into), "fetch", "--quiet", "origin", ref, redact=repository)
-    if await _git("-C", str(into), "rev-parse", "FETCH_HEAD") != revision:
+    await git("clone", "--quiet", "--no-checkout", "--", repository, str(into), redact=repository)
+    await git("-C", str(into), "fetch", "--quiet", "origin", ref, redact=repository)
+    if await git("-C", str(into), "rev-parse", "FETCH_HEAD") != revision:
         raise CheckoutFailed("the candidate moved while it was being fetched")
     # A ref may point at a tag object; checking that out would run the tagged commit
     # while the evidence named the tag. Only a commit is a candidate.
-    if await _git("-C", str(into), "cat-file", "-t", revision) != "commit":
+    if await git("-C", str(into), "cat-file", "-t", revision) != "commit":
         raise CheckoutFailed("the candidate is not a commit")
-    descends = await _succeeds("-C", str(into), "merge-base", "--is-ancestor", built_on, revision)
-    await _git("-C", str(into), "checkout", "--quiet", "--detach", revision)
-    if await _git("-C", str(into), "rev-parse", "HEAD") != revision:
+    descends = await git_succeeds(
+        "-C", str(into), "merge-base", "--is-ancestor", built_on, revision
+    )
+    await git("-C", str(into), "checkout", "--quiet", "--detach", revision)
+    if await git("-C", str(into), "rev-parse", "HEAD") != revision:
         raise CheckoutFailed("the checked-out revision is not the candidate")
-    await _leave_only_the_tracked_files(into)
+    await leave_only_the_tracked_files(into)
     return into, descends
 
 
 async def pristine_checkout(repository: str, revision: str, into: Path) -> Path:
     """The files of one revision and nothing else: no Git metadata, so neither the remote
     address nor any credential embedded in it is exposed to whatever runs there."""
-    if not _FULL_COMMIT_HASH.fullmatch(revision):
+    if not FULL_COMMIT_HASH.fullmatch(revision):
         raise CheckoutFailed(f"a revision must be a 40-character commit hash, not {revision!r}")
-    await _git("clone", "--quiet", "--no-checkout", "--", repository, str(into), redact=repository)
-    await _git("-C", str(into), "checkout", "--quiet", "--detach", revision)
-    head = await _git("-C", str(into), "rev-parse", "HEAD")
+    await git("clone", "--quiet", "--no-checkout", "--", repository, str(into), redact=repository)
+    await git("-C", str(into), "checkout", "--quiet", "--detach", revision)
+    head = await git("-C", str(into), "rev-parse", "HEAD")
     if head != revision:
         raise CheckoutFailed(f"checked out {head}, expected {revision}")
-    await _leave_only_the_tracked_files(into)
+    await leave_only_the_tracked_files(into)
     return into
 
 
-async def _leave_only_the_tracked_files(checkout: Path) -> None:
+async def leave_only_the_tracked_files(checkout: Path) -> None:
     """Remove the Git metadata, confirm the tree is exactly the tracked tree, and set
     permissions from what Git recorded: a file is executable by everyone if it is tracked
     as executable, readable by everyone either way. The host's umask, its filesystem and
@@ -189,15 +193,15 @@ def _entries_on_disk(root: bytes, prefix: bytes, directories: list[bytes]) -> di
     return found
 
 
-async def _succeeds(*arguments: str) -> bool:
+async def git_succeeds(*arguments: str) -> bool:
     try:
-        await _git(*arguments)
+        await git(*arguments)
     except CheckoutFailed:
         return False
     return True
 
 
-async def _git(*arguments: str, redact: str | None = None) -> str:
+async def git(*arguments: str, redact: str | None = None) -> str:
     return (await _git_output(*arguments, redact=redact)).decode(errors="replace").strip()
 
 
