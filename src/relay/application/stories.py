@@ -40,6 +40,7 @@ from relay.application.closure import (
     story_basis,
 )
 from relay.application.completion import basis_of_gate as completion_gate_basis
+from relay.application.completion import end_request as end_completion_request
 from relay.application.completion import evaluate_completion, roadmap_changed
 from relay.application.completion import settle_gate as settle_completion_gate
 from relay.domain.evidence import ProcessContract
@@ -786,6 +787,11 @@ async def close_feature(pool: Pool, project_id: str, action: HumanAction) -> Rec
         )
         if action.action == "cancel":
             await _end_replacements_that_lost_their_ground(connection, project_id)
+            await end_completion_request(
+                connection, project_id, feature_id, "abandoned", "the feature was cancelled"
+            )
+        if action.action == "resume":
+            await evaluate_completion(connection, project_id, feature_id)
         outcome = {"pause": "paused", "cancel": "cancelled", "resume": "resumed"}[action.action]
         await append_event(
             connection,

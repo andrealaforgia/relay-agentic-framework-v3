@@ -12,7 +12,8 @@ from typing import Any
 
 from relay.application.assignments import announce_again, revoke_every_grant
 from relay.application.closure import lock_gate
-from relay.application.final_checks import Completion
+from relay.application.completion import evaluate_completion
+from relay.application.final_checks import Completion, end_batches_left_running
 from relay.application.integration import (
     Integration,
     IntegrationRefused,
@@ -43,6 +44,8 @@ class Features:
         self._completion = completion or Completion(
             pool, integration.oracle, integration.remote_timeout
         )
+        # A completion put off behind a push is taken up when that push settles.
+        integration.after_settlement = self.complete_what_is_owed
 
     async def decide(self, action: HumanAction) -> Receipt:
         """What the Product Owner decides at a gate, followed by whatever that leaves
@@ -111,7 +114,16 @@ class Features:
             await lock_gate(connection, project_id)
             if starting:
                 await revoke_every_grant(connection, project_id)
+                await end_batches_left_running(connection, project_id)
             await hand_on_unfinished_batches(connection, project_id, starting=starting)
+            for feature in await (
+                await connection.execute(
+                    "SELECT feature_id FROM features WHERE project_id = %s "
+                    "AND state IN ('delivering', 'checking', 'needs_decision') ORDER BY opened",
+                    (project_id,),
+                )
+            ).fetchall():
+                await evaluate_completion(connection, project_id, feature["feature_id"])
         await self._integration.reconcile()
         await self._reviews.publish_candidates()
         async with self._pool.connection() as connection, connection.transaction():
@@ -138,6 +150,7 @@ class Features:
                     # checks. The integration stays owed; the pass, and the other
                     # projects, carry on. It is not tried again in this pass.
                     continue
+        await self.complete_what_is_owed(project_id)
 
     async def _integrations_owed(self, project_id: str) -> list[uuid.UUID]:
         async with self._pool.connection() as connection:

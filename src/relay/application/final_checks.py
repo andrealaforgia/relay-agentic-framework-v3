@@ -27,6 +27,7 @@ from relay.application.completion import (
     CONTROL_PLANE,
     owe_completion,
     roadmap_in_force,
+    stopped,
     stories_of,
 )
 from relay.application.stories import _digest as digest_of
@@ -39,6 +40,8 @@ from relay.persistence.ledger import append_event
 from relay.persistence.outbox import enqueue
 from relay.testing.oracle import ProcessOracle
 from relay.transport.envelope import Envelope, MessageKind
+
+_SUCCESSORS_TAKEN_UP_AT_ONCE = 3
 
 
 @dataclass(frozen=True)
@@ -82,18 +85,37 @@ class Completion:
 
     async def take_up(self, assignment_id: uuid.UUID) -> CompletionReceipt:
         """Start the next generation of the request this completion is owed for, run its
-        checks, and end it."""
+        checks, and end it. A generation that finds what it recorded has changed owes a
+        successor, and that one is taken up here too, a bounded number of times: nobody
+        else is told that it now exists."""
+        receipt, successor = await self._take_up(assignment_id)
+        for _ in range(_SUCCESSORS_TAKEN_UP_AT_ONCE):
+            if successor is None:
+                break
+            receipt, successor = await self._take_up(successor)
+        return receipt
+
+    async def _take_up(
+        self, assignment_id: uuid.UUID
+    ) -> tuple[CompletionReceipt, uuid.UUID | None]:
         async with self._pool.connection() as connection:
             owed = await (
                 await connection.execute(
-                    "SELECT a.project_id, a.feature_id, p.repository, p.trunk "
+                    "SELECT a.project_id, a.feature_id, a.state, p.repository, p.trunk "
                     "FROM assignments a JOIN projects p USING (project_id) "
                     "WHERE a.assignment_id = %s AND a.kind = 'complete'",
                     (assignment_id,),
                 )
             ).fetchone()
-        if owed is None:
-            raise LookupError(f"no completion is owed under {assignment_id}")
+            if owed is None:
+                raise LookupError(f"no completion is owed under {assignment_id}")
+            if owed["state"] != "wanted":
+                # Before the repository is asked anything: what became of a completion
+                # that was already taken up, or retired unused, is on record.
+                return await _disposition(connection, assignment_id), None
+            waits = await stopped(connection, owed["project_id"], owed["feature_id"])
+        if waits is not None:
+            return _not_started(waits), None
         if not is_gate_bearing(self._oracle.isolation.name):
             raise ActionRefused(
                 f"{self._oracle.isolation.name} execution cannot complete a feature; "
@@ -101,6 +123,8 @@ class Completion:
             )
         head = await trunk_head(owed["repository"], owed["trunk"], timeout=self._remote_timeout)
         batch = await self._start(assignment_id, owed["project_id"], owed["feature_id"], head)
+        if isinstance(batch, CompletionReceipt):
+            return batch, None
         try:
             await self._run_checks(batch, owed["repository"])
         except BaseException:
@@ -110,18 +134,25 @@ class Completion:
 
     async def _start(
         self, assignment_id: uuid.UUID, project_id: str, feature_id: str, head: str
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | CompletionReceipt:
+        """Under the gate lock, look again at everything that was looked at before the
+        repository was read, and bind one generation to exactly this assignment."""
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id)
             await _locked_feature(connection, project_id, feature_id)
             assignment = await (
                 await connection.execute(
-                    "SELECT issued_on->>'request_id' AS request_id FROM assignments "
+                    "SELECT state, issued_on->>'request_id' AS request_id FROM assignments "
                     "WHERE assignment_id = %s FOR UPDATE",
                     (assignment_id,),
                 )
             ).fetchone()
             assert assignment is not None
+            if assignment["state"] != "wanted":
+                return await _disposition(connection, assignment_id)
+            waits = await stopped(connection, project_id, feature_id)
+            if waits is not None:
+                return _not_started(waits)
             request_id = uuid.UUID(assignment["request_id"])
             snapshot = await _snapshot(connection, project_id, feature_id)
             generation = await (
@@ -201,8 +232,12 @@ class Completion:
                     ),
                 )
 
-    async def _end(self, batch_id: uuid.UUID, *, cut_short: bool = False) -> CompletionReceipt:
-        """The one rule that ends a generation, whoever calls it."""
+    async def _end(
+        self, batch_id: uuid.UUID, *, cut_short: bool = False
+    ) -> tuple[CompletionReceipt, uuid.UUID | None]:
+        """The one rule that ends a generation, whoever calls it: after its runs, or
+        after something cut them short. Returns what became of it and, if what it
+        recorded was found changed, the completion owed in its place."""
         async with self._pool.connection() as connection:
             located = await (
                 await connection.execute(
@@ -219,15 +254,18 @@ class Completion:
             await _locked_feature(connection, project_id, feature_id)
             batch = await (
                 await connection.execute(
-                    "SELECT b.*, r.state AS request_state FROM completion_batches b "
-                    "JOIN completion_requests r USING (request_id) "
-                    "WHERE b.batch_id = %s FOR UPDATE OF b, r",
-                    (batch_id,),
+                    "SELECT * FROM completion_batches WHERE batch_id = %s FOR UPDATE", (batch_id,)
                 )
             ).fetchone()
             assert batch is not None
-            if batch["state"] != "running" or batch["request_state"] != "live":
-                return CompletionReceipt(batch["state"], batch_id, batch["reason"] or "")
+            if batch["state"] != "running":
+                # Its request ended, or another call ended it. A request that ends takes
+                # its running generation with it, so a running one is always current.
+                return CompletionReceipt(batch["state"], batch_id, batch["reason"] or ""), None
+            waits = await stopped(connection, project_id, feature_id)
+            if waits is not None:
+                await _owed_again(connection, batch, "held", f"the feature is {waits}")
+                return CompletionReceipt("held", batch_id, f"the feature is {waits}"), None
             receipts = await (
                 await connection.execute(
                     "SELECT r.obligation_id::text, r.digest, r.revision, r.satisfied, "
@@ -243,34 +281,92 @@ class Completion:
                 if each["revision"] == batch["trunk"]
             ]
             if cut_short or observed != batch["snapshot"]["obligations"]:
-                return await self._owed_again(
-                    connection, batch, "interrupted", "the checks could not all be run"
+                why = "the checks could not all be run"
+                await _owed_again(connection, batch, "interrupted", why)
+                return CompletionReceipt("interrupted", batch_id, why), None
+            if batch["snapshot"] != await _snapshot(connection, project_id, feature_id):
+                why = "what these checks were a check of changed while they were running"
+                successor = await _owed_again(connection, batch, "discarded", why)
+                return CompletionReceipt("discarded", batch_id, why), successor
+            pushing = await (
+                await connection.execute(
+                    "SELECT 1 FROM integration_intents WHERE project_id = %s "
+                    "AND state = 'outstanding'",
+                    (project_id,),
                 )
+            ).fetchone()
+            if pushing is not None:
+                # A push may be on its way, or may have landed with its settlement not
+                # yet committed. Either way the records and the repository cannot both
+                # be read as one moment. Its settlement takes this up again.
+                why = "an integration of this project is on its way to trunk"
+                await _owed_again(connection, batch, "deferred", why)
+                return CompletionReceipt("deferred", batch_id, why), None
             try:
+                # Under the exclusive gate lock, and with no push outstanding: nothing
+                # of Relay's can move this trunk before the summary commits.
                 head = await trunk_head(
                     located["repository"], located["trunk"], timeout=self._remote_timeout
                 )
             except CheckoutFailed:
-                return await self._owed_again(
-                    connection, batch, "deferred", "trunk could not be read"
-                )
+                why = "trunk could not be read"
+                await _owed_again(connection, batch, "deferred", why)
+                return CompletionReceipt("deferred", batch_id, why), None
             if head != batch["trunk"]:
-                return await self._owed_again(
-                    connection, batch, "discarded", "trunk moved while the checks were running"
-                )
+                why = "trunk moved while the checks were running"
+                successor = await _owed_again(connection, batch, "discarded", why)
+                return CompletionReceipt("discarded", batch_id, why), successor
             if not all(each["satisfied"] for each in receipts):
-                return await _fail(connection, batch, receipts)
-            return await _complete(connection, batch, receipts)
+                return await _fail(connection, batch, receipts), None
+            return await _complete(connection, batch, receipts), None
 
-    async def _owed_again(
-        self, connection: Connection, batch: dict[str, Any], state: str, reason: str
-    ) -> CompletionReceipt:
-        """This generation decided nothing; one new completion is owed for its request."""
-        await _close(connection, batch, state, reason)
-        await owe_completion(
-            connection, batch["project_id"], batch["feature_id"], batch["request_id"]
+
+async def end_batches_left_running(connection: Connection, project_id: str) -> None:
+    """On start: whatever was running these checks is gone. Each is ended, with one
+    completion owed after it; its receipts stay as what was seen. Under the gate lock."""
+    left = await (
+        await connection.execute(
+            "SELECT * FROM completion_batches WHERE project_id = %s AND state = 'running' "
+            "ORDER BY created_at FOR UPDATE",
+            (project_id,),
         )
-        return CompletionReceipt(state, batch["batch_id"], reason)
+    ).fetchall()
+    for batch in left:
+        waits = await stopped(connection, project_id, batch["feature_id"])
+        if waits is not None:
+            await _owed_again(connection, batch, "held", f"the feature is {waits}")
+        else:
+            await _owed_again(
+                connection, batch, "interrupted", "the process running these checks ended"
+            )
+
+
+async def _owed_again(
+    connection: Connection, batch: dict[str, Any], state: str, reason: str
+) -> uuid.UUID:
+    """This generation decided nothing; one new completion is owed for its request. This
+    is the only place a completion is owed again."""
+    await _close(connection, batch, state, reason)
+    return await owe_completion(
+        connection, batch["project_id"], batch["feature_id"], batch["request_id"]
+    )
+
+
+async def _disposition(connection: Connection, assignment_id: uuid.UUID) -> CompletionReceipt:
+    """What became of a completion that is no longer wanted."""
+    batch = await (
+        await connection.execute(
+            "SELECT batch_id, state, reason FROM completion_batches WHERE assignment_id = %s",
+            (assignment_id,),
+        )
+    ).fetchone()
+    if batch is None:
+        return CompletionReceipt("retired", None, "this completion was withdrawn unused")
+    return CompletionReceipt(batch["state"], batch["batch_id"], batch["reason"] or "")
+
+
+def _not_started(waits: str) -> CompletionReceipt:
+    return CompletionReceipt("not_started", None, f"the feature is {waits}: nothing starts")
 
 
 async def _snapshot(connection: Connection, project_id: str, feature_id: str) -> dict[str, Any]:

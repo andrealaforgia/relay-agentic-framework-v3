@@ -27,15 +27,100 @@ async def evaluate_completion(connection: Connection, project_id: str, feature_i
     feature is ready to be completed."""
     feature = await (
         await connection.execute(
-            "SELECT state, closed_by, standing(project_id, feature_id, NULL) AS standing "
-            "FROM features WHERE project_id = %s AND feature_id = %s FOR UPDATE",
+            "SELECT state FROM features WHERE project_id = %s AND feature_id = %s FOR UPDATE",
             (project_id, feature_id),
         )
     ).fetchone()
     assert feature is not None
-    ready = await prerequisites_hold(connection, project_id, feature_id)
-    if feature["state"] == "delivering" and ready and feature["standing"] is None:
-        await _admit(connection, project_id, feature_id)
+    state = feature["state"]
+    if state == "delivering":
+        if await prerequisites_hold(connection, project_id, feature_id) and not await stopped(
+            connection, project_id, feature_id
+        ):
+            await _admit(connection, project_id, feature_id)
+    elif state == "checking":
+        if not await prerequisites_hold(connection, project_id, feature_id):
+            # Released: in practice a decision has made the roadmap stale. The Analyst
+            # can reconfirm it or replace it, which they could not while it was checked.
+            await _back_to_delivery(connection, project_id, feature_id)
+            await end_request(
+                connection, project_id, feature_id, "overtaken", "the feature is no longer ready"
+            )
+    elif state == "needs_decision" and not await _gate_is_open(connection, project_id, feature_id):
+        # A decision superseded the gate on the failed check. Reconfirming or replacing
+        # the roadmap makes the feature ready again, and the checks are run afresh.
+        await _back_to_delivery(connection, project_id, feature_id)
+
+
+async def stopped(connection: Connection, project_id: str, feature_id: str) -> str | None:
+    """What keeps a feature's final checks from starting or deciding for now: it is
+    paused, or a question is open over it or over any of its stories. Cancelled is
+    returned exactly."""
+    row = await (
+        await connection.execute(
+            "SELECT standing(%s, %s, NULL) AS standing, "
+            "(SELECT string_agg(question_id::text, ', ' ORDER BY asked_at) FROM questions "
+            "WHERE project_id = %s AND feature_id = %s AND state = 'open') AS questions",
+            (project_id, feature_id, project_id, feature_id),
+        )
+    ).fetchone()
+    assert row is not None
+    if row["standing"] is not None:
+        return str(row["standing"])
+    return f"waiting on question {row['questions']}" if row["questions"] else None
+
+
+async def end_request(
+    connection: Connection, project_id: str, feature_id: str, state: str, why: str
+) -> None:
+    """End a feature's live completion request with whatever it still has: a generation
+    that is running ends with it, and a completion still wanted is retired. Receipts are
+    kept. Nothing is owed after it."""
+    request = await (
+        await connection.execute(
+            "UPDATE completion_requests SET state = %s WHERE project_id = %s AND feature_id = %s "
+            "AND state = 'live' RETURNING request_id",
+            (state, project_id, feature_id),
+        )
+    ).fetchone()
+    if request is None:
+        return
+    await connection.execute(
+        "UPDATE completion_batches SET state = %s, reason = %s WHERE request_id = %s "
+        "AND state = 'running'",
+        (state, why, request["request_id"]),
+    )
+    await connection.execute(
+        "UPDATE assignments SET state = 'retired' WHERE project_id = %s AND feature_id = %s "
+        "AND kind = 'complete' AND state = 'wanted'",
+        (project_id, feature_id),
+    )
+    await append_event(
+        connection,
+        project_id,
+        f"completion.request_{state}",
+        subject_id=feature_id,
+        payload={"request_id": str(request["request_id"]), "reason": why},
+    )
+
+
+async def _back_to_delivery(connection: Connection, project_id: str, feature_id: str) -> None:
+    await connection.execute(
+        "UPDATE features SET state = 'delivering' WHERE project_id = %s AND feature_id = %s",
+        (project_id, feature_id),
+    )
+
+
+async def _gate_is_open(connection: Connection, project_id: str, feature_id: str) -> bool:
+    return (
+        await (
+            await connection.execute(
+                "SELECT 1 FROM gates WHERE project_id = %s AND feature_id = %s "
+                "AND kind = 'completion' AND state = 'open'",
+                (project_id, feature_id),
+            )
+        ).fetchone()
+    ) is not None
 
 
 async def prerequisites_hold(connection: Connection, project_id: str, feature_id: str) -> bool:
@@ -135,10 +220,7 @@ async def settle_gate(connection: Connection, gate: dict[str, Any], outcome: str
         return
     # The roadmap is to change. Until a later revision is approved the feature is not
     # ready, however often that is looked at: a proposal sent back leaves this owed.
-    await connection.execute(
-        "UPDATE features SET state = 'delivering' WHERE project_id = %s AND feature_id = %s",
-        (project_id, feature_id),
-    )
+    await _back_to_delivery(connection, project_id, feature_id)
     await owe(
         connection,
         REVISE,

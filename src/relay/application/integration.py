@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import tempfile
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Concatenate
 
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
@@ -117,6 +118,25 @@ _OUTCOME_OF_INTENT = {
 }
 
 
+def _then_wake[**P](
+    settle: Callable[Concatenate[Integration, uuid.UUID, P], Awaitable[IntegrationReceipt]],
+) -> Callable[Concatenate[Integration, uuid.UUID, P], Awaitable[IntegrationReceipt]]:
+    """After a method that may settle an intent has returned, and so after its
+    transaction has committed, tell whoever waits on this project's pushes."""
+
+    async def settled_and_woken(
+        self: Integration, intent_id: uuid.UUID, /, *arguments: P.args, **named: P.kwargs
+    ) -> IntegrationReceipt:
+        receipt = await settle(self, intent_id, *arguments, **named)
+        if self.after_settlement is not None and receipt.outcome is not Outcome.PENDING:
+            async with self._pool.connection() as connection:
+                intent = await _intent(connection, intent_id)
+            await self.after_settlement(intent["project_id"])
+        return receipt
+
+    return settled_and_woken
+
+
 class Integration:
     def __init__(
         self, pool: Pool, mirrors: Path, oracle: ProcessOracle, push_timeout: float = 120.0
@@ -126,6 +146,9 @@ class Integration:
         self._oracle = oracle
         # How long any one exchange with the repository may take, a read as much as a push.
         self._push_timeout = push_timeout
+        # Called with the project after an authorised push has been driven or settled,
+        # outside any transaction: something that waited for it may be able to go on.
+        self.after_settlement: Callable[[str], Awaitable[None]] | None = None
 
     def _mirror(self, project_id: str) -> Mirror:
         return Mirror(self._mirrors / f"{require_identifier('project', project_id)}.git")
@@ -687,6 +710,7 @@ class Integration:
             issued_on={"cycle_id": str(cycle_id)},
         )
 
+    @_then_wake
     async def _drive(self, intent_id: uuid.UUID) -> IntegrationReceipt:
         """Send the authorised update. Everything that can be settled on this side is
         settled first; the send is then counted, in its own transaction, immediately
@@ -845,6 +869,7 @@ class Integration:
             return IntegrationReceipt(Outcome.PENDING, intent["batch_id"], intent["refusal"])
         return await self._drive(intent_id)
 
+    @_then_wake
     async def _converged(self, intent_id: uuid.UUID) -> IntegrationReceipt:
         async with self._pool.connection() as connection, connection.transaction():
             located = await _intent(connection, intent_id)
@@ -907,6 +932,7 @@ class Integration:
             await evaluate_story_gate(connection, intent["project_id"], row["story_id"])
             return IntegrationReceipt(Outcome.INTEGRATED, intent["batch_id"])
 
+    @_then_wake
     async def _refused(
         self, intent_id: uuid.UUID, reason: str, *, sent: bool
     ) -> IntegrationReceipt:
@@ -959,6 +985,7 @@ class Integration:
             )
         return IntegrationReceipt(Outcome.PENDING, intent["batch_id"], reason)
 
+    @_then_wake
     async def _conflicted(self, intent_id: uuid.UUID, head: str) -> IntegrationReceipt:
         """Trunk has moved on to something that is not the candidate. No push under this
         intent can land now, so the intent is over, and the candidate must be observed

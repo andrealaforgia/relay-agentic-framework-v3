@@ -39,6 +39,7 @@ from relay.application.closure import (
     require_current,
     story_basis,
 )
+from relay.application.completion import evaluate_completion
 from relay.application.features import Features
 from relay.application.stories import (
     _close_gate,
@@ -410,6 +411,7 @@ class Decisions:
                 if revision == proposed:
                     await reopen_roadmap_gate(connection, project_id, feature_id)
                 await release_next(connection, project_id)
+                await evaluate_completion(connection, project_id, feature_id)
         await self._features.reconcile(project_id)
 
     async def reconfirm_story(
@@ -765,7 +767,10 @@ async def _after_a_decision(connection: Connection, scope: dict[str, Any]) -> No
     gates = await (
         await connection.execute(
             "SELECT * FROM gates WHERE project_id = %s AND feature_id = %s AND state = 'open' "
-            "AND ((kind = 'roadmap' AND %s::text IS NULL) OR story_id = ANY(%s)) FOR UPDATE",
+            # A decision over the whole feature also overtakes the gate on a final check
+            # that failed: what was shown there was shown under the decisions before it.
+            "AND ((kind IN ('roadmap', 'completion') AND %s::text IS NULL) "
+            "OR story_id = ANY(%s)) FOR UPDATE",
             (project_id, feature_id, story_scope, in_scope),
         )
     ).fetchall()
@@ -821,6 +826,8 @@ async def _after_a_decision(connection: Connection, scope: dict[str, Any]) -> No
                 story_id=story["story_id"],
                 behaviour_id=behaviour["behaviour_id"],
             )
+    # A feature at its final checks whose roadmap this has made stale is no longer ready.
+    await evaluate_completion(connection, project_id, feature_id)
 
 
 async def _owe_reconfirmation(
