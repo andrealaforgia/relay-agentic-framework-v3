@@ -71,15 +71,22 @@ class Behaviours:
         return Mirror(self._mirrors / f"{require_identifier('project', project_id)}.git")
 
     async def open_project(self, project_id: str, repository: str, trunk: str = "main") -> None:
+        """One project per managed trunk: what a candidate must still satisfy is recorded
+        per project, and a project's lock covers only its own pushes. Projects may share
+        a repository on different branches."""
+        address = canonical_repository(repository)
         async with self._pool.connection() as connection, connection.transaction():
-            await connection.execute(
-                "INSERT INTO projects (project_id, repository, trunk) VALUES (%s, %s, %s)",
-                (
-                    require_identifier("project", project_id),
-                    canonical_repository(repository),
-                    trunk,
-                ),
-            )
+            managed = await (
+                await connection.execute(
+                    "INSERT INTO projects (project_id, repository, trunk) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (repository, trunk) DO NOTHING RETURNING project_id",
+                    (require_identifier("project", project_id), address, trunk),
+                )
+            ).fetchone()
+            if managed is None:
+                raise ValueError(
+                    f"branch {trunk!r} of that repository is already managed by another project"
+                )
             await connection.execute(
                 "INSERT INTO project_gates (project_id) VALUES (%s)", (project_id,)
             )

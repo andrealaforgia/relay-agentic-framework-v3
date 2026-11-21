@@ -7,6 +7,10 @@ CREATE TABLE projects (
     opened_at     timestamptz NOT NULL DEFAULT now()
 );
 
+-- One project per managed trunk. Projects may share a repository on different branches.
+CREATE UNIQUE INDEX one_project_per_trunk ON projects (repository, trunk);
+
+
 CREATE TABLE behaviours (
     project_id      text NOT NULL REFERENCES projects,
     behaviour_id    text NOT NULL,

@@ -24,11 +24,18 @@ def test_a_relative_local_path_is_made_absolute_once(
         "git@github.com:someone/project.git",
         "https://example.com/someone/project.git",
         "ssh://git@example.com/someone/project.git",
-        "file:///srv/git/project.git",
+        "file://another-host/srv/git/project.git",
     ],
 )
 def test_a_remote_address_is_kept_as_given(address: str) -> None:
     assert canonical_repository(address) == address
+
+
+@pytest.mark.parametrize(
+    "url", ["file:///srv/git/my%20project.git", "file://localhost/srv/git/my%20project.git"]
+)
+def test_a_file_url_to_this_machine_is_the_repository_at_that_path(url: str) -> None:
+    assert canonical_repository(url) == canonical_repository("/srv/git/my project.git")
 
 
 def test_an_address_carrying_credentials_is_still_refused() -> None:

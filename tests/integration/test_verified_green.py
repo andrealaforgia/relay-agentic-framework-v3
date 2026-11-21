@@ -5,6 +5,7 @@ paired with the red: same contract, same runtime, built on the revision the red 
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,11 @@ from tests.integration.fixtures import (
 )
 
 PROJECT = "vat-calculator"
+
+
+def branch(repository: Path, name: str) -> None:
+    """Another branch of the same repository, at the current head."""
+    subprocess.run(["git", "-C", str(repository), "branch", name], check=True)
 
 
 async def released_to_builder(
@@ -255,7 +261,8 @@ async def test_another_projects_candidate_on_the_same_repository_is_not_this_pro
 ) -> None:
     repository = tmp_path / "subject"
     behaviours, red_revision = await released_to_builder(database, repository, runner_image)
-    await behaviours.open_project("other-team", str(repository))
+    branch(repository, "release")  # one trunk is managed by one project (D-9)
+    await behaviours.open_project("other-team", str(repository), trunk="release")
     await in_a_story(behaviours, "other-team")
     await behaviours.propose(
         "other-team", "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0, story_revision=1

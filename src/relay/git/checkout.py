@@ -12,7 +12,7 @@ import tempfile
 from contextlib import suppress
 from pathlib import Path
 from typing import IO
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from relay.domain.identifiers import require_identifier
 
@@ -75,6 +75,13 @@ def canonical_repository(repository: str) -> str:
     here, once: Git run from another directory would otherwise read it as another place."""
     require_credential_free(repository)
     head = repository.split("/", 1)[0]
+    if repository.startswith("file://"):
+        # The same place as its path, and known by the same address: one trunk is
+        # managed by one project, however it was written when the project was opened.
+        address = urlsplit(repository)
+        if address.hostname in (None, "localhost"):
+            return str(Path(unquote(address.path)).resolve())
+        return repository
     if "://" in repository or ":" in head:
         return repository  # a URL, or an scp-style host:path address
     return str(Path(repository).resolve())
