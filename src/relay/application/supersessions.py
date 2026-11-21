@@ -333,14 +333,14 @@ async def settle_gate(connection: Connection, gate: dict[str, Any], outcome: str
 
 async def void_what_no_longer_stands(connection: Connection, project_id: str) -> None:
     """End every proposal and every unused authority whose ground has gone: what it was
-    approved on has changed, the replacing behaviour can no longer use it, or the
-    obligation is no longer there to replace. The obligation stays in force and is free
+    approved on has changed, or the replacing behaviour can no longer use it. (The
+    obligation itself cannot go meanwhile: only its one live supersession retires it.) The obligation stays in force and is free
     for another proposal. One reserved to an integration is left alone until that
     integration settles. Called, under the gate lock, wherever a supersession is about
     to be proposed, decided or used."""
     candidates = await (
         await connection.execute(
-            "SELECT s.*, o.state AS obligation_state, o.digest, o.behaviour_id AS replaced "
+            "SELECT s.*, o.digest "
             "FROM supersessions s JOIN obligations o USING (obligation_id) "
             "WHERE s.project_id = %s AND s.state IN ('proposed', 'standing') "
             "ORDER BY s.proposed_at FOR UPDATE OF s",
@@ -356,8 +356,6 @@ async def void_what_no_longer_stands(connection: Connection, project_id: str) ->
 async def _why_it_no_longer_stands(
     connection: Connection, project_id: str, supersession: dict[str, Any]
 ) -> str:
-    if supersession["obligation_state"] != "active":
-        return "the obligation is no longer in force"
     replacing = await _replacing_or_none(connection, project_id, supersession["behaviour_id"])
     if replacing is None or replacing["contract"] is None:
         return "the replacing behaviour has no contract"

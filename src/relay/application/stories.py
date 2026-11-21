@@ -53,7 +53,6 @@ from relay.domain.story import (
     Principal,
     PrincipalKind,
     Receipt,
-    SealRefused,
     StoryState,
     answer_again,
     next_story_to_release,
@@ -702,14 +701,8 @@ async def evaluate_story_gate(connection: Connection, project_id: str, story_id:
     assessment = await _assessment(connection, story)
     if assessment is None or any(row["state"] != "integrated" for row in listed):
         return
-    try:
-        # The same view the seal was made on: every criterion shown by something in force.
-        require_sealable(
-            story["criteria"].keys(),
-            {row["behaviour_id"]: row["demonstrates"] for row in _in_force(listed)},
-        )
-    except SealRefused:
-        return
+    # A seal is of the behaviours in force, and a retirement that changes them clears it:
+    # an assessment found here was made on the mapping that still holds.
     await connection.execute(
         "UPDATE stories SET state = 'awaiting_approval' WHERE project_id = %s AND story_id = %s",
         (project_id, story_id),

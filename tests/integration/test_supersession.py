@@ -6,6 +6,7 @@ the replacement reaches trunk."""
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -22,10 +23,18 @@ from relay.domain.evidence import Baseline, Expected
 from relay.domain.story import ActionRefused, StoryState
 from relay.git.checkout import RemoteUnavailable
 from relay.git.mirror import Mirror
+from relay.testing.oracle import ContainerIsolation
 from tests.integration.decision_world import DecisionWorld
-from tests.integration.fixtures import ANALYST, CONTRACT, PRODUCT_OWNER, VERIFIER
+from tests.integration.fixtures import (
+    ANALYST,
+    CONTRACT,
+    PRODUCT_OWNER,
+    VERIFIER,
+    HeldAtABarrier,
+    held_at_the_barrier,
+)
 from tests.integration.story_world import at_the_story_gate
-from tests.integration.trunk_world import GREETING, PROJECT
+from tests.integration.trunk_world import GREETING, PROJECT, ZERO_STAYS_ZERO
 
 REDUCED_RATE = replace(
     CONTRACT,
@@ -111,6 +120,7 @@ async def test_an_approved_supersession_lets_the_replacement_in_and_retires_what
     assert item.manifest["replaces"]["contract"]["contract_id"] == CONTRACT.contract_id
     assert item.manifest["with"]["contract"]["contract_id"] == REDUCED_RATE.contract_id
     assert (item.manifest["with"]["story_id"], item.manifest["reason"]) == ("S2", WHY)
+    assert item.manifest["with"]["story_revision"] == await world.revision("S2")
 
     assert (await world.decide(gate)).disposition == "effective"
     assert await world.in_force() == [CONTRACT.contract_id]  # still in force for everyone else
@@ -201,11 +211,22 @@ async def test_the_verifier_can_withdraw_a_proposal_nobody_has_decided(
     await world.awaiting_builder("Z", REDUCED_RATE, "S2")
     gate = await world.propose()
 
+    with pytest.raises(ActionRefused, match="for the verifier"):
+        await world.supersessions.withdraw(ANALYST, PROJECT, gate)
     await world.supersessions.withdraw(VERIFIER, PROJECT, gate)
 
     assert await world.stories.inbox(PROJECT) == []
     assert (await world.decide(gate)).disposition == "stale"
-    await world.propose()
+    with pytest.raises(ActionRefused, match="no such proposal waiting"):
+        await world.supersessions.withdraw(VERIFIER, PROJECT, gate)
+    decided = await world.propose()
+    await world.decide(decided)
+    with pytest.raises(ActionRefused, match="no such proposal waiting"):
+        await world.supersessions.withdraw(VERIFIER, PROJECT, decided)
+    assert await world.column("SELECT state FROM supersessions ORDER BY proposed_at") == [
+        "withdrawn",
+        "standing",
+    ]
 
 
 async def test_an_approval_that_comes_after_the_replacement_went_in_the_ordinary_way_is_stale(
@@ -397,3 +418,87 @@ async def test_an_authority_survives_a_restart_and_is_used_once(world: Supersedi
     await world.features.start()
     assert await world.column("SELECT state FROM supersessions") == ["used"]
     assert (await world.events()).count("obligation.retired") == 1
+
+
+async def test_a_required_project_check_is_not_replaced_by_a_storys_work(
+    world: Superseding,
+) -> None:
+    await world.integration.require_check(PROJECT, GREETING.as_check())
+    await world.awaiting_builder("Z", REDUCED_RATE, "S2")
+    [check] = [
+        each for each in await world.supersessions.obligations(PROJECT) if each.source == "check"
+    ]
+
+    with pytest.raises(ActionRefused, match="required project check"):
+        await world.supersessions.propose(
+            VERIFIER,
+            PROJECT,
+            obligation=check.obligation_id,
+            digest=check.digest,
+            behaviour="Z",
+            reason=WHY,
+        )
+
+    assert await world.column("SELECT count(*) FROM supersessions") == [0]
+
+
+async def test_a_replacement_is_proposed_only_for_work_that_can_go_on(world: Superseding) -> None:
+    await world.awaiting_builder("Z", REDUCED_RATE, "S2")
+    await world.close("pause", reason="the rates are being reconsidered")
+
+    with pytest.raises(ActionRefused, match="paused"):
+        await world.propose()
+
+    assert await world.stories.inbox(PROJECT) == []
+
+
+async def test_a_behaviour_with_no_contract_yet_replaces_nothing(world: Superseding) -> None:
+    await world.behaviours.propose(
+        PROJECT, "S2", "Z", "the reduced rate", ["AC1"],
+        basis=await world.basis("S2"), story_revision=await world.revision("S2"),
+    )  # fmt: skip
+
+    with pytest.raises(ActionRefused, match="no registered contract"):
+        await world.propose()
+
+
+async def test_a_proposal_is_approved_or_sent_back_and_records_what_it_was_made_on(
+    world: Superseding,
+) -> None:
+    await world.awaiting_builder("Z", REDUCED_RATE, "S2")
+    gate = await world.propose()
+    obligation = await world.obligation_of("B1")
+
+    assert await world.column("SELECT basis FROM supersessions") == [
+        {
+            "obligation_id": str(obligation.obligation_id),
+            "obligation_digest": obligation.digest,
+            "contract_digest": REDUCED_RATE.digest,
+            "story_revision": await world.revision("S2"),
+            "decisions": await world.basis("S2"),
+        }
+    ]
+    with pytest.raises(ActionRefused):
+        await world.decide(gate, "reject", reason="no")
+    assert await world.column("SELECT state FROM supersessions") == ["proposed"]
+
+
+async def test_trunk_moved_by_someone_else_under_an_excused_push_leaves_the_authority_standing(
+    world: Superseding,
+) -> None:
+    await world.integration.require_check(PROJECT, ZERO_STAYS_ZERO)  # something to run
+    await z_reviewed(world)
+    await world.decide(await world.propose())
+    barrier = HeldAtABarrier(ContainerIsolation(world.image))
+    running = asyncio.create_task(world.integration_with(barrier).integrate(PROJECT, "Z", "first"))
+    await held_at_the_barrier(running, barrier)
+
+    elsewhere = world.advance_trunk({"notes.txt": "someone else was here\n"})
+    barrier.release.set()
+
+    assert (await running).outcome is Outcome.CONFLICTED
+    assert world.trunk() == elsewhere
+    assert await world.column("SELECT state FROM supersessions WHERE intent_id IS NULL") == [
+        "standing"
+    ]
+    assert (await world.obligation_of("B1")).state == "active"

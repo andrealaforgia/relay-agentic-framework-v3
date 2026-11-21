@@ -155,3 +155,17 @@ async def test_only_a_behaviour_on_trunk_is_declared_to_be_replaced(world: Super
         )
 
     assert [each["subject"] for each in await world.owed()] == ["behaviour"]
+
+
+async def test_a_decision_asks_nothing_about_a_behaviour_that_was_replaced(
+    world: Superseding,
+) -> None:
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    await world.deliver("B1")
+    await z_replaces_b1(world, await z_awaiting_builder(world, ["AC1"]))
+
+    await world.answer(await world.ask("S1"))
+
+    assert sorted(
+        (each["subject"], each["behaviour_id"]) for each in await world.owed() if each["story_id"]
+    ) == [("behaviour", "Z"), ("story", None)]
