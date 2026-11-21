@@ -23,6 +23,7 @@ from relay.application.closure import (
     require_open,
     require_startable,
 )
+from relay.application.workers import is_alive
 from relay.domain.story import ActionRefused, Principal, PrincipalKind
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
@@ -124,7 +125,7 @@ async def announce_again(connection: Connection, project_id: str) -> int:
         await connection.execute(
             "UPDATE outbox SET published_at = NULL WHERE message_id IN "
             "(SELECT a.command_message_id FROM assignments a "
-            "WHERE a.project_id = %s AND a.state = 'wanted' "
+            "WHERE a.project_id = %s AND a.state = 'wanted' AND a.parked IS NULL "
             "AND standing(a.project_id, a.feature_id, a.story_id) IS NULL) "
             "RETURNING message_id",
             (project_id,),
@@ -211,15 +212,18 @@ async def retire(connection: Connection, assignment_id: uuid.UUID) -> None:
 
 
 async def revoke_every_grant(connection: Connection, project_id: str) -> None:
-    """On start: whoever held a grant was in a process that is gone. Every grant is taken
-    back, with or without a first effect, and a green run left unfinished is marked so.
-    What those workers recorded stays as history."""
+    """On start: whoever held a grant in the control plane's own process is gone with it.
+    Each of those grants is taken back, with or without a first effect, and a green run
+    left unfinished is marked so. What they recorded stays as history. A grant held by a
+    worker process is not touched here: whether that worker is alive is asked of the
+    database, and what it left is dealt with by `Invocations.recover`."""
     await connection.execute(
         "UPDATE green_runs SET state = 'interrupted' WHERE state = 'started' AND assignment_id "
-        "IN (SELECT assignment_id FROM assignments WHERE project_id = %s)",
+        "IN (SELECT assignment_id FROM assignments WHERE project_id = %s "
+        "AND granted_worker IS NULL)",
         (project_id,),
     )
-    await _revoke(connection, project_id, "TRUE", ())
+    await _revoke(connection, project_id, "granted_worker IS NULL", ())
 
 
 async def retire_all_of_story(connection: Connection, project_id: str, story_id: str) -> None:
@@ -323,9 +327,14 @@ class Assignments:
     def __init__(self, pool: Pool) -> None:
         self._pool = pool
 
-    async def claim(self, principal: Principal, assignment_id: uuid.UUID) -> uuid.UUID:
+    async def claim(
+        self, principal: Principal, assignment_id: uuid.UUID, worker: uuid.UUID | None = None
+    ) -> uuid.UUID:
         """Grant a wanted assignment of an open feature to this worker, and return the
-        grant. The same worker asking again is given the same grant."""
+        grant. The same worker asking again is given the same grant. `worker` is the
+        worker process the grant belongs to, which has to be alive: when it is gone, the
+        pass deals with what it left. A grant with no worker is one made by a caller in
+        the control plane's own process, and ends with that process."""
         async with self._pool.connection() as connection:
             known = await (
                 await connection.execute(
@@ -383,6 +392,10 @@ class Assignments:
                 raise ActionRefused(
                     f"the integration of {assignment['behaviour_id']} has not settled yet"
                 )
+            if assignment["parked"] is not None:
+                raise ActionRefused(f"this work is parked: {assignment['parked']}")
+            if worker is not None and not await is_alive(connection, worker):
+                raise ActionRefused("this worker is not running")
             if assignment["state"] == "granted":
                 if assignment["granted_to"] != principal.identity:
                     raise ActionRefused("this work is already granted to another worker")
@@ -392,9 +405,9 @@ class Assignments:
                 raise ActionRefused("this work is no longer wanted")
             grant_id = uuid.uuid7()
             await connection.execute(
-                "UPDATE assignments SET state = 'granted', grant_id = %s, granted_to = %s "
-                "WHERE assignment_id = %s",
-                (grant_id, principal.identity, assignment_id),
+                "UPDATE assignments SET state = 'granted', grant_id = %s, granted_to = %s, "
+                "granted_worker = %s WHERE assignment_id = %s",
+                (grant_id, principal.identity, worker, assignment_id),
             )
             await append_event(
                 connection,
@@ -425,7 +438,7 @@ async def _revoke(
     ).fetchall()
     await connection.execute(
         "UPDATE assignments SET state = 'wanted', grant_id = NULL, granted_to = NULL, "
-        "first_effect_at = NULL WHERE assignment_id = ANY(%s)",
+        "granted_worker = NULL, first_effect_at = NULL WHERE assignment_id = ANY(%s)",
         ([grant["assignment_id"] for grant in revoked],),
     )
     for grant in revoked:

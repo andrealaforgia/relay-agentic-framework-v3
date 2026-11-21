@@ -112,7 +112,7 @@ CREATE UNIQUE INDEX one_open_gate_per_subject
 CREATE TABLE inbox_items (
     item_id    uuid PRIMARY KEY,
     project_id text NOT NULL REFERENCES projects,
-    kind       text NOT NULL CHECK (kind IN ('gate', 'question')),
+    kind       text NOT NULL CHECK (kind IN ('gate', 'question', 'invocation')),
     gate_id    uuid REFERENCES gates,
     state      text NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'closed')),
     opened_at  timestamptz NOT NULL DEFAULT now()

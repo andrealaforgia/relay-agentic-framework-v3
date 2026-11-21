@@ -19,6 +19,7 @@ from relay.application.integration import (
     IntegrationRefused,
     hand_on_unfinished_batches,
 )
+from relay.application.invocations import Invocations
 from relay.application.reviews import Reviews
 from relay.application.stories import Stories, close_feature
 from relay.domain.story import ActionRefused, HumanAction, Receipt
@@ -35,10 +36,12 @@ class Features:
         reviews: Reviews,
         integration: Integration,
         completion: Completion | None = None,
+        invocations: Invocations | None = None,
     ) -> None:
         self._pool = pool
         self._reviews = reviews
         self._integration = integration
+        self._invocations = invocations
         # In this process the control plane observes final checks as it observes an
         # integration's: with the same oracle, and the same patience with the remote.
         # A completion put off behind a push is taken up by whichever control plane
@@ -110,6 +113,9 @@ class Features:
                 await lock_gate(connection, project_id)
                 await lock_project(connection, project_id)
                 await evaluate_completion(connection, project_id, feature["feature_id"])
+        if self._invocations is not None:
+            # What a worker that is gone left behind: a grant, a call, a known result.
+            await self._invocations.recover(project_id)
         # The completions are taken up once, at the end of this pass.
         await self._integration.reconcile(then_completions=False)
         await self._reviews.publish_candidates()
