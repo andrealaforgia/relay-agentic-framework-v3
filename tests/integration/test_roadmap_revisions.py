@@ -67,6 +67,7 @@ async def test_a_story_exists_once_its_roadmap_is_approved_and_not_before(
 async def test_a_roadmap_that_was_sent_back_can_be_proposed_again(world: StoryWorld) -> None:
     first = await world.roadmap(STANDARD_RATE, GREETS)
     await world.decide(first, "request_changes", reason="one story is enough")
+    assert (await world.stories.roadmap_of(PROJECT, "F1")).proposed is None
 
     again = await world.revise(STANDARD_RATE)
 
@@ -136,6 +137,9 @@ async def test_a_dropped_story_is_withdrawn_and_an_added_one_takes_its_turn(
 
     assert await world.story("S2") is StoryState.WITHDRAWN
     assert await world.story("S3") is StoryState.PLANNED
+    with pytest.raises(ActionRefused, match="S2 is already the name of a story"):
+        # A name that was used is used: a story that was dropped is not proposed afresh.
+        await world.revise(Kept("S3"), Kept("S1"), GREETS)
     assert (await world.stories.roadmap_of(PROJECT, "F1")).stories == ("S3", "S1")
     with pytest.raises(ActionRefused, match="not being worked on"):
         await world.behaviours.propose(PROJECT, "S2", "B9", "too late", ["AC1"], basis=0)

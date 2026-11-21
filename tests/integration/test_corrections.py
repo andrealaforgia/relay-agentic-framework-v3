@@ -200,6 +200,15 @@ async def test_a_proposal_that_only_adds_is_reconfirmed_and_put_to_the_person_ag
     await decided(world, story=None)
     proposal = next(each for each in await world.owed() if each["revision"] == 2)
     grant = await world.claims.claim(ANALYST, proposal["assignment_id"])
+    with pytest.raises(ActionRefused, match="not the current one"):
+        # The grant is for the proposal. It says nothing about the roadmap in force.
+        await world.decisions.reconfirm_roadmap(
+            ANALYST, PROJECT, "F1", grant=grant, basis=1, revision=1
+        )
+    with pytest.raises(ActionRefused, match="is not F1's roadmap"):
+        await world.decisions.reconfirm_roadmap(
+            ANALYST, PROJECT, "F1", grant=grant, basis=1, revision=7
+        )
 
     await world.decisions.reconfirm_roadmap(
         ANALYST, PROJECT, "F1", grant=grant, basis=1, revision=2

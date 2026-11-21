@@ -1196,9 +1196,8 @@ async def _settle_roadmap(connection: Connection, gate: Mapping[str, Any], outco
             "AND revision = %s",
             (project_id, feature_id, revision),
         )
-        await retire_what_a_roadmap_answers(
-            connection, project_id, feature_id, revisions=[revision]
-        )
+        # Nothing is owed for it: a proposal waiting to be reconfirmed has no open gate
+        # to be sent back at.
         return True
     effective, _ = await _revisions_of(connection, project_id, feature_id)
     entries = await _entries(connection, project_id, feature_id, revision)

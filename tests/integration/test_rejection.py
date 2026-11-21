@@ -5,6 +5,7 @@ the feature starts."""
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from pathlib import Path
 from typing import Any
@@ -12,11 +13,21 @@ from typing import Any
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
+from relay.application.behaviours import Behaviours
 from relay.application.stories import Dropped, Kept, StoryDraft
 from relay.domain.behaviour import BehaviourState
+from relay.domain.evidence import RedRejection
 from relay.domain.story import ActionRefused, HumanAction, Receipt, StoryState
+from relay.testing.oracle import ContainerIsolation, ProcessOracle
 from tests.integration.decision_world import DecisionWorld
-from tests.integration.fixtures import ANALYST, PRODUCT_OWNER, run_green
+from tests.integration.fixtures import (
+    ANALYST,
+    CONTRACT,
+    PRODUCT_OWNER,
+    HeldAtABarrier,
+    held_at_the_barrier,
+    run_green,
+)
 from tests.integration.story_world import GREETS, STANDARD_RATE, at_the_story_gate
 from tests.integration.trunk_world import GREETING, PROJECT
 
@@ -268,3 +279,37 @@ async def test_a_story_that_is_rejected_or_withdrawn_is_history_to_questions_and
         ("roadmap", None),
         ("story", "C1"),
     ]
+
+
+async def test_setting_aside_the_story_that_holds_the_place_lets_another_feature_start(
+    world: DecisionWorld,
+) -> None:
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    await world.decide(await world.roadmap(ANOTHER, feature="F2"))
+    assert await world.story("T1") is StoryState.PLANNED
+
+    await reject(world, "S1")
+
+    assert await world.story("T1") is StoryState.RELEASED
+    assert (await world.events())[-2:] == ["story.rejected", "story.released"]
+
+
+async def test_a_red_that_finishes_after_its_story_was_set_aside_is_evidence_only(
+    world: DecisionWorld,
+) -> None:
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.begin_test_design(PROJECT, "B1")
+    await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
+    barrier = HeldAtABarrier(ContainerIsolation(world.image))
+    slow = Behaviours(world.database, world.mirrors, ProcessOracle(barrier))
+    running = asyncio.create_task(slow.run_red(PROJECT, "B1"))
+    await held_at_the_barrier(running, barrier)
+
+    await reject(world, "S1")
+    barrier.release.set()
+
+    assert (await running).rejection is RedRejection.SUPERSEDED
+    assert await world.state("B1") is BehaviourState.VALIDATING_RED
+    assert await world.column("SELECT count(*) FROM assignments WHERE kind = 'build'") == [0]
+    assert await world.column("SELECT count(*) FROM executions WHERE purpose = 'red'") == [1]
