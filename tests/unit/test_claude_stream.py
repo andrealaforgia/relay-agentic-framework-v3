@@ -1,6 +1,7 @@
 """Reading what the Claude CLI prints, from streams recorded from real runs. The
 terminal event is kept whole and classified by its own fields; nothing is inferred."""
 
+import json
 from decimal import Decimal
 from pathlib import Path
 
@@ -94,3 +95,40 @@ def test_counters_the_provider_did_not_report_are_not_zero() -> None:
     assert reported.output_tokens is None
     assert reported.cache_write_1h_tokens is None
     assert ended.provider_cost_usd is None
+
+
+def test_a_terminal_event_is_a_success_only_if_both_of_its_fields_say_so() -> None:
+    def ended(**fields: object) -> Terminal:
+        [found] = read_stream([json.dumps({"type": "result", **fields})])
+        assert isinstance(found, Terminal)
+        return found
+
+    assert ended(subtype="success", is_error=False).succeeded
+    assert not ended(subtype="success", is_error=True).succeeded
+    assert not ended(subtype="error_during_execution", is_error=False).succeeded
+    assert not ended(subtype="success").succeeded
+
+
+def test_a_tool_call_that_was_refused_is_read_as_refused() -> None:
+    [outcome] = read_stream(
+        [
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "is_error": True,
+                                "content": "Permission to read /etc/passwd was denied",
+                            }
+                        ]
+                    },
+                }
+            )
+        ]
+    )
+
+    assert isinstance(outcome, ToolOutcome)
+    assert outcome.is_error and "denied" in outcome.content
