@@ -27,7 +27,6 @@ from relay.providers.claude import (
     ProviderUnavailable,
     Request,
 )
-from relay.providers.stream import Event, Terminal
 
 # How often a call is prepared again because what it was prepared from moved.
 _PREPARATIONS = 3
@@ -65,7 +64,7 @@ class Task(Protocol):
 
 class Provider(Protocol):
     async def invoke(
-        self, request: Request, *, on_event: Callable[[Event], None] | None = None
+        self, request: Request, *, on_result: Callable[[ProviderResult], None] | None = None
     ) -> ProviderResult: ...
 
 
@@ -115,8 +114,7 @@ class Worker:
             if admission.outcome == "apply":
                 # A result is already known for this work. Nothing is called.
                 return await self._invocations.apply(admission.invocation_id, self._session)
-            result = await self._call(admission.invocation_id, task, assignment, call)
-            state = await self._record(admission.invocation_id, task, assignment, call, result)
+            state = await self._call(admission.invocation_id, task, assignment, call)
             if state == "returned":
                 state = await self._invocations.apply(admission.invocation_id, self._session)
                 if state != "rejected":
@@ -129,38 +127,16 @@ class Worker:
             # The call gave nothing usable. Whether another is allowed is admission's to
             # say, and the next briefing says what was wrong with this one.
 
-    async def _record(
-        self,
-        invocation_id: uuid.UUID,
-        task: Task,
-        assignment: Mapping[str, Any],
-        call: Call,
-        result: ProviderResult,
-    ) -> str:
-        problem = _problem(task, result)
-        retained = (
-            await task.retain(assignment, call)
-            if result.outcome is Outcome.RETURNED and problem is None and not result.unusable
-            else None
-        )
-        return await self._invocations.record(
-            invocation_id, result, problem=problem, retained=retained
-        )
-
     async def _call(
         self, invocation_id: uuid.UUID, task: Task, assignment: Mapping[str, Any], call: Call
-    ) -> ProviderResult:
-        """Call the provider, and whatever happens, leave on record what is known of
-        the call at the moment it is known: that it never started, that it ended with
-        this result, or that nobody can say."""
-        ended: list[Terminal] = []
-
-        def listen(event: Event) -> None:
-            if isinstance(event, Terminal):
-                ended.append(event)
-
+    ) -> str:
+        """Call the provider and record what came of it. Whatever happens from the call
+        being made to its record being durable, what is known of the call is recorded:
+        that it never started, that it ended with this result, or that nobody can say.
+        Returns the state the call was recorded in."""
+        heard: list[ProviderResult] = []
         try:
-            return await self._provider.invoke(
+            result = await self._provider.invoke(
                 Request(
                     invocation_id=invocation_id,
                     definition=call.prepared.definition,
@@ -173,32 +149,61 @@ class Worker:
                     timeout=call.timeout,
                     budget_usd=call.budget_usd,
                 ),
-                on_event=listen,
+                on_result=heard.append,
             )
         except ProviderUnavailable as unavailable:
             # Established before anything was launched: nothing was spent.
-            return ProviderResult(Outcome.NOT_STARTED, reason=str(unavailable))
+            result = ProviderResult(Outcome.NOT_STARTED, reason=str(unavailable))
         except BaseException as cut_short:
             # Cancelled, or failed in a way nobody planned for, after the call may have
-            # been launched. If its terminal event had been read, that is its result, and
-            # it is recorded as any result is. Recorded by a task of its own: a caller
-            # cancelled again must not take the record with it.
+            # been launched. If the provider had already said how it ended, that is its
+            # result, as the provider classified it.
             known = (
-                ProviderResult(
-                    Outcome.RETURNED if ended[-1].succeeded else Outcome.ERRORED, ended[-1]
-                )
-                if ended
+                heard[-1]
+                if heard
                 else ProviderResult(
                     Outcome.UNCERTAIN, reason=f"the call was cut short: {cut_short!r}"
                 )
             )
-            recording = asyncio.create_task(
-                self._record(invocation_id, task, assignment, call, known)
-            )
-            self._recording.add(recording)
-            recording.add_done_callback(self._recording.discard)
-            await asyncio.shield(recording)
+            await self._recorded(invocation_id, task, assignment, call, known)
             raise
+        return await self._recorded(invocation_id, task, assignment, call, result)
+
+    async def _recorded(
+        self,
+        invocation_id: uuid.UUID,
+        task: Task,
+        assignment: Mapping[str, Any],
+        call: Call,
+        result: ProviderResult,
+    ) -> str:
+        """Record, by a task of the worker's own: a caller that is cancelled while the
+        record is being made does not take the record with it."""
+        recording = asyncio.create_task(self._record(invocation_id, task, assignment, call, result))
+        self._recording.add(recording)
+        recording.add_done_callback(self._recording.discard)
+        return await asyncio.shield(recording)
+
+    async def _record(
+        self,
+        invocation_id: uuid.UUID,
+        task: Task,
+        assignment: Mapping[str, Any],
+        call: Call,
+        result: ProviderResult,
+    ) -> str:
+        problem = _problem(task, result)
+        retained = None
+        if result.outcome is Outcome.RETURNED and problem is None and not result.unusable:
+            try:
+                retained = await task.retain(assignment, call)
+            except Exception as failure:  # noqa: BLE001 - whatever stopped it is recorded
+                # The reply arrived and what it left could not be kept. That is known,
+                # and is recorded with what the call used.
+                problem = f"what the call left could not be kept: {failure}"
+        return await self._invocations.record(
+            invocation_id, result, problem=problem, retained=retained
+        )
 
 
 def _problem(task: Task, result: ProviderResult) -> str | None:

@@ -497,8 +497,17 @@ async def _has_an_unsettled_integration(
 
 
 async def _retire(connection: Connection, where: str, parameters: tuple[Any, ...]) -> None:
+    retired = await (
+        await connection.execute(
+            "UPDATE assignments SET state = 'retired', grant_id = NULL, granted_to = NULL, "
+            f"parked = NULL WHERE state = ANY(%s) AND {where} RETURNING assignment_id",
+            (list(_LIVE), *parameters),
+        )
+    ).fetchall()
+    # Work that is ended asks nothing more of anyone: a call of it that a person was
+    # being asked about leaves the inbox with it.
     await connection.execute(
-        "UPDATE assignments SET state = 'retired', grant_id = NULL, granted_to = NULL "
-        f"WHERE state = ANY(%s) AND {where}",
-        (list(_LIVE), *parameters),
+        "UPDATE inbox_items SET state = 'closed' WHERE state = 'open' AND invocation_id IN "
+        "(SELECT invocation_id FROM invocations WHERE assignment_id = ANY(%s))",
+        ([each["assignment_id"] for each in retired],),
     )

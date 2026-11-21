@@ -44,13 +44,13 @@ class Scripted:
         self.then_waits = then_waits
         self.waiting = asyncio.Event()
 
-    async def invoke(self, request: Request, *, on_event: Any = None) -> ProviderResult:
+    async def invoke(self, request: Request, *, on_result: Any = None) -> ProviderResult:
         self.asked.append(request)
         result = self._results.pop(0)
         if isinstance(result, BaseException):
             raise result
-        if result.terminal is not None and on_event is not None:
-            on_event(result.terminal)
+        if result.terminal is not None and on_result is not None:
+            on_result(result)
         if self.then_waits:
             self.waiting.set()
             await asyncio.Event().wait()
@@ -66,9 +66,15 @@ class Summing:
         self.problems: list[str | None] = []
         # Set to make the next preparation read what the work is about too early.
         self.reads_too_early = False
+        self.cannot_keep: Exception | None = None
+        self.keeping: asyncio.Event | None = None
+        self.at_keeping = asyncio.Event()
+        self.during_preparation: Any = None
 
     async def prepare(self, assignment: Mapping[str, Any], last_problem: str | None) -> Call:
         self.problems.append(last_problem)
+        if self.during_preparation is not None:
+            await self.during_preparation()
         read_on = await self._invocations.as_it_stands(assignment["assignment_id"])
         if self.reads_too_early:
             self.reads_too_early = False
@@ -78,6 +84,11 @@ class Summing:
         )
 
     async def retain(self, assignment: Mapping[str, Any], call: Call) -> str | None:
+        if self.keeping is not None:
+            self.at_keeping.set()
+            await self.keeping.wait()
+        if self.cannot_keep is not None:
+            raise self.cannot_keep
         return KEPT
 
     def problem_with(self, reply: Any) -> str | None:
@@ -381,3 +392,114 @@ async def test_a_briefing_written_from_what_has_moved_is_written_again(bench: Be
     assert bench.task.problems == [None, None]  # prepared twice, called once
     assert len(provider.asked) == 1
     assert await bench.states() == ["applied"]
+
+
+async def until(bench: Bench, *states: str) -> None:
+    async with asyncio.timeout(30):
+        while await bench.states() != list(states):
+            await asyncio.sleep(0.05)
+
+
+async def test_a_reply_whose_tree_could_not_be_kept_is_recorded_with_what_it_used(
+    bench: Bench,
+) -> None:
+    """3B-S1-2.1."""
+    bench.task.cannot_keep = OSError("no space left on device")
+    worker = await bench.worker(Scripted(said(), UNCERTAIN))
+
+    await worker.carry_out(await bench.owed())
+
+    async with bench.world.database.connection() as connection:
+        row = await (
+            await connection.execute("SELECT * FROM invocations WHERE attempt = 1")
+        ).fetchone()
+    assert row is not None
+    assert row["state"] == "rejected"
+    assert row["reason"] == "what the call left could not be kept: no space left on device"
+    assert (row["envelope"]["subtype"], row["retained"]) == ("success", None)
+    assert row["provider_cost_usd"] is not None
+
+
+async def test_a_caller_cancelled_while_the_tree_is_being_kept_still_has_its_call_recorded(
+    bench: Bench,
+) -> None:
+    """3B-S1-2.1: the provider has returned; the handoff to the record is not the caller's
+    to lose."""
+    bench.task.keeping = asyncio.Event()
+    worker = await bench.worker(Scripted(said()))
+    carrying = asyncio.create_task(worker.carry_out(await bench.owed()))
+    await bench.task.at_keeping.wait()
+
+    carrying.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await carrying
+    assert await bench.states() == ["intended"]
+    bench.task.keeping.set()
+
+    await until(bench, "returned")
+    assert await bench.world.column("SELECT retained FROM invocations") == [KEPT]
+
+
+async def test_a_caller_cancelled_while_the_record_is_being_made_still_has_it_made(
+    bench: Bench,
+) -> None:
+    """3B-S1-2.1: the record transaction is waiting, for a lock say, when the caller goes."""
+    worker = await bench.worker(Scripted(said()))
+    real = bench.invocations.record
+    waiting, go_on = asyncio.Event(), asyncio.Event()
+
+    async def waits_first(*arguments: Any, **named: Any) -> str:
+        waiting.set()
+        await go_on.wait()
+        return await real(*arguments, **named)
+
+    bench.invocations.record = waits_first  # type: ignore[method-assign]
+    carrying = asyncio.create_task(worker.carry_out(await bench.owed()))
+    await waiting.wait()
+
+    carrying.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await carrying
+    assert await bench.states() == ["intended"]
+    go_on.set()
+
+    await until(bench, "returned")
+
+
+async def test_a_call_cut_short_after_a_result_that_must_not_be_used_does_not_use_it(
+    bench: Bench,
+) -> None:
+    """3B-S1-2.2: what the adapter decided about the result is what is recorded, also
+    when the caller is cancelled while the adapter waits for the process."""
+    unverified = replace(said(), unusable="the run reported a result without saying what it had")
+    provider = Scripted(unverified, then_waits=True)
+    worker = await bench.worker(provider)
+    carrying = asyncio.create_task(worker.carry_out(await bench.owed()))
+    await provider.waiting.wait()
+
+    carrying.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await carrying
+
+    assert await bench.states() == ["rejected"]
+    assert await bench.world.column("SELECT provider_cost_usd IS NOT NULL FROM invocations") == [
+        True
+    ]
+    await bench.invocations.recover(PROJECT)
+    assert bench.applied == []
+
+
+async def test_a_worker_that_lost_its_connection_while_preparing_makes_no_call(
+    bench: Bench,
+) -> None:
+    """3B-S1-2.8."""
+    provider = Scripted(said())
+    worker = await bench.worker(provider)
+    assert bench.session is not None
+    bench.task.during_preparation = bench.session.stop
+
+    left = await worker.carry_out(await bench.owed())
+
+    assert left.startswith("refused") and "no longer known to be running" in left
+    assert provider.asked == []
+    assert await bench.states() == []

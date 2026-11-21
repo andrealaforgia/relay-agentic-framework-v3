@@ -360,3 +360,19 @@ async def test_a_result_from_a_run_that_never_said_what_it_had_is_not_a_reply(
     assert result.outcome is Outcome.RETURNED
     assert result.terminal is not None and result.terminal.usage
     assert "without first saying what it had" in result.unusable
+
+
+async def test_the_result_is_told_as_classified_before_the_process_is_waited_for(
+    tmp_path: Path,
+) -> None:
+    """3B-S1-2.2: a caller cut short while the run lingers has what the adapter decided."""
+    headless = tmp_path / "headless.jsonl"
+    headless.write_text((RECORDED / "success.jsonl").read_text().split("\n", 1)[1])
+    told: list[Any] = []
+
+    result = await ClaudeAdapter(
+        STUB, {"PATH": os.environ["PATH"], "STUB_STREAM": str(headless)}
+    ).invoke(request(tmp_path), on_result=told.append)
+
+    assert told == [result]
+    assert told[0].unusable

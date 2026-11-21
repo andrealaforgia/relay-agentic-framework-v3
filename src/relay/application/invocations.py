@@ -14,6 +14,7 @@ again finds what the first one left.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import uuid
@@ -140,6 +141,7 @@ class Invocations:
         self._effects_for = effects_for
         self._prices = prices
         self._session: WorkerSession | None = None
+        self._starting = asyncio.Lock()
 
     async def admit(
         self,
@@ -159,6 +161,10 @@ class Invocations:
                 # Also what refuses a grant with no worker at all: only a worker process,
                 # whose being alive can be asked, may make a paid call.
                 return Admission("refused", reason="this grant is not this worker's")
+            if not await is_alive(connection, worker.worker_id):
+                # It has lost the connection by which anyone knows it is alive. A call
+                # it made now would be one nobody could account for.
+                return Admission("refused", reason="this worker is no longer known to be running")
             latest = await _latest(connection, assignment_id)
             if latest is not None:
                 state = latest["state"]
@@ -267,6 +273,13 @@ class Invocations:
                 # applied under the grant that holds the work now, and its own grant stays
                 # on record as what it ran under.
                 adopted_under = assignment["grant_id"]
+                # Having a known result to apply is that grant's first effect: a pause
+                # holds it, and does not take it back.
+                await connection.execute(
+                    "UPDATE assignments SET first_effect_at = COALESCE(first_effect_at, now()) "
+                    "WHERE assignment_id = %s",
+                    (assignment["assignment_id"],),
+                )
             await connection.execute(
                 "UPDATE invocations SET state = %s, reason = %s, envelope = %s, reply = %s, "
                 "retained = %s, usage = %s, provider_cost_usd = %s, estimated_cost_usd = %s, "
@@ -373,26 +386,33 @@ class Invocations:
             invocation = await _located(connection, invocation_id)
         effects = self._effects_for(invocation)
         for position, effect in enumerate(effects):
-            taken = await self._take(invocation_id, worker, effects, position)
-            if isinstance(taken, str):
-                if taken == "done":
-                    continue
-                return taken
-            run = EffectRun(
-                invocation,
-                f"{invocation_id}:{effect.name}",
-                taken,
-                invocation["applied_under"] or invocation["grant_id"],
-            )
+            key, mine = (invocation_id, effect.name), object()
             try:
+                taken = await self._take(invocation_id, worker, effects, position, mine)
+                if isinstance(taken, str):
+                    if taken == "done":
+                        continue
+                    return taken
+                run = EffectRun(
+                    invocation,
+                    f"{invocation_id}:{effect.name}",
+                    taken,
+                    invocation["applied_under"] or invocation["grant_id"],
+                )
                 try:
                     detail = await effect.perform(run)
+                    marked = await self._mark(invocation_id, effect, run, detail)
                 except ActionRefused as refused:
+                    # By the service, in `perform`, or in `settle`, whose transaction
+                    # has been rolled back by now.
                     return await self._reject(invocation_id, effect.name, taken, str(refused))
-                if not await self._mark(invocation_id, effect, run, detail):
-                    return "superseded"
+                if marked != "done":
+                    return marked
             finally:
-                worker.running.discard((invocation_id, effect.name))
+                # Whatever cut this short, and wherever: only the call that took the
+                # effect lets it go.
+                if worker.running.get(key) is mine:
+                    del worker.running[key]
         async with self._pool.connection() as connection, connection.transaction():
             await connection.execute(
                 "UPDATE invocations SET state = 'applied' WHERE invocation_id = %s "
@@ -407,6 +427,7 @@ class Invocations:
         worker: WorkerSession,
         effects: Sequence[Effect],
         position: int,
+        token: object,
     ) -> int | str:
         """Admit one effect: the try number taken, or why it is not to be performed."""
         async with self._pool.connection() as connection, connection.transaction():
@@ -475,7 +496,7 @@ class Invocations:
             )
             # Said before this transaction commits: nobody can see the effect as started
             # by this process and not being carried out by it.
-            worker.running.add(key)
+            worker.running[key] = token
             return int(effect["try"]) + 1
 
     async def _mark(
@@ -484,36 +505,75 @@ class Invocations:
         effect: Effect,
         run: EffectRun,
         detail: Mapping[str, Any] | None,
-    ) -> bool:
-        """The effect is done, if this try is still the one that may say so. A try that
-        was taken over while it ran decides nothing: neither that the effect is done,
-        nor anything its `settle` would have written."""
+    ) -> str:
+        """Mark the effect done, and write what it writes, if this try may still say so
+        and the invocation still authorises it. Returns `done`, or why not: `superseded`
+        (the try was taken over), `overtaken` (what the result was about ended or
+        changed while the effect ran), `held` (stopped for now: the effect is taken
+        again when the stop clears). The locks are taken in the order `_take` takes
+        them: the assignment, the invocation, then the effect."""
         async with self._pool.connection() as connection, connection.transaction():
-            marked = await (
+            located = await _located(connection, invocation_id)
+            assignment = await _locked_assignment(connection, located["assignment_id"])
+            invocation = await _locked_invocation(connection, invocation_id)
+            current = await (
                 await connection.execute(
-                    "UPDATE invocation_effects SET state = 'done', detail = %s "
-                    "WHERE invocation_id = %s AND name = %s AND state = 'started' AND try = %s "
-                    "RETURNING name",
-                    (
-                        Jsonb(dict(detail)) if detail is not None else None,
-                        invocation_id,
-                        effect.name,
-                        run.attempt,
-                    ),
+                    "SELECT 1 FROM invocation_effects WHERE invocation_id = %s AND name = %s "
+                    "AND state = 'started' AND try = %s FOR UPDATE",
+                    (invocation_id, effect.name, run.attempt),
                 )
             ).fetchone()
-            if marked is None:
-                return False
+            if current is None:
+                return "superseded"
+            # What this effect itself changed is not something that overtook it.
+            moved = (detail or {}).get("stands")
+            expecting = {**invocation, "expects": {**invocation["expects"], **(moved or {})}}
+            ended = await _ended_for_good(connection, assignment, expecting)
+            if ended:
+                await connection.execute(
+                    "UPDATE invocations SET state = 'overtaken', reason = %s "
+                    "WHERE invocation_id = %s",
+                    (ended, invocation_id),
+                )
+                await _note(
+                    connection,
+                    assignment,
+                    "invocation.overtaken",
+                    invocation_id,
+                    invocation["attempt"],
+                )
+                return "overtaken"
+            if (
+                await closure_of_feature(
+                    connection,
+                    assignment["project_id"],
+                    assignment["feature_id"],
+                    assignment["story_id"],
+                )
+                is not None
+            ):
+                # Given up, not cut short: whoever comes when the stop has cleared
+                # takes it, without having to find out whether this process is alive.
+                await connection.execute(
+                    "UPDATE invocation_effects SET state = 'pending' "
+                    "WHERE invocation_id = %s AND name = %s",
+                    (invocation_id, effect.name),
+                )
+                return "held"
+            await connection.execute(
+                "UPDATE invocation_effects SET state = 'done', detail = %s "
+                "WHERE invocation_id = %s AND name = %s",
+                (Jsonb(dict(detail)) if detail is not None else None, invocation_id, effect.name),
+            )
             if effect.settle is not None:
                 await effect.settle(connection, run)
-            moved = (detail or {}).get("stands")
             if moved:
                 # What this effect itself changed is what the next one expects to find.
                 await connection.execute(
                     "UPDATE invocations SET expects = expects || %s WHERE invocation_id = %s",
                     (Jsonb(dict(moved)), invocation_id),
                 )
-            return True
+            return "done"
 
     async def _reject(self, invocation_id: uuid.UUID, name: str, attempt: int, reason: str) -> str:
         """What the model said was refused by the service it was for. A known call, and
@@ -579,6 +639,7 @@ class Invocations:
             invocation = await _locked_invocation(connection, invocation_id)
             latest = await _latest(connection, assignment["assignment_id"])
             assert latest is not None
+            # Work that has been ended is no longer parked: ending it cleared that.
             if latest["invocation_id"] != invocation_id or assignment["parked"] is None:
                 receipt = Receipt("stale", "nothing changed: this work is not parked on that call")
             elif action.action == "retry":
@@ -681,8 +742,22 @@ class Invocations:
             for assignment in orphaned:
                 if await is_alive(connection, assignment["granted_worker"]):
                     continue
-                latest = await _latest(connection, assignment["assignment_id"])
-                if latest is None or latest["state"] in ("errored", "rejected", "not_started"):
+                # What this grant has to show for itself: a grant that admitted no call
+                # of its own, or whose last call gave nothing, is taken back, whatever
+                # earlier grants of the same work left. A person's permission to retry
+                # is on the work, and stays.
+                own = await (
+                    await connection.execute(
+                        "SELECT state FROM invocations WHERE assignment_id = %s AND "
+                        "(grant_id = %s OR applied_under = %s) ORDER BY attempt DESC LIMIT 1",
+                        (
+                            assignment["assignment_id"],
+                            assignment["grant_id"],
+                            assignment["grant_id"],
+                        ),
+                    )
+                ).fetchone()
+                if own is None or own["state"] in ("errored", "rejected", "not_started"):
                     await _release(connection, assignment)
             known = await (
                 await connection.execute(
@@ -692,8 +767,10 @@ class Invocations:
                 )
             ).fetchall()
         if known and self._effects_for is not None:
-            if self._session is None:
-                self._session = await WorkerSession.start(self._pool, "control-plane")
+            async with self._starting:
+                # One session for this object's recoveries, however many passes ask at once.
+                if self._session is None:
+                    self._session = await WorkerSession.start(self._pool, "control-plane")
             for each in known:
                 await self.apply(each["invocation_id"], self._session)
 

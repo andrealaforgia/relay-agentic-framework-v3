@@ -195,6 +195,7 @@ class ClaudeAdapter:
         *,
         on_event: Callable[[Event], None] | None = None,
         on_start: Callable[[int], None] | None = None,
+        on_result: Callable[[ProviderResult], None] | None = None,
         checked: bool = True,
     ) -> ProviderResult:
         if checked:
@@ -221,6 +222,7 @@ class ClaudeAdapter:
                 on_start(group)
             started: Started | None = None
             terminal: Terminal | None = None
+            result: ProviderResult | None = None
             reason = ""
             try:
                 try:
@@ -241,6 +243,11 @@ class ClaudeAdapter:
                 except TimeoutError:
                     reason = f"no result within {request.timeout} seconds"
                 if terminal is not None:
+                    # Said before the process is waited for: a caller that is cut short
+                    # while waiting has the result as it was classified, not the raw event.
+                    result = _classified(terminal, group, started)
+                    if on_result is not None:
+                        on_result(result)
                     with contextlib.suppress(TimeoutError):
                         async with asyncio.timeout(self._grace):
                             await process.wait()
@@ -248,19 +255,8 @@ class ClaudeAdapter:
                 # Whatever happened, including the caller being cancelled: nothing of
                 # this run is left running.
                 await _end(process, group)
-            if terminal is not None:
-                outcome = Outcome.RETURNED if terminal.succeeded else Outcome.ERRORED
-                return ProviderResult(
-                    outcome,
-                    terminal,
-                    process_group=group,
-                    started=started,
-                    # A result from a run that never said what it had is kept, with what
-                    # it used, and is not a reply.
-                    unusable=""
-                    if started is not None
-                    else "the run reported a result without first saying what it had",
-                )
+            if result is not None:
+                return result
             complaints.seek(0)
             said = complaints.read()[-2000:].decode(errors="replace").strip()
             reason = reason or "the run ended without reporting a result"
@@ -285,6 +281,20 @@ class ClaudeAdapter:
             raise ProviderUnavailable(
                 f"the installed Claude CLI does not offer {', '.join(missing)}"
             )
+
+
+def _classified(terminal: Terminal, group: int, started: Started | None) -> ProviderResult:
+    return ProviderResult(
+        Outcome.RETURNED if terminal.succeeded else Outcome.ERRORED,
+        terminal,
+        process_group=group,
+        started=started,
+        # A result from a run that never said what it had is kept, with what it used, and
+        # is not a reply.
+        unusable=""
+        if started is not None
+        else "the run reported a result without first saying what it had",
+    )
 
 
 async def _say(process: asyncio.subprocess.Process, briefing: str) -> None:
