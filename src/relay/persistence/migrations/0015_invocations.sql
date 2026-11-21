@@ -58,9 +58,8 @@ CREATE TABLE invocations (
     provider_cost_usd  numeric,
     estimated_cost_usd numeric,
     price_table     text,
-    -- A person's permission for one more call after this one, and the call that used it.
+    -- The request by which a person allowed one more call after this one.
     retry_authorised_by text,
-    retry_consumed_by   uuid,
     started_at      timestamptz NOT NULL DEFAULT clock_timestamp(),
     ended_at        timestamptz,
     UNIQUE (assignment_id, attempt)

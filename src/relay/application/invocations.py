@@ -26,7 +26,6 @@ from psycopg.types.json import Jsonb
 
 from relay.application.assignments import CORRECT, RECONFIRM
 from relay.application.closure import (
-    CANCELLED,
     closure_of_feature,
     feature_basis,
     lock_gate,
@@ -139,7 +138,6 @@ class Invocations:
             if assignment["state"] != "granted" or assignment["grant_id"] != grant_id:
                 return Admission("refused", reason="this grant is not the current one")
             latest = await _latest(connection, assignment_id)
-            retrying = False
             if latest is not None:
                 state = latest["state"]
                 if state == "returned":
@@ -148,16 +146,9 @@ class Invocations:
                     return Admission("refused", reason="a call for this work is in flight")
                 if state in ("applied", "overtaken"):
                     return Admission("finished")
-                # Looked at before whether the work is parked: an authorised retry is
-                # what unparks it.
-                retrying = (
-                    latest["retry_authorised_by"] is not None
-                    and latest["retry_consumed_by"] is None
-                )
-                if state == "uncertain" and not retrying:
-                    return Admission("refused", reason=f"parked: {_UNCERTAIN}")
-            if assignment["parked"] is not None and not retrying:
-                return Admission("refused", reason=f"parked: {assignment['parked']}")
+                # Otherwise the last call gave nothing: it was uncertain, errored,
+                # rejected or never started. Work that is waiting on a person for that
+                # reason is parked, and parked work has no grant to be here under.
             try:
                 # Every stop that would refuse a claim refuses a paid call, the first
                 # and every one after it.
@@ -200,12 +191,6 @@ class Invocations:
                     Jsonb(admitted_on),
                 ),
             )
-            if retrying:
-                assert latest is not None
-                await connection.execute(
-                    "UPDATE invocations SET retry_consumed_by = %s WHERE invocation_id = %s",
-                    (invocation_id, latest["invocation_id"]),
-                )
             # The paid call is the grant's first effect: a pause from here on leaves the
             # grant alone, and what the call returns is held, not lost.
             await connection.execute(
@@ -501,8 +486,7 @@ class Invocations:
                 receipt = Receipt("stale", "nothing changed: this work is not parked on that call")
             elif action.action == "retry":
                 await connection.execute(
-                    "UPDATE invocations SET retry_authorised_by = %s, retry_consumed_by = NULL "
-                    "WHERE invocation_id = %s",
+                    "UPDATE invocations SET retry_authorised_by = %s WHERE invocation_id = %s",
                     (action.request_id, invocation_id),
                 )
                 await _unpark(connection, assignment)
@@ -529,6 +513,12 @@ class Invocations:
                 )
             await record_receipt(connection, action, receipt)
             return receipt
+
+    async def reason_of(self, invocation_id: uuid.UUID) -> str | None:
+        """Why a call gave nothing usable, for the briefing of the next."""
+        async with self._pool.connection() as connection:
+            reason: str | None = (await _located(connection, invocation_id))["reason"]
+            return reason
 
     async def parked(self, project_id: str) -> list[Parked]:
         """The calls a person is being asked about, oldest first."""
@@ -713,12 +703,9 @@ async def _ended_for_good(
 ) -> str:
     """Why the result will never be applied, or empty if it still may be."""
     if assignment["state"] == "retired":
-        return "the work it was for is no longer wanted"
-    stopped = await closure_of_feature(
-        connection, assignment["project_id"], assignment["feature_id"], assignment["story_id"]
-    )
-    if stopped == CANCELLED:
         return "the work it was for was ended"
+    # Work that is ended for good (a cancel, a rejection, a reopened red) is retired by
+    # whatever ended it, so that is the one thing to look for.
     if first:
         # Before anything has been done with it: is it still about what there is? Its
         # own later effects may move these, so they are compared only here.
