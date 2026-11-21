@@ -788,15 +788,26 @@ class Reviews:
                 "SELECT 1 FROM behaviours WHERE project_id = %s AND behaviour_id = %s FOR UPDATE",
                 (project_id, behaviour_id),
             )
-            if await closure_of_behaviour(connection, project_id, behaviour_id) == CANCELLED:
-                # The story was rejected or withdrawn, or the feature cancelled, while
-                # the caller was looking. What it saw is evidence, and moves nothing.
-                return False
+            ended = await closure_of_behaviour(connection, project_id, behaviour_id) == CANCELLED
             try:
                 await _require_current(
                     connection, {"project_id": project_id, "behaviour_id": behaviour_id}
                 )
+                stale = False
             except ActionRefused:
+                stale = True
+            if ended or stale:
+                # The story was rejected or withdrawn, the feature cancelled, or a
+                # decision landed, while the caller was looking. What it saw moves
+                # nothing, and is kept: after a restart it would otherwise be as if
+                # nobody had seen it.
+                await append_event(
+                    connection,
+                    project_id,
+                    "review.conflict_observed",
+                    subject_id=behaviour_id,
+                    payload={"cycle_id": str(cycle_id), "reason": reason, "acted_on": False},
+                )
                 return False
             if while_unpublished:
                 cycle = await (

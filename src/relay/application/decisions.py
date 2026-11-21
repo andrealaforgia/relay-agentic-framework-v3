@@ -378,7 +378,9 @@ class Decisions:
         whose basis has moved cannot be made approvable this way, and has to be replaced."""
         _require_role(principal, "analyst")
         async with self._pool.connection() as connection, connection.transaction():
-            await lock_gate(connection, project_id)
+            # Exclusively, as every roadmap write is: reconfirming a proposal looks at
+            # the stories it edits, which others lock in their own order.
+            await lock_gate(connection, project_id, exclusive=True)
             await _locked_project(connection, project_id)
             statement = {"roadmap": feature_id, "basis": basis, "revision": revision}
             if not await _said_already(connection, project_id, grant, statement):

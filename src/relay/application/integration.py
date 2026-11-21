@@ -1005,7 +1005,12 @@ async def _close_unfinished(
             connection,
             batch,
             "abandoned" if closed_by == CANCELLED else "held",
-            f"{why}, and the feature is {closed_by}",
+            f"{why}, and "
+            + (
+                await what_ended(connection, project_id, behaviour_id)
+                if closed_by == CANCELLED
+                else f"the feature is {closed_by}"
+            ),
         )
         return
     await _close_batch(connection, batch, "interrupted", f"{why}; to be run again")

@@ -821,7 +821,13 @@ async def _open_roadmap_gate(
             live[entry["story_id"]] if entry["kind"] == "kept" else entry
         )
         # A correction keeps saying what it corrects, in every later revision.
-        corrects = entry["corrects"] or live.get(entry["story_id"], {}).get("corrects")
+        # A new story corrects what its proposal says, and nothing else: a story of the
+        # same name may meanwhile have been created by another feature.
+        corrects = (
+            entry["corrects"]
+            if entry["kind"] == "new"
+            else live.get(entry["story_id"], {}).get("corrects")
+        )
         if corrects is not None:
             shown["corrects"] = corrects
         stories.append(shown)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from typing import Any
 
@@ -165,6 +166,8 @@ async def test_a_conflict_seen_as_a_story_is_rejected_blocks_nothing(
     assert await world.column("SELECT state FROM review_cycles") == ["open"]
     assert await world.state("B1") is BehaviourState.REVIEW
     assert "review.cycle_blocked" not in await world.events()
+    # What was seen is on the record all the same, for whoever looks after a restart.
+    assert (await world.events()).count("review.conflict_observed") == 1
 
 
 async def test_rejecting_a_story_ends_the_request_whose_checks_were_waiting_to_run_again(
@@ -243,3 +246,99 @@ async def test_a_story_that_was_dropped_stays_withdrawn_when_its_feature_is_canc
         StoryState.CANCELLED,
         StoryState.WITHDRAWN,
     )
+
+
+async def test_reconfirming_a_story_and_reconfirming_a_proposal_that_edits_it_do_not_deadlock(
+    world: DecisionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await world.revise(Kept("S1"), REWORDED_S2)
+    await world.answer(await world.ask(story=None))
+    owed = await world.owed()
+    proposal = next(each for each in owed if each["revision"] == 2)
+    story = next(each for each in owed if each["story_id"] == "S2")
+    for_the_proposal = await world.claims.claim(ANALYST, proposal["assignment_id"])
+    for_the_story = await world.claims.claim(ANALYST, story["assignment_id"])
+    holding, go_on = asyncio.Event(), asyncio.Event()
+    real = decisions_module._locked_project
+
+    async def held_with_the_story(*arguments: Any) -> None:
+        if not holding.is_set():
+            holding.set()
+            await go_on.wait()
+        await real(*arguments)
+
+    monkeypatch.setattr(decisions_module, "_locked_project", held_with_the_story)
+    the_story = asyncio.create_task(
+        world.decisions.reconfirm_story(
+            ANALYST, PROJECT, "S2", grant=for_the_story, basis=1, revision=1
+        )
+    )
+    await holding.wait()
+    the_proposal = asyncio.create_task(
+        world.decisions.reconfirm_roadmap(
+            ANALYST, PROJECT, "F1", grant=for_the_proposal, basis=1, revision=2
+        )
+    )
+    await world.until_someone_waits_for_a_lock()
+    go_on.set()
+
+    await the_story
+    with pytest.raises(ActionRefused, match="has to be replaced"):
+        await the_proposal
+    assert await world.column("SELECT current_on FROM stories WHERE story_id = 'S2'") == [1]
+
+
+async def test_a_new_story_is_shown_correcting_only_what_its_proposal_says(
+    world: DecisionWorld,
+) -> None:
+    """Feature F2 proposes an ordinary new story C1. Before it is approved, feature F1
+    creates a C1 of its own as the correction of a rejected story. When F2's proposal is
+    shown again, its C1 corrects nothing."""
+    ordinary = StoryDraft("C1", "A catalogue", "items are listed", {"AC1": "it lists"})
+    correction = StoryDraft(
+        "C1", "The rate, corrected", "the gross price is shown", {"AC1": "120"}, corrects="S1"
+    )
+    await world.roadmap(ordinary, feature="F2")
+    await reject(world, "S1")
+    await world.decide(await world.revise(Kept("S1"), Kept("S2"), correction))
+    await world.answer(await world.ask(story=None, feature="F2"))
+
+    await world.reconfirm(next(each for each in await world.owed() if each["feature_id"] == "F2"))
+
+    [shown] = [
+        item for item in await world.stories.inbox(PROJECT) if item.manifest["feature_id"] == "F2"
+    ]
+    assert shown.manifest["stories"] == [
+        {"story_id": "C1", "title": "A catalogue", "outcome": "items are listed",
+         "criteria": {"AC1": "it lists"}}
+    ]  # fmt: skip
+    ours = await world.revise(Kept("S1"), Kept("C1"), Kept("S2"))
+    [reorder] = [item for item in await world.stories.inbox(PROJECT) if item.gate_id == ours]
+    assert [story.get("corrects") for story in reorder.manifest["stories"]] == [None, "S1", None]
+
+
+async def test_checks_closed_at_a_restart_after_their_story_was_rejected_say_so(
+    world: DecisionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await world.integration.require_check(PROJECT, ZERO_STAYS_ZERO)
+    base = await world.awaiting_builder("B1")
+    await world.reviewed("B1", on=base)
+    barrier = HeldAtABarrier(ContainerIsolation(world.image))
+    dying = world.integration_with(barrier)
+
+    async def nothing(self: Any, batch_id: Any) -> None:
+        return None
+
+    monkeypatch.setattr(type(dying), "_abandon", nothing)  # a process that is killed tidies nothing
+    running = asyncio.create_task(dying.integrate(PROJECT, "B1", "once"))
+    await held_at_the_barrier(running, barrier)
+    await reject(world)
+    running.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await running
+
+    await Features(world.database, world.reviews, world.integration).start()
+
+    again = await world.integration.integrate(PROJECT, "B1", "once")
+    assert again.outcome is Outcome.SUPERSEDED
+    assert "S1 was rejected" in again.reason and "cancelled" not in again.reason
