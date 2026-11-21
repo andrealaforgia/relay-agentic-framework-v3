@@ -43,8 +43,14 @@ from relay.application.closure import (
 )
 from relay.application.reviews import gate_of
 from relay.application.stories import evaluate_story_gate, lock_story, require_story_at_work
+from relay.application.supersessions import (
+    add_obligation,
+    regression_set,
+    reserve,
+    settle_with_the_integration,
+)
 from relay.domain.behaviour import Behaviour, BehaviourState
-from relay.domain.evidence import CheckContract, Execution, ProcessContract, is_gate_bearing
+from relay.domain.evidence import CheckContract, Execution, is_gate_bearing
 from relay.domain.identifiers import require_identifier
 from relay.domain.integration import (
     TrunkReading,
@@ -139,6 +145,7 @@ class Integration:
                 raise ValueError(
                     f"a check named {check.contract_id!r} is already required"
                 ) from None
+            await add_obligation(connection, project_id, "check", check)
             await connection.execute(
                 "UPDATE projects SET check_policy_version = check_policy_version + 1 "
                 "WHERE project_id = %s",
@@ -342,13 +349,16 @@ class Integration:
                 if intent is not None:
                     reconcile = intent["intent_id"]
                 else:
-                    checks = await _regression_set(connection, project_id)
+                    checks, excused_under = await regression_set(
+                        connection, project_id, behaviour_id
+                    )
                     batch = {
                         "batch_id": uuid.uuid7(),
                         "project_id": project_id,
                         "behaviour_id": behaviour_id,
                         "request_id": request_id,
                         "generation": generation,
+                        "supersession_id": excused_under,
                         "basis": await story_basis(connection, project_id, row["story_id"]),
                         "cycle_id": cycle["cycle_id"],
                         "candidate_revision": cycle["candidate_revision"],
@@ -557,8 +567,8 @@ class Integration:
             intent_id = uuid.uuid7()
             await connection.execute(
                 "INSERT INTO integration_intents (intent_id, project_id, behaviour_id, cycle_id, "
-                "batch_id, candidate_revision, expected_trunk, repository, trunk) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "batch_id, candidate_revision, expected_trunk, repository, trunk, "
+                "supersession_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     intent_id,
                     project_id,
@@ -569,8 +579,13 @@ class Integration:
                     batch["expected_trunk"],
                     project["repository"],
                     project["trunk"],
+                    batch["supersession_id"],
                 ),
             )
+            if batch["supersession_id"] is not None:
+                # This push was checked without the obligation it replaces. From here
+                # that exemption is this integration's, whatever is decided meanwhile.
+                await reserve(connection, batch["supersession_id"], intent_id)
             await _close_batch(connection, batch, "authorised", None, event=False)
             submissions = await (
                 await connection.execute(
@@ -837,6 +852,17 @@ class Integration:
             )
             # A reconfirmation that could not be claimed while this was outstanding can be now.
             await announce_again(connection, intent["project_id"])
+            # What it shows is now something every later candidate must still satisfy;
+            # and if it was let in as a replacement, what it replaces is retired.
+            assert behaviour.contract is not None
+            await add_obligation(
+                connection,
+                intent["project_id"],
+                "behaviour",
+                behaviour.contract.as_check(),
+                intent["behaviour_id"],
+            )
+            await settle_with_the_integration(connection, intent, integrated=True)
             await connection.execute(
                 "UPDATE review_cycles SET state = 'integrated' WHERE cycle_id = %s",
                 (intent["cycle_id"],),
@@ -930,6 +956,7 @@ class Integration:
             )
             # A reconfirmation that could not be claimed while this was outstanding can be now.
             await announce_again(connection, intent["project_id"])
+            await settle_with_the_integration(connection, intent, integrated=False)
             await append_event(
                 connection,
                 intent["project_id"],
@@ -1161,29 +1188,6 @@ async def _outstanding_intent(connection: Connection, project_id: str) -> dict[s
     ).fetchone()
 
 
-async def _regression_set(connection: Connection, project_id: str) -> list[CheckContract]:
-    """Everything a candidate must still satisfy: the project's required checks and the
-    expectation of every behaviour already on trunk."""
-    required = await (
-        await connection.execute(
-            "SELECT contract FROM required_checks WHERE project_id = %s ORDER BY contract_id",
-            (project_id,),
-        )
-    ).fetchall()
-    integrated = await (
-        await connection.execute(
-            "SELECT contract FROM behaviours WHERE project_id = %s "
-            "AND state IN ('integrated', 'completed') ORDER BY behaviour_id",
-            (project_id,),
-        )
-    ).fetchall()
-    checks = [CheckContract.from_dict(row["contract"]) for row in required] + [
-        ProcessContract.from_dict(row["contract"]).as_check() for row in integrated
-    ]
-    # The same obligation can arrive by both routes. It is one check, run once.
-    return list({check.digest: check for check in checks}.values())
-
-
 def _why_incomplete(
     batch: dict[str, Any], executions: list[tuple[CheckContract, Execution]]
 ) -> str:
@@ -1201,7 +1205,8 @@ async def _insert_batch(connection: Connection, batch: dict[str, Any], *, state:
     await connection.execute(
         "INSERT INTO check_batches (batch_id, project_id, behaviour_id, request_id, cycle_id, "
         "candidate_revision, expected_trunk, check_policy_version, regression_digest, members, "
-        "state, generation, basis) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        "state, generation, basis, supersession_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (
             batch["batch_id"],
             batch["project_id"],
@@ -1216,6 +1221,7 @@ async def _insert_batch(connection: Connection, batch: dict[str, Any], *, state:
             state,
             batch["generation"],
             batch["basis"],
+            batch["supersession_id"],
         ),
     )
 
@@ -1245,7 +1251,9 @@ async def _why_stale(
         return "a decision of the Product Owner's was made while these checks were running"
     if (await gate_of(connection, cycle)).state is not GateState.SATISFIED:
         return "the review gate is no longer satisfied"
-    checks = await _regression_set(connection, batch["project_id"])
+    # Recomputed for this behaviour: an authority given, voided or used while the batch
+    # ran changes the set, and so the digest, and the batch decides nothing.
+    checks, _ = await regression_set(connection, batch["project_id"], batch["behaviour_id"])
     if regression_digest(project["check_policy_version"], checks) != batch["regression_digest"]:
         return "the checks required of a candidate changed while this batch was running"
     if await _outstanding_intent(connection, batch["project_id"]) is not None:
@@ -1309,6 +1317,7 @@ async def _park(
     )
     # A reconfirmation that could not be claimed while this was outstanding can be now.
     await announce_again(connection, intent["project_id"])
+    await settle_with_the_integration(connection, intent, integrated=False)
     # A conflict on the candidate ref could not stop this intent while it was owed. The
     # intent is over, so the conflict now stops the cycle being used for another.
     await connection.execute(

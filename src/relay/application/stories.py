@@ -402,7 +402,7 @@ class Stories:
             project_id = located["project_id"]
             # A roadmap gate is decided under the exclusive gate lock, as its proposal
             # was published: approving it reads and rewrites other stories.
-            await lock_gate(connection, project_id, exclusive=located["kind"] == "roadmap")
+            await lock_gate(connection, project_id, exclusive=located["kind"] != "story")
             # Story, then project, then feature: the order every transition uses. The
             # project comes before any feature because releasing the next story, under
             # the project lock, may reach into a feature other than this one.
@@ -430,7 +430,16 @@ class Stories:
                 # decided afterwards. A gate that is no longer open is another matter:
                 # it will never be decided, and saying it waits would be untrue.
                 raise ActionRefused(f"the feature is {stopped}: its gates wait")
-            current = await _basis_now(connection, gate, story)
+            if gate["kind"] == "supersession":
+                from relay.application import supersessions  # it imports this module
+
+                current = await supersessions.basis_of_gate(connection, gate)
+                gate = await (
+                    await connection.execute("SELECT * FROM gates WHERE gate_id = %s", (gate_id,))
+                ).fetchone()
+                assert gate is not None
+            else:
+                current = await _basis_now(connection, gate, story)
             if gate["state"] != "open" or gate["basis"] != current:
                 if gate["state"] == "open":
                     # What this gate showed is no longer what there is to decide on.
@@ -438,7 +447,7 @@ class Stories:
                 receipt = Receipt("stale", "nothing changed: this gate is no longer open")
                 await _record(connection, action, receipt)
                 return receipt
-            if story is None and action.action == "reject":
+            if gate["kind"] != "story" and action.action == "reject":
                 raise ActionRefused(
                     "'reject' is not something that can be done here: a roadmap is sent "
                     "back with request_changes"
@@ -446,7 +455,11 @@ class Stories:
             outcome = {"approve": "approved", "reject": "rejected"}.get(
                 action.action, "changes_requested"
             )
-            moved_on = await _settle_roadmap(connection, gate, outcome) if story is None else ""
+            moved_on = (
+                await _settle_roadmap(connection, gate, outcome)
+                if gate["kind"] == "roadmap"
+                else ""
+            )
             if moved_on:
                 # What this proposal is about has changed since it was written. It is
                 # not approved as it stands; the Analyst proposes again.
@@ -455,8 +468,11 @@ class Stories:
                 await _record(connection, action, receipt)
                 return receipt
             await _close_gate(connection, gate, "decided", outcome)
-            if story is not None:
+            if gate["kind"] == "story":
+                assert story is not None
                 await _settle_story(connection, story, outcome)
+            elif gate["kind"] == "supersession":
+                await supersessions.settle_gate(connection, gate, outcome)
             await append_event(
                 connection,
                 project_id,

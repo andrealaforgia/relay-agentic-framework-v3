@@ -90,7 +90,7 @@ CREATE TABLE gates (
     gate_id         uuid PRIMARY KEY,
     project_id      text NOT NULL,
     feature_id      text NOT NULL,
-    kind            text NOT NULL CHECK (kind IN ('roadmap', 'story')),
+    kind            text NOT NULL CHECK (kind IN ('roadmap', 'story', 'supersession')),
     story_id        text,
     -- What the gate was opened on. A gate whose basis is no longer current is stale.
     basis           jsonb NOT NULL,
