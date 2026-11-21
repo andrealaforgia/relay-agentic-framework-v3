@@ -657,7 +657,8 @@ async def _after_a_decision(connection: Connection, scope: dict[str, Any]) -> No
         await connection.execute(
             "SELECT story_id, story_basis(project_id, story_id) AS basis FROM stories "
             "WHERE project_id = %s AND feature_id = %s AND (%s::text IS NULL OR story_id = %s) "
-            "AND state NOT IN ('approved', 'rejected', 'cancelled') ORDER BY position FOR UPDATE",
+            "AND state NOT IN ('approved', 'rejected', 'cancelled', 'withdrawn') "
+            "ORDER BY position FOR UPDATE",
             (project_id, feature_id, story_scope, story_scope),
         )
     ).fetchall()
@@ -929,6 +930,11 @@ async def _require_scope(
         raise ActionRefused(f"unknown feature {feature_id!r}")
     if story_id is not None and known["story_state"] is None:
         raise ActionRefused(f"{story_id!r} is not a story of {feature_id!r}")
+    if to_change and known["story_state"] in ("rejected", "withdrawn"):
+        raise ActionRefused(
+            f"{story_id} is {known['story_state']}: it is history, and nothing more is "
+            "asked or assumed about it"
+        )
     if to_change and known["story_state"] == "approved":
         raise ActionRefused(f"{story_id} is approved: changing it is a correction")
 

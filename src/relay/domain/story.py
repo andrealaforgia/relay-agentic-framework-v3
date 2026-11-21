@@ -273,7 +273,14 @@ def answer_again(action: HumanAction, recorded: tuple[str, Receipt] | None) -> R
     return receipt
 
 
-AT_A_GATE = {"approve": frozenset[str](), "request_changes": frozenset({"reason"})}
+AT_A_GATE = {
+    "approve": frozenset[str](),
+    "request_changes": frozenset({"reason"}),
+    "reject": frozenset({"reason"}),
+}
+# Setting aside a story that is being worked on. A gate is one fixed thing to decide on;
+# a story at work is not, so the person says which revision, under which decisions.
+ON_A_STORY = {"reject": frozenset({"reason", "revision", "basis"})}
 ON_A_QUESTION = {"answer": frozenset({"text"})}
 ON_A_DECISION = {"replace": frozenset({"text"})}
 ON_A_FEATURE = {

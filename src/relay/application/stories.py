@@ -17,7 +17,13 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from relay.application.assignments import retire_all_of_feature, revoke_unstarted_grants
+from relay.application.assignments import (
+    CORRECT,
+    owe,
+    retire_all_of_feature,
+    retire_all_of_story,
+    revoke_unstarted_grants,
+)
 from relay.application.closure import (
     CANCELLED,
     PAUSED,
@@ -37,6 +43,7 @@ from relay.domain.identifiers import require_identifier
 from relay.domain.story import (
     HOLDING_THE_SLOT,
     ON_A_FEATURE,
+    ON_A_STORY,
     ActionRefused,
     Candidate,
     Entry,
@@ -426,7 +433,14 @@ class Stories:
                 receipt = Receipt("stale", "nothing changed: this gate is no longer open")
                 await _record(connection, action, receipt)
                 return receipt
-            outcome = "approved" if action.action == "approve" else "changes_requested"
+            if story is None and action.action == "reject":
+                raise ActionRefused(
+                    "'reject' is not something that can be done here: a roadmap is sent "
+                    "back with request_changes"
+                )
+            outcome = {"approve": "approved", "reject": "rejected"}.get(
+                action.action, "changes_requested"
+            )
             if story is None and not await _settle_roadmap(connection, gate, outcome):
                 # The stories this proposal is about have moved on since it was written.
                 # It is not approved as it stands; the Analyst proposes again.
@@ -471,6 +485,56 @@ class Stories:
                 )
             ).fetchall()
         return [InboxItem(**row) for row in rows]
+
+    async def reject(self, project_id: str, action: HumanAction) -> Receipt:
+        """The Product Owner sets aside a story that is being worked on, for instance
+        because an answer has changed what it should do. The action names the story's
+        revision and decision basis as the person saw them: if either has moved, or the
+        story is no longer being worked on, nothing changes and the receipt says so."""
+        require_human(action.principal)
+        require_well_formed(action, ON_A_STORY)
+        story_id = action.target
+        try:
+            revision, basis = int(action.payload["revision"]), int(action.payload["basis"])
+        except ValueError:
+            raise ActionRefused("reject names a revision and a basis, as numbers") from None
+        # A story's name is its project's own: the receipt is for this project's story.
+        action = replace(action, target=f"{project_id}/{story_id}")
+        async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id, exclusive=True)
+            story = await _locked_story(connection, project_id, story_id)
+            await _locked_project(connection, project_id)
+            if (seen := answer_again(action, await _recorded(connection, action))) is not None:
+                return seen
+            as_seen = (revision, basis) == (
+                story["revision"],
+                await story_basis(connection, project_id, story_id),
+            )
+            if not as_seen or not permits_behaviour_work(StoryState(story["state"])):
+                receipt = Receipt(
+                    "stale",
+                    f"nothing changed: {story_id} is {story['state'].replace('_', ' ')} at "
+                    f"revision {story['revision']}, not what this was about",
+                )
+                await _record(connection, action, receipt)
+                return receipt
+            await _reject(connection, story)
+            await append_event(
+                connection,
+                project_id,
+                "story.rejected",
+                subject_id=story_id,
+                payload={
+                    "by": action.principal.identity,
+                    "request_id": action.request_id,
+                    "revision": revision,
+                    "said": {"reason": action.payload["reason"]},
+                },
+            )
+            await release_next(connection, project_id)
+            receipt = Receipt("effective", "rejected")
+            await _record(connection, action, receipt)
+            return receipt
 
     async def roadmap_of(self, project_id: str, feature_id: str) -> Roadmap:
         """Where the feature's roadmap stands, as a role reads it before proposing a
@@ -1171,6 +1235,14 @@ async def _settle_roadmap(connection: Connection, gate: Mapping[str, Any], outco
                 "UPDATE stories SET state = 'withdrawn' WHERE project_id = %s AND story_id = %s",
                 (project_id, entry["story_id"]),
             )
+            await retire_all_of_story(connection, project_id, entry["story_id"])
+    # The Analyst owed a correction for each rejection this revision now answers.
+    await connection.execute(
+        "UPDATE assignments SET state = 'done', grant_id = NULL, granted_to = NULL "
+        "WHERE project_id = %s AND feature_id = %s AND kind = 'correct' "
+        "AND state IN ('wanted', 'granted') AND issued_on->>'story_id' = ANY(%s)",
+        (project_id, feature_id, [e["corrects"] for e in entries if e["corrects"] is not None]),
+    )
     return True
 
 
@@ -1181,6 +1253,9 @@ async def _settle_story(connection: Connection, story: Mapping[str, Any], outcom
             (story["project_id"], story["story_id"]),
         )
         return
+    if outcome == "rejected":
+        await _reject(connection, story)
+        return
     # A new revision of the same story: what was integrated and what was reviewed stay.
     await connection.execute(
         # The seal belonged to the revision that was reviewed; the new one has none.
@@ -1188,6 +1263,55 @@ async def _settle_story(connection: Connection, story: Mapping[str, Any], outcom
         "sealed_revision = NULL "
         "WHERE project_id = %s AND story_id = %s",
         (story["project_id"], story["story_id"]),
+    )
+
+
+async def _reject(connection: Connection, story: Mapping[str, Any]) -> None:
+    """Set a story aside for good. What it put on trunk stays there, and stays something
+    every later candidate must still satisfy. For its own unfinished work this is what
+    cancelling a feature is: nothing of it starts, what is on its way is kept as
+    evidence and moves nothing, and a push already authorised runs to its end. The
+    Analyst is owed a correction."""
+    project_id, story_id = story["project_id"], story["story_id"]
+    await connection.execute(
+        "UPDATE stories SET state = 'rejected', seal_id = NULL, sealed_revision = NULL "
+        "WHERE project_id = %s AND story_id = %s",
+        (project_id, story_id),
+    )
+    await retire_all_of_story(connection, project_id, story_id)
+    await connection.execute(
+        "UPDATE inbox_items SET state = 'closed' WHERE state = 'open' AND question_id IN "
+        "(SELECT question_id FROM questions WHERE project_id = %s AND scope_story = %s "
+        "AND state = 'open')",
+        (project_id, story_id),
+    )
+    await connection.execute(
+        "UPDATE questions SET state = 'withdrawn' WHERE project_id = %s AND scope_story = %s "
+        "AND state = 'open'",
+        (project_id, story_id),
+    )
+    await connection.execute(
+        "UPDATE check_batches SET state = 'abandoned', "
+        "reason = 'the story was rejected before these checks could be run again' "
+        "WHERE project_id = %s AND state = 'held' AND behaviour_id IN "
+        "(SELECT behaviour_id FROM behaviours WHERE project_id = %s AND story_id = %s)",
+        (project_id, project_id, story_id),
+    )
+    await owe(
+        connection,
+        CORRECT,
+        Envelope(
+            message_kind=MessageKind.COMMAND,
+            event_type="correction.requested",
+            project_id=project_id,
+            sender=CONTROL_PLANE,
+            recipient="analyst",
+            idempotency_key=f"correct:{project_id}:{story_id}",
+            correlation_id=uuid.uuid7(),
+            payload={"story_id": story_id, "feature_id": story["feature_id"]},
+        ),
+        issued_on={"story_id": story_id},
+        feature_id=story["feature_id"],
     )
 
 

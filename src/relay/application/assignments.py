@@ -33,6 +33,7 @@ REMEDIATE = "remediate"
 REVIEW = "review"
 INTEGRATE = "integrate"
 RECONFIRM = "reconfirm"
+CORRECT = "correct"
 _LIVE = ("wanted", "granted")
 
 
@@ -218,6 +219,10 @@ async def revoke_every_grant(connection: Connection, project_id: str) -> None:
     await _revoke(connection, project_id, "TRUE", ())
 
 
+async def retire_all_of_story(connection: Connection, project_id: str, story_id: str) -> None:
+    await _retire(connection, "project_id = %s AND story_id = %s", (project_id, story_id))
+
+
 async def retire_reconfirmations(
     connection: Connection, project_id: str, feature_id: str, story_id: str | None
 ) -> None:
@@ -318,9 +323,11 @@ class Assignments:
             subject_id = (
                 assignment["behaviour_id"] or assignment["story_id"] or assignment["feature_id"]
             )
-            if assignment["kind"] != RECONFIRM:
+            ordinary = assignment["kind"] not in (RECONFIRM, CORRECT)
+            if ordinary:
                 # Ordinary work relies on the story, the contract and the evidence so
-                # far being current. Reconfirming is how they become so.
+                # far being current. Reconfirming is how they become so, and a
+                # correction is owed for a story that is finished with.
                 await require_startable(
                     connection, project_id, assignment["story_id"], assignment["behaviour_id"]
                 )
@@ -329,7 +336,7 @@ class Assignments:
                     connection, project_id, assignment["feature_id"], assignment["story_id"]
                 )
             )
-            if assignment["kind"] != RECONFIRM:
+            if ordinary or assignment["kind"] == CORRECT:
                 pass
             elif assignment["behaviour_id"] is not None and await _has_an_unsettled_integration(
                 connection, project_id, assignment["behaviour_id"]

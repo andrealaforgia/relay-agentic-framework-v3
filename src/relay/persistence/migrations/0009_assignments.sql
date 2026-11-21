@@ -11,7 +11,8 @@ CREATE TABLE assignments (
     story_id        text,
     behaviour_id    text,
     kind            text NOT NULL
-                    CHECK (kind IN ('build', 'remediate', 'review', 'integrate', 'reconfirm')),
+                    CHECK (kind IN ('build', 'remediate', 'review', 'integrate', 'reconfirm',
+                                    'correct')),
     role            text NOT NULL,
     issued_on       jsonb NOT NULL,
     state           text NOT NULL DEFAULT 'wanted'

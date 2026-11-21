@@ -42,12 +42,18 @@ CREATE TABLE decisions (
 ALTER TABLE inbox_items ADD COLUMN question_id uuid REFERENCES questions;
 
 -- What stops work in a scope, if anything: the one place that says so, for SQL and for
--- code alike. Null: nothing. 'cancelled' exactly, for a cancelled feature. Otherwise
+-- code alike. Null: nothing. 'cancelled' exactly, for a cancelled feature, or for a
+-- story that was rejected or withdrawn. Otherwise
 -- every reason that applies, the pause first.
 CREATE FUNCTION standing(project text, feature text, story text) RETURNS text
 LANGUAGE sql STABLE AS $$
     SELECT CASE
         WHEN f.closed_by = 'cancelled' THEN 'cancelled'
+        -- A story that was rejected, or dropped from its roadmap, is finished with: for
+        -- its own work that is the same as a cancellation.
+        WHEN EXISTS (SELECT 1 FROM stories s WHERE s.project_id = f.project_id
+                     AND s.story_id = story AND s.state IN ('rejected', 'withdrawn'))
+            THEN 'cancelled'
         ELSE nullif(concat_ws(', and ', f.closed_by, (
             SELECT 'waiting on question ' || string_agg(q.question_id::text, ', ' ORDER BY q.asked_at)
             FROM questions q
