@@ -34,6 +34,7 @@ from tests.integration.fixtures import (
     held_at_the_barrier,
 )
 from tests.integration.story_world import at_the_story_gate
+from tests.integration.test_rejection import reject
 from tests.integration.trunk_world import GREETING, PROJECT, ZERO_STAYS_ZERO
 
 REDUCED_RATE = replace(
@@ -622,3 +623,25 @@ async def test_replacing_a_behaviour_of_an_approved_story_leaves_the_current_sto
     assert world.trunk() == candidate
     assert await world.stories.seal_of(PROJECT, "S2") == sealed
     assert await world.story("S2") is StoryState.AWAITING_APPROVAL
+
+
+@pytest.mark.parametrize("ended_by", ["rejecting its story", "cancelling its feature"])
+async def test_ending_the_replacements_story_ends_its_proposal_there_and_then(
+    world: Superseding, ended_by: str
+) -> None:
+    """3AII-S3-II-2.1. Nothing is left in the inbox asking for a decision that can no
+    longer matter, and a later withdrawal does not rewrite why the proposal ended."""
+    await world.awaiting_builder("Z", REDUCED_RATE, "S2")
+    gate = await world.propose()
+
+    if ended_by == "rejecting its story":
+        await reject(world, "S2")
+    else:
+        await world.close("cancel", reason="dropped")
+
+    assert "supersession" not in [item.kind for item in await world.stories.inbox(PROJECT)]
+    ended = await world.column("SELECT state || ': ' || ended_because FROM supersessions")
+    assert ended == ["void: the replacing behaviour's story or feature has ended"]
+    with pytest.raises(ActionRefused, match="no such proposal waiting"):
+        await world.supersessions.withdraw(VERIFIER, PROJECT, gate)
+    assert await world.column("SELECT state || ': ' || ended_because FROM supersessions") == ended

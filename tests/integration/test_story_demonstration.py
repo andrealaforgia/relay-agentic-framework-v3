@@ -134,6 +134,13 @@ async def test_a_contract_on_trunk_that_no_longer_stands_is_declared_to_be_repla
 
     assert await world.owed() == []
     assert await world.in_force() == [CONTRACT.contract_id]  # a declaration removes nothing
+    # 3AII-S3-II-2.2. Another decision asks nothing more about B1: the declaration
+    # stands until the replacement is on trunk, and nobody is invited to contradict it.
+    await world.answer(await world.ask("S1"))
+    assert [(each["subject"], each["behaviour_id"]) for each in await world.owed()] == [
+        ("story", None)
+    ]
+    await world.reconfirm_everything()
     with pytest.raises(ActionRefused, match="B1 is to be replaced"):
         await world.seal()
     # Other work in the story goes on meanwhile.
@@ -218,9 +225,16 @@ async def test_a_reconfirmation_owed_for_a_behaviour_is_withdrawn_when_it_is_rep
     owed = {each["behaviour_id"]: each for each in await world.owed()}
     assert "B1" in owed
 
+    async with world.database.connection() as connection:
+        await connection.execute("UPDATE outbox SET published_at = now()")  # all sent once
     monkeypatch.undo()
     await world.integration.reconcile()
 
+    # 3AII-S3-II-2.3: what was withdrawn is not sent again.
+    assert await world.column(
+        "SELECT count(*) FROM outbox WHERE published_at IS NULL AND "
+        f"envelope->'payload'->>'assignment_id' = '{owed['B1']['assignment_id']}'"
+    ) == [0]
     assert world.trunk() == candidate
     assert "B1" not in {each["behaviour_id"] for each in await world.owed()}
     with pytest.raises(ActionRefused):

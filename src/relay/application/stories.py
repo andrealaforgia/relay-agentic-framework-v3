@@ -761,6 +761,8 @@ async def close_feature(pool: Pool, project_id: str, action: HumanAction) -> Rec
                 feature_id,
             ),
         )
+        if action.action == "cancel":
+            await _end_replacements_that_lost_their_ground(connection, project_id)
         outcome = {"pause": "paused", "cancel": "cancelled", "resume": "resumed"}[action.action]
         await append_event(
             connection,
@@ -1358,6 +1360,15 @@ async def _settle_story(connection: Connection, story: Mapping[str, Any], outcom
     )
 
 
+async def _end_replacements_that_lost_their_ground(connection: Connection, project_id: str) -> None:
+    """A story or feature has just ended. A proposal that one of its behaviours replace
+    something ends with it, here, with its gate and its place in the inbox, and says
+    why: it is not left for a person to decide or for its author to withdraw."""
+    from relay.application import supersessions  # it imports this module
+
+    await supersessions.void_what_no_longer_stands(connection, project_id)
+
+
 async def _reject(connection: Connection, story: Mapping[str, Any]) -> None:
     """Set a story aside for good. What it put on trunk stays there, and stays something
     every later candidate must still satisfy. For its own unfinished work this is what
@@ -1392,6 +1403,7 @@ async def _reject(connection: Connection, story: Mapping[str, Any]) -> None:
     )
     # After the checks above were found by the assignments that wanted them.
     await retire_all_of_story(connection, project_id, story_id)
+    await _end_replacements_that_lost_their_ground(connection, project_id)
     await owe(
         connection,
         CORRECT,

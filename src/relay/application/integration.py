@@ -864,8 +864,6 @@ class Integration:
                 "UPDATE integration_intents SET state = 'integrated' WHERE intent_id = %s",
                 (intent_id,),
             )
-            # A reconfirmation that could not be claimed while this was outstanding can be now.
-            await announce_again(connection, intent["project_id"])
             # What it shows is now something every later candidate must still satisfy;
             # and if it was let in as a replacement, what it replaces is retired.
             assert behaviour.contract is not None
@@ -877,6 +875,9 @@ class Integration:
                 intent["behaviour_id"],
             )
             await settle_with_the_integration(connection, intent, integrated=True)
+            # A reconfirmation that could not be claimed while this was outstanding can be
+            # now. After the retirement above, so that what it withdrew is not sent again.
+            await announce_again(connection, intent["project_id"])
             await connection.execute(
                 "UPDATE review_cycles SET state = 'integrated' WHERE cycle_id = %s",
                 (intent["cycle_id"],),

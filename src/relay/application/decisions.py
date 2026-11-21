@@ -801,7 +801,9 @@ async def _after_a_decision(connection: Connection, scope: dict[str, Any]) -> No
             await connection.execute(
                 "SELECT behaviour_id, correlation_id FROM behaviours WHERE project_id = %s "
                 "AND story_id = %s AND contract IS NOT NULL AND superseded_by IS NULL "
-                "ORDER BY position",
+                # Declared to be replaced: that stands until the replacement is on
+                # trunk, and no one is asked whether the contract stands after all.
+                "AND NOT to_be_replaced ORDER BY position",
                 (project_id, story["story_id"]),
             )
         ).fetchall()
