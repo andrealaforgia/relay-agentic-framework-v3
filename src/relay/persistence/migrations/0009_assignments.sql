@@ -12,7 +12,7 @@ CREATE TABLE assignments (
     behaviour_id    text,
     kind            text NOT NULL
                     CHECK (kind IN ('build', 'remediate', 'review', 'integrate', 'reconfirm',
-                                    'correct')),
+                                    'correct', 'complete', 'revise')),
     role            text NOT NULL,
     issued_on       jsonb NOT NULL,
     state           text NOT NULL DEFAULT 'wanted'

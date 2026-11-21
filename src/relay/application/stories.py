@@ -39,6 +39,7 @@ from relay.application.closure import (
     require_startable,
     story_basis,
 )
+from relay.application.completion import evaluate_completion
 from relay.domain.evidence import ProcessContract
 from relay.domain.identifiers import require_identifier
 from relay.domain.story import (
@@ -490,6 +491,7 @@ class Stories:
                 },
             )
             await release_next(connection, project_id)
+            await evaluate_completion(connection, project_id, located["feature_id"])
             receipt = Receipt("effective", outcome)
             await _record(connection, action, receipt)
             return receipt

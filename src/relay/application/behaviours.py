@@ -619,7 +619,7 @@ async def _paired_red(
 async def record_execution(
     connection: Connection,
     project_id: str,
-    behaviour_id: str,
+    behaviour_id: str | None,
     purpose: str,
     contract_digest: str,
     execution: Execution,

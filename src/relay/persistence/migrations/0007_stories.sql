@@ -4,7 +4,10 @@ CREATE TABLE features (
     feature_id text NOT NULL,
     problem    text NOT NULL,
     state      text NOT NULL DEFAULT 'planning'
-        CHECK (state IN ('discovery', 'planning', 'delivering', 'completed', 'cancelled')),
+        -- checking: every story is resolved and the final checks are owed or running.
+        -- needs_decision: a final check failed on trunk and a person has to say what next.
+        CHECK (state IN ('discovery', 'planning', 'delivering', 'checking', 'needs_decision',
+                         'completed', 'cancelled')),
     -- Closed to new work by the Product Owner: null, 'paused' or 'cancelled'.
     closed_by  text CHECK (closed_by IN ('paused', 'cancelled')),
     -- Features of a project take their turn in the order they were opened.
@@ -90,7 +93,7 @@ CREATE TABLE gates (
     gate_id         uuid PRIMARY KEY,
     project_id      text NOT NULL,
     feature_id      text NOT NULL,
-    kind            text NOT NULL CHECK (kind IN ('roadmap', 'story', 'supersession')),
+    kind            text NOT NULL CHECK (kind IN ('roadmap', 'story', 'supersession', 'completion')),
     story_id        text,
     -- What the gate was opened on. A gate whose basis is no longer current is stale.
     basis           jsonb NOT NULL,

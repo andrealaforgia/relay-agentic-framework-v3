@@ -212,7 +212,8 @@ async def test_a_second_feature_waits_for_the_project_and_gets_its_turn_without_
     await world.decide(await world.gate())
 
     assert await world.story("S2") is StoryState.RELEASED
-    assert (await world.events())[-2:] == ["gate.approved", "story.released"]
+    # The first feature has no story left: it goes to its final checks as the second starts.
+    assert (await world.events())[-3:] == ["gate.approved", "story.released", "feature.checking"]
 
 
 async def test_asking_for_changes_reopens_the_same_story_and_releases_nothing(

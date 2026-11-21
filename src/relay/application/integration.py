@@ -224,6 +224,14 @@ class Integration:
             )
         )
 
+    @property
+    def oracle(self) -> ProcessOracle:
+        return self._oracle
+
+    @property
+    def remote_timeout(self) -> float:
+        return self._push_timeout
+
     def _require_gate_bearing_checks(self) -> None:
         """Before anything is taken up or launched, by either way in."""
         if not is_gate_bearing(self._oracle.isolation.name):

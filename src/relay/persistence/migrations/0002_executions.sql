@@ -3,8 +3,10 @@
 CREATE TABLE executions (
     execution_id     uuid PRIMARY KEY,
     project_id       text NOT NULL,
-    behaviour_id     text NOT NULL,
-    purpose          text NOT NULL CHECK (purpose IN ('red', 'green', 'check')),
+    -- Null for a feature's final check, which is of the project's trunk as a whole.
+    behaviour_id     text,
+    purpose          text NOT NULL CHECK (purpose IN ('red', 'green', 'check', 'final_check')),
+    CHECK ((purpose = 'final_check') = (behaviour_id IS NULL)),
     revision         text NOT NULL CHECK (revision ~ '^[0-9a-f]{40}$'),
     contract_digest  text NOT NULL,
     isolation        text NOT NULL,
