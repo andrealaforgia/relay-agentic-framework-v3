@@ -5,6 +5,7 @@ records must stay what was true then."""
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -13,11 +14,17 @@ from psycopg_pool import AsyncConnectionPool
 
 from relay.application.integration import Outcome
 from relay.application.reviews import NewFinding, Review
-from relay.application.stories import Dropped, Kept
+from relay.application.stories import Dropped, Kept, StoryDraft
+from relay.domain.evidence import Expected, Launch
 from relay.domain.review import Carried, Severity
 from relay.domain.story import ActionRefused, Receipt
 from tests.integration.completion_world import CompletionWorld, last_story_at_its_gate
-from tests.integration.fixtures import ANALYST, VAT_APPLIES_STANDARD_RATE, VERIFIER
+from tests.integration.fixtures import (
+    ANALYST,
+    PRODUCT_OWNER,
+    VAT_APPLIES_STANDARD_RATE,
+    VERIFIER,
+)
 from tests.integration.story_world import GREETS, INJECTION, STANDARD_RATE, STYLE
 from tests.integration.test_supersession import (
     REDUCED_RATE,
@@ -234,3 +241,62 @@ async def test_what_a_replaced_behaviour_left_open_is_not_a_limitation_of_what_w
     ]
     assert summary["limitations"] == []
     assert [each["behaviour_id"] for each in summary["checked"]] == ["Z"]
+
+
+FAREWELL = replace(
+    GREETING,
+    contract_id="B3-farewell",
+    observes="the farewell the product prints",
+    launch=Launch(
+        argv=("sh", "-c", "cat farewell.txt 2>/dev/null || echo none"), timeout_seconds=30
+    ),
+    expect=Expected(exit_code=0, stdout="bye\n"),
+)
+
+
+def correcting(story: str) -> StoryDraft:
+    return StoryDraft(story, "Standard rate, shown properly", "shown with its currency",
+                      {"AC1": "100 net is shown as 120"}, corrects="S1")  # fmt: skip
+
+
+async def test_a_story_is_corrected_by_the_correction_that_was_delivered(
+    world: CompletionWorld,
+) -> None:
+    """3AII-S4-1.5. A correction proposed and then dropped corrected nothing."""
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    await world.stories.open_feature(PRODUCT_OWNER, PROJECT, "F2", "shoppers want a greeting")
+    await world.stories.decide(
+        world.action(await world.stories.publish_roadmap(ANALYST, PROJECT, "F2", [GREETS], basis=0))
+    )
+    await world.deliver("B1")
+    await world.seal()
+    await world.assess("B1 shows 120 for 100")
+    await world.decide(await world.gate(), "reject", reason="the currency is missing")
+    # F2 has the project's place, so a correction of S1 stays planned and can be dropped.
+    await world.decide(await world.revise(Kept("S1"), correcting("C1")))
+    revision, _ = await world.stories.revisions_of(PROJECT, "C1")
+    await world.decide(
+        await world.revise(
+            Kept("S1"),
+            Dropped("C1", story_revision=revision, story_basis=await world.basis("C1")),
+            correcting("D1"),
+        )
+    )
+    await world.deliver("G", "S2", GREETING, {"greeting.txt": "hello\n"})
+    await world.seal("S2")
+    await world.assess("G prints hello", "S2")
+    await world.decide(await world.gate())
+    assert await world.feature("F2") == "completed"
+    await world.deliver("D", "D1", FAREWELL, {"farewell.txt": "bye\n"})
+    await world.seal("D1")
+    await world.assess("D prints bye", "D1")
+
+    await world.decide(await world.gate())
+
+    summary = await world.summary()
+    assert summary is not None
+    assert [(s["story_id"], s["outcome"], s["corrected_by"]) for s in summary["stories"]] == [
+        ("S1", "rejected", "D1"),
+        ("C1", "withdrawn", None),
+        ("D1", "accepted", None),
+    ]

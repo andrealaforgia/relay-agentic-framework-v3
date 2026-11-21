@@ -76,15 +76,31 @@ def canonical_repository(repository: str) -> str:
     require_credential_free(repository)
     head = repository.split("/", 1)[0]
     if repository.startswith("file://"):
-        # The same place as its path, and known by the same address: one trunk is
-        # managed by one project, however it was written when the project was opened.
-        address = urlsplit(repository)
-        if address.hostname in (None, "localhost"):
-            return str(Path(unquote(address.path)).resolve())
-        return repository
+        # Git reads a file URL from this machine whatever host it names, so it is the
+        # same place as its path: one trunk is managed by one project, however the
+        # address was written when the project was opened.
+        return _local_identity(Path(unquote(urlsplit(repository).path)))
     if "://" in repository or ":" in head:
         return repository  # a URL, or an scp-style host:path address
-    return str(Path(repository).resolve())
+    return _local_identity(Path(repository))
+
+
+def _local_identity(path: Path) -> str:
+    """A repository on this machine is known by the directory that holds its refs: a
+    work tree, the `.git` inside it and a linked work tree are one set of branches. A
+    path that is not a repository is known by itself."""
+    resolved = path.resolve()
+    found = subprocess.run(
+        ["git", "-C", str(resolved), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        check=False,
+        # Only this directory is asked, not whatever repository it may happen to be in.
+        env={**_GIT_ENVIRONMENT, "GIT_CEILING_DIRECTORIES": str(resolved.parent)},
+    )
+    if found.returncode != 0:
+        return str(resolved)
+    return str(Path(found.stdout.strip()).resolve())
 
 
 async def trunk_head(repository: str, trunk: str, *, timeout: float | None = None) -> str:

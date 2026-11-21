@@ -42,6 +42,7 @@ from relay.testing.oracle import ProcessOracle
 from relay.transport.envelope import Envelope, MessageKind
 
 _SUCCESSORS_TAKEN_UP_AT_ONCE = 3
+_ROUNDS_OF_TAKING_UP = 3
 
 
 @dataclass(frozen=True)
@@ -92,8 +93,32 @@ class Completion:
         for _ in range(_SUCCESSORS_TAKEN_UP_AT_ONCE):
             if successor is None:
                 break
-            receipt, successor = await self._take_up(successor)
+            _, successor = await self._take_up(successor)
+        # What became of the generation bound to this completion: asked again, the
+        # record gives the same answer.
         return receipt
+
+    async def take_up_what_is_owed(self, project_id: str) -> None:
+        """Take up the completions owed for a project. A request is attempted once in a
+        pass, however many completions it has been owed: one that keeps being put off
+        waits for the next pass instead of holding this one."""
+        attempted: set[str] = set()
+        for _ in range(_ROUNDS_OF_TAKING_UP):
+            owed = [
+                (assignment, request)
+                for assignment, request in await self.owed(project_id)
+                if request not in attempted
+            ]
+            if not owed:
+                break
+            for assignment, request in owed:
+                attempted.add(request)
+                try:
+                    await self.take_up(assignment)
+                except CheckoutFailed, ActionRefused:
+                    # The repository could not be read, or this process cannot observe
+                    # checks. The completion stays owed.
+                    continue
 
     async def _take_up(
         self, assignment_id: uuid.UUID
@@ -127,11 +152,27 @@ class Completion:
             return batch, None
         try:
             await self._run_checks(batch, owed["repository"])
+            return await self._end(batch["batch_id"])
         except BaseException:
-            # Whatever receipts were committed say how far the checks got.
-            await self._end(batch["batch_id"])
+            # The checks, or the transaction that would have ended them, were cut short.
+            # Nothing was decided if the batch is still running, and nobody else will
+            # end it while this process lives.
+            await self._cut_short(batch)
             raise
-        return await self._end(batch["batch_id"])
+
+    async def _cut_short(self, batch: dict[str, Any]) -> None:
+        async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, batch["project_id"])
+            await _locked_feature(connection, batch["project_id"], batch["feature_id"])
+            running = await (
+                await connection.execute(
+                    "SELECT * FROM completion_batches WHERE batch_id = %s "
+                    "AND state = 'running' FOR UPDATE",
+                    (batch["batch_id"],),
+                )
+            ).fetchone()
+            if running is not None:
+                await _left_unfinished(connection, running, "the checks could not all be run")
 
     async def _start(
         self, assignment_id: uuid.UUID, project_id: str, feature_id: str, head: str
@@ -234,10 +275,9 @@ class Completion:
                 )
 
     async def _end(self, batch_id: uuid.UUID) -> tuple[CompletionReceipt, uuid.UUID | None]:
-        """The one rule that ends a generation, whoever calls it: after its runs, or
-        after something cut them short, which it tells apart by the receipts there are.
-        Returns what became of it and, if what it recorded was found changed, the
-        completion owed in its place."""
+        """The rule that ends a generation whose checks have all run. Returns what became
+        of it and, if what it recorded was found changed, the completion owed in its
+        place."""
         async with self._pool.connection() as connection:
             located = await (
                 await connection.execute(
@@ -275,14 +315,11 @@ class Completion:
                     (batch_id,),
                 )
             ).fetchall()
-            observed = [
+            # This is reached only after every check has run and its receipt committed.
+            assert [
                 {"obligation_id": each["obligation_id"], "digest": each["digest"]}
                 for each in receipts
-            ]
-            if observed != batch["snapshot"]["obligations"]:
-                why = "the checks could not all be run"
-                await _owed_again(connection, batch, "interrupted", why)
-                return CompletionReceipt("interrupted", batch_id, why), None
+            ] == batch["snapshot"]["obligations"]
             if batch["snapshot"] != await _snapshot(connection, project_id, feature_id):
                 why = "what these checks were a check of changed while they were running"
                 successor = await _owed_again(connection, batch, "discarded", why)
@@ -331,13 +368,17 @@ async def end_batches_left_running(connection: Connection, project_id: str) -> N
         )
     ).fetchall()
     for batch in left:
-        waits = await stopped(connection, project_id, batch["feature_id"])
-        if waits is not None:
-            await _owed_again(connection, batch, "held", f"the feature is {waits}")
-        else:
-            await _owed_again(
-                connection, batch, "interrupted", "the process running these checks ended"
-            )
+        await _left_unfinished(connection, batch, "the process running these checks ended")
+
+
+async def _left_unfinished(connection: Connection, batch: dict[str, Any], why: str) -> None:
+    """A running generation that will not be ended by its own checks: it decided
+    nothing, and one completion is owed after it."""
+    waits = await stopped(connection, batch["project_id"], batch["feature_id"])
+    if waits is not None:
+        await _owed_again(connection, batch, "held", f"the feature is {waits}")
+    else:
+        await _owed_again(connection, batch, "interrupted", why)
 
 
 async def _owed_again(
@@ -507,13 +548,17 @@ async def _summary(
     assert feature is not None
     stories = await (
         await connection.execute(
-            "SELECT s.story_id, s.title, s.state, s.revision, c.story_id AS corrected_by, "
-            "g.gate_id::text, g.manifest_digest FROM stories s "
-            "LEFT JOIN stories c ON c.project_id = s.project_id AND c.corrects = s.story_id "
+            # Corrected by a story of the roadmap that was certified: a correction that
+            # was proposed and then dropped corrected nothing.
+            "SELECT s.story_id, s.title, s.state, s.revision, (SELECT c.story_id "
+            "FROM stories c JOIN roadmap_entries e USING (project_id, story_id) "
+            "WHERE c.project_id = s.project_id AND c.corrects = s.story_id "
+            "AND e.feature_id = s.feature_id AND e.revision = %s AND e.kind <> 'dropped') "
+            "AS corrected_by, g.gate_id::text, g.manifest_digest FROM stories s "
             "LEFT JOIN gates g ON g.project_id = s.project_id AND g.story_id = s.story_id "
             "AND g.kind = 'story' AND g.state = 'decided' AND g.outcome = 'approved' "
             "WHERE s.project_id = %s AND s.feature_id = %s ORDER BY s.roadmap_revision, s.position",
-            (project_id, feature_id),
+            (batch["snapshot"]["roadmap_revision"], project_id, feature_id),
         )
     ).fetchall()
     behaviours = await (

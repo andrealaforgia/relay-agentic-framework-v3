@@ -17,7 +17,7 @@ from relay.application import final_checks
 from relay.application.features import Features
 from relay.application.final_checks import Completion
 from relay.application.integration import Outcome
-from relay.application.stories import Kept
+from relay.application.stories import Dropped, Kept, StoryDraft
 from relay.domain.story import ActionRefused, Receipt, StoryState
 from relay.git.checkout import CheckoutFailed, RemoteUnavailable
 from relay.git.mirror import Mirror
@@ -31,7 +31,7 @@ from tests.integration.fixtures import (
     HeldAtABarrier,
     held_at_the_barrier,
 )
-from tests.integration.story_world import GREETS
+from tests.integration.story_world import GREETS, STANDARD_RATE
 from tests.integration.trunk_world import GREETING, PROJECT, ZERO_STAYS_ZERO
 
 
@@ -70,6 +70,26 @@ async def a_second_feature(world: CompletionWorld) -> uuid.UUID:
     """Another feature of the same project, proposed and not yet approved."""
     await world.stories.open_feature(PRODUCT_OWNER, PROJECT, "F2", "shoppers want a greeting")
     return await world.stories.publish_roadmap(ANALYST, PROJECT, "F2", [GREETS], basis=0)
+
+
+RECEIPT = StoryDraft("S3", "Receipt", "the shopper gets a receipt", {"AC1": "one is printed"})
+
+
+async def two_features_at_work(world: CompletionWorld) -> None:
+    """F1 with one story accepted and one still planned, while F2 holds the project's
+    place: F1's planned story was waiting on a question when the place came free."""
+    await world.decide(await world.roadmap(STANDARD_RATE, RECEIPT))
+    await world.stories.decide(world.action(await a_second_feature(world)))
+    await world.deliver("B1")
+    await world.seal()
+    await world.assess("B1 shows 120 for 100, as the story asks")
+    question = await world.ask("S3")
+    await world.decide(await world.gate())
+    assert await world.story("S2") is StoryState.RELEASED
+    await world.answer(question)
+    await world.reconfirm_everything()
+    assert [await world.feature("F1"), await world.feature("F2")] == ["delivering"] * 2
+    assert await world.story("S3") is StoryState.PLANNED
 
 
 async def admitted_and_not_taken_up(
@@ -203,8 +223,12 @@ async def test_a_process_that_stops_after_the_runs_and_before_deciding_completes
     async def the_process_dies(*_: Any, **__: Any) -> None:
         raise KeyboardInterrupt
 
+    async def and_cleans_nothing_up(*_: Any, **__: Any) -> None:
+        return None
+
     with monkeypatch.context() as patched:
         patched.setattr(Completion, "_end", the_process_dies)
+        patched.setattr(Completion, "_cut_short", and_cleans_nothing_up)
         with pytest.raises(KeyboardInterrupt):
             await world.decide(gate)
     assert (await world.feature(), await world.batches()) == ("checking", ["running"])
@@ -404,12 +428,17 @@ async def test_a_decision_over_the_feature_supersedes_the_gate_of_a_failed_check
 
 
 @pytest.mark.parametrize("landed", [False, True])
+@pytest.mark.parametrize("settled_by_another_control_plane", [False, True])
 async def test_a_push_on_its_way_puts_the_decision_off_until_it_has_settled(
-    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch, landed: bool
+    world: CompletionWorld,
+    monkeypatch: pytest.MonkeyPatch,
+    landed: bool,
+    settled_by_another_control_plane: bool,
 ) -> None:
-    """S3-15.1 and S3-16.4. With a push authorised and unanswered, the repository and the
-    records cannot be read as one moment, whether or not the push has arrived. Once it
-    settles, the completion is taken up with nothing else called."""
+    """S3-15.1, S3-16.4 and 3AII-S4-1.4. With a push authorised and unanswered, the
+    repository and the records cannot be read as one moment, whether or not the push has
+    arrived. Once it settles, the completion is taken up with nothing else called,
+    whichever control plane settled it."""
     gate = await last_story_at_its_gate(world)
     second = await a_second_feature(world)
     await admitted_and_not_taken_up(world, gate)
@@ -433,7 +462,8 @@ async def test_a_push_on_its_way_puts_the_decision_off_until_it_has_settled(
         assert (await world.batches(), await world.feature()) == (["deferred"], "checking")
         assert await world.completions_wanted() == 1
 
-    await world.integration.reconcile()  # the push is settled; nothing else is called
+    settler = world.integration_with() if settled_by_another_control_plane else world.integration
+    await settler.reconcile()  # the push is settled; nothing else is called
 
     assert world.trunk() == greeted
     assert await world.batches() == ["deferred", "completed"]
@@ -569,8 +599,12 @@ async def test_checks_left_running_under_a_pause_are_held_when_the_control_plane
     async def the_process_dies(*_: Any, **__: Any) -> None:
         raise KeyboardInterrupt
 
+    async def and_cleans_nothing_up(*_: Any, **__: Any) -> None:
+        return None
+
     with monkeypatch.context() as patched:
         patched.setattr(Completion, "_end", the_process_dies)
+        patched.setattr(Completion, "_cut_short", and_cleans_nothing_up)
         with pytest.raises(KeyboardInterrupt):
             await world.decide(gate)
     await world.close("pause", reason="wait for the audit")
@@ -584,3 +618,141 @@ async def test_checks_left_running_under_a_pause_are_held_when_the_control_plane
     ]
     await world.close("resume")
     assert (await world.feature(), await world.batches()) == ("completed", ["held", "completed"])
+
+
+async def test_one_settlement_looks_for_completions_once(
+    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3AII-S4-1.4."""
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    looked: list[str] = []
+    real = Completion.take_up_what_is_owed
+
+    async def counted(self: Completion, project_id: str) -> None:
+        looked.append(project_id)
+        await real(self, project_id)
+
+    monkeypatch.setattr(Completion, "take_up_what_is_owed", counted)
+
+    await world.deliver("B1")
+
+    assert looked == [PROJECT]
+
+
+async def test_a_caller_cancelled_while_the_checks_are_being_ended_leaves_them_to_the_next_pass(
+    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3AII-S4-1.2. The process lives on, so nothing but the ordinary pass will come."""
+    await admitted_and_not_taken_up(world)
+    real = final_checks.trunk_head
+    reads = 0
+    at_the_last_read = asyncio.Event()
+
+    async def never_answers_the_second_time(*arguments: Any, **named: Any) -> str:
+        nonlocal reads
+        reads += 1
+        if reads > 1:
+            at_the_last_read.set()
+            await asyncio.Event().wait()
+        return await real(*arguments, **named)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(final_checks, "trunk_head", never_answers_the_second_time)
+        passing = asyncio.create_task(world.features.complete_what_is_owed(PROJECT))
+        await at_the_last_read.wait()
+        passing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await passing
+
+    assert (await world.feature(), await world.batches()) == ("checking", ["interrupted"])
+    assert await world.completions_wanted() == 1
+
+    await world.features.reconcile(PROJECT)
+
+    assert (await world.feature(), await world.batches()) == (
+        "completed",
+        ["interrupted", "completed"],
+    )
+    assert await world.column("SELECT count(*) FROM feature_summaries") == [1]
+
+
+async def test_a_completion_delivered_again_after_its_checks_were_discarded_is_answered_the_same(
+    world: CompletionWorld,
+) -> None:
+    """3AII-S4-1.6. The successor is driven, and the answer is still this completion's."""
+    owed = await admitted_and_not_taken_up(world)
+    barrier = HeldAtABarrier(ContainerIsolation(world.image))
+    completion = Completion(world.database, ProcessOracle(barrier))
+    running = asyncio.create_task(completion.take_up(owed))
+    await held_at_the_barrier(running, barrier)
+    world.advance_trunk({"notes.txt": "someone else was here\n"})
+    barrier.release.set()
+
+    first = await running
+
+    assert first.outcome == "discarded"
+    assert await world.batches() == ["discarded", "completed"]
+    assert await completion.take_up(owed) == first
+
+
+async def test_the_pass_holds_one_features_row_at_a_time(world: CompletionWorld) -> None:
+    """3AII-S4-1.3. A decision that releases a story into another feature holds its own
+    feature's row and asks for the other's; the pass must never do the reverse."""
+    await two_features_at_work(world)
+
+    async with world.database.connection() as held, held.transaction():
+        await held.execute("SELECT 1 FROM features WHERE feature_id = 'F2' FOR UPDATE")
+        passing = asyncio.create_task(world.features.reconcile(PROJECT))
+        await world.until_someone_waits_for_a_lock()
+        async with world.database.connection() as other, other.transaction():
+            await other.execute("SELECT 1 FROM features WHERE feature_id = 'F1' FOR UPDATE NOWAIT")
+    await passing
+
+
+async def test_dropping_the_last_planned_story_is_what_completes_the_feature(
+    world: CompletionWorld,
+) -> None:
+    """3AII-S4-1.7. The roadmap decision alone makes the feature ready."""
+    await two_features_at_work(world)
+    revision, _ = await world.stories.revisions_of(PROJECT, "S3")
+    proposal = await world.revise(
+        Kept("S1"), Dropped("S3", story_revision=revision, story_basis=await world.basis("S3"))
+    )
+    assert (await world.feature("F1"), await world.batches()) == ("delivering", [])
+
+    await world.decide(proposal)
+
+    assert [await world.feature("F1"), await world.feature("F2")] == ["completed", "delivering"]
+    summary = await world.summary()
+    assert summary is not None
+    assert [(story["story_id"], story["outcome"]) for story in summary["stories"]] == [
+        ("S1", "accepted"),
+        ("S3", "withdrawn"),
+    ]
+
+
+async def test_checks_that_fail_to_run_after_a_cancel_owe_nothing_more(
+    world: CompletionWorld,
+) -> None:
+    """S3-16.5. The cancel has ended the batch; cleaning up after the failure that
+    follows must not owe a completion for a feature that is finished with."""
+
+    class ThenFails(HeldAtABarrier):
+        async def run(self, *arguments: Any) -> Any:
+            await super().run(*arguments)
+            raise RuntimeError("the container runtime went away")
+
+    gate = await last_story_at_its_gate(world)
+    barrier = ThenFails(ContainerIsolation(world.image))
+    running = asyncio.create_task(checking_with(world, barrier).decide(world.action(gate)))
+    await held_at_the_barrier(running, barrier)
+
+    await world.close("cancel", reason="dropped")
+    barrier.release.set()
+    with pytest.raises(RuntimeError):
+        await running
+
+    assert (await world.feature(), await world.batches()) == ("cancelled", ["abandoned"])
+    assert await world.completions_wanted() == 0
+    await world.features.start()
+    assert (await world.batches(), await world.completions_wanted()) == (["abandoned"], 0)

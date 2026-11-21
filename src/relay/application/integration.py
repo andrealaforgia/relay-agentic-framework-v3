@@ -42,6 +42,7 @@ from relay.application.closure import (
     story_basis,
     what_ended,
 )
+from relay.application.final_checks import Completion
 from relay.application.reviews import gate_of
 from relay.application.stories import evaluate_story_gate, lock_story, require_story_at_work
 from relay.application.supersessions import (
@@ -128,10 +129,10 @@ def _then_wake[**P](
         self: Integration, intent_id: uuid.UUID, /, *arguments: P.args, **named: P.kwargs
     ) -> IntegrationReceipt:
         receipt = await settle(self, intent_id, *arguments, **named)
-        if self.after_settlement is not None and receipt.outcome is not Outcome.PENDING:
+        if receipt.outcome is not Outcome.PENDING:
             async with self._pool.connection() as connection:
                 intent = await _intent(connection, intent_id)
-            await self.after_settlement(intent["project_id"])
+            await self.completion.take_up_what_is_owed(intent["project_id"])
         return receipt
 
     return settled_and_woken
@@ -146,9 +147,9 @@ class Integration:
         self._oracle = oracle
         # How long any one exchange with the repository may take, a read as much as a push.
         self._push_timeout = push_timeout
-        # Called with the project after an authorised push has been driven or settled,
-        # outside any transaction: something that waited for it may be able to go on.
-        self.after_settlement: Callable[[str], Awaitable[None]] | None = None
+        # A feature's final checks put off behind a push are taken up by whichever
+        # control plane settles that push, with the oracle it observes its own checks by.
+        self.completion = Completion(pool, oracle, push_timeout)
 
     def _mirror(self, project_id: str) -> Mirror:
         return Mirror(self._mirrors / f"{require_identifier('project', project_id)}.git")
@@ -712,6 +713,9 @@ class Integration:
 
     @_then_wake
     async def _drive(self, intent_id: uuid.UUID) -> IntegrationReceipt:
+        return await self._send(intent_id)
+
+    async def _send(self, intent_id: uuid.UUID) -> IntegrationReceipt:
         """Send the authorised update. Everything that can be settled on this side is
         settled first; the send is then counted, in its own transaction, immediately
         before it leaves. If this process dies after that, the record still says a push
@@ -851,7 +855,14 @@ class Integration:
         async with self._pool.connection() as connection:
             intent = await _intent(connection, intent_id)
         if intent["state"] != "outstanding":
+            # Settled earlier, and whoever settled it has said so.
             return _receipt_of(intent)
+        return await self._settle_from_trunk(intent_id, intent)
+
+    @_then_wake
+    async def _settle_from_trunk(
+        self, intent_id: uuid.UUID, intent: dict[str, Any]
+    ) -> IntegrationReceipt:
         reading, head = await self._read_trunk(intent)
         if reading is TrunkReading.CONVERGED:
             return await self._converged(intent_id)
@@ -867,9 +878,8 @@ class Integration:
             # Refused once already, with an earlier send still unanswered. Sending again
             # would learn nothing; only trunk moving can settle this.
             return IntegrationReceipt(Outcome.PENDING, intent["batch_id"], intent["refusal"])
-        return await self._drive(intent_id)
+        return await self._send(intent_id)
 
-    @_then_wake
     async def _converged(self, intent_id: uuid.UUID) -> IntegrationReceipt:
         async with self._pool.connection() as connection, connection.transaction():
             located = await _intent(connection, intent_id)
@@ -932,7 +942,6 @@ class Integration:
             await evaluate_story_gate(connection, intent["project_id"], row["story_id"])
             return IntegrationReceipt(Outcome.INTEGRATED, intent["batch_id"])
 
-    @_then_wake
     async def _refused(
         self, intent_id: uuid.UUID, reason: str, *, sent: bool
     ) -> IntegrationReceipt:
@@ -985,7 +994,6 @@ class Integration:
             )
         return IntegrationReceipt(Outcome.PENDING, intent["batch_id"], reason)
 
-    @_then_wake
     async def _conflicted(self, intent_id: uuid.UUID, head: str) -> IntegrationReceipt:
         """Trunk has moved on to something that is not the candidate. No push under this
         intent can land now, so the intent is over, and the candidate must be observed

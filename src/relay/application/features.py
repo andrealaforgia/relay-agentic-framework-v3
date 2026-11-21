@@ -41,11 +41,9 @@ class Features:
         self._integration = integration
         # In this process the control plane observes final checks as it observes an
         # integration's: with the same oracle, and the same patience with the remote.
-        self._completion = completion or Completion(
-            pool, integration.oracle, integration.remote_timeout
-        )
-        # A completion put off behind a push is taken up when that push settles.
-        integration.after_settlement = self.complete_what_is_owed
+        # A completion put off behind a push is taken up by whichever control plane
+        # settles that push: that is the integration's own doing, not wired here.
+        self._completion = completion or integration.completion
 
     async def decide(self, action: HumanAction) -> Receipt:
         """What the Product Owner decides at a gate, followed by whatever that leaves
@@ -69,26 +67,7 @@ class Features:
         return await self._completion.summary_of(project_id, feature_id)
 
     async def complete_what_is_owed(self, project_id: str) -> None:
-        """Take up the completions owed for a project. A request is attempted once in a
-        pass, however many completions it has been owed: one that keeps being put off
-        waits for the next pass instead of holding this one."""
-        attempted: set[str] = set()
-        for _ in range(_ROUNDS_OF_TAKING_UP):
-            owed = [
-                (assignment, request)
-                for assignment, request in await self._completion.owed(project_id)
-                if request not in attempted
-            ]
-            if not owed:
-                break
-            for assignment, request in owed:
-                attempted.add(request)
-                try:
-                    await self._completion.take_up(assignment)
-                except CheckoutFailed, ActionRefused:
-                    # The repository could not be read, or this process cannot observe
-                    # checks. The completion stays owed.
-                    continue
+        await self._completion.take_up_what_is_owed(project_id)
 
     async def close(self, project_id: str, action: HumanAction) -> Receipt:
         """Pause, resume or cancel the feature the action names. A resume, even one
@@ -116,13 +95,19 @@ class Features:
                 await revoke_every_grant(connection, project_id)
                 await end_batches_left_running(connection, project_id)
             await hand_on_unfinished_batches(connection, project_id, starting=starting)
-            for feature in await (
+            features = await (
                 await connection.execute(
                     "SELECT feature_id FROM features WHERE project_id = %s "
                     "AND state IN ('delivering', 'checking', 'needs_decision') ORDER BY opened",
                     (project_id,),
                 )
-            ).fetchall():
+            ).fetchall()
+        for feature in features:
+            # Each in a transaction of its own: this holds one feature's row at a time,
+            # and so never waits for one while holding another, as a decision that
+            # releases a story into another feature does.
+            async with self._pool.connection() as connection, connection.transaction():
+                await lock_gate(connection, project_id)
                 await evaluate_completion(connection, project_id, feature["feature_id"])
         await self._integration.reconcile()
         await self._reviews.publish_candidates()
