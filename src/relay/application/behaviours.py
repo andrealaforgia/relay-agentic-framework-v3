@@ -74,6 +74,7 @@ class Behaviours:
         """One project per managed trunk: what a candidate must still satisfy is recorded
         per project, and a project's lock covers only its own pushes. Projects may share
         a repository on different branches."""
+        require_identifier("project", project_id)
         address = canonical_repository(repository)
         async with self._pool.connection() as connection, connection.transaction():
             managed = await (

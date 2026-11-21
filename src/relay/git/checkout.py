@@ -87,20 +87,25 @@ def canonical_repository(repository: str) -> str:
 
 def _local_identity(path: Path) -> str:
     """A repository on this machine is known by the directory that holds its refs: a
-    work tree, the `.git` inside it and a linked work tree are one set of branches. A
-    path that is not a repository is known by itself."""
+    work tree, the `.git` inside it and a linked work tree are one set of branches, and
+    so is a name Git completes with `.git`. Where there is no repository there is
+    nothing to know it by, and it is refused: a path enrolled before its repository
+    existed would be known by another name afterwards."""
     resolved = path.resolve()
-    found = subprocess.run(
-        ["git", "-C", str(resolved), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        capture_output=True,
-        text=True,
-        check=False,
-        # Only this directory is asked, not whatever repository it may happen to be in.
-        env={**_GIT_ENVIRONMENT, "GIT_CEILING_DIRECTORIES": str(resolved.parent)},
-    )
-    if found.returncode != 0:
-        return str(resolved)
-    return str(Path(found.stdout.strip()).resolve())
+    # As Git itself looks: the path, and then the path with `.git` after it.
+    for candidate in (resolved, resolved.with_name(resolved.name + ".git")):
+        found = subprocess.run(
+            ["git", "-C", os.fspath(candidate), "rev-parse", "--path-format=absolute",
+             "--git-common-dir"],
+            capture_output=True,
+            check=False,
+            # Only this directory is asked, not whatever repository it may happen to be in.
+            env={**_GIT_ENVIRONMENT, "GIT_CEILING_DIRECTORIES": os.fspath(candidate.parent)},
+        )  # fmt: skip
+        if found.returncode == 0:
+            # Exactly Git's own terminator is removed: a name may end in a space.
+            return os.fspath(Path(os.fsdecode(found.stdout.removesuffix(b"\n"))).resolve())
+    raise ValueError("there is no Git repository at that path")
 
 
 async def trunk_head(repository: str, trunk: str, *, timeout: float | None = None) -> str:

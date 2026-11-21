@@ -11,7 +11,7 @@ import uuid
 from typing import Any
 
 from relay.application.assignments import announce_again, revoke_every_grant
-from relay.application.closure import lock_gate
+from relay.application.closure import lock_gate, lock_project
 from relay.application.completion import evaluate_completion
 from relay.application.final_checks import Completion, end_batches_left_running
 from relay.application.integration import (
@@ -108,6 +108,7 @@ class Features:
             # releases a story into another feature does.
             async with self._pool.connection() as connection, connection.transaction():
                 await lock_gate(connection, project_id)
+                await lock_project(connection, project_id)
                 await evaluate_completion(connection, project_id, feature["feature_id"])
         await self._integration.reconcile()
         await self._reviews.publish_candidates()

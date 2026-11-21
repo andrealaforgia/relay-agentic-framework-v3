@@ -756,3 +756,149 @@ async def test_checks_that_fail_to_run_after_a_cancel_owe_nothing_more(
     assert await world.completions_wanted() == 0
     await world.features.start()
     assert (await world.batches(), await world.completions_wanted()) == (["abandoned"], 0)
+
+
+async def test_a_caller_cancelled_just_as_the_checks_were_started_leaves_them_to_the_next_pass(
+    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3AII-S4-2.3. The generation is committed and its completion consumed; the caller
+    is cancelled before it hears so."""
+    await admitted_and_not_taken_up(world)
+    real = Completion._start
+    committed = asyncio.Event()
+
+    async def committed_and_never_heard_of(self: Completion, *arguments: Any) -> Any:
+        await real(self, *arguments)
+        committed.set()
+        await asyncio.Event().wait()
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Completion, "_start", committed_and_never_heard_of)
+        passing = asyncio.create_task(world.features.complete_what_is_owed(PROJECT))
+        await committed.wait()
+        assert await world.batches() == ["running"]
+        passing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await passing
+
+    assert (await world.batches(), await world.completions_wanted()) == (["interrupted"], 1)
+
+    await world.features.reconcile(PROJECT)
+
+    assert (await world.feature(), await world.batches()) == (
+        "completed",
+        ["interrupted", "completed"],
+    )
+
+
+async def test_cleaning_up_after_cut_short_checks_asks_for_the_project_before_the_feature(
+    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3AII-S4-2.4. An approval sent again holds the project and asks for the feature;
+    the clean-up must never hold the feature and ask for the project."""
+    await admitted_and_not_taken_up(world)
+    real_start, real_cut = Completion._start, Completion._cut_short
+    committed, cleaning, go_on = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def committed_and_never_heard_of(self: Completion, *arguments: Any) -> Any:
+        await real_start(self, *arguments)
+        committed.set()
+        await asyncio.Event().wait()
+
+    async def when_told(self: Completion, *arguments: Any) -> None:
+        cleaning.set()
+        await go_on.wait()
+        await real_cut(self, *arguments)
+
+    monkeypatch.setattr(Completion, "_start", committed_and_never_heard_of)
+    monkeypatch.setattr(Completion, "_cut_short", when_told)
+    passing = asyncio.create_task(world.features.complete_what_is_owed(PROJECT))
+    await committed.wait()
+    passing.cancel()
+    await cleaning.wait()
+
+    async with world.database.connection() as held, held.transaction():
+        await held.execute("SELECT 1 FROM projects FOR UPDATE")
+        go_on.set()
+        await world.until_someone_waits_for_a_lock()
+        async with world.database.connection() as other, other.transaction():
+            await other.execute("SELECT 1 FROM features WHERE feature_id = 'F1' FOR UPDATE NOWAIT")
+    with pytest.raises(asyncio.CancelledError):
+        await passing
+
+    assert (await world.batches(), await world.completions_wanted()) == (["interrupted"], 1)
+
+
+async def deferred_behind_a_push_that_landed(
+    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1's final checks put off behind F2's push, which arrived and was not answered."""
+    gate = await last_story_at_its_gate(world)
+    second = await a_second_feature(world)
+    await admitted_and_not_taken_up(world, gate)
+    await world.stories.decide(world.action(second))
+    base = await world.awaiting_builder("G", GREETING, "S2")
+    await world.reviewed("G", {"greeting.txt": "hello\n"}, on=base)
+    real = Mirror._push
+
+    async def lost_reply(self: Mirror, *arguments: Any, **named: Any) -> Any:
+        await real(self, *arguments, **named)
+        raise RemoteUnavailable("no route to host")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Mirror, "_push", lost_reply)
+        assert (await world.integrate("G", "the-push")).outcome is Outcome.PENDING
+        await world.features.complete_what_is_owed(PROJECT)
+    assert (await world.batches(), await world.completions_wanted()) == (["deferred"], 1)
+
+
+@pytest.mark.parametrize("made_up_for_by", ["the integration asked for again", "the scan"])
+async def test_a_wake_up_cut_short_after_the_push_settled_is_made_up_for(
+    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch, made_up_for_by: str
+) -> None:
+    """3AII-S4-2.5. The settlement is committed, so no outstanding push is left to find
+    the completion by."""
+    await deferred_behind_a_push_that_landed(world, monkeypatch)
+    settled = asyncio.Event()
+
+    async def never_gets_to_it(self: Completion, project_id: str) -> None:
+        settled.set()
+        await asyncio.Event().wait()
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Completion, "take_up_what_is_owed", never_gets_to_it)
+        settling = asyncio.create_task(world.integration.reconcile())
+        await settled.wait()
+        settling.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await settling
+    assert (await world.batches(), await world.completions_wanted()) == (["deferred"], 1)
+    assert await world.column(
+        "SELECT count(*) FROM integration_intents WHERE state = 'outstanding'"
+    ) == [0]
+
+    if made_up_for_by == "the scan":
+        assert await world.integration.reconcile() == 0
+    else:
+        assert (await world.integrate("G", "the-push")).outcome is Outcome.INTEGRATED
+
+    assert (await world.feature(), await world.batches()) == (
+        "completed",
+        ["deferred", "completed"],
+    )
+
+
+async def test_two_control_planes_settling_one_push_complete_the_feature_once(
+    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3AII-S4-2.5. Both look for completions afterwards; looking twice is safe."""
+    await deferred_behind_a_push_that_landed(world, monkeypatch)
+
+    await asyncio.gather(world.integration.reconcile(), world.integration_with().reconcile())
+
+    assert (await world.feature(), await world.batches()) == (
+        "completed",
+        ["deferred", "completed"],
+    )
+    assert await world.column("SELECT count(*) FROM feature_summaries") == [1]
+    assert (await world.events()).count("feature.completed") == 1

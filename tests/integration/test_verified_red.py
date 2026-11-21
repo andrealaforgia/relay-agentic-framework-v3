@@ -4,6 +4,7 @@ neither the source nor the observation."""
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -314,6 +315,7 @@ async def test_state_ledger_and_outbox_commit_together_or_not_at_all(
 async def test_the_ledger_cannot_be_rewritten(
     database: AsyncConnectionPool, tmp_path: Path
 ) -> None:
+    commit(tmp_path / "subject", {"vat.py": VAT_RETURNS_NET})
     await awaiting_red(database, tmp_path / "subject", NativeIsolation())
 
     async with database.connection() as connection:
@@ -381,16 +383,27 @@ async def test_a_repository_address_that_may_carry_a_credential_is_refused_and_s
 @pytest.mark.parametrize(
     "address",
     [
-        "/srv/git/vat.git",
-        "file:///srv/git/vat.git",
         "git@git.example:team/vat.git",
         "ssh://git@git.example/vat.git",
         "https://git.example/team/vat.git",
     ],
 )
-async def test_an_ordinary_repository_address_is_accepted(
+async def test_an_ordinary_remote_address_is_accepted(
     database: AsyncConnectionPool, tmp_path: Path, address: str
 ) -> None:
+    await Behaviours(database, tmp_path / "mirrors", ProcessOracle(NativeIsolation())).open_project(
+        PROJECT, address
+    )
+
+
+@pytest.mark.parametrize("written_as", ["a path", "a file URL"])
+async def test_a_repository_on_this_machine_is_accepted_by_path_or_file_url(
+    database: AsyncConnectionPool, tmp_path: Path, written_as: str
+) -> None:
+    commit(tmp_path / "subject", {"vat.py": VAT_RETURNS_NET})
+    subject = tmp_path / "subject"
+    address = subject.as_uri() if written_as == "a file URL" else str(subject)
+
     await Behaviours(database, tmp_path / "mirrors", ProcessOracle(NativeIsolation())).open_project(
         PROJECT, address
     )
@@ -400,7 +413,9 @@ async def test_a_failure_does_not_copy_the_repository_address_into_the_ledger(
     database: AsyncConnectionPool, tmp_path: Path, runner_image: str
 ) -> None:
     missing = tmp_path / "canary-address-of-a-repository-that-is-not-there"
+    commit(missing, {"vat.py": VAT_RETURNS_NET})
     behaviours = await awaiting_red(database, missing, ContainerIsolation(runner_image))
+    shutil.rmtree(missing)  # it was there when the project was opened, and is gone
 
     with pytest.raises(CheckoutFailed) as failure:
         await behaviours.run_red(PROJECT, "B1")
@@ -415,6 +430,7 @@ async def test_a_failure_does_not_copy_the_repository_address_into_the_ledger(
 async def test_a_behaviour_id_relay_could_never_build_is_refused_when_proposed(
     database: AsyncConnectionPool, tmp_path: Path, behaviour_id: str
 ) -> None:
+    commit(tmp_path / "subject", {"vat.py": VAT_RETURNS_NET})
     behaviours = Behaviours(database, tmp_path / "mirrors", ProcessOracle(NativeIsolation()))
     await behaviours.open_project(PROJECT, str(tmp_path / "subject"))
     await in_a_story(behaviours, PROJECT)

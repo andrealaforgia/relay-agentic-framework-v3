@@ -22,7 +22,7 @@ from psycopg.types.json import Jsonb
 
 from relay.application.assignments import take_up
 from relay.application.behaviours import record_execution
-from relay.application.closure import feature_basis, lock_gate
+from relay.application.closure import feature_basis, lock_gate, lock_project
 from relay.application.completion import (
     CONTROL_PLANE,
     owe_completion,
@@ -147,35 +147,45 @@ class Completion:
                 "checks must be observed in a container"
             )
         head = await trunk_head(owed["repository"], owed["trunk"], timeout=self._remote_timeout)
-        batch = await self._start(assignment_id, owed["project_id"], owed["feature_id"], head)
-        if isinstance(batch, CompletionReceipt):
-            return batch, None
+        # Named before it exists: whatever cuts this short, from the transaction that
+        # creates the generation onwards, can end exactly the one this call created.
+        batch_id = uuid.uuid7()
         try:
+            batch = await self._start(
+                batch_id, assignment_id, owed["project_id"], owed["feature_id"], head
+            )
+            if isinstance(batch, CompletionReceipt):
+                return batch, None
             await self._run_checks(batch, owed["repository"])
-            return await self._end(batch["batch_id"])
+            return await self._end(batch_id)
         except BaseException:
-            # The checks, or the transaction that would have ended them, were cut short.
-            # Nothing was decided if the batch is still running, and nobody else will
-            # end it while this process lives.
-            await self._cut_short(batch)
+            # Starting, the checks, or the transaction that would have ended them, was
+            # cut short. Nothing was decided if the batch is still running, and nobody
+            # else will end it while this process lives.
+            await self._cut_short(owed["project_id"], owed["feature_id"], batch_id)
             raise
 
-    async def _cut_short(self, batch: dict[str, Any]) -> None:
+    async def _cut_short(self, project_id: str, feature_id: str, batch_id: uuid.UUID) -> None:
         async with self._pool.connection() as connection, connection.transaction():
-            await lock_gate(connection, batch["project_id"])
-            await _locked_feature(connection, batch["project_id"], batch["feature_id"])
+            await lock_gate(connection, project_id)
+            await _locked_feature(connection, project_id, feature_id)
             running = await (
                 await connection.execute(
                     "SELECT * FROM completion_batches WHERE batch_id = %s "
                     "AND state = 'running' FOR UPDATE",
-                    (batch["batch_id"],),
+                    (batch_id,),
                 )
             ).fetchone()
             if running is not None:
                 await _left_unfinished(connection, running, "the checks could not all be run")
 
     async def _start(
-        self, assignment_id: uuid.UUID, project_id: str, feature_id: str, head: str
+        self,
+        batch_id: uuid.UUID,
+        assignment_id: uuid.UUID,
+        project_id: str,
+        feature_id: str,
+        head: str,
     ) -> dict[str, Any] | CompletionReceipt:
         """Under the gate lock, look again at everything that was looked at before the
         repository was read, and bind one generation to exactly this assignment."""
@@ -206,7 +216,7 @@ class Completion:
             ).fetchone()
             assert generation is not None
             batch = {
-                "batch_id": uuid.uuid7(),
+                "batch_id": batch_id,
                 "request_id": request_id,
                 "project_id": project_id,
                 "feature_id": feature_id,
@@ -672,6 +682,7 @@ async def _close(
 
 
 async def _locked_feature(connection: Connection, project_id: str, feature_id: str) -> None:
+    await lock_project(connection, project_id)
     await connection.execute(
         "SELECT 1 FROM features WHERE project_id = %s AND feature_id = %s FOR UPDATE",
         (project_id, feature_id),

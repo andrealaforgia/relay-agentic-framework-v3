@@ -89,4 +89,25 @@ def test_a_directory_inside_a_repository_is_not_that_repository(tmp_path: Path) 
     work_tree = with_a_work_tree(tmp_path / "vat")
     (work_tree / "docs").mkdir()
 
-    assert canonical_repository(str(work_tree / "docs")) == str((work_tree / "docs").resolve())
+    with pytest.raises(ValueError, match="no Git repository"):
+        canonical_repository(str(work_tree / "docs"))
+
+
+async def test_a_repository_named_without_its_dot_git_is_still_that_repository(
+    behaviours: Behaviours, tmp_path: Path
+) -> None:
+    """3AII-S4-2.1."""
+    repository = bare(tmp_path / "vat.git")
+    assert git_reads(str(tmp_path / "vat"))
+    await behaviours.open_project("checkout", str(repository))
+
+    with pytest.raises(ValueError, match="already managed"):
+        await behaviours.open_project("billing", str(tmp_path / "vat"))
+
+
+async def test_a_project_is_not_opened_on_a_path_with_no_repository(
+    behaviours: Behaviours, tmp_path: Path
+) -> None:
+    """3AII-S4-2.1: enrolled now, it would be known by another name once it existed."""
+    with pytest.raises(ValueError, match="no Git repository"):
+        await behaviours.open_project("checkout", str(tmp_path / "not-yet"))

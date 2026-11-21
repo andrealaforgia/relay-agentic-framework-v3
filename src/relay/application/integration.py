@@ -122,8 +122,10 @@ _OUTCOME_OF_INTENT = {
 def _then_wake[**P](
     settle: Callable[Concatenate[Integration, uuid.UUID, P], Awaitable[IntegrationReceipt]],
 ) -> Callable[Concatenate[Integration, uuid.UUID, P], Awaitable[IntegrationReceipt]]:
-    """After a method that may settle an intent has returned, and so after its
-    transaction has committed, tell whoever waits on this project's pushes."""
+    """After a method that settles an intent, or finds it settled, has returned, and so
+    after the settlement has committed, take up what waited on this project's pushes.
+    Finding it settled counts: whoever settled it may have been cut short before this.
+    Looking again changes nothing if there is nothing owed."""
 
     async def settled_and_woken(
         self: Integration, intent_id: uuid.UUID, /, *arguments: P.args, **named: P.kwargs
@@ -303,6 +305,17 @@ class Integration:
             except CheckoutFailed:
                 continue  # nothing learned about this one; the others still get their turn
             settled += receipt.outcome is not Outcome.PENDING
+        # A settlement whose own wake-up was cut short has no outstanding intent left to
+        # be found by. What it freed is still on record as owed, and is taken up here.
+        async with self._pool.connection() as connection:
+            waiting = await (
+                await connection.execute(
+                    "SELECT DISTINCT project_id FROM assignments WHERE kind = 'complete' "
+                    "AND state = 'wanted' ORDER BY project_id"
+                )
+            ).fetchall()
+        for row in waiting:
+            await self.completion.take_up_what_is_owed(row["project_id"])
         return settled
 
     async def retry_integration(self, project_id: str, behaviour_id: str, reason: str) -> None:
@@ -851,18 +864,12 @@ class Integration:
         )
         return reading, seen.head
 
+    @_then_wake
     async def _reconcile(self, intent_id: uuid.UUID) -> IntegrationReceipt:
         async with self._pool.connection() as connection:
             intent = await _intent(connection, intent_id)
         if intent["state"] != "outstanding":
-            # Settled earlier, and whoever settled it has said so.
             return _receipt_of(intent)
-        return await self._settle_from_trunk(intent_id, intent)
-
-    @_then_wake
-    async def _settle_from_trunk(
-        self, intent_id: uuid.UUID, intent: dict[str, Any]
-    ) -> IntegrationReceipt:
         reading, head = await self._read_trunk(intent)
         if reading is TrunkReading.CONVERGED:
             return await self._converged(intent_id)

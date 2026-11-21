@@ -19,6 +19,15 @@ PAUSED = "paused"
 CANCELLED = "cancelled"
 
 
+async def lock_project(connection: Connection, project_id: str) -> None:
+    """The project's row, which every ledger entry writes to. Taken before any feature's
+    row, by everyone: a transaction that held a feature and then recorded an event would
+    meet one that holds the project and asks for that feature."""
+    await connection.execute(
+        "SELECT 1 FROM projects WHERE project_id = %s FOR NO KEY UPDATE", (project_id,)
+    )
+
+
 async def lock_gate(connection: Connection, project_id: str, *, exclusive: bool = False) -> None:
     """Taken before any other row of the project, in every workflow transaction."""
     strength = "UPDATE" if exclusive else "SHARE"
