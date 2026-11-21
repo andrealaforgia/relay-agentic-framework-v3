@@ -94,9 +94,13 @@ class Behaviours:
         demonstrates: Sequence[str],
         *,
         basis: int,
+        story_revision: int,
     ) -> None:
         """Add a behaviour to a story that is being worked on, naming the acceptance
-        criteria it will demonstrate. There is no behaviour without a story."""
+        criteria it will demonstrate. There is no behaviour without a story. The
+        proposal names the story revision and decision basis its author read: a
+        criterion keeps its name when it is reworded, and work must not start from the
+        old wording."""
         behaviour = Behaviour.propose(behaviour_id, summary)
         # Read once, before anything is awaited: what is checked, stored and written to
         # the ledger is this, whatever the caller does to its own list meanwhile.
@@ -105,7 +109,7 @@ class Behaviours:
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id)
             position = await add_behaviour_to_story(
-                connection, project_id, story_id, demonstrates, basis
+                connection, project_id, story_id, demonstrates, basis, story_revision
             )
             await connection.execute(
                 "INSERT INTO behaviours (project_id, behaviour_id, summary, state, "

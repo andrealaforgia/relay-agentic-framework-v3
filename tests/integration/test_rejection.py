@@ -298,7 +298,9 @@ async def test_a_red_that_finishes_after_its_story_was_set_aside_is_evidence_onl
     world: DecisionWorld,
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     await world.behaviours.begin_test_design(PROJECT, "B1")
     await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
     barrier = HeldAtABarrier(ContainerIsolation(world.image))

@@ -43,7 +43,9 @@ async def test_an_open_question_stops_its_story_and_the_answer_becomes_shared_co
     world: DecisionWorld,
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     await world.behaviours.begin_test_design(PROJECT, "B1")
     await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
 
@@ -228,7 +230,9 @@ async def test_a_pause_and_a_question_each_stop_the_story_until_each_is_cleared(
     world: DecisionWorld,
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     feature_wide = await world.ask(story=None)
     about_the_story = await world.ask("S1")
     await world.close("pause", reason="budget review")
@@ -307,7 +311,9 @@ async def test_a_question_waits_for_work_that_was_admitted_before_it(
     world: DecisionWorld, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     admitted, go_on = asyncio.Event(), asyncio.Event()
     real = behaviours_module.require_story_at_work
 

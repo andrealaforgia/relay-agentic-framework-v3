@@ -280,7 +280,9 @@ async def test_a_green_that_finishes_after_a_cancel_is_kept_as_evidence_only(
 async def test_a_red_that_finishes_after_a_cancel_is_kept_as_evidence_only(
     world: StoryWorld,
 ) -> None:
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     await world.behaviours.begin_test_design(PROJECT, "B1")
     await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
     barrier, behaviours = held(world)
@@ -299,7 +301,9 @@ async def test_a_red_that_finishes_after_a_cancel_is_kept_as_evidence_only(
 async def test_a_red_that_finishes_during_a_pause_is_judged_and_its_build_waits(
     world: StoryWorld,
 ) -> None:
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     await world.behaviours.begin_test_design(PROJECT, "B1")
     await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
     barrier, behaviours = held(world)

@@ -109,6 +109,7 @@ async def test_a_planned_story_is_reworded_only_when_the_revision_is_approved(
         ],
         "dropped": [],
         "added": [],
+        "moved": [],
     }
 
     await world.decide(gate)
@@ -142,7 +143,9 @@ async def test_a_dropped_story_is_withdrawn_and_an_added_one_takes_its_turn(
         await world.revise(Kept("S3"), Kept("S1"), GREETS)
     assert (await world.stories.roadmap_of(PROJECT, "F1")).stories == ("S3", "S1")
     with pytest.raises(ActionRefused, match="not being worked on"):
-        await world.behaviours.propose(PROJECT, "S2", "B9", "too late", ["AC1"], basis=0)
+        await world.behaviours.propose(
+            PROJECT, "S2", "B9", "too late", ["AC1"], basis=0, story_revision=1
+        )
 
 
 async def test_what_is_under_way_or_finished_cannot_be_changed_by_a_revision(

@@ -39,6 +39,7 @@ from relay.application.closure import (
     lock_gate,
     require_open,
     story_basis,
+    what_ended,
 )
 from relay.application.reviews import gate_of
 from relay.application.stories import evaluate_story_gate, lock_story, require_story_at_work
@@ -523,7 +524,12 @@ class Integration:
                 # The one boundary for trunk: a closure that committed before this
                 # transaction means no intent. What the checks saw is kept.
                 state = "abandoned" if closed_by == CANCELLED else "held"
-                reason = f"the feature was {closed_by} before these checks could decide"
+                ended = (
+                    await what_ended(connection, project_id, behaviour_id)
+                    if closed_by == CANCELLED
+                    else f"the feature was {closed_by}"
+                )
+                reason = f"{ended} before these checks could decide"
                 await _close_batch(connection, batch, state, reason)
                 return IntegrationReceipt(_OUTCOME_OF_BATCH[state], batch_id, reason)
             stale = await _why_stale(connection, batch, behaviour, row, cycle, project)

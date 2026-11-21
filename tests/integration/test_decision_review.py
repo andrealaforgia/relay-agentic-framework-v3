@@ -282,7 +282,9 @@ async def test_a_gate_already_superseded_is_stale_whatever_else_is_waiting(
 
 
 async def test_a_refusal_names_every_reason_the_closure_first(world: DecisionWorld) -> None:
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     await world.behaviours.begin_test_design(PROJECT, "B1")
     await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
     await decided(world)
@@ -349,7 +351,9 @@ async def test_a_roadmap_published_just_before_a_question_is_covered_by_it(
 async def test_a_decision_waits_for_work_that_was_admitted_before_it(
     world: DecisionWorld, monkeypatch: pytest.MonkeyPatch, decision: str
 ) -> None:
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     assumed = await world.decisions.assume(ANALYST, PROJECT, "F1", story_id="S1", text="pounds")
     about_the_other_story = await world.ask("S2")
     admitted, go_on = asyncio.Event(), asyncio.Event()
@@ -637,7 +641,9 @@ async def test_a_seal_is_refused_once_with_the_question_the_story_and_every_stal
 ) -> None:
     await world.deliver("B1")
     greeting = replace(CONTRACT, contract_id="B2-greeting")
-    await world.behaviours.propose(PROJECT, "S1", "B2", "a greeting", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B2", "a greeting", ["AC1"], basis=0, story_revision=1
+    )
     await world.behaviours.begin_test_design(PROJECT, "B2")
     await world.behaviours.register_acceptance_test(PROJECT, "B2", greeting, basis=0)
     await decided(world)

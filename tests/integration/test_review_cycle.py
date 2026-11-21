@@ -72,7 +72,7 @@ class World:
         await self.behaviours.open_project(PROJECT, str(self.repository))
         await in_a_story(self.behaviours, PROJECT)
         await self.behaviours.propose(
-            PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0
+            PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0, story_revision=1
         )
         await self.behaviours.begin_test_design(PROJECT, "B1")
         await self.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
@@ -797,7 +797,13 @@ async def test_one_projects_unreachable_repository_does_not_hold_up_another(
     await first.behaviours.open_project("other-project", str(second.repository))
     await in_a_story(first.behaviours, "other-project")
     await first.behaviours.propose(
-        "other-project", "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0
+        "other-project",
+        "S1",
+        "B1",
+        "standard VAT rate is applied",
+        ["AC1"],
+        basis=0,
+        story_revision=1,
     )
     await first.behaviours.begin_test_design("other-project", "B1")
     await first.behaviours.register_acceptance_test("other-project", "B1", CONTRACT, basis=0)
@@ -954,7 +960,13 @@ async def test_one_unreadable_legacy_mirror_does_not_stop_adoption_for_another_p
     await first.behaviours.open_project("other-project", str(other_repository))
     await in_a_story(first.behaviours, "other-project")
     await first.behaviours.propose(
-        "other-project", "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0
+        "other-project",
+        "S1",
+        "B1",
+        "standard VAT rate is applied",
+        ["AC1"],
+        basis=0,
+        story_revision=1,
     )
     await first.behaviours.begin_test_design("other-project", "B1")
     await first.behaviours.register_acceptance_test("other-project", "B1", CONTRACT, basis=0)

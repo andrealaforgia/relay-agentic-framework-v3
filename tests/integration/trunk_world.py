@@ -143,7 +143,13 @@ class TrunkWorld:
         """A behaviour with a verified red on the current trunk. Returns that revision."""
         basis = await self.basis(story)
         await self.behaviours.propose(
-            self.project, story, behaviour, contract.observes, ["AC1"], basis=basis
+            self.project,
+            story,
+            behaviour,
+            contract.observes,
+            ["AC1"],
+            basis=basis,
+            story_revision=await self.revision(story),
         )
         if self.side_by_side:
             # Relay makes a behaviour wait for the ones before it in its story. The
@@ -236,6 +242,15 @@ class TrunkWorld:
         async with asyncio.timeout(30):
             while not flag.exists():
                 await asyncio.sleep(0.05)
+
+    async def revision(self, story: str = "S1") -> int:
+        """The story's revision, as a role would read it just before proposing."""
+        [revision] = await self.column(
+            f"SELECT revision FROM stories WHERE project_id = '{self.project}' "
+            f"AND story_id = '{story}'"
+        )
+        assert isinstance(revision, int)
+        return revision
 
     async def basis(self, story: str = "S1") -> int:
         """The decision basis a role would read with the story, just before it submits."""

@@ -54,7 +54,9 @@ async def test_nothing_is_released_until_a_person_approves_the_roadmap(world: St
 
     assert not await world.exists("S1")  # proposed, and nothing more until it is approved
     with pytest.raises(LookupError):
-        await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+        await world.behaviours.propose(
+            PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+        )
     [waiting] = await world.stories.inbox(PROJECT)
     assert (waiting.gate_id, waiting.kind) == (gate, "roadmap")
     assert [story["story_id"] for story in waiting.manifest["stories"]] == ["S1", "S2"]
@@ -87,9 +89,13 @@ async def test_a_delivered_story_stops_at_its_gate_and_survives_a_restart_with_a
     assert shown.manifest["assessment"]["statement"].startswith("B1 shows 120")
     assert shown.manifest["usage"] == "unknown"
     with pytest.raises(ActionRefused, match="awaiting approval"):
-        await world.behaviours.propose(PROJECT, "S1", "B2", "one more", ["AC1"], basis=0)
+        await world.behaviours.propose(
+            PROJECT, "S1", "B2", "one more", ["AC1"], basis=0, story_revision=1
+        )
     with pytest.raises(ActionRefused, match="planned"):
-        await world.behaviours.propose(PROJECT, "S2", "B2", "greeting", ["AC1"], basis=0)
+        await world.behaviours.propose(
+            PROJECT, "S2", "B2", "greeting", ["AC1"], basis=0, story_revision=1
+        )
 
     for key in [key async for key in broker.scan_iter(f"{namespace}:*")]:
         await broker.delete(key)
@@ -113,7 +119,9 @@ async def test_a_delivered_story_stops_at_its_gate_and_survives_a_restart_with_a
     assert await world.story("S2") is StoryState.RELEASED
     assert (await world.events()).count("story.released") == 2
     assert await restarted.inbox(PROJECT) == []
-    await world.behaviours.propose(PROJECT, "S2", "B2", "greeting", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S2", "B2", "greeting", ["AC1"], basis=0, story_revision=1
+    )
 
 
 async def test_the_gate_opens_whichever_comes_last_the_seal_the_assessment_or_the_integration(
@@ -137,12 +145,16 @@ async def test_a_list_that_leaves_an_acceptance_criterion_out_cannot_be_sealed(
 ) -> None:
     two_criteria = StoryDraft("S1", "Rates", "prices are right", {"AC1": "standard", "AC2": "zero"})
     await world.decide(await world.roadmap(two_criteria))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
 
     with pytest.raises(SealRefused, match="AC2"):
         await world.seal()
     with pytest.raises(ActionRefused, match="no acceptance criteria"):
-        await world.behaviours.propose(PROJECT, "S1", "B2", "made up", ["AC9"], basis=0)
+        await world.behaviours.propose(
+            PROJECT, "S1", "B2", "made up", ["AC9"], basis=0, story_revision=1
+        )
 
 
 async def test_a_behaviour_added_after_the_seal_keeps_the_gate_shut_until_sealed_again(
@@ -151,7 +163,9 @@ async def test_a_behaviour_added_after_the_seal_keeps_the_gate_shut_until_sealed
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.deliver("B1")
     await world.seal()
-    await world.behaviours.propose(PROJECT, "S1", "B2", "one more", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B2", "one more", ["AC1"], basis=0, story_revision=1
+    )
 
     with pytest.raises(ActionRefused, match="sealed"):
         await world.assess("B1 is enough")
@@ -165,8 +179,12 @@ async def test_a_behaviour_added_after_the_seal_keeps_the_gate_shut_until_sealed
 
 async def test_a_behaviour_waits_for_the_one_before_it_to_reach_trunk(world: StoryWorld) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
-    await world.behaviours.propose(PROJECT, "S1", "B2", "one more", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
+    await world.behaviours.propose(
+        PROJECT, "S1", "B2", "one more", ["AC1"], basis=0, story_revision=1
+    )
 
     with pytest.raises(ActionRefused, match="waits for B1"):
         await world.behaviours.begin_test_design(PROJECT, "B2")
@@ -322,7 +340,9 @@ async def test_nothing_is_started_on_a_behaviour_whose_story_is_not_being_worked
     """Written directly: by the real route a story reaches its gate only when all its
     behaviours are on trunk, so none is left to start anything on."""
     await world.decide(await world.roadmap(STANDARD_RATE))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     async with world.database.connection() as connection:
         await connection.execute("UPDATE stories SET state = 'awaiting_approval'")
 
@@ -346,7 +366,9 @@ async def test_a_feature_has_one_roadmap_and_a_sealed_list_one_assessment(
     with pytest.raises(ActionRefused, match="the one in force is 1"):
         # A second first roadmap: it does not say what it revises.
         await world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [GREETS], basis=0)
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     await world.seal()
     await world.assess("it will do")
 
@@ -360,10 +382,14 @@ async def test_an_assessment_of_an_earlier_list_does_not_open_the_gate_for_a_lat
     world: StoryWorld,
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     await world.seal()
     await world.assess("B1 alone will do")
-    await world.behaviours.propose(PROJECT, "S1", "B2", "and a greeting", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B2", "and a greeting", ["AC1"], basis=0, story_revision=1
+    )
     for behaviour, contract, files in (
         ("B1", CONTRACT, None),
         ("B2", GREETING, {"greeting.txt": "hello\n"}),
@@ -394,11 +420,15 @@ async def test_a_seal_or_an_assessment_of_a_list_that_has_moved_on_is_refused(
 ) -> None:
     """The Analyst read the first sealed list. Its verdict must not land on the second."""
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     read_by_the_verifier = await world.stories.revisions_of(PROJECT, "S1")
     await world.seal()
     read_by_the_analyst = await world.stories.revisions_of(PROJECT, "S1")
-    await world.behaviours.propose(PROJECT, "S1", "B2", "and a greeting", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B2", "and a greeting", ["AC1"], basis=0, story_revision=1
+    )
 
     with pytest.raises(ActionRefused, match="moved on"):
         await world.stories.seal(
@@ -430,7 +460,9 @@ async def test_an_assessment_names_the_seal_it_was_written_against(world: StoryW
     """The Verifier seals the same list twice. What the Analyst wrote about the first
     seal is not about the second, though every revision number is the same."""
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     await world.seal()
     read_by_the_analyst = await world.stories.seal_of(PROJECT, "S1")
     assert read_by_the_analyst is not None
@@ -698,10 +730,14 @@ async def test_a_behaviour_that_demonstrates_nothing_is_refused_when_proposed(
     before = await world.stories.revisions_of(PROJECT, "S1")
 
     with pytest.raises(ActionRefused, match="at least one acceptance criterion"):
-        await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", [], basis=0)
+        await world.behaviours.propose(
+            PROJECT, "S1", "B1", "standard rate", [], basis=0, story_revision=1
+        )
 
     assert await world.stories.revisions_of(PROJECT, "S1") == before
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     await world.seal()
 
 
@@ -725,7 +761,7 @@ async def test_a_proposal_records_the_same_criteria_in_the_behaviour_and_in_the_
     await world.decide(await world.roadmap(two_criteria))
 
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", OneThingThenAnother(), basis=0
+        PROJECT, "S1", "B1", "standard rate", OneThingThenAnother(), basis=0, story_revision=1
     )
 
     [stored] = await world.column("SELECT demonstrates FROM behaviours")

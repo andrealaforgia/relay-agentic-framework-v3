@@ -788,6 +788,10 @@ class Reviews:
                 "SELECT 1 FROM behaviours WHERE project_id = %s AND behaviour_id = %s FOR UPDATE",
                 (project_id, behaviour_id),
             )
+            if await closure_of_behaviour(connection, project_id, behaviour_id) == CANCELLED:
+                # The story was rejected or withdrawn, or the feature cancelled, while
+                # the caller was looking. What it saw is evidence, and moves nothing.
+                return False
             try:
                 await _require_current(
                     connection, {"project_id": project_id, "behaviour_id": behaviour_id}

@@ -70,7 +70,9 @@ def held(world: DecisionWorld) -> tuple[HeldAtABarrier, Behaviours]:
 
 
 async def registered(world: DecisionWorld) -> None:
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     await world.behaviours.begin_test_design(PROJECT, "B1")
     await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
 

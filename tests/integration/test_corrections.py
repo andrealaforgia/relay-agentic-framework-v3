@@ -243,7 +243,9 @@ async def test_sending_a_proposal_back_leaves_what_is_owed_for_the_roadmap_in_fo
         ("story", None),
     ]
     assert await world.reconfirm_everything() == 3
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=1)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=1, story_revision=1
+    )
 
 
 async def test_an_approved_revision_is_the_answer_for_the_stories_it_rewords(

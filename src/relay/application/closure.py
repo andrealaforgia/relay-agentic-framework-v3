@@ -167,3 +167,20 @@ async def require_startable(
         reasons.append(f"{row['why']}, and its owner has yet to reconfirm it")
     if reasons:
         raise ActionRefused("; and ".join(reasons) + ": nothing new starts here")
+
+
+async def what_ended(connection: Connection, project_id: str, behaviour_id: str) -> str:
+    """In words, what put an end to work on a behaviour: its story was rejected or
+    withdrawn, or its feature was cancelled. For the record, where "cancelled" alone
+    would say the wrong thing about a feature that is still open for a correction."""
+    row = await (
+        await connection.execute(
+            "SELECT s.story_id, s.state FROM behaviours b "
+            "JOIN stories s USING (project_id, story_id) "
+            "WHERE b.project_id = %s AND b.behaviour_id = %s",
+            (project_id, behaviour_id),
+        )
+    ).fetchone()
+    if row is not None and row["state"] in ("rejected", "withdrawn"):
+        return f"{row['story_id']} was {row['state']}"
+    return "the feature was cancelled"

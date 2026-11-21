@@ -201,7 +201,9 @@ class Stories:
         if not entries:
             raise ValueError("a roadmap needs at least one story")
         async with self._pool.connection() as connection, connection.transaction():
-            await lock_gate(connection, project_id)
+            # Exclusively: a proposal inspects, and its approval changes, stories that
+            # other transactions lock in their own order under the shared gate lock.
+            await lock_gate(connection, project_id, exclusive=True)
             await _locked_project(connection, project_id)
             feature = await _locked_feature(connection, project_id, feature_id)
             require_open(await closure_of_feature(connection, project_id, feature_id))
@@ -398,7 +400,9 @@ class Stories:
             if located is None:
                 raise ActionRefused("no such gate")
             project_id = located["project_id"]
-            await lock_gate(connection, project_id)
+            # A roadmap gate is decided under the exclusive gate lock, as its proposal
+            # was published: approving it reads and rewrites other stories.
+            await lock_gate(connection, project_id, exclusive=located["kind"] == "roadmap")
             # Story, then project, then feature: the order every transition uses. The
             # project comes before any feature because releasing the next story, under
             # the project lock, may reach into a feature other than this one.
@@ -442,13 +446,12 @@ class Stories:
             outcome = {"approve": "approved", "reject": "rejected"}.get(
                 action.action, "changes_requested"
             )
-            if story is None and not await _settle_roadmap(connection, gate, outcome):
-                # The stories this proposal is about have moved on since it was written.
-                # It is not approved as it stands; the Analyst proposes again.
+            moved_on = await _settle_roadmap(connection, gate, outcome) if story is None else ""
+            if moved_on:
+                # What this proposal is about has changed since it was written. It is
+                # not approved as it stands; the Analyst proposes again.
                 await _close_gate(connection, gate, "superseded", "superseded")
-                receipt = Receipt(
-                    "stale", "nothing changed: what this roadmap would change has moved on"
-                )
+                receipt = Receipt("stale", f"nothing changed: {moved_on}")
                 await _record(connection, action, receipt)
                 return receipt
             await _close_gate(connection, gate, "decided", outcome)
@@ -595,6 +598,7 @@ async def add_behaviour_to_story(
     story_id: str,
     demonstrates: Sequence[str],
     basis: int,
+    story_revision: int,
 ) -> int:
     """Make room for one more behaviour in a story that is being worked on, and return
     its position. Any change to the list makes a new list revision, which the Verifier
@@ -603,6 +607,11 @@ async def add_behaviour_to_story(
     _require_at_work(story)
     await require_startable(connection, project_id, story_id)
     require_basis(basis, await story_basis(connection, project_id, story_id))
+    if story_revision != story["revision"]:
+        raise ActionRefused(
+            f"{story_id} has moved on: this was proposed against revision {story_revision}, "
+            f"and it is now at revision {story['revision']}"
+        )
     if not demonstrates:
         # It could be built and integrated, and then no list containing it could ever
         # be sealed: the story would hold the project and never reach its gate.
@@ -794,7 +803,7 @@ async def _open_roadmap_gate(
         row["story_id"]: row
         for row in await (
             await connection.execute(
-                "SELECT story_id, title, outcome, criteria FROM stories "
+                "SELECT story_id, title, outcome, criteria, corrects FROM stories "
                 "WHERE project_id = %s AND story_id = ANY(%s)",
                 (project_id, [entry["story_id"] for entry in entries]),
             )
@@ -811,10 +820,18 @@ async def _open_roadmap_gate(
         shown = {"story_id": entry["story_id"]} | text(
             live[entry["story_id"]] if entry["kind"] == "kept" else entry
         )
-        if entry["corrects"] is not None:
-            shown["corrects"] = entry["corrects"]
+        # A correction keeps saying what it corrects, in every later revision.
+        corrects = entry["corrects"] or live.get(entry["story_id"], {}).get("corrects")
+        if corrects is not None:
+            shown["corrects"] = corrects
         stories.append(shown)
     effective, _ = await _revisions_of(connection, project_id, feature_id)
+    was_at = {
+        member.story_id: place
+        for place, member in enumerate(
+            await _members(connection, project_id, feature_id, effective), start=1
+        )
+    }
     manifest = {
         "feature_id": feature_id,
         "problem": feature["problem"],
@@ -831,6 +848,12 @@ async def _open_roadmap_gate(
             ],
             "dropped": [e["story_id"] for e in entries if e["kind"] == "dropped"],
             "added": [e["story_id"] for e in entries if e["kind"] == "new"],
+            # A reorder changes nothing else, and would otherwise show as nothing at all.
+            "moved": [
+                {"story_id": e["story_id"], "from": was_at[e["story_id"]], "to": e["position"]}
+                for e in entries
+                if e["kind"] in ("kept", "reworded") and was_at[e["story_id"]] != e["position"]
+            ],
         },
     }
     return await _open_gate(
@@ -949,6 +972,13 @@ async def _why_an_edit_is_out_of_date(
 
 
 async def _require_unused(connection: Connection, project_id: str, story_ids: list[str]) -> None:
+    if why := await _why_a_name_is_taken(connection, project_id, story_ids):
+        raise ActionRefused(why)
+
+
+async def _why_a_name_is_taken(
+    connection: Connection, project_id: str, story_ids: list[str]
+) -> str:
     taken = await (
         await connection.execute(
             "SELECT story_id FROM stories WHERE project_id = %s AND story_id = ANY(%s) "
@@ -956,8 +986,9 @@ async def _require_unused(connection: Connection, project_id: str, story_ids: li
             (project_id, story_ids),
         )
     ).fetchone()
-    if taken is not None:
-        raise ActionRefused(f"{taken['story_id']} is already the name of a story of this project")
+    if taken is None:
+        return ""
+    return f"{taken['story_id']} is already the name of a story of this project"
 
 
 async def _end_proposal(
@@ -1055,7 +1086,7 @@ async def _cancel(connection: Connection, project_id: str, feature_id: str) -> N
     """Free the project's place and withdraw everything still waiting for a person."""
     await connection.execute(
         "UPDATE stories SET state = 'cancelled' WHERE project_id = %s AND feature_id = %s "
-        "AND state NOT IN ('approved', 'rejected')",
+        "AND state NOT IN ('approved', 'rejected', 'withdrawn')",
         (project_id, feature_id),
     )
     open_gates = await (
@@ -1183,11 +1214,12 @@ async def _basis_now(
     )
 
 
-async def _settle_roadmap(connection: Connection, gate: Mapping[str, Any], outcome: str) -> bool:
+async def _settle_roadmap(connection: Connection, gate: Mapping[str, Any], outcome: str) -> str:
     """Apply the person's decision on a proposal. Sent back, it ends. Approved, it
     replaces the roadmap in force, all at once: but only if it is still a valid change
     to what is there now, and each of its edits is still of the story it was written
-    against. Returns False, having changed nothing, if it is not."""
+    against. Returns why not, having changed nothing, if it is not; otherwise an
+    empty string."""
     project_id, feature_id = gate["project_id"], gate["feature_id"]
     revision: int = gate["basis"]["roadmap_revision"]
     if outcome != "approved":
@@ -1198,14 +1230,22 @@ async def _settle_roadmap(connection: Connection, gate: Mapping[str, Any], outco
         )
         # Nothing is owed for it: a proposal waiting to be reconfirmed has no open gate
         # to be sent back at.
-        return True
+        return ""
     effective, _ = await _revisions_of(connection, project_id, feature_id)
     entries = await _entries(connection, project_id, feature_id, revision)
-    if why_not_a_revision(
-        await _members(connection, project_id, feature_id, effective),
-        [Entry(entry["story_id"], entry["kind"], entry["corrects"]) for entry in entries],
-    ) or await _why_an_edit_is_out_of_date(connection, project_id, entries):
-        return False
+    why = (
+        why_not_a_revision(
+            await _members(connection, project_id, feature_id, effective),
+            [Entry(entry["story_id"], entry["kind"], entry["corrects"]) for entry in entries],
+        )
+        or await _why_an_edit_is_out_of_date(connection, project_id, entries)
+        # Another feature may have been given one of these names since publication.
+        or await _why_a_name_is_taken(
+            connection, project_id, [e["story_id"] for e in entries if e["kind"] == "new"]
+        )
+    )
+    if why:
+        return why
     if effective is not None:
         await connection.execute(
             "UPDATE roadmaps SET state = 'superseded' WHERE project_id = %s "
@@ -1270,7 +1310,7 @@ async def _settle_roadmap(connection: Connection, gate: Mapping[str, Any], outco
         "AND state IN ('wanted', 'granted') AND issued_on->>'story_id' = ANY(%s)",
         (project_id, feature_id, [e["corrects"] for e in entries if e["corrects"] is not None]),
     )
-    return True
+    return ""
 
 
 async def _settle_story(connection: Connection, story: Mapping[str, Any], outcome: str) -> None:
@@ -1305,7 +1345,6 @@ async def _reject(connection: Connection, story: Mapping[str, Any]) -> None:
         "WHERE project_id = %s AND story_id = %s",
         (project_id, story_id),
     )
-    await retire_all_of_story(connection, project_id, story_id)
     await connection.execute(
         "UPDATE inbox_items SET state = 'closed' WHERE state = 'open' AND question_id IN "
         "(SELECT question_id FROM questions WHERE project_id = %s AND scope_story = %s "
@@ -1318,12 +1357,16 @@ async def _reject(connection: Connection, story: Mapping[str, Any]) -> None:
         (project_id, story_id),
     )
     await connection.execute(
-        "UPDATE check_batches SET state = 'abandoned', "
+        "UPDATE check_batches k SET state = 'abandoned', "
         "reason = 'the story was rejected before these checks could be run again' "
-        "WHERE project_id = %s AND state = 'held' AND behaviour_id IN "
+        "WHERE k.project_id = %s AND (k.state = 'held' OR (k.state = 'interrupted' AND EXISTS "
+        "(SELECT 1 FROM assignments a WHERE a.kind = 'integrate' AND a.state = 'wanted' "
+        "AND a.issued_on->>'batch_id' = k.batch_id::text))) AND k.behaviour_id IN "
         "(SELECT behaviour_id FROM behaviours WHERE project_id = %s AND story_id = %s)",
         (project_id, project_id, story_id),
     )
+    # After the checks above were found by the assignments that wanted them.
+    await retire_all_of_story(connection, project_id, story_id)
     await owe(
         connection,
         CORRECT,

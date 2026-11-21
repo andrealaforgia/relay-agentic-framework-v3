@@ -56,16 +56,24 @@ async def test_a_proposal_names_the_basis_it_was_written_on_and_needs_a_current_
     await decided(world)
 
     with pytest.raises(ActionRefused, match="S1 is not current"):
-        await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=1)
+        await world.behaviours.propose(
+            PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=1, story_revision=1
+        )
     await world.reconfirm_everything()
     with pytest.raises(ActionRefused, match="written on decision basis 0"):
-        await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+        await world.behaviours.propose(
+            PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+        )
 
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=1)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=1, story_revision=1
+    )
 
 
 async def test_a_contract_names_the_basis_it_was_written_on(world: DecisionWorld) -> None:
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     await world.behaviours.begin_test_design(PROJECT, "B1")
     await decided(world)
     await world.reconfirm_everything()
@@ -120,7 +128,9 @@ async def test_a_candidate_is_not_integrated_on_a_contract_nobody_has_reconfirme
 async def test_a_red_in_flight_when_a_decision_lands_is_evidence_only_even_if_all_is_reconfirmed(
     world: DecisionWorld,
 ) -> None:
-    await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
+    await world.behaviours.propose(
+        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
     await world.behaviours.begin_test_design(PROJECT, "B1")
     await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
     barrier = HeldAtABarrier(ContainerIsolation(world.image))
