@@ -39,7 +39,9 @@ from relay.application.closure import (
     require_startable,
     story_basis,
 )
-from relay.application.completion import evaluate_completion
+from relay.application.completion import basis_of_gate as completion_gate_basis
+from relay.application.completion import evaluate_completion, roadmap_changed
+from relay.application.completion import settle_gate as settle_completion_gate
 from relay.domain.evidence import ProcessContract
 from relay.domain.identifiers import require_identifier
 from relay.domain.story import (
@@ -208,6 +210,13 @@ class Stories:
             await _locked_project(connection, project_id)
             feature = await _locked_feature(connection, project_id, feature_id)
             require_open(await closure_of_feature(connection, project_id, feature_id))
+            if feature["state"] in ("checking", "needs_decision"):
+                # A revision and a completion could otherwise be decided against each
+                # other. The Product Owner sends the feature back from its gate first.
+                raise ActionRefused(
+                    "the feature is at its final check: its roadmap is not proposed again "
+                    "until that is decided"
+                )
             require_basis(basis, await feature_basis(connection, project_id, feature_id))
             effective, proposed = await _revisions_of(connection, project_id, feature_id)
             if revises != effective:
@@ -401,6 +410,14 @@ class Stories:
             ).fetchone()
             if located is None:
                 raise ActionRefused("no such gate")
+            if located["kind"] == "completion":
+                if action.action not in ("retry", "request_changes"):
+                    raise ActionRefused(
+                        "a final check that failed is answered with retry or "
+                        "request_changes, and nothing else"
+                    )
+            elif action.action == "retry":
+                raise ActionRefused("'retry' is for a feature whose final check failed")
             project_id = located["project_id"]
             # A roadmap gate is decided under the exclusive gate lock, as its proposal
             # was published: approving it reads and rewrites other stories.
@@ -440,6 +457,8 @@ class Stories:
                     await connection.execute("SELECT * FROM gates WHERE gate_id = %s", (gate_id,))
                 ).fetchone()
                 assert gate is not None
+            elif gate["kind"] == "completion":
+                current = await completion_gate_basis(connection, gate)
             else:
                 current = await _basis_now(connection, gate, story)
             if gate["state"] != "open" or gate["basis"] != current:
@@ -454,7 +473,7 @@ class Stories:
                     "'reject' is not something that can be done here: a roadmap is sent "
                     "back with request_changes"
                 )
-            outcome = {"approve": "approved", "reject": "rejected"}.get(
+            outcome = {"approve": "approved", "reject": "rejected", "retry": "retried"}.get(
                 action.action, "changes_requested"
             )
             moved_on = (
@@ -475,6 +494,8 @@ class Stories:
                 await _settle_story(connection, story, outcome)
             elif gate["kind"] == "supersession":
                 await supersessions.settle_gate(connection, gate, outcome)
+            elif gate["kind"] == "completion":
+                await settle_completion_gate(connection, gate, outcome)
             await append_event(
                 connection,
                 project_id,
@@ -1332,6 +1353,7 @@ async def _settle_roadmap(connection: Connection, gate: Mapping[str, Any], outco
         revisions=[revision, *([effective] if effective is not None else [])],
         stories=[e["story_id"] for e in entries if e["kind"] in ("reworded", "dropped")],
     )
+    await roadmap_changed(connection, project_id, feature_id)
     # The Analyst owed a correction for each rejection this revision now answers.
     await connection.execute(
         "UPDATE assignments SET state = 'done', grant_id = NULL, granted_to = NULL "

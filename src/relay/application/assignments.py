@@ -344,6 +344,10 @@ class Assignments:
                 )
             ).fetchone()
             assert assignment is not None
+            if assignment["kind"] == REVISE:
+                # Answered by publishing a roadmap revision, which needs no grant: a
+                # grant that could be taken back would only hide that the change is owed.
+                raise ActionRefused("a roadmap change is made by proposing the roadmap again")
             if assignment["kind"] in (INTEGRATE, COMPLETE):
                 # Its grant and its first effect are made together, by the control plane.
                 # A grant on its own would leave the checks never started.

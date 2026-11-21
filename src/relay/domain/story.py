@@ -277,6 +277,8 @@ AT_A_GATE = {
     "approve": frozenset[str](),
     "request_changes": frozenset({"reason"}),
     "reject": frozenset({"reason"}),
+    # Only where a feature's final check failed: run the checks again.
+    "retry": frozenset[str](),
 }
 # Setting aside a story that is being worked on. A gate is one fixed thing to decide on;
 # a story at work is not, so the person says which revision, under which decisions.

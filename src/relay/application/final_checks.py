@@ -29,6 +29,8 @@ from relay.application.completion import (
     roadmap_in_force,
     stories_of,
 )
+from relay.application.stories import _digest as digest_of
+from relay.application.stories import _open_gate as open_gate
 from relay.domain.evidence import CheckContract, is_gate_bearing
 from relay.domain.story import ActionRefused
 from relay.git.checkout import CheckoutFailed, pristine_checkout, trunk_head
@@ -256,7 +258,8 @@ class Completion:
                 return await self._owed_again(
                     connection, batch, "discarded", "trunk moved while the checks were running"
                 )
-            assert all(each["satisfied"] for each in receipts)
+            if not all(each["satisfied"] for each in receipts):
+                return await _fail(connection, batch, receipts)
             return await _complete(connection, batch, receipts)
 
     async def _owed_again(
@@ -338,6 +341,62 @@ async def _complete(
     return CompletionReceipt("completed", batch["batch_id"])
 
 
+async def _fail(
+    connection: Connection, batch: dict[str, Any], receipts: list[dict[str, Any]]
+) -> CompletionReceipt:
+    """A check is not satisfied on the commit that is trunk. Nothing is completed: a
+    person is shown what failed and says whether to check again or change the roadmap."""
+    project_id, feature_id = batch["project_id"], batch["feature_id"]
+    reason = "not satisfied on trunk: " + ", ".join(
+        each["name"] for each in receipts if not each["satisfied"]
+    )
+    await _close(connection, batch, "failed", reason)
+    await connection.execute(
+        "UPDATE completion_requests SET state = 'failed' WHERE request_id = %s",
+        (batch["request_id"],),
+    )
+    await connection.execute(
+        "UPDATE features SET state = 'needs_decision' WHERE project_id = %s AND feature_id = %s",
+        (project_id, feature_id),
+    )
+    manifest = {
+        "batch_id": str(batch["batch_id"]),
+        "trunk": batch["trunk"],
+        "checked": _as_checked(receipts),
+    }
+    await open_gate(
+        connection,
+        project_id,
+        feature_id,
+        kind="completion",
+        story_id=None,
+        basis={
+            "batch_id": str(batch["batch_id"]),
+            "evidence": digest_of(manifest),
+            "roadmap_revision": batch["snapshot"]["roadmap_revision"],
+            "decisions": batch["snapshot"]["basis"],
+        },
+        manifest=manifest,
+    )
+    return CompletionReceipt("failed", batch["batch_id"], reason)
+
+
+def _as_checked(receipts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each obligation that was checked, by identity, with the run that observed it."""
+    return [
+        {
+            "obligation_id": each["obligation_id"],
+            "name": each["name"],
+            "source": each["source"],
+            "behaviour_id": each["behaviour_id"],
+            "digest": each["digest"],
+            "execution_id": each["execution_id"],
+            "satisfied": each["satisfied"],
+        }
+        for each in receipts
+    ]
+
+
 async def _summary(
     connection: Connection, batch: dict[str, Any], receipts: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -392,18 +451,7 @@ async def _summary(
             for behaviour in behaviours
         ],
         "trunk": batch["trunk"],
-        "checked": [
-            {
-                "obligation_id": each["obligation_id"],
-                "name": each["name"],
-                "source": each["source"],
-                "behaviour_id": each["behaviour_id"],
-                "digest": each["digest"],
-                "execution_id": each["execution_id"],
-                "satisfied": each["satisfied"],
-            }
-            for each in receipts
-        ],
+        "checked": _as_checked(receipts),
         # Not measured yet, and never shown as zero.
         "usage": "unknown",
     }

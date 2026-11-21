@@ -12,7 +12,8 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from relay.application.assignments import COMPLETE, owe
+from relay.application.assignments import COMPLETE, REVISE, owe
+from relay.application.closure import feature_basis
 from relay.domain.story import Member, StoryState, is_resolved
 from relay.persistence.database import Connection
 from relay.persistence.ledger import append_event
@@ -38,10 +39,13 @@ async def evaluate_completion(connection: Connection, project_id: str, feature_i
 
 
 async def prerequisites_hold(connection: Connection, project_id: str, feature_id: str) -> bool:
-    """A roadmap in force that is current, with no proposal waiting; and every story of
-    it resolved, with none still to be released or being worked on."""
+    """A roadmap in force that is current, with no proposal waiting and no change to it
+    owed; and every story of it resolved, with none still to be released or being
+    worked on."""
     roadmap = await roadmap_in_force(connection, project_id, feature_id)
     if roadmap is None or not roadmap["current"] or roadmap["proposal_waiting"]:
+        return False
+    if await _roadmap_change_owed(connection, project_id, feature_id):
         return False
     members = [
         Member(story["story_id"], StoryState(story["state"]), story["corrects"])
@@ -100,6 +104,81 @@ async def owe_completion(
         issued_on={"request_id": str(request_id)},
         feature_id=feature_id,
     )
+
+
+async def basis_of_gate(connection: Connection, gate: dict[str, Any]) -> dict[str, Any] | None:
+    """What a gate on a failed final check would be opened on now: the same batch and
+    the same evidence, under the roadmap and the decisions in force now. Trunk is not
+    part of it: after trunk has moved, a retry still means fresh checks on the head."""
+    feature = await (
+        await connection.execute(
+            "SELECT state FROM features WHERE project_id = %s AND feature_id = %s",
+            (gate["project_id"], gate["feature_id"]),
+        )
+    ).fetchone()
+    roadmap = await roadmap_in_force(connection, gate["project_id"], gate["feature_id"])
+    if feature is None or feature["state"] != "needs_decision" or roadmap is None:
+        return None
+    return {
+        "batch_id": gate["basis"]["batch_id"],
+        "evidence": gate["basis"]["evidence"],
+        "roadmap_revision": roadmap["revision"],
+        "decisions": await feature_basis(connection, gate["project_id"], gate["feature_id"]),
+    }
+
+
+async def settle_gate(connection: Connection, gate: dict[str, Any], outcome: str) -> None:
+    """The Product Owner's answer to a final check that failed."""
+    project_id, feature_id = gate["project_id"], gate["feature_id"]
+    if outcome == "retried":
+        await _admit(connection, project_id, feature_id)
+        return
+    # The roadmap is to change. Until a later revision is approved the feature is not
+    # ready, however often that is looked at: a proposal sent back leaves this owed.
+    await connection.execute(
+        "UPDATE features SET state = 'delivering' WHERE project_id = %s AND feature_id = %s",
+        (project_id, feature_id),
+    )
+    await owe(
+        connection,
+        REVISE,
+        Envelope(
+            message_kind=MessageKind.COMMAND,
+            event_type="roadmap.revision_requested",
+            project_id=project_id,
+            sender=CONTROL_PLANE,
+            recipient="analyst",
+            idempotency_key=f"revise:{gate['gate_id']}",
+            correlation_id=uuid.uuid7(),
+            payload={"feature_id": feature_id, "batch_id": gate["basis"]["batch_id"]},
+        ),
+        issued_on={
+            "batch_id": gate["basis"]["batch_id"],
+            "roadmap_revision": gate["basis"]["roadmap_revision"],
+        },
+        feature_id=feature_id,
+    )
+
+
+async def roadmap_changed(connection: Connection, project_id: str, feature_id: str) -> None:
+    """A roadmap revision was approved: a change that was owed has been made."""
+    await connection.execute(
+        "UPDATE assignments SET state = 'done' WHERE project_id = %s AND feature_id = %s "
+        "AND kind = 'revise' AND state = 'wanted'",
+        (project_id, feature_id),
+    )
+
+
+async def _roadmap_change_owed(connection: Connection, project_id: str, feature_id: str) -> bool:
+    return (
+        await (
+            await connection.execute(
+                "SELECT 1 FROM assignments WHERE project_id = %s AND feature_id = %s "
+                "AND kind = 'revise' AND state IN ('wanted', 'granted') LIMIT 1",
+                (project_id, feature_id),
+            )
+        ).fetchone()
+    ) is not None
 
 
 async def _admit(connection: Connection, project_id: str, feature_id: str) -> None:
