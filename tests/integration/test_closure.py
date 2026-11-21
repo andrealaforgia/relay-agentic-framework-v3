@@ -279,7 +279,7 @@ async def test_a_pause_and_the_release_of_a_story_cannot_cross(
         await world.close("pause", reason="stop")
         with pytest.raises(ActionRefused, match="paused"):
             await world.decide(gate)
-        assert await world.story("S1") is StoryState.PLANNED
+        assert not await world.exists("S1")
         return
     holding, go_on = asyncio.Event(), asyncio.Event()
     real = stories_module._locked_project

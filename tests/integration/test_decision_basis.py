@@ -471,8 +471,7 @@ async def test_a_roadmap_waiting_for_approval_is_put_again_with_the_decision_sho
     ]
     assert [story["story_id"] for story in item.manifest["stories"]] == ["S1"]
     await world.decide(item.gate_id)
-    assert await world.story("S1") is StoryState.PLANNED  # its own reconfirmation is still owed
-    await world.reconfirm_everything()
+    assert await world.owed() == []  # the story is created now, under the decision
     assert await world.story("S1") is StoryState.RELEASED
 
 

@@ -19,7 +19,9 @@ CREATE TABLE roadmaps (
     feature_id text NOT NULL,
     revision   integer NOT NULL,
     state      text NOT NULL DEFAULT 'proposed'
-        CHECK (state IN ('proposed', 'approved', 'superseded')),
+        -- proposed: waiting for a person. approved: in force. superseded: was in force.
+        -- sent_back: declined at its gate. replaced: withdrawn by a later proposal.
+        CHECK (state IN ('proposed', 'approved', 'superseded', 'sent_back', 'replaced')),
     -- The decision basis this revision is current on: the one its author read when it
     -- was published, or a later one it was reconfirmed for.
     current_on integer NOT NULL,
@@ -39,7 +41,9 @@ CREATE TABLE stories (
     criteria         jsonb NOT NULL,
     state            text NOT NULL DEFAULT 'planned' CHECK (state IN
         ('planned', 'released', 'changes_requested', 'awaiting_approval', 'approved', 'rejected',
-         'cancelled')),
+         'cancelled', 'withdrawn')),
+    -- The rejected story this one was created to correct, if any. Never changed.
+    corrects         text,
     revision         integer NOT NULL DEFAULT 1,
     -- Every change to the list of behaviours makes a new list revision; the Verifier's
     -- seal names the one it vouches for.

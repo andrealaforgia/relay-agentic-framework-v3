@@ -46,6 +46,22 @@ class StoryWorld(TrunkWorld):
             ANALYST, self.project, feature, list(stories), basis=0
         )
 
+    async def revise(self, *entries: Any, feature: str = "F1") -> uuid.UUID:
+        """What the Analyst does to propose the roadmap again: read what is in force and
+        what is waiting, and publish against exactly that."""
+        current = await self.stories.roadmap_of(self.project, feature)
+        [basis] = await self.column(f"SELECT feature_basis('{self.project}', '{feature}')")
+        assert isinstance(basis, int)
+        return await self.stories.publish_roadmap(
+            ANALYST,
+            self.project,
+            feature,
+            list(entries),
+            basis=basis,
+            revises=current.effective,
+            replaces=current.proposed,
+        )
+
     async def decide(self, gate: uuid.UUID, action: str = "approve", **payload: str) -> Receipt:
         self.requests += 1
         return await self.stories.decide(
@@ -91,6 +107,13 @@ class StoryWorld(TrunkWorld):
             basis=await self.basis(story),
             seal=seal or uuid.uuid7(),
         )
+
+    async def exists(self, story: str) -> bool:
+        """Whether there is such a story yet. A story proposed in a roadmap nobody has
+        approved is not one."""
+        return await self.column(
+            f"SELECT 1 FROM stories WHERE project_id = '{self.project}' AND story_id = '{story}'"
+        ) == [1]
 
     async def story(self, story: str = "S1") -> StoryState:
         return await self.stories.state_of(self.project, story)

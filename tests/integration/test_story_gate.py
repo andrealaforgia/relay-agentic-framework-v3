@@ -52,8 +52,8 @@ async def world(database: AsyncConnectionPool, tmp_path: Path, runner_image: str
 async def test_nothing_is_released_until_a_person_approves_the_roadmap(world: StoryWorld) -> None:
     gate = await world.roadmap(STANDARD_RATE, GREETS)
 
-    assert await world.story("S1") is StoryState.PLANNED
-    with pytest.raises(ActionRefused, match="planned"):
+    assert not await world.exists("S1")  # proposed, and nothing more until it is approved
+    with pytest.raises(LookupError):
         await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
     [waiting] = await world.stories.inbox(PROJECT)
     assert (waiting.gate_id, waiting.kind) == (gate, "roadmap")
@@ -269,8 +269,8 @@ async def test_an_action_that_arrives_after_the_gate_was_decided_is_stale(
     late = await world.decide(gate)
 
     assert late.disposition == "stale"
-    assert await world.story("S1") is StoryState.PLANNED
-    assert await world.column("SELECT state FROM roadmaps") == ["superseded"]
+    assert not await world.exists("S1")
+    assert await world.column("SELECT state FROM roadmaps") == ["sent_back"]
 
 
 async def test_of_an_approval_and_a_change_request_at_once_exactly_one_takes_effect(
@@ -287,7 +287,7 @@ async def test_of_an_approval_and_a_change_request_at_once_exactly_one_takes_eff
 
     assert sorted(receipt.disposition for receipt in receipts) == ["effective", "stale"]
     [effective] = [receipt for receipt in receipts if receipt.disposition == "effective"]
-    released = await world.story("S1") is StoryState.RELEASED
+    released = await world.exists("S1") and await world.story("S1") is StoryState.RELEASED
     assert released == (effective.outcome == "approved")
 
 
@@ -343,7 +343,8 @@ async def test_a_feature_has_one_roadmap_and_a_sealed_list_one_assessment(
     world: StoryWorld,
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
-    with pytest.raises(ActionRefused, match="already has a roadmap"):
+    with pytest.raises(ActionRefused, match="the one in force is 1"):
+        # A second first roadmap: it does not say what it revises.
         await world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [GREETS], basis=0)
     await world.behaviours.propose(PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0)
     await world.seal()
@@ -385,10 +386,7 @@ async def test_a_roadmap_nobody_has_approved_releases_nothing_when_another_gate_
 
     await world.decide(first, "request_changes", reason="split it")
 
-    assert (await world.story("S1"), await world.story("S2")) == (
-        StoryState.PLANNED,
-        StoryState.PLANNED,
-    )
+    assert not await world.exists("S1") and not await world.exists("S2")
 
 
 async def test_a_seal_or_an_assessment_of_a_list_that_has_moved_on_is_refused(
@@ -492,6 +490,7 @@ async def test_the_roadmap_a_person_is_shown_is_the_roadmap_that_is_released(
     )
 
     [shown] = await world.stories.inbox(PROJECT)
+    await world.decide(shown.gate_id)
     assert [story["story_id"] for story in shown.manifest["stories"]] == await world.column(
         "SELECT story_id FROM stories ORDER BY position"
     )
@@ -621,7 +620,7 @@ async def test_a_request_id_recorded_meanwhile_by_another_request_undoes_this_on
         await world.stories.decide(HumanAction(PRODUCT_OWNER, "one", str(second), "approve"))
 
     assert await world.column(f"SELECT state FROM gates WHERE gate_id = '{second}'") == ["open"]
-    assert await world.story("S2") is StoryState.PLANNED
+    assert not await world.exists("S2")
 
 
 async def test_the_last_integration_and_an_assessment_arriving_together_both_finish(

@@ -82,7 +82,7 @@ async def test_an_open_question_stops_its_story_and_the_answer_becomes_shared_co
 
 
 async def test_asking_again_after_a_lost_reply_is_the_same_question(world: DecisionWorld) -> None:
-    await world.roadmap(STANDARD_RATE)
+    await world.decide(await world.roadmap(STANDARD_RATE))
 
     first = await world.decisions.ask(VERIFIER, "ask-1", PROJECT, "F1", story_id="S1", **RATE)
     again = await world.decisions.ask(VERIFIER, "ask-1", PROJECT, "F1", story_id="S1", **RATE)
@@ -112,14 +112,16 @@ async def test_a_question_asked_before_any_roadmap_stops_planning_until_it_is_an
     with pytest.raises(ActionRefused, match="written on decision basis 0"):
         # Planned before the answer was known.
         await world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [STANDARD_RATE], basis=0)
-    await world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [STANDARD_RATE], basis=1)
+    await world.decide(
+        await world.stories.publish_roadmap(ANALYST, PROJECT, "F1", [STANDARD_RATE], basis=1)
+    )
     context = await world.decisions.context_for(PROJECT, "F1", "S1")
     assert [each.text for each in context.decisions] == ["zero-rated"]
     assert (await world.decisions.context_for(PROJECT, "F1")).basis == 1
 
 
 async def test_only_a_person_answers_and_a_question_is_answered_once(world: DecisionWorld) -> None:
-    await world.roadmap(STANDARD_RATE)
+    await world.decide(await world.roadmap(STANDARD_RATE))
     question = await world.ask("S1")
     answer = HumanAction(PRODUCT_OWNER, "a1", str(question), "answer", {"text": "zero-rated"})
 
@@ -141,7 +143,7 @@ async def test_only_a_person_answers_and_a_question_is_answered_once(world: Deci
 
 
 async def test_a_decision_is_replaced_once_and_keeps_its_scope(world: DecisionWorld) -> None:
-    await world.roadmap(STANDARD_RATE, GREETS)
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.answer(await world.ask("S1"))
     [original] = (await world.decisions.context_for(PROJECT, "F1", "S1")).decisions
 
@@ -163,7 +165,7 @@ async def test_a_decision_is_replaced_once_and_keeps_its_scope(world: DecisionWo
 
 
 async def test_what_a_model_assumed_is_kept_apart_and_moves_nothing(world: DecisionWorld) -> None:
-    await world.roadmap(STANDARD_RATE)
+    await world.decide(await world.roadmap(STANDARD_RATE))
 
     assumed = await world.decisions.assume(
         ANALYST, PROJECT, "F1", story_id="S1", text="amounts are whole pounds"
@@ -187,36 +189,24 @@ async def test_what_a_model_assumed_is_kept_apart_and_moves_nothing(world: Decis
 async def test_a_stopped_story_is_not_released_and_nothing_in_its_feature_jumps_it(
     world: DecisionWorld,
 ) -> None:
-    first = await world.roadmap(STANDARD_RATE, GREETS)
-    question = await world.ask("S1")
     another = StoryDraft("T1", "Another feature", "something else", {"AC1": "it works"})
-    second = await world.roadmap(another, feature="F2")
+    await world.decide(await world.roadmap(another, feature="F2"))  # T1 holds the place
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    question = await world.ask("S1")
 
-    await world.decide(first)
+    await world.close("cancel", feature="F2", reason="dropped")  # the place falls free
+
     assert (await world.story("S1"), await world.story("S2")) == (
         StoryState.PLANNED,
         StoryState.PLANNED,
     )
-    await world.decide(second)
-    assert await world.story("T1") is StoryState.RELEASED
-
-    await world.answer(question)
-    assert await world.story("S1") is StoryState.PLANNED  # the place is taken, for now
-
-
-async def test_answering_releases_the_story_that_was_waiting_only_for_the_answer(
-    world: DecisionWorld,
-) -> None:
-    gate = await world.roadmap(STANDARD_RATE, GREETS)
-    question = await world.ask("S1")
-    await world.decide(gate)
-    assert await world.story("S1") is StoryState.PLANNED
-
     await world.answer(question)
     assert await world.story("S1") is StoryState.PLANNED  # written before the answer
     assert await world.reconfirm_everything() == 1
-
-    assert await world.story("S1") is StoryState.RELEASED
+    assert (await world.story("S1"), await world.story("S2")) == (
+        StoryState.RELEASED,
+        StoryState.PLANNED,
+    )
     assert (await world.events())[-2:] == ["story.reconfirmed", "story.released"]
 
 
@@ -258,7 +248,7 @@ async def test_a_pause_and_a_question_each_stop_the_story_until_each_is_cleared(
 
 
 async def test_cancelling_a_feature_withdraws_its_questions(world: DecisionWorld) -> None:
-    await world.roadmap(STANDARD_RATE)
+    await world.decide(await world.roadmap(STANDARD_RATE))
     question = await world.ask("S1")
 
     await world.close("cancel", reason="dropped")
@@ -341,7 +331,7 @@ async def test_a_question_waits_for_work_that_was_admitted_before_it(
 async def test_a_question_is_about_a_feature_or_one_of_its_own_stories(
     world: DecisionWorld,
 ) -> None:
-    await world.roadmap(STANDARD_RATE)
+    await world.decide(await world.roadmap(STANDARD_RATE))
     another = StoryDraft("T1", "Another feature", "something else", {"AC1": "it works"})
     await world.roadmap(another, feature="F2")
 

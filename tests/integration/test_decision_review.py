@@ -105,7 +105,7 @@ async def test_a_grant_from_one_project_does_nothing_in_another(
 async def test_the_context_of_a_story_is_asked_for_under_its_own_feature(
     world: DecisionWorld,
 ) -> None:
-    await world.roadmap(ANOTHER, feature="F2")
+    await world.decide(await world.roadmap(ANOTHER, feature="F2"))
     await decided(world, story=None)
     assumed = await world.decisions.assume(ANALYST, PROJECT, "F2", text="whole pounds")
     await world.replace(assumed, "pence")

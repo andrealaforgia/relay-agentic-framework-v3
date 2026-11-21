@@ -52,6 +52,8 @@ class StoryState(StrEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
     CANCELLED = "cancelled"
+    # Dropped from its roadmap before it ever started.
+    WITHDRAWN = "withdrawn"
 
 
 _WORKING = frozenset({StoryState.RELEASED, StoryState.CHANGES_REQUESTED})
@@ -88,6 +90,94 @@ def require_sealable(
 
 
 @dataclass(frozen=True)
+class Member:
+    """A story as a roadmap sees it: its state, and the rejected story it corrects, if
+    it is a correction. Which story corrects which is fixed when the correction is
+    created and never changes."""
+
+    story_id: str
+    state: StoryState
+    corrects: str | None = None
+
+
+def is_resolved(story: Member, members: Sequence[Member]) -> bool:
+    """A story is resolved when it is approved, or when it is rejected and the story
+    that corrects it is resolved. A rejection stays a rejection: it is answered, by a
+    chain of corrections that ends in an approval, never undone."""
+    if story.state is StoryState.APPROVED:
+        return True
+    if story.state is not StoryState.REJECTED:
+        return False
+    return any(is_resolved(other, members) for other in members if other.corrects == story.story_id)
+
+
+@dataclass(frozen=True)
+class Entry:
+    """One line of a proposed roadmap: a story of the roadmap being revised that is
+    kept, reworded or dropped, or a new story, which may correct a rejected one."""
+
+    story_id: str
+    kind: str
+    corrects: str | None = None
+
+
+def why_not_a_revision(effective: Sequence[Member], entries: Sequence[Entry]) -> str:
+    """Why these entries may not replace the effective roadmap, or an empty string if
+    they may. Checked when a proposal is published and again when it is approved: the
+    stories it is about can change state in between.
+
+    What is finished or under way is kept as it is and in its order. Only a planned
+    story may be reworded, moved or dropped. Every rejection that is not yet answered
+    has exactly one correction, and no rejection ever has two."""
+    listed = [entry.story_id for entry in entries]
+    if not [entry for entry in entries if entry.kind != "dropped"]:
+        return "a roadmap needs at least one story"
+    for story_id in listed:
+        if listed.count(story_id) > 1:
+            return f"{story_id} appears twice"
+    known = {member.story_id: member for member in effective}
+    for entry in entries:
+        if entry.kind == "new" and entry.story_id in known:
+            return f"{entry.story_id} is already a story of this roadmap"
+        if entry.kind != "new" and entry.story_id not in known:
+            return f"{entry.story_id} is not a story of the roadmap being revised"
+    unaccounted = sorted(set(known) - set(listed))
+    if unaccounted:
+        return f"{unaccounted} of the roadmap being revised are not accounted for"
+    settled = [m.story_id for m in effective if m.state is not StoryState.PLANNED]
+    for entry in entries:
+        if entry.story_id in settled and entry.kind != "kept":
+            state = known[entry.story_id].state.value.replace("_", " ")
+            return f"{entry.story_id} is {state}: it can only be kept as it is"
+    if [entry.story_id for entry in entries if entry.story_id in settled] != settled:
+        return f"{settled} are finished or under way and keep their order"
+    result = [
+        Member(entry.story_id, StoryState.PLANNED, entry.corrects)
+        if entry.kind == "new"
+        else known[entry.story_id]
+        for entry in entries
+        if entry.kind != "dropped"
+    ]
+    rejected = [member for member in result if member.state is StoryState.REJECTED]
+    for entry in entries:
+        if entry.kind == "new" and entry.corrects not in (
+            None,
+            *(member.story_id for member in rejected),
+        ):
+            return (
+                f"{entry.story_id} corrects {entry.corrects}, "
+                "which is not a rejected story of this feature"
+            )
+    for story in rejected:
+        corrections = [member for member in result if member.corrects == story.story_id]
+        if len(corrections) > 1:
+            return f"{story.story_id} would have two corrections"
+        if not corrections and not is_resolved(story, result):
+            return f"{story.story_id} is rejected and nothing in this roadmap corrects it"
+    return ""
+
+
+@dataclass(frozen=True)
 class Candidate:
     feature_id: str
     story_id: str
@@ -96,6 +186,8 @@ class Candidate:
     # is waiting to be reconfirmed after a decision: it may not start, and the stories
     # after it in its feature wait behind it.
     stopped: bool = False
+    # The rejected story this one corrects, if it is a correction.
+    corrects: str | None = None
 
 
 def next_story_to_release(
@@ -103,20 +195,35 @@ def next_story_to_release(
 ) -> Candidate | None:
     """The one story of a project that may start now, if any. `features` are the
     project's features that are open to work, in the order they were opened, each with
-    the stories of its approved roadmap in order. `slot_taken` says that some story of
+    the stories of its effective roadmap in order. `slot_taken` says that some story of
     the project, in any feature, a paused one included, already holds its place.
 
-    One story at a time per project. Within a feature a story waits for every earlier
-    one to be approved; a feature waits its turn behind the features opened before it
-    only for as long as they have something to release."""
+    One story at a time per project. A feature waits its turn behind the features
+    opened before it only for as long as they have something to release.
+
+    Within a feature, a rejection that has not been answered stops all ordinary work:
+    the only story that may start is the correction of an unanswered rejection, found
+    by what it corrects and not by where it was put. Otherwise a story waits for every
+    earlier one to be resolved."""
     stories = [story for roadmap in features for story in roadmap]
     if slot_taken or any(story.state in HOLDING_THE_SLOT for story in stories):
         return None
     for roadmap in features:
-        for story in roadmap:
-            if story.state is StoryState.PLANNED and not story.stopped:
+        members = [Member(story.story_id, story.state, story.corrects) for story in roadmap]
+        unanswered = {
+            member.story_id
+            for member in members
+            if member.state is StoryState.REJECTED and not is_resolved(member, members)
+        }
+        for story, member in zip(roadmap, members, strict=True):
+            startable = story.state is StoryState.PLANNED and not story.stopped
+            if unanswered:
+                if startable and story.corrects in unanswered:
+                    return story
+                continue
+            if startable:
                 return story
-            if story.state is not StoryState.APPROVED:
+            if not is_resolved(member, members):
                 break  # this feature is stuck behind an earlier story; try the next
     return None
 

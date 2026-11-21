@@ -381,7 +381,7 @@ class Decisions:
                 roadmap = await (
                     await connection.execute(
                         "SELECT revision FROM roadmaps WHERE project_id = %s AND feature_id = %s "
-                        "AND state <> 'superseded' ORDER BY revision DESC LIMIT 1 FOR UPDATE",
+                        "AND state IN ('approved', 'proposed') ORDER BY revision DESC LIMIT 1 FOR UPDATE",
                         (project_id, feature_id),
                     )
                 ).fetchone()
@@ -684,7 +684,7 @@ async def _after_a_decision(connection: Connection, scope: dict[str, Any]) -> No
         roadmap = await (
             await connection.execute(
                 "SELECT 1 FROM roadmaps WHERE project_id = %s AND feature_id = %s "
-                "AND state <> 'superseded' LIMIT 1",
+                "AND state IN ('approved', 'proposed') LIMIT 1",
                 (project_id, feature_id),
             )
         ).fetchone()
