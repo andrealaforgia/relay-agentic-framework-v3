@@ -128,7 +128,8 @@ class Completion:
         try:
             await self._run_checks(batch, owed["repository"])
         except BaseException:
-            await self._end(batch["batch_id"], cut_short=True)
+            # Whatever receipts were committed say how far the checks got.
+            await self._end(batch["batch_id"])
             raise
         return await self._end(batch["batch_id"])
 
@@ -232,12 +233,11 @@ class Completion:
                     ),
                 )
 
-    async def _end(
-        self, batch_id: uuid.UUID, *, cut_short: bool = False
-    ) -> tuple[CompletionReceipt, uuid.UUID | None]:
+    async def _end(self, batch_id: uuid.UUID) -> tuple[CompletionReceipt, uuid.UUID | None]:
         """The one rule that ends a generation, whoever calls it: after its runs, or
-        after something cut them short. Returns what became of it and, if what it
-        recorded was found changed, the completion owed in its place."""
+        after something cut them short, which it tells apart by the receipts there are.
+        Returns what became of it and, if what it recorded was found changed, the
+        completion owed in its place."""
         async with self._pool.connection() as connection:
             located = await (
                 await connection.execute(
@@ -268,7 +268,7 @@ class Completion:
                 return CompletionReceipt("held", batch_id, f"the feature is {waits}"), None
             receipts = await (
                 await connection.execute(
-                    "SELECT r.obligation_id::text, r.digest, r.revision, r.satisfied, "
+                    "SELECT r.obligation_id::text, r.digest, r.satisfied, "
                     "r.execution_id::text, o.name, o.source, o.behaviour_id "
                     "FROM completion_receipts r JOIN obligations o USING (obligation_id) "
                     "WHERE r.batch_id = %s ORDER BY o.created_at",
@@ -278,9 +278,8 @@ class Completion:
             observed = [
                 {"obligation_id": each["obligation_id"], "digest": each["digest"]}
                 for each in receipts
-                if each["revision"] == batch["trunk"]
             ]
-            if cut_short or observed != batch["snapshot"]["obligations"]:
+            if observed != batch["snapshot"]["obligations"]:
                 why = "the checks could not all be run"
                 await _owed_again(connection, batch, "interrupted", why)
                 return CompletionReceipt("interrupted", batch_id, why), None

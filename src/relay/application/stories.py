@@ -39,7 +39,6 @@ from relay.application.closure import (
     require_startable,
     story_basis,
 )
-from relay.application.completion import basis_of_gate as completion_gate_basis
 from relay.application.completion import end_request as end_completion_request
 from relay.application.completion import evaluate_completion, roadmap_changed
 from relay.application.completion import settle_gate as settle_completion_gate
@@ -461,7 +460,10 @@ class Stories:
                 ).fetchone()
                 assert gate is not None
             elif gate["kind"] == "completion":
-                current = await completion_gate_basis(connection, gate)
+                # Nothing changes what this gate was opened on while it is open: no
+                # roadmap is proposed meanwhile, and a decision over the feature
+                # supersedes the gate in its own transaction.
+                current = gate["basis"]
             else:
                 current = await _basis_now(connection, gate, story)
             if gate["state"] != "open" or gate["basis"] != current:
@@ -794,8 +796,6 @@ async def close_feature(pool: Pool, project_id: str, action: HumanAction) -> Rec
             await end_completion_request(
                 connection, project_id, feature_id, "abandoned", "the feature was cancelled"
             )
-        if action.action == "resume":
-            await evaluate_completion(connection, project_id, feature_id)
         outcome = {"pause": "paused", "cancel": "cancelled", "resume": "resumed"}[action.action]
         await append_event(
             connection,

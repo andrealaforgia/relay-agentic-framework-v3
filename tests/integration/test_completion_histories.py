@@ -219,12 +219,17 @@ async def test_a_process_that_stops_after_the_runs_and_before_deciding_completes
 
 
 async def test_a_pause_before_the_completion_is_taken_up_starts_nothing(
-    world: CompletionWorld,
+    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await admitted_and_not_taken_up(world)
     await world.close("pause", reason="wait")
 
-    await world.features.complete_what_is_owed(PROJECT)
+    async def unreachable(*_: Any, **__: Any) -> str:
+        raise AssertionError("the repository was asked")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(final_checks, "trunk_head", unreachable)
+        await world.features.complete_what_is_owed(PROJECT)
 
     assert (await world.batches(), await world.completions_wanted()) == ([], 1)
     await world.close("resume")
@@ -487,3 +492,95 @@ async def test_a_feature_is_ready_once_a_proposal_that_was_waiting_is_sent_back(
     await world.decide(proposal, "request_changes", reason="not needed after all")
 
     assert (await world.feature(), await world.batches()) == ("completed", ["completed"])
+
+
+async def test_a_question_before_the_completion_is_taken_up_starts_nothing_and_its_answer_ends_it(
+    world: CompletionWorld,
+) -> None:
+    """S3-16.3. The completion that was owed is retired with its request: taken up
+    after the answer, it would check a feature whose roadmap no longer stands."""
+    await admitted_and_not_taken_up(world)
+
+    question = await world.ask(story=None)  # followed by the pass, which starts nothing
+
+    assert (await world.batches(), await world.completions_wanted()) == ([], 1)
+    assert await world.feature() == "checking"
+
+    await world.answer(question)
+
+    assert (await world.feature(), await requests(world)) == ("delivering", ["overtaken"])
+    assert (await world.batches(), await world.completions_wanted()) == ([], 0)
+    await world.reconfirm_everything()
+    assert (await world.feature(), await world.batches()) == ("completed", ["completed"])
+
+
+async def test_readiness_is_settled_in_the_transaction_that_changes_it(
+    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process that stops between committing a decision and its pass leaves nothing
+    half-said: the feature is already out of its checks, or already back in them."""
+    await admitted_and_not_taken_up(world)
+
+    async def the_process_stops(*_: Any, **__: Any) -> None:
+        return None
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Features, "reconcile", the_process_stops)
+        await world.answer(await world.ask(story=None))
+        assert (await world.feature(), await requests(world)) == ("delivering", ["overtaken"])
+        assert await world.completions_wanted() == 0
+
+        await world.reconfirm_everything()
+        assert (await world.feature(), await world.batches()) == ("checking", [])
+        assert await world.completions_wanted() == 1
+
+    await world.features.start()
+    assert (await world.feature(), await world.batches()) == ("completed", ["completed"])
+
+
+async def test_the_pass_admits_a_feature_that_is_ready_and_was_never_looked_at(
+    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The net under every transition: a feature whose last story was accepted before
+    Relay looked at readiness there, as one accepted by an earlier version was."""
+    from relay.application import stories
+
+    gate = await last_story_at_its_gate(world)
+
+    async def not_looked_at(*_: Any, **__: Any) -> None:
+        return None
+
+    with monkeypatch.context() as patched:
+        patched.setattr(stories, "evaluate_completion", not_looked_at)
+        await world.stories.decide(world.action(gate))
+    assert (await world.feature(), await world.completions_wanted()) == ("delivering", 0)
+
+    await world.features.reconcile(PROJECT)
+
+    assert (await world.feature(), await world.batches()) == ("completed", ["completed"])
+
+
+async def test_checks_left_running_under_a_pause_are_held_when_the_control_plane_starts(
+    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S3-16.5."""
+    gate = await last_story_at_its_gate(world)
+
+    async def the_process_dies(*_: Any, **__: Any) -> None:
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Completion, "_end", the_process_dies)
+        with pytest.raises(KeyboardInterrupt):
+            await world.decide(gate)
+    await world.close("pause", reason="wait for the audit")
+
+    await world.features.start()
+
+    assert (await world.feature(), await world.batches()) == ("checking", ["held"])
+    assert await world.completions_wanted() == 1
+    assert await world.column("SELECT count(*) FROM executions WHERE purpose = 'final_check'") == [
+        1
+    ]
+    await world.close("resume")
+    assert (await world.feature(), await world.batches()) == ("completed", ["held", "completed"])

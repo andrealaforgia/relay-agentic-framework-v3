@@ -13,7 +13,6 @@ import uuid
 from typing import Any
 
 from relay.application.assignments import COMPLETE, REVISE, owe
-from relay.application.closure import feature_basis
 from relay.domain.story import Member, StoryState, is_resolved
 from relay.persistence.database import Connection
 from relay.persistence.ledger import append_event
@@ -34,9 +33,10 @@ async def evaluate_completion(connection: Connection, project_id: str, feature_i
     assert feature is not None
     state = feature["state"]
     if state == "delivering":
-        if await prerequisites_hold(connection, project_id, feature_id) and not await stopped(
-            connection, project_id, feature_id
-        ):
+        # A feature that is paused or waiting on a question does not become ready: its
+        # gates wait and its grants are taken back. So this is not asked here; whether
+        # the checks may start is asked when they are taken up.
+        if await prerequisites_hold(connection, project_id, feature_id):
             await _admit(connection, project_id, feature_id)
     elif state == "checking":
         if not await prerequisites_hold(connection, project_id, feature_id):
@@ -54,20 +54,15 @@ async def evaluate_completion(connection: Connection, project_id: str, feature_i
 
 async def stopped(connection: Connection, project_id: str, feature_id: str) -> str | None:
     """What keeps a feature's final checks from starting or deciding for now: it is
-    paused, or a question is open over it or over any of its stories. Cancelled is
-    returned exactly."""
+    paused, or a question is open over it. Cancelled is returned exactly. A question
+    over one of its stories cannot be open: every story of it is finished with."""
     row = await (
         await connection.execute(
-            "SELECT standing(%s, %s, NULL) AS standing, "
-            "(SELECT string_agg(question_id::text, ', ' ORDER BY asked_at) FROM questions "
-            "WHERE project_id = %s AND feature_id = %s AND state = 'open') AS questions",
-            (project_id, feature_id, project_id, feature_id),
+            "SELECT standing(%s, %s, NULL) AS standing", (project_id, feature_id)
         )
     ).fetchone()
     assert row is not None
-    if row["standing"] is not None:
-        return str(row["standing"])
-    return f"waiting on question {row['questions']}" if row["questions"] else None
+    return str(row["standing"]) if row["standing"] is not None else None
 
 
 async def end_request(
@@ -191,27 +186,6 @@ async def owe_completion(
     )
 
 
-async def basis_of_gate(connection: Connection, gate: dict[str, Any]) -> dict[str, Any] | None:
-    """What a gate on a failed final check would be opened on now: the same batch and
-    the same evidence, under the roadmap and the decisions in force now. Trunk is not
-    part of it: after trunk has moved, a retry still means fresh checks on the head."""
-    feature = await (
-        await connection.execute(
-            "SELECT state FROM features WHERE project_id = %s AND feature_id = %s",
-            (gate["project_id"], gate["feature_id"]),
-        )
-    ).fetchone()
-    roadmap = await roadmap_in_force(connection, gate["project_id"], gate["feature_id"])
-    if feature is None or feature["state"] != "needs_decision" or roadmap is None:
-        return None
-    return {
-        "batch_id": gate["basis"]["batch_id"],
-        "evidence": gate["basis"]["evidence"],
-        "roadmap_revision": roadmap["revision"],
-        "decisions": await feature_basis(connection, gate["project_id"], gate["feature_id"]),
-    }
-
-
 async def settle_gate(connection: Connection, gate: dict[str, Any], outcome: str) -> None:
     """The Product Owner's answer to a final check that failed."""
     project_id, feature_id = gate["project_id"], gate["feature_id"]
@@ -220,7 +194,8 @@ async def settle_gate(connection: Connection, gate: dict[str, Any], outcome: str
         return
     # The roadmap is to change. Until a later revision is approved the feature is not
     # ready, however often that is looked at: a proposal sent back leaves this owed.
-    await _back_to_delivery(connection, project_id, feature_id)
+    # With its gate decided, the evaluation that follows every decision puts the feature
+    # back among those being delivered.
     await owe(
         connection,
         REVISE,

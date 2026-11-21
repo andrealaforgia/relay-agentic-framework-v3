@@ -12,14 +12,26 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from relay.application.integration import Outcome
-from relay.application.reviews import Review
+from relay.application.reviews import NewFinding, Review
 from relay.application.stories import Dropped, Kept
-from relay.domain.review import Carried
+from relay.domain.review import Carried, Severity
 from relay.domain.story import ActionRefused, Receipt
 from tests.integration.completion_world import CompletionWorld, last_story_at_its_gate
 from tests.integration.fixtures import ANALYST, VAT_APPLIES_STANDARD_RATE, VERIFIER
 from tests.integration.story_world import GREETS, INJECTION, STANDARD_RATE, STYLE
+from tests.integration.test_supersession import (
+    REDUCED_RATE,
+    VAT_APPLIES_REDUCED_RATE,
+    Superseding,
+)
 from tests.integration.trunk_world import GREETING, PROJECT
+
+NOT_A_NUMBER = NewFinding(Severity.LOW, "a word is not refused", "vat.py", "say it is not a number")
+ROUNDING = NewFinding(Severity.LOW, "rounding is not stated", "vat.py", "state it")
+
+
+class Replacing(Superseding, CompletionWorld):
+    """A project carried to completion in which one behaviour replaces another."""
 
 
 @pytest.fixture
@@ -82,7 +94,10 @@ async def test_the_summary_tells_the_decisions_of_a_person_from_those_of_a_model
     answered = await world.ask(story=None)
     await world.answer(answered, "the standard rate")
     await world.reconfirm_everything()
-    await world.decisions.assume(ANALYST, PROJECT, "F1", text="prices are in pounds")
+    guessed = await world.decisions.assume(ANALYST, PROJECT, "F1", text="prices are in pounds")
+    await world.decisions.assume(ANALYST, PROJECT, "F1", text="amounts are rounded down")
+    await world.replace(guessed, "prices are in euros")  # no longer in force, so not listed
+    await world.reconfirm_everything()
     await world.deliver("B1")
     await world.seal()
     await world.assess("B1 shows 120 for 100")
@@ -93,9 +108,10 @@ async def test_the_summary_tells_the_decisions_of_a_person_from_those_of_a_model
     assert summary is not None
     assert [(each["source"], each["text"]) for each in summary["decisions"]] == [
         ("product_owner", "the standard rate"),
-        ("model", "prices are in pounds"),
+        ("model", "amounts are rounded down"),
+        ("product_owner", "prices are in euros"),
     ]
-    assert [each["text"] for each in summary["assumptions"]] == ["prices are in pounds"]
+    assert [each["text"] for each in summary["assumptions"]] == ["amounts are rounded down"]
 
 
 async def test_the_summary_lists_what_was_left_open_and_not_what_was_fixed(
@@ -105,15 +121,36 @@ async def test_the_summary_lists_what_was_left_open_and_not_what_was_fixed(
     `open`; it is not a limitation of what was delivered."""
     await world.decide(await world.roadmap(STANDARD_RATE))
     base = await world.awaiting_builder("B1")
-    await world.reviewed("B1", on=base, reviews={"sentinel": Review(findings=(INJECTION,))})
-    [blocker] = await world.column("SELECT finding_id FROM findings")
+    await world.reviewed(
+        "B1",
+        on=base,
+        reviews={
+            "sentinel": Review(findings=(INJECTION,)),
+            "qa": Review(findings=(NOT_A_NUMBER, ROUNDING)),
+        },
+    )
+
+    async def raised(finding: NewFinding) -> str:
+        [found] = await world.column(
+            f"SELECT finding_id FROM findings WHERE claim = '{finding.claim}'"
+        )
+        return str(found)
+
     await world.reviewed(
         "B1",
         {"vat.py": VAT_APPLIES_STANDARD_RATE + "# parsed as an integer\n"},
         on=base,
         reviews={
-            "sentinel": Review(carried={str(blocker): Carried.VERIFIED_FIXED}),
-            "qa": Review(findings=(STYLE,)),
+            "sentinel": Review(carried={await raised(INJECTION): Carried.VERIFIED_FIXED}),
+            # Of three small things, one was fixed, one was taken back, one is left.
+            "qa": Review(
+                findings=(STYLE,),
+                carried={
+                    await raised(NOT_A_NUMBER): Carried.VERIFIED_FIXED,
+                    await raised(ROUNDING): Carried.WITHDRAWN,
+                },
+                withdrawal_reasons={await raised(ROUNDING): "the story says how"},
+            ),
         },
     )
     assert (await world.integrate("B1")).outcome is Outcome.INTEGRATED
@@ -130,10 +167,7 @@ async def test_the_summary_lists_what_was_left_open_and_not_what_was_fixed(
         "qa",
         STYLE.claim,
     )
-    assert [limitation["finding_id"]] == [
-        str(each)
-        for each in await world.column("SELECT finding_id FROM findings WHERE severity = 1")
-    ]
+    assert limitation["finding_id"] == await raised(STYLE)
 
 
 async def test_the_summary_names_the_roadmap_revisions_there_were(world: CompletionWorld) -> None:
@@ -169,3 +203,34 @@ async def test_the_change_owed_after_a_failed_check_is_not_something_a_worker_cl
 
     with pytest.raises(ActionRefused, match="proposing the roadmap again"):
         await world.claims.claim(ANALYST, owed)
+
+
+async def test_what_a_replaced_behaviour_left_open_is_not_a_limitation_of_what_was_delivered(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    world = Replacing(database, tmp_path, runner_image)
+    world.base = await world.open()
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    base = await world.awaiting_builder("B1")
+    await world.reviewed("B1", on=base, reviews={"qa": Review(findings=(STYLE,))})
+    assert (await world.integrate("B1")).outcome is Outcome.INTEGRATED
+    await world.seal()
+    await world.assess("B1 shows 120 for 100")
+    await world.decide(await world.gate())
+    base = await world.awaiting_builder("Z", REDUCED_RATE, "S2")
+    await world.reviewed("Z", {"vat.py": VAT_APPLIES_REDUCED_RATE}, on=base)
+    await world.decide(await world.propose())
+    assert (await world.integrate("Z")).outcome is Outcome.INTEGRATED
+    await world.seal("S2")
+    await world.assess("Z shows 105 for 100", "S2")
+
+    await world.decide(await world.gate())
+
+    summary = await world.summary()
+    assert summary is not None
+    assert [(each["behaviour_id"], each["in_force"]) for each in summary["behaviours"]] == [
+        ("B1", False),
+        ("Z", True),
+    ]
+    assert summary["limitations"] == []
+    assert [each["behaviour_id"] for each in summary["checked"]] == ["Z"]
