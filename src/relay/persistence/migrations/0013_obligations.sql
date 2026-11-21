@@ -49,9 +49,8 @@ CREATE UNIQUE INDEX one_replacement_per_obligation ON supersessions (obligation_
 CREATE UNIQUE INDEX one_obligation_per_replacement ON supersessions (project_id, behaviour_id)
     WHERE state IN ('proposed', 'standing', 'reserved');
 
--- What replaced a behaviour on trunk, once that has happened. The behaviour stays in its
--- story's list as history.
-ALTER TABLE behaviours ADD COLUMN superseded_by text;
+-- (behaviours.superseded_by and behaviours.to_be_replaced are added in 0011, where the
+-- function that reads them is defined.)
 
 -- The exemption a batch of checks was started with, and an integration authorised with.
 ALTER TABLE check_batches ADD COLUMN supersession_id uuid REFERENCES supersessions;

@@ -22,6 +22,14 @@ $$;
 -- its evidence together or not at all, so one number serves for all of it.
 ALTER TABLE behaviours ADD COLUMN current_on integer;
 
+-- What replaced a behaviour on trunk, once that has happened. The behaviour stays in its
+-- story's list as history.
+ALTER TABLE behaviours ADD COLUMN superseded_by text;
+
+-- The Verifier has said, after a decision, that this behaviour's contract no longer
+-- stands and will be replaced. It removes nothing from what candidates must satisfy.
+ALTER TABLE behaviours ADD COLUMN to_be_replaced boolean NOT NULL DEFAULT false;
+
 -- Why work on a story, or on one of its behaviours, may not start: something it relies
 -- on was made under decisions that have since changed, and its owner has not
 -- reconfirmed it. Every such reason, the story's first. Null if everything is current.
@@ -32,11 +40,15 @@ LANGUAGE sql STABLE AS $$
             s.story_id || ' is not current: it was confirmed on decision basis '
             || s.current_on || ' and the basis is now ' || story_basis(s.project_id, s.story_id)
         END,
-        CASE WHEN b.contract IS NOT NULL
-                  AND b.current_on <> story_basis(s.project_id, s.story_id) THEN
-            'the contract of ' || b.behaviour_id || ' is not current: it was confirmed on '
-            || 'decision basis ' || b.current_on || ' and the basis is now '
-            || story_basis(s.project_id, s.story_id)
+        CASE
+            -- Replaced on trunk: history, with nothing left to be current about.
+            WHEN b.contract IS NULL OR b.superseded_by IS NOT NULL THEN NULL
+            WHEN b.to_be_replaced THEN
+                b.behaviour_id || ' is to be replaced, and its replacement is not on trunk yet'
+            WHEN b.current_on <> story_basis(s.project_id, s.story_id) THEN
+                'the contract of ' || b.behaviour_id || ' is not current: it was confirmed on '
+                || 'decision basis ' || b.current_on || ' and the basis is now '
+                || story_basis(s.project_id, s.story_id)
         END), '')
     FROM stories s LEFT JOIN behaviours b
       ON b.project_id = s.project_id AND b.story_id = s.story_id AND b.behaviour_id = behaviour

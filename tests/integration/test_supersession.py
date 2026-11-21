@@ -296,6 +296,14 @@ async def test_a_refused_push_leaves_the_obligation_and_the_authority_as_they_no
     assert await world.column("SELECT state FROM supersessions") == [
         "standing" if meanwhile == "nothing" else "void"
     ]
+    if meanwhile == "nothing":
+        # The authority stands as before. When the person lets the push be tried again,
+        # the replacement is still excused from what it replaces.
+        world.hook_flag("refuse").unlink()
+        await world.integration.retry_integration(PROJECT, "Z", "the hook is fixed")
+        assert (await world.integrate("Z")).outcome is Outcome.INTEGRATED
+        assert await world.in_force() == [REDUCED_RATE.contract_id]
+        return
     if meanwhile == "a decision":
         # The obligation is free again, for this behaviour or another.
         await world.reconfirm_everything()
@@ -326,3 +334,66 @@ async def test_an_approved_story_is_left_exactly_as_it_was_when_its_behaviour_is
 
     assert await story_one() == before
     assert (await world.obligation_of("B1")).state == "retired"
+
+
+async def test_only_the_replacement_is_excused_and_its_sibling_is_not(world: Superseding) -> None:
+    """Two candidates of the same story in play at once, which the story order does not
+    allow by itself; the fixture arranges it, as the integration tests do."""
+    world.side_by_side = True
+    base = await world.awaiting_builder("Z", REDUCED_RATE, "S2")
+    await world.awaiting_builder("Y", GREETING, "S2")
+    await world.decide(await world.propose())
+    await world.reviewed(
+        "Y", {"greeting.txt": "hello\n", "vat.py": VAT_APPLIES_REDUCED_RATE}, on=base
+    )
+
+    assert (await world.integrate("Y")).outcome is Outcome.CHECKS_FAILED  # it breaks B1
+
+    assert world.trunk() == base
+    await world.reviewed("Z", {"vat.py": VAT_APPLIES_REDUCED_RATE}, on=base)
+    assert (await world.integrate("Z")).outcome is Outcome.INTEGRATED
+
+
+async def test_a_behaviour_replaces_one_obligation_at_a_time(world: Superseding) -> None:
+    await world.deliver("G", "S2", GREETING, {"greeting.txt": "hello\n"})
+    await world.awaiting_builder("Z", REDUCED_RATE, "S2")
+    await world.decide(await world.propose(replaced="B1"))
+
+    with pytest.raises(ActionRefused, match="already"):
+        await world.propose(replaced="G")
+
+    assert await world.column("SELECT count(*) FROM supersessions") == [1]
+
+
+async def test_an_approval_is_stale_while_the_replacement_is_being_pushed_without_it(
+    world: Superseding, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = await world.awaiting_builder("Z", GREETING, "S2")
+    gate = await world.propose()
+    await world.reviewed("Z", {"greeting.txt": "hello\n"}, on=base)
+
+    async def unreachable(*_: Any, **__: Any) -> None:
+        raise RemoteUnavailable("no route to host")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Mirror, "_push", unreachable)
+        assert (await world.integrate("Z")).outcome is Outcome.PENDING
+
+        assert (await world.decide(gate)).disposition == "stale"
+
+    assert await world.column("SELECT state FROM supersessions") == ["void"]
+    assert (await world.obligation_of("B1")).state == "active"
+
+
+async def test_an_authority_survives_a_restart_and_is_used_once(world: Superseding) -> None:
+    candidate = await z_reviewed(world)
+    await world.decide(await world.propose())
+
+    await world.features.start()
+
+    assert await world.column("SELECT state FROM supersessions") == ["standing"]
+    assert (await world.integrate("Z")).outcome is Outcome.INTEGRATED
+    assert world.trunk() == candidate
+    await world.features.start()
+    assert await world.column("SELECT state FROM supersessions") == ["used"]
+    assert (await world.events()).count("obligation.retired") == 1

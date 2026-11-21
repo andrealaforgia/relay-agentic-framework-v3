@@ -53,6 +53,7 @@ from relay.domain.story import (
     Principal,
     PrincipalKind,
     Receipt,
+    SealRefused,
     StoryState,
     answer_again,
     next_story_to_release,
@@ -298,7 +299,8 @@ class Stories:
             require_basis(basis, await story_basis(connection, project_id, story_id))
             require_sealable(
                 story["criteria"].keys(),
-                {row["behaviour_id"]: row["demonstrates"] for row in listed},
+                # A behaviour that was replaced on trunk demonstrates nothing now.
+                {row["behaviour_id"]: row["demonstrates"] for row in _in_force(listed)},
             )
             seal_id = uuid.uuid7()
             await connection.execute(
@@ -699,6 +701,14 @@ async def evaluate_story_gate(connection: Connection, project_id: str, story_id:
     listed = await _behaviours_of(connection, project_id, story_id)
     assessment = await _assessment(connection, story)
     if assessment is None or any(row["state"] != "integrated" for row in listed):
+        return
+    try:
+        # The same view the seal was made on: every criterion shown by something in force.
+        require_sealable(
+            story["criteria"].keys(),
+            {row["behaviour_id"]: row["demonstrates"] for row in _in_force(listed)},
+        )
+    except SealRefused:
         return
     await connection.execute(
         "UPDATE stories SET state = 'awaiting_approval' WHERE project_id = %s AND story_id = %s",
@@ -1468,6 +1478,12 @@ async def _close_gate(
     )
 
 
+def _in_force(listed: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The behaviours of a story that still stand. One that was replaced on trunk stays
+    in the list as history."""
+    return [row for row in listed if row["superseded_by"] is None]
+
+
 async def _story_review(
     connection: Connection,
     story: Mapping[str, Any],
@@ -1513,6 +1529,8 @@ async def _story_review(
                 "behaviour_id": row["behaviour_id"],
                 "summary": row["summary"],
                 "demonstrates": list(row["demonstrates"]),
+                # Set if this behaviour was replaced on trunk: it is shown as history.
+                "superseded_by": row["superseded_by"],
                 "contract": row["contract"],
                 "contract_digest": ProcessContract.from_dict(row["contract"]).digest,
                 "integrated_revision": evidence["candidate_revision"],
@@ -1531,6 +1549,13 @@ async def _story_review(
         "criteria": story["criteria"],
         "list_revision": story["sealed_revision"],
         "behaviours": behaviours,
+        # What shows each criterion now: the behaviours in force, and no others.
+        "demonstrated_by": {
+            criterion: [
+                row["behaviour_id"] for row in _in_force(listed) if criterion in row["demonstrates"]
+            ]
+            for criterion in story["criteria"]
+        },
         "assessment": {
             "assessment_id": str(assessment["assessment_id"]),
             "statement": assessment["statement"],
@@ -1643,7 +1668,8 @@ async def _behaviours_of(
 ) -> list[dict[str, Any]]:
     return await (
         await connection.execute(
-            "SELECT behaviour_id, summary, state, contract, demonstrates FROM behaviours "
+            "SELECT behaviour_id, summary, state, contract, demonstrates, superseded_by "
+            "FROM behaviours "
             "WHERE project_id = %s AND story_id = %s ORDER BY position",
             (project_id, story_id),
         )

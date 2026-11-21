@@ -497,6 +497,73 @@ class Decisions:
                 )  # fmt: skip
         await self._features.reconcile(project_id)
 
+    async def declare_replaced(
+        self,
+        principal: Principal,
+        project_id: str,
+        behaviour_id: str,
+        *,
+        grant: uuid.UUID,
+        basis: int,
+        obligation: uuid.UUID,
+    ) -> None:
+        """The Verifier's other answer for a behaviour already on trunk: its contract no
+        longer stands, and it will be replaced. It names the behaviour's obligation by
+        identity. It completes the reconfirmation and is not an authority: nothing is
+        removed from what candidates must satisfy until a supersession approved by the
+        Product Owner has been integrated. Until then the story cannot be sealed."""
+        _require_role(principal, "verifier")
+        async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id)
+            row = await _locked_behaviour_row(connection, project_id, behaviour_id)
+            await lock_story(connection, project_id, row["story_id"])
+            await _locked_project(connection, project_id)
+            statement = {
+                "behaviour": behaviour_id,
+                "basis": basis,
+                "to_be_replaced": str(obligation),
+            }
+            if not await _said_already(connection, project_id, grant, statement):
+                require_basis(basis, await story_basis(connection, project_id, row["story_id"]))
+                if row["state"] not in ("integrated", "completed"):
+                    raise ActionRefused(
+                        f"{behaviour_id} is not on trunk: its contract can be amended"
+                    )
+                standing = await (
+                    await connection.execute(
+                        "SELECT 1 FROM obligations WHERE obligation_id = %s AND project_id = %s "
+                        "AND behaviour_id = %s AND state = 'active'",
+                        (obligation, project_id, behaviour_id),
+                    )
+                ).fetchone()
+                if standing is None:
+                    raise ActionRefused(f"that is not the obligation {behaviour_id} carries now")
+                await complete_reconfirmation(
+                    connection, grant, project_id, "behaviour", behaviour_id
+                )
+                await connection.execute(
+                    "UPDATE behaviours SET to_be_replaced = true, current_on = %s "
+                    "WHERE project_id = %s AND behaviour_id = %s",
+                    (basis, project_id, behaviour_id),
+                )
+                await _reconfirmed(
+                    connection, project_id, principal, grant, "behaviour", behaviour_id, basis,
+                    statement, announce=False,
+                )  # fmt: skip
+                await append_event(
+                    connection,
+                    project_id,
+                    "behaviour.declared_to_be_replaced",
+                    subject_id=behaviour_id,
+                    payload={
+                        "by": principal.identity,
+                        "basis": basis,
+                        "obligation_id": str(obligation),
+                    },
+                    correlation_id=row["correlation_id"],
+                )
+        await self._features.reconcile(project_id)
+
     async def amend_contract(
         self,
         principal: Principal,
@@ -733,7 +800,8 @@ async def _after_a_decision(connection: Connection, scope: dict[str, Any]) -> No
         contracts = await (
             await connection.execute(
                 "SELECT behaviour_id, correlation_id FROM behaviours WHERE project_id = %s "
-                "AND story_id = %s AND contract IS NOT NULL ORDER BY position",
+                "AND story_id = %s AND contract IS NOT NULL AND superseded_by IS NULL "
+                "ORDER BY position",
                 (project_id, story["story_id"]),
             )
         ).fetchall()
