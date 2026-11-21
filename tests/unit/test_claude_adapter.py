@@ -21,7 +21,6 @@ from relay.providers.claude import (
     Outcome,
     ProviderUnavailable,
     Request,
-    scrubbed,
 )
 from relay.providers.definitions import AgentDefinition
 
@@ -162,23 +161,16 @@ async def test_the_run_gets_the_environment_it_was_given_and_nothing_of_the_supe
     assert "RELAY_DATABASE_URL" not in called(tmp_path)["env"]
 
 
-def test_the_supervisors_own_settings_are_withheld_from_the_environment_handed_on() -> None:
-    kept = scrubbed(
-        {
-            "PATH": "/usr/bin",
-            "HOME": "/home/po",
-            "RELAY_DATABASE_URL": "postgresql://relay:secret@db/relay",
-            "DATABASE_URL": "postgresql://x",
-            "REDIS_URL": "redis://x",
-            "GIT_ASKPASS": "/bin/askpass",
-            "GH_TOKEN": "t",
-            "GITHUB_TOKEN": "t",
-            "SSH_AUTH_SOCK": "/tmp/agent",
-            "PGPASSWORD": "p",
-        }
-    )
+async def test_an_adapter_given_no_environment_passes_on_only_what_a_run_needs_to_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s")
+    monkeypatch.setenv("STUB_RECORD", str(tmp_path / "call.json"))  # not passed on either
 
-    assert kept == {"PATH": "/usr/bin", "HOME": "/home/po"}
+    result = await ClaudeAdapter(STUB).invoke(request(tmp_path))
+
+    assert result.outcome is Outcome.UNCERTAIN  # the stand-in was told nothing to replay
+    assert not (tmp_path / "call.json").exists()
 
 
 async def test_a_run_that_ends_in_an_error_is_known_and_is_not_a_reply(tmp_path: Path) -> None:

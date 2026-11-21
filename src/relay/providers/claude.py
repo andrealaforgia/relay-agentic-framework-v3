@@ -52,10 +52,7 @@ _ALWAYS_PASSED = (
     "--permission-prompts",
     "--no-session-persistence",
 )
-# What the supervisor holds and a model's process has no business with.
-_WITHHELD = re.compile(
-    r"RELAY_.*|DATABASE_URL|REDIS_URL|PG[A-Z]+|GIT_.*|GH_.*|GITHUB_.*|SSH_.*", re.IGNORECASE
-)
+_NEEDED_TO_START = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR")
 _ONE_LINE_LIMIT = 64 * 1024 * 1024
 
 
@@ -111,11 +108,6 @@ class Capabilities:
     flags: frozenset[str] = field(default_factory=frozenset)
 
 
-def scrubbed(environment: Mapping[str, str]) -> dict[str, str]:
-    """An environment to hand to a run: the given one without what is the supervisor's."""
-    return {name: value for name, value in environment.items() if not _WITHHELD.fullmatch(name)}
-
-
 class ClaudeAdapter:
     name = "claude"
 
@@ -126,7 +118,12 @@ class ClaudeAdapter:
         grace: float = 2.0,
     ) -> None:
         self._binary = binary
-        self._environment = dict(scrubbed(os.environ) if environment is None else environment)
+        # Given nothing, a run gets nothing of the supervisor's but what it needs to start.
+        self._environment = dict(
+            {name: value for name, value in os.environ.items() if name in _NEEDED_TO_START}
+            if environment is None
+            else environment
+        )
         # How long a run that has reported its result is given to exit by itself.
         self._grace = grace
         self._capabilities: Capabilities | None = None
