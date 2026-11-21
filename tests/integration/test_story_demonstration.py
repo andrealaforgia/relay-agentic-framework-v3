@@ -5,6 +5,7 @@ is in force after it."""
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,8 @@ from relay.application.integration import Outcome
 from relay.application.stories import StoryDraft
 from relay.domain.behaviour import BehaviourState
 from relay.domain.story import ActionRefused, SealRefused, StoryState
+from relay.git.checkout import RemoteUnavailable
+from relay.git.mirror import Mirror
 from tests.integration.fixtures import ANALYST, CONTRACT, VERIFIER
 from tests.integration.story_world import GREETS, STANDARD_RATE
 from tests.integration.test_supersession import (
@@ -169,3 +172,77 @@ async def test_a_decision_asks_nothing_about_a_behaviour_that_was_replaced(
     assert sorted(
         (each["subject"], each["behaviour_id"]) for each in await world.owed() if each["story_id"]
     ) == [("behaviour", "Z"), ("story", None)]
+
+
+async def test_a_seal_written_before_a_replacement_and_sent_after_it_is_refused(
+    world: Superseding,
+) -> None:
+    """3AII-S3-II-1.2. The Verifier read a list in which B1 and Z both showed AC1."""
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    await world.deliver("B1")
+    base = await z_awaiting_builder(world, ["AC1"])
+    revision, listed = await world.stories.revisions_of(PROJECT, "S1")
+
+    await z_replaces_b1(world, base)
+
+    with pytest.raises(ActionRefused, match="list"):
+        await world.stories.seal(
+            VERIFIER, PROJECT, "S1",
+            story_revision=revision, list_revision=listed, basis=await world.basis("S1"),
+        )  # fmt: skip
+    assert await world.stories.seal_of(PROJECT, "S1") is None
+
+
+async def z_pushed_and_unanswered(world: Superseding, monkeypatch: pytest.MonkeyPatch) -> str:
+    """B1 and Z in story 1; Z's excused push has gone and nothing came back."""
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    await world.deliver("B1")
+    base = await z_awaiting_builder(world, ["AC1"])
+    await world.decide(await world.propose())
+    candidate = await world.reviewed("Z", {"vat.py": VAT_APPLIES_REDUCED_RATE}, on=base)
+
+    async def unreachable(*_: Any, **__: Any) -> None:
+        raise RemoteUnavailable("no route to host")
+
+    monkeypatch.setattr(Mirror, "_push", unreachable)  # until the test undoes it
+    assert (await world.integrate("Z")).outcome is Outcome.PENDING
+    return candidate
+
+
+async def test_a_reconfirmation_owed_for_a_behaviour_is_withdrawn_when_it_is_replaced(
+    world: Superseding, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3AII-S3-II-1.6. The decision came while the replacement's push was unanswered."""
+    candidate = await z_pushed_and_unanswered(world, monkeypatch)
+    await world.answer(await world.ask("S1"))
+    owed = {each["behaviour_id"]: each for each in await world.owed()}
+    assert "B1" in owed
+
+    monkeypatch.undo()
+    await world.integration.reconcile()
+
+    assert world.trunk() == candidate
+    assert "B1" not in {each["behaviour_id"] for each in await world.owed()}
+    with pytest.raises(ActionRefused):
+        await world.claims.claim(VERIFIER, owed["B1"]["assignment_id"])
+
+
+async def test_retiring_a_behaviour_takes_its_row_before_its_storys(
+    world: Superseding, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3AII-S3-II-1.3. A reconfirmation holds the behaviour and then asks for its story.
+    A settlement that held the story and then asked for the behaviour would wait on it
+    for ever. With the behaviour held here, the settlement must be waiting for it
+    without holding the story."""
+    candidate = await z_pushed_and_unanswered(world, monkeypatch)
+    monkeypatch.undo()
+    async with world.database.connection() as held, held.transaction():
+        await held.execute("SELECT 1 FROM behaviours WHERE behaviour_id = 'B1' FOR UPDATE")
+        settling = asyncio.create_task(world.integration.reconcile())
+        await world.until_someone_waits_for_a_lock()
+
+        await held.execute("SELECT 1 FROM stories WHERE story_id = 'S1' FOR UPDATE NOWAIT")
+
+    await settling
+    assert world.trunk() == candidate
+    assert (await world.obligation_of("B1")).state == "retired"

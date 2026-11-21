@@ -16,10 +16,12 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from relay.application.assignments import retire_all_of_behaviour
 from relay.application.closure import (
     CANCELLED,
     closure_of_behaviour,
     lock_gate,
+    require_basis,
     require_startable,
     story_basis,
 )
@@ -66,11 +68,16 @@ class Supersessions:
         obligation: uuid.UUID,
         digest: str,
         behaviour: str,
+        contract_digest: str,
+        story_revision: int,
+        basis: int,
         reason: str,
     ) -> uuid.UUID:
-        """The Verifier proposes that one behaviour replace one obligation, naming the
-        obligation by identity and by the digest it was read at. This opens a gate that
-        shows the Product Owner both contracts in full."""
+        """The Verifier proposes that one behaviour replace one obligation. It names the
+        obligation by identity and by the digest it was read at, and the replacement by
+        the contract, story revision and decisions it was read on: a proposal that
+        arrives after any of them changed is not about what is there now. This opens a
+        gate that shows the Product Owner both contracts in full."""
         if principal.kind is not PrincipalKind.WORKER or principal.role != "verifier":
             raise ActionRefused("a supersession is for the verifier to propose")
         if not reason.strip():
@@ -105,15 +112,22 @@ class Supersessions:
                     "there is already a replacement proposed or standing for that obligation, "
                     "or one that this behaviour makes"
                 )
-            basis = await _basis(connection, project_id, replaced, replacing)
-            assert basis is not None
+            if await _being_pushed(connection, project_id, behaviour):
+                raise ActionRefused(
+                    f"{behaviour} has an integration authorised already, without a replacement"
+                )
+            on = await _basis(connection, project_id, replaced, replacing)
+            assert on is not None
+            if (contract_digest, story_revision) != (on["contract_digest"], on["story_revision"]):
+                raise ActionRefused(f"that is not {behaviour} as it stands now")
+            require_basis(basis, on["decisions"])
             gate_id = await _open_gate(
                 connection,
                 project_id,
                 replacing["feature_id"],
                 kind="supersession",
                 story_id=replacing["story_id"],
-                basis=basis,
+                basis=on,
                 manifest={
                     "reason": reason,
                     "replaces": {
@@ -140,7 +154,7 @@ class Supersessions:
                     behaviour,
                     reason,
                     principal.identity,
-                    Jsonb(basis),
+                    Jsonb(on),
                     gate_id,
                 ),
             )
@@ -271,18 +285,20 @@ async def settle_with_the_integration(
         "UPDATE behaviours SET superseded_by = %s WHERE project_id = %s AND behaviour_id = %s",
         (intent["behaviour_id"], intent["project_id"], retired["behaviour_id"]),
     )
+    # Nothing is owed for a behaviour that is now history: a reconfirmation a decision
+    # asked for while this push was on its way is withdrawn, claimed or not.
+    await retire_all_of_behaviour(connection, intent["project_id"], retired["behaviour_id"])
     # A seal vouches for one mapping of criteria to the behaviours in force. That mapping
-    # has just changed for every story that lists either behaviour and is still being
-    # worked on; a story already approved is history and is left exactly as it was.
+    # has just changed for the story that lists the retired behaviour, if it is still
+    # being worked on: its seal goes, and its list is a new revision, so that a seal
+    # written from the old list is refused. The replacement's own story, if another, is
+    # shown by the replacement as before. An approved story is history and is left as it was.
     await connection.execute(
-        "UPDATE stories SET seal_id = NULL, sealed_revision = NULL WHERE project_id = %s "
-        "AND state IN ('released', 'changes_requested') AND story_id IN "
-        "(SELECT story_id FROM behaviours WHERE project_id = %s AND behaviour_id = ANY(%s))",
-        (
-            intent["project_id"],
-            intent["project_id"],
-            [intent["behaviour_id"], retired["behaviour_id"]],
-        ),
+        "UPDATE stories SET seal_id = NULL, sealed_revision = NULL, "
+        "list_revision = list_revision + 1 WHERE project_id = %s "
+        "AND state IN ('released', 'changes_requested') AND story_id = "
+        "(SELECT story_id FROM behaviours WHERE project_id = %s AND behaviour_id = %s)",
+        (intent["project_id"], intent["project_id"], retired["behaviour_id"]),
     )
     await append_event(
         connection,
@@ -295,6 +311,38 @@ async def settle_with_the_integration(
             "supersession_id": str(authority["supersession_id"]),
         },
     )
+
+
+async def ended_by_an_ordinary_integration(
+    connection: Connection, project_id: str, behaviour_id: str
+) -> None:
+    """An integration of this behaviour was authorised with no exemption. A proposal
+    that it replace something has lost its ground, and ends here, in the transaction
+    that authorises the push, whatever then becomes of the push."""
+    proposals = await (
+        await connection.execute(
+            "SELECT * FROM supersessions WHERE project_id = %s AND behaviour_id = %s "
+            "AND state IN ('proposed', 'standing') FOR UPDATE",
+            (project_id, behaviour_id),
+        )
+    ).fetchall()
+    for each in proposals:
+        await _end(connection, each, "void", "the replacing behaviour was sent to trunk without it")
+
+
+async def replaced_under(connection: Connection, supersession_id: uuid.UUID | None) -> str | None:
+    """The behaviour whose obligation this authority replaces."""
+    if supersession_id is None:
+        return None
+    row = await (
+        await connection.execute(
+            "SELECT o.behaviour_id FROM supersessions s JOIN obligations o USING (obligation_id) "
+            "WHERE s.supersession_id = %s",
+            (supersession_id,),
+        )
+    ).fetchone()
+    assert row is not None
+    return str(row["behaviour_id"])
 
 
 async def basis_of_gate(connection: Connection, gate: dict[str, Any]) -> dict[str, Any] | None:
@@ -365,14 +413,7 @@ async def _why_it_no_longer_stands(
         return "the replacing behaviour's story or feature has ended"
     if replacing["state"] in ("integrated", "completed"):
         return "the replacing behaviour reached trunk without it"
-    outstanding = await (
-        await connection.execute(
-            "SELECT 1 FROM integration_intents WHERE project_id = %s AND behaviour_id = %s "
-            "AND state = 'outstanding'",
-            (project_id, supersession["behaviour_id"]),
-        )
-    ).fetchone()
-    if outstanding is not None:
+    if await _being_pushed(connection, project_id, supersession["behaviour_id"]):
         return "the replacing behaviour has an integration authorised without it"
     now = await _basis(
         connection,
@@ -383,6 +424,18 @@ async def _why_it_no_longer_stands(
     if now != supersession["basis"]:
         return "what it was proposed on has changed"
     return ""
+
+
+async def _being_pushed(connection: Connection, project_id: str, behaviour_id: str) -> bool:
+    return (
+        await (
+            await connection.execute(
+                "SELECT 1 FROM integration_intents WHERE project_id = %s AND behaviour_id = %s "
+                "AND state = 'outstanding'",
+                (project_id, behaviour_id),
+            )
+        ).fetchone()
+    ) is not None
 
 
 async def _basis(

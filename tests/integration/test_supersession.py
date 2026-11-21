@@ -68,15 +68,27 @@ class Superseding(DecisionWorld):
         )
 
     async def propose(self, replaced: str = "B1", by: str = "Z") -> uuid.UUID:
-        obligation = await self.obligation_of(replaced)
         return await self.supersessions.propose(
-            VERIFIER,
-            self.project,
-            obligation=obligation.obligation_id,
-            digest=obligation.digest,
-            behaviour=by,
-            reason=WHY,
+            VERIFIER, self.project, reason=WHY, **await self.as_read(replaced, by)
         )
+
+    async def as_read(self, replaced: str = "B1", by: str = "Z") -> dict[str, Any]:
+        """What the Verifier read just before proposing: the obligation, and the
+        replacing behaviour's contract, story revision and decision basis."""
+        obligation = await self.obligation_of(replaced)
+        [story] = await self.column(
+            f"SELECT story_id FROM behaviours WHERE behaviour_id = '{by}' "
+            f"AND project_id = '{self.project}'"
+        )
+        assert isinstance(story, str)
+        return {
+            "obligation": obligation.obligation_id,
+            "digest": obligation.digest,
+            "behaviour": by,
+            "contract_digest": await self.contract_digest(by),
+            "story_revision": await self.revision(story),
+            "basis": await self.basis(story),
+        }
 
 
 @pytest.fixture
@@ -140,8 +152,7 @@ async def test_a_supersession_is_proposed_by_the_verifier_for_an_obligation_as_i
     world: Superseding,
 ) -> None:
     await world.awaiting_builder("Z", REDUCED_RATE, "S2")
-    obligation = await world.obligation_of("B1")
-    named = {"obligation": obligation.obligation_id, "digest": obligation.digest, "reason": WHY}
+    named = {**await world.as_read(), "reason": WHY}
 
     for principal, changed, why in (
         (ANALYST, {}, "verifier"),
@@ -153,9 +164,7 @@ async def test_a_supersession_is_proposed_by_the_verifier_for_an_obligation_as_i
         (VERIFIER, {"behaviour": "nobody"}, "unknown behaviour"),
     ):
         with pytest.raises(ActionRefused, match=why):
-            await world.supersessions.propose(
-                principal, PROJECT, **{"behaviour": "Z", **named, **changed}
-            )
+            await world.supersessions.propose(principal, PROJECT, **{**named, **changed})
 
     assert await world.stories.inbox(PROJECT) == []
 
@@ -433,10 +442,12 @@ async def test_a_required_project_check_is_not_replaced_by_a_storys_work(
         await world.supersessions.propose(
             VERIFIER,
             PROJECT,
-            obligation=check.obligation_id,
-            digest=check.digest,
-            behaviour="Z",
             reason=WHY,
+            **{
+                **await world.as_read(),
+                "obligation": check.obligation_id,
+                "digest": check.digest,
+            },
         )
 
     assert await world.column("SELECT count(*) FROM supersessions") == [0]
@@ -458,8 +469,19 @@ async def test_a_behaviour_with_no_contract_yet_replaces_nothing(world: Supersed
         basis=await world.basis("S2"), story_revision=await world.revision("S2"),
     )  # fmt: skip
 
+    obligation = await world.obligation_of("B1")
     with pytest.raises(ActionRefused, match="no registered contract"):
-        await world.propose()
+        await world.supersessions.propose(
+            VERIFIER,
+            PROJECT,
+            reason=WHY,
+            obligation=obligation.obligation_id,
+            digest=obligation.digest,
+            behaviour="Z",
+            contract_digest=REDUCED_RATE.digest,
+            story_revision=await world.revision("S2"),
+            basis=await world.basis("S2"),
+        )
 
 
 async def test_a_proposal_is_approved_or_sent_back_and_records_what_it_was_made_on(
@@ -502,3 +524,101 @@ async def test_trunk_moved_by_someone_else_under_an_excused_push_leaves_the_auth
         "standing"
     ]
     assert (await world.obligation_of("B1")).state == "active"
+
+
+@pytest.mark.parametrize(
+    "misread", [{"contract_digest": CONTRACT.digest}, {"story_revision": 7}, {"basis": 7}]
+)
+async def test_a_proposal_names_the_replacement_as_its_author_read_it(
+    world: Superseding, misread: dict[str, Any]
+) -> None:
+    """3AII-S3-II-1.5. A proposal that arrives after the replacement changed is not a
+    proposal about what it has become."""
+    await world.awaiting_builder("Z", REDUCED_RATE, "S2")
+
+    with pytest.raises(ActionRefused):
+        await world.supersessions.propose(
+            VERIFIER, PROJECT, reason=WHY, **{**await world.as_read(), **misread}
+        )
+
+    assert await world.stories.inbox(PROJECT) == []
+
+
+async def test_checks_that_ran_across_an_approval_do_not_let_the_replacement_in_without_it(
+    world: Superseding,
+) -> None:
+    """3AII-S3-II-1.1. An independent check asks exactly what B1 asks, so excusing Z from
+    B1 changes no check that runs. The batch must still not decide under an authority
+    it did not start with: Z would be on trunk with B1 never retired."""
+    await world.integration.require_check(PROJECT, CONTRACT.as_check())
+    base = await world.awaiting_builder("Z", GREETING, "S2")
+    gate = await world.propose()
+    await world.reviewed("Z", {"greeting.txt": "hello\n"}, on=base)
+    barrier = HeldAtABarrier(ContainerIsolation(world.image))
+    running = asyncio.create_task(world.integration_with(barrier).integrate(PROJECT, "Z", "first"))
+    await held_at_the_barrier(running, barrier)
+
+    assert (await world.decide(gate)).disposition == "effective"
+    barrier.release.set()
+
+    assert (await running).outcome is Outcome.SUPERSEDED
+    assert world.trunk() == base
+    assert (await world.integrate("Z")).outcome is Outcome.INTEGRATED
+    assert (await world.obligation_of("B1")).state == "retired"
+    assert await world.column("SELECT state FROM supersessions") == ["used"]
+    assert (await world.events()).count("obligation.retired") == 1
+
+
+async def test_a_replacement_already_being_pushed_without_it_is_not_proposed(
+    world: Superseding, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3AII-S3-II-1.4, the push first."""
+    base = await world.awaiting_builder("Z", GREETING, "S2")
+    await world.reviewed("Z", {"greeting.txt": "hello\n"}, on=base)
+
+    async def unreachable(*_: Any, **__: Any) -> None:
+        raise RemoteUnavailable("no route to host")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Mirror, "_push", unreachable)
+        assert (await world.integrate("Z")).outcome is Outcome.PENDING
+
+        with pytest.raises(ActionRefused, match="integration"):
+            await world.propose()
+
+    assert await world.stories.inbox(PROJECT) == []
+
+
+async def test_an_ordinary_push_of_the_replacement_ends_its_proposal_there_and_then(
+    world: Superseding,
+) -> None:
+    """3AII-S3-II-1.4, the proposal first. The push is refused and the behaviour is
+    parked before anyone looks at the proposal again: it has ended all the same."""
+    base = await world.awaiting_builder("Z", GREETING, "S2")
+    gate = await world.propose()
+    await world.reviewed("Z", {"greeting.txt": "hello\n"}, on=base)
+    world.hook_flag("refuse").touch()
+
+    assert (await world.integrate("Z")).outcome is Outcome.REJECTED
+
+    assert await world.column("SELECT state FROM supersessions") == ["void"]
+    assert await world.stories.inbox(PROJECT) == []
+    assert (await world.decide(gate)).disposition == "stale"
+    assert await world.column("SELECT state FROM supersessions") == ["void"]
+
+
+async def test_replacing_a_behaviour_of_an_approved_story_leaves_the_current_storys_seal(
+    world: Superseding,
+) -> None:
+    """3AII-S3-II-1.7. What shows story 2's criterion is Z before and after."""
+    candidate = await z_reviewed(world)
+    await world.decide(await world.propose())
+    await world.seal("S2")
+    await world.assess("Z shows the reduced rate", "S2")
+    sealed = await world.stories.seal_of(PROJECT, "S2")
+
+    assert (await world.integrate("Z")).outcome is Outcome.INTEGRATED
+
+    assert world.trunk() == candidate
+    assert await world.stories.seal_of(PROJECT, "S2") == sealed
+    assert await world.story("S2") is StoryState.AWAITING_APPROVAL

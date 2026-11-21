@@ -45,7 +45,9 @@ from relay.application.reviews import gate_of
 from relay.application.stories import evaluate_story_gate, lock_story, require_story_at_work
 from relay.application.supersessions import (
     add_obligation,
+    ended_by_an_ordinary_integration,
     regression_set,
+    replaced_under,
     reserve,
     settle_with_the_integration,
 )
@@ -586,6 +588,10 @@ class Integration:
                 # This push was checked without the obligation it replaces. From here
                 # that exemption is this integration's, whatever is decided meanwhile.
                 await reserve(connection, batch["supersession_id"], intent_id)
+            else:
+                await ended_by_an_ordinary_integration(
+                    connection, batch["project_id"], batch["behaviour_id"]
+                )
             await _close_batch(connection, batch, "authorised", None, event=False)
             submissions = await (
                 await connection.execute(
@@ -837,6 +843,14 @@ class Integration:
             behaviour, row = await _locked_behaviour(
                 connection, located["project_id"], located["behaviour_id"]
             )
+            # If this push replaces a behaviour, that one is written too. Its row is
+            # taken now, with the other behaviour and before any story: a reconfirmation
+            # holds a behaviour and then asks for its story, and must never meet a
+            # settlement that holds the story and asks for the behaviour. (Which
+            # authority an intent carries never changes once it is authorised.)
+            replaced = await replaced_under(connection, located["supersession_id"])
+            if replaced is not None:
+                await _locked_behaviour(connection, located["project_id"], replaced)
             # The story is locked here, before anything writes to the project row (the
             # ledger does): behaviour, story, project is the order everyone keeps, and
             # the gate evaluation below needs the story.
@@ -1252,10 +1266,17 @@ async def _why_stale(
     if (await gate_of(connection, cycle)).state is not GateState.SATISFIED:
         return "the review gate is no longer satisfied"
     # Recomputed for this behaviour: an authority given, voided or used while the batch
-    # ran changes the set, and so the digest, and the batch decides nothing.
-    checks, _ = await regression_set(connection, batch["project_id"], batch["behaviour_id"])
+    # ran changes what the batch may decide.
+    checks, excused_under = await regression_set(
+        connection, batch["project_id"], batch["behaviour_id"]
+    )
     if regression_digest(project["check_policy_version"], checks) != batch["regression_digest"]:
         return "the checks required of a candidate changed while this batch was running"
+    if excused_under != batch["supersession_id"]:
+        # The same checks may run with and without an exemption, when something else
+        # asks what the replaced obligation asks. The push would still mean something
+        # different: with the authority it retires the obligation, without it it does not.
+        return "what this behaviour may replace was decided while this batch was running"
     if await _outstanding_intent(connection, batch["project_id"]) is not None:
         return "another integration of this project was authorised meanwhile"
     return ""
