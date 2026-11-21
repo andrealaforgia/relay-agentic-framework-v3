@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import socket
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from relay.domain.story import Principal, PrincipalKind
 from relay.persistence.database import Connection, Pool
@@ -23,6 +23,9 @@ class WorkerSession:
     role: str
     _pool: Pool
     _held: Connection | None
+    # The effects this process is carrying out at this moment. One it is recorded as
+    # having started and is not carrying out was cut short, and may be taken up again.
+    running: set[tuple[uuid.UUID, str]] = field(default_factory=set)
 
     @classmethod
     async def start(cls, pool: Pool, role: str) -> WorkerSession:

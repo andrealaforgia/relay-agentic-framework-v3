@@ -319,3 +319,44 @@ async def test_an_effort_the_cli_cannot_be_asked_for_is_refused_and_not_dropped(
         await limited.invoke(request(tmp_path, effort="high"))
     with pytest.raises(ProviderUnavailable, match="--max-budget-usd"):
         await limited.invoke(request(tmp_path, budget_usd=Decimal(1)))
+
+
+@pytest.mark.parametrize("missing", ["tools", "mcp_servers"])
+async def test_a_run_that_does_not_say_what_it_has_is_ended(tmp_path: Path, missing: str) -> None:
+    """3B-S1-1.9: an inventory that is missing is not an empty one."""
+    silent = tmp_path / "silent.jsonl"
+    started = json.loads((RECORDED / "success.jsonl").read_text().splitlines()[0])
+    del started[missing]
+    silent.write_text(json.dumps(started) + "\n")
+
+    result = await ClaudeAdapter(
+        STUB, {"PATH": os.environ["PATH"], "STUB_STREAM": str(silent), "STUB_HANG": "1"}
+    ).invoke(request(tmp_path))
+
+    assert result.outcome is Outcome.UNCERTAIN
+    assert "did not say" in result.reason
+
+
+async def test_a_run_that_is_not_the_session_relay_started_is_ended(tmp_path: Path) -> None:
+    result = await adapter(tmp_path, STUB_KEEP_SESSION="1", STUB_HANG="1").invoke(
+        request(tmp_path, invocation_id=uuid.uuid7())
+    )
+
+    assert result.outcome is Outcome.UNCERTAIN
+    assert "not the session" in result.reason
+
+
+async def test_a_result_from_a_run_that_never_said_what_it_had_is_not_a_reply(
+    tmp_path: Path,
+) -> None:
+    """3B-S1-1.9: it is kept, with what it used, and it cannot be used."""
+    headless = tmp_path / "headless.jsonl"
+    headless.write_text((RECORDED / "success.jsonl").read_text().split("\n", 1)[1])
+
+    result = await ClaudeAdapter(
+        STUB, {"PATH": os.environ["PATH"], "STUB_STREAM": str(headless)}
+    ).invoke(request(tmp_path))
+
+    assert result.outcome is Outcome.RETURNED
+    assert result.terminal is not None and result.terminal.usage
+    assert "without first saying what it had" in result.unusable

@@ -44,6 +44,13 @@ CREATE TABLE invocations (
     -- What the call was admitted under: the grant, the attempt, and the revisions and
     -- decision basis of what it is about.
     admitted_on     jsonb NOT NULL,
+    -- The revisions and decision basis the next effect of its apply expects to find. It
+    -- starts as what the call was admitted on, and moves only by what an effect of its
+    -- own says it changed.
+    expects         jsonb NOT NULL,
+    -- For a result that arrived after the work had been granted again: the grant it is
+    -- applied under. Its own grant stays on record as what it ran under.
+    applied_under   uuid,
     state           text NOT NULL DEFAULT 'intended'
                     CHECK (state IN ('intended', 'returned', 'errored', 'applied', 'rejected',
                                      'overtaken', 'not_started', 'uncertain')),

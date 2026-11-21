@@ -19,8 +19,10 @@ from typing import Any
 class Started:
     session_id: str
     model: str
-    tools: tuple[str, ...]
-    mcp_servers: tuple[str, ...]
+    # What the run says it has. None where it did not say: an inventory that is missing
+    # is not an empty one.
+    tools: tuple[str, ...] | None
+    mcp_servers: tuple[str, ...] | None
     version: str
 
 
@@ -189,10 +191,10 @@ def _read_block(block: dict[str, Any]) -> list[Event]:
     return []
 
 
-def _names(listed: Any) -> tuple[str, ...]:
+def _names(listed: Any) -> tuple[str, ...] | None:
     """Tools are listed by name; servers as objects with a name."""
     if not isinstance(listed, list):
-        return ()
+        return None
     return tuple(
         str(each.get("name", "")) if isinstance(each, dict) else str(each) for each in listed
     )

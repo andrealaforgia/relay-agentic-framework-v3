@@ -394,8 +394,23 @@ class Assignments:
                 )
             if assignment["parked"] is not None:
                 raise ActionRefused(f"this work is parked: {assignment['parked']}")
-            if worker is not None and not await is_alive(connection, worker):
-                raise ActionRefused("this worker is not running")
+            if worker is not None:
+                registered = await (
+                    await connection.execute(
+                        "SELECT role FROM workers WHERE worker_id = %s", (worker,)
+                    )
+                ).fetchone()
+                # The caller, the worker process and the role are one thing or nothing
+                # is granted: what the pass later concludes from that process being gone
+                # must be about the caller that holds the grant.
+                if (
+                    registered is None
+                    or registered["role"] != principal.role
+                    or principal.identity != f"{principal.role}@{worker}"
+                ):
+                    raise ActionRefused("this worker is not the one asking")
+                if not await is_alive(connection, worker):
+                    raise ActionRefused("this worker is not running")
             if assignment["state"] == "granted":
                 if assignment["granted_to"] != principal.identity:
                     raise ActionRefused("this work is already granted to another worker")

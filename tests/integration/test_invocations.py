@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,7 @@ from psycopg_pool import AsyncConnectionPool
 from relay.application.features import Features
 from relay.application.invocations import Effect, EffectRun, Invocations, Prepared
 from relay.application.workers import WorkerSession, is_alive
-from relay.domain.story import ActionRefused, HumanAction, Receipt
+from relay.domain.story import ActionRefused, HumanAction, Principal, PrincipalKind, Receipt
 from relay.providers.claude import Outcome, ProviderResult
 from relay.providers.definitions import AgentDefinition
 from relay.providers.stream import Terminal, read_stream
@@ -45,7 +46,10 @@ PREPARED = Prepared(
     effective_agent_sha256="c" * 64,
     briefing="Make B1 pass.",
     schema={"type": "object"},
+    read_on={},
 )
+# The commit a build's workspace was kept as.
+KEPT = "c" * 40
 UNCERTAIN = ProviderResult(Outcome.UNCERTAIN, reason="no result within 5 seconds")
 NOT_STARTED = ProviderResult(Outcome.NOT_STARTED, reason="could not be launched")
 
@@ -68,24 +72,32 @@ class Applying:
         self.failing: dict[str, Exception] = {}
         self.waiting: dict[str, asyncio.Event] = {}
         self.doing: dict[str, Any] = {}
+        self.grants: list[uuid.UUID] = []
+        self.settled: list[str] = []
         self.reached = asyncio.Event()
 
     def effects_for(self, _: dict[str, Any]) -> list[Effect]:
-        return [Effect("first", self._perform("first")), Effect("second", self._perform("second"))]
+        return [
+            Effect("first", self._perform("first"), self._settle),
+            Effect("second", self._perform("second")),
+        ]
+
+    async def _settle(self, connection: Any, run: EffectRun) -> None:
+        self.settled.append(f"{run.effect_id.rsplit(':', 1)[1]}:{run.attempt}")
 
     def _perform(self, name: str) -> Any:
         async def perform(run: EffectRun) -> Mapping[str, Any] | None:
-            this = run.identity.split(":", 1)[1]
+            this = f"{name}:{run.attempt}"
             self.ran.append(this)
+            self.grants.append(run.grant_id)
             for held in (name, this):
                 if held in self.waiting:
                     self.reached.set()
                     await self.waiting[held].wait()
             if name in self.failing:
                 raise self.failing[name]
-            if name in self.doing:
-                await self.doing[name]()
-            return {"did": name}
+            moved = await self.doing[name](run) if name in self.doing else None
+            return {"did": name, **({"stands": moved} if moved else {})}
 
         return perform
 
@@ -97,6 +109,10 @@ class Calling:
         self.world = world
         self.applying = Applying()
         self.invocations = Invocations(world.database, self.applying.effects_for)
+        # The pass of this project knows about calls: a resume and a start recover them.
+        world.features = Features(
+            world.database, world.reviews, world.integration, invocations=self.invocations
+        )
         self.sessions: list[WorkerSession] = []
         self.requests = 0
 
@@ -117,9 +133,13 @@ class Calling:
         grant = await self.world.claims.claim(worker.principal, assignment, worker.worker_id)
         return assignment, grant
 
+    async def prepared(self) -> Prepared:
+        """As a task prepares: on what the work is about as it stands now."""
+        return replace(PREPARED, read_on=await self.invocations.as_it_stands(await self.owed()))
+
     async def admitted(self, worker: WorkerSession) -> uuid.UUID:
         assignment, grant = await self.claimed(worker)
-        admission = await self.invocations.admit(worker, assignment, grant, PREPARED)
+        admission = await self.invocations.admit(worker, assignment, grant, await self.prepared())
         assert admission.outcome == "admitted", admission.reason
         assert admission.invocation_id is not None
         return admission.invocation_id
@@ -167,7 +187,7 @@ async def test_a_call_is_on_record_before_it_is_made(calling: Calling) -> None:
     worker = await calling.worker()
     assignment, grant = await calling.claimed(worker)
 
-    admission = await calling.invocations.admit(worker, assignment, grant, PREPARED)
+    admission = await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
 
     assert (admission.outcome, admission.attempt) == ("admitted", 1)
     async with calling.world.database.connection() as connection:
@@ -199,18 +219,18 @@ async def test_a_delivery_that_comes_again_never_buys_a_second_call(calling: Cal
     """S3-18.1, on both sides of the record and after the apply."""
     worker = await calling.worker()
     assignment, grant = await calling.claimed(worker)
-    first = await calling.invocations.admit(worker, assignment, grant, PREPARED)
+    first = await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
     assert first.invocation_id is not None
 
-    during = await calling.invocations.admit(worker, assignment, grant, PREPARED)
+    during = await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
     assert (during.outcome, "in flight" in during.reason) == ("refused", True)
 
-    await calling.invocations.record(first.invocation_id, said())
-    recorded = await calling.invocations.admit(worker, assignment, grant, PREPARED)
+    await calling.invocations.record(first.invocation_id, said(), retained=KEPT)
+    recorded = await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
     assert (recorded.outcome, recorded.invocation_id) == ("apply", first.invocation_id)
 
     assert await calling.invocations.apply(first.invocation_id, worker) == "applied"
-    after = await calling.invocations.admit(worker, assignment, grant, PREPARED)
+    after = await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
     assert after.outcome == "finished"
 
     assert await calling.states() == ["applied"]
@@ -220,7 +240,7 @@ async def test_a_delivery_that_comes_again_never_buys_a_second_call(calling: Cal
 async def test_what_a_call_returned_is_stored_whole_with_what_it_used(calling: Calling) -> None:
     invocation = await calling.admitted(await calling.worker())
 
-    assert await calling.invocations.record(invocation, said()) == "returned"
+    assert await calling.invocations.record(invocation, said(), retained=KEPT) == "returned"
 
     async with calling.world.database.connection() as connection:
         row = await (await connection.execute("SELECT * FROM invocations")).fetchone()
@@ -264,13 +284,13 @@ async def test_a_reply_that_cannot_be_used_is_a_known_call_and_the_next_is_anoth
 ) -> None:
     worker = await calling.worker()
     assignment, grant = await calling.claimed(worker)
-    first = await calling.invocations.admit(worker, assignment, grant, PREPARED)
+    first = await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
     assert first.invocation_id is not None
 
     state = await calling.invocations.record(
         first.invocation_id, said(), problem="the reply names no commit"
     )
-    second = await calling.invocations.admit(worker, assignment, grant, PREPARED)
+    second = await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
 
     assert state == "rejected"
     assert await calling.world.column("SELECT reply FROM invocations WHERE attempt = 1") == [
@@ -287,7 +307,9 @@ async def test_after_three_calls_that_gave_nothing_a_person_is_asked(calling: Ca
     worker = await calling.worker()
     assignment, grant = await calling.claimed(worker)
     for _ in range(3):
-        admission = await calling.invocations.admit(worker, assignment, grant, PREPARED)
+        admission = await calling.invocations.admit(
+            worker, assignment, grant, await calling.prepared()
+        )
         assert admission.invocation_id is not None
         await calling.invocations.record(admission.invocation_id, said(), problem="unusable")
 
@@ -357,7 +379,7 @@ async def test_a_pause_before_the_call_is_admitted_stops_it_and_one_after_does_n
     grant_again = await calling.world.column(
         "SELECT grant_id FROM assignments WHERE kind = 'build'"
     )
-    paused = await calling.invocations.admit(worker, assignment, grant, PREPARED)
+    paused = await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
     assert paused.outcome == "refused"
     assert await calling.states() == []
     assert grant_again == [None]  # nothing had been done under it, so the pause took it back
@@ -367,7 +389,7 @@ async def test_a_pause_before_the_call_is_admitted_stops_it_and_one_after_does_n
     await calling.world.close("pause", reason="wait again")
 
     assert (await calling.assignment())[2] is True  # the call is the grant's first effect
-    assert await calling.invocations.record(invocation, said()) == "returned"
+    assert await calling.invocations.record(invocation, said(), retained=KEPT) == "returned"
 
 
 async def test_a_pause_between_a_reply_that_could_not_be_used_and_the_next_call_stops_it(
@@ -375,12 +397,12 @@ async def test_a_pause_between_a_reply_that_could_not_be_used_and_the_next_call_
 ) -> None:
     worker = await calling.worker()
     assignment, grant = await calling.claimed(worker)
-    first = await calling.invocations.admit(worker, assignment, grant, PREPARED)
+    first = await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
     assert first.invocation_id is not None
     await calling.invocations.record(first.invocation_id, said(), problem="unusable")
 
     await calling.world.close("pause", reason="wait")
-    retry = await calling.invocations.admit(worker, assignment, grant, PREPARED)
+    retry = await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
 
     assert (retry.outcome, "paused" in retry.reason) == ("refused", True)
     assert await calling.states() == ["rejected"]
@@ -451,7 +473,7 @@ async def test_a_worker_gone_during_its_call_leaves_a_person_to_say_whether_to_c
 
     assert await calling.invocations.parked(PROJECT) == []
     assignment, grant = await calling.claimed(second)
-    admission = await calling.invocations.admit(second, assignment, grant, PREPARED)
+    admission = await calling.invocations.admit(second, assignment, grant, await calling.prepared())
     assert (admission.outcome, admission.attempt) == ("admitted", 2)
     assert await calling.world.column("SELECT worker_id FROM invocations ORDER BY attempt") == [
         first.worker_id,
@@ -510,7 +532,7 @@ async def test_a_result_that_arrives_late_and_first_is_used_and_the_retry_is_not
     await calling.invocations.recover(PROJECT)
     await calling.invocations.decide(calling.person(invocation, "retry"))
 
-    assert await calling.invocations.record(invocation, said()) == "returned"
+    assert await calling.invocations.record(invocation, said(), retained=KEPT) == "returned"
 
     assert await calling.states() == ["returned"]
     assert await calling.assignment() == ("granted", None, True)
@@ -533,7 +555,7 @@ async def test_a_result_that_arrives_after_its_retry_was_admitted_is_kept_and_no
     second = await calling.worker()
     successor = await calling.admitted(second)
 
-    assert await calling.invocations.record(invocation, said()) == "overtaken"
+    assert await calling.invocations.record(invocation, said(), retained=KEPT) == "overtaken"
 
     assert await calling.states() == ["overtaken", "intended"]
     assert await calling.world.column(
@@ -541,7 +563,7 @@ async def test_a_result_that_arrives_after_its_retry_was_admitted_is_kept_and_no
     ) == [Decimal("0.0008912")]  # what it used is on record
     assert await calling.invocations.apply(invocation, second) == "overtaken"
     assert calling.applying.ran == []
-    await calling.invocations.record(successor, said())
+    await calling.invocations.record(successor, said(), retained=KEPT)
     assert await calling.invocations.apply(successor, second) == "applied"
 
 
@@ -551,7 +573,7 @@ async def test_an_apply_cut_short_is_carried_on_from_the_effect_it_had_reached(
     """S3-18.4. The model is not called to finish an apply."""
     worker = await calling.worker()
     invocation = await calling.admitted(worker)
-    await calling.invocations.record(invocation, said())
+    await calling.invocations.record(invocation, said(), retained=KEPT)
     calling.applying.failing["second"] = RuntimeError("the process stopped")
 
     with pytest.raises(RuntimeError):
@@ -572,7 +594,7 @@ async def test_two_deliveries_of_one_result_do_not_both_carry_out_an_effect(
     """S3-19.4."""
     one, other = await calling.worker(), await calling.worker()
     invocation = await calling.admitted(one)
-    await calling.invocations.record(invocation, said())
+    await calling.invocations.record(invocation, said(), retained=KEPT)
     calling.applying.waiting["first"] = asyncio.Event()
 
     applying = asyncio.create_task(calling.invocations.apply(invocation, one))
@@ -589,7 +611,7 @@ async def test_a_try_that_was_taken_over_while_it_ran_decides_nothing(calling: C
     comes back first, while the try that took over is still running."""
     one, other = await calling.worker(), await calling.worker()
     invocation = await calling.admitted(one)
-    await calling.invocations.record(invocation, said())
+    await calling.invocations.record(invocation, said(), retained=KEPT)
     calling.applying.waiting["first:1"] = asyncio.Event()
     calling.applying.waiting["first:2"] = asyncio.Event()
     first_try = asyncio.create_task(calling.invocations.apply(invocation, one))
@@ -616,7 +638,7 @@ async def test_a_reply_the_service_refuses_is_a_known_call_that_gave_nothing(
 ) -> None:
     worker = await calling.worker()
     invocation = await calling.admitted(worker)
-    await calling.invocations.record(invocation, said())
+    await calling.invocations.record(invocation, said(), retained=KEPT)
     calling.applying.failing["second"] = ActionRefused("the commit does not descend from the red")
 
     assert await calling.invocations.apply(invocation, worker) == "rejected"
@@ -634,14 +656,15 @@ async def test_a_known_result_is_held_through_a_pause_and_applied_once_after_it(
     """S3-20.3."""
     worker = await calling.worker()
     invocation = await calling.admitted(worker)
-    await calling.invocations.record(invocation, said())
+    await calling.invocations.record(invocation, said(), retained=KEPT)
 
     await calling.world.close("pause", reason="wait")
     assert await calling.invocations.apply(invocation, worker) == "held"
     assert (await calling.states(), calling.applying.ran) == (["returned"], [])
 
-    await calling.world.close("resume")
-    assert await calling.invocations.apply(invocation, worker) == "applied"
+    await calling.world.close("resume")  # and nothing else: the worker is still alive
+
+    assert await calling.states() == ["applied"]
     assert calling.applying.ran == ["first:1", "second:1"]
     assert await calling.world.column("SELECT count(*) FROM invocations") == [1]
 
@@ -649,7 +672,7 @@ async def test_a_known_result_is_held_through_a_pause_and_applied_once_after_it(
 async def test_a_known_result_for_work_that_was_ended_is_never_applied(calling: Calling) -> None:
     worker = await calling.worker()
     invocation = await calling.admitted(worker)
-    await calling.invocations.record(invocation, said())
+    await calling.invocations.record(invocation, said(), retained=KEPT)
 
     await calling.world.close("cancel", reason="dropped")
 
@@ -657,16 +680,16 @@ async def test_a_known_result_for_work_that_was_ended_is_never_applied(calling: 
     assert (await calling.states(), calling.applying.ran) == (["overtaken"], [])
     assignment = await calling.owed()
     grant = uuid.uuid7()
-    assert (await calling.invocations.admit(worker, assignment, grant, PREPARED)).outcome == (
-        "finished"
-    )
+    assert (
+        await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
+    ).outcome == ("finished")
 
 
 async def test_a_cancel_between_two_effects_stops_the_second(calling: Calling) -> None:
     """S3-19.4: retained, then cancelled, is not then published."""
     worker = await calling.worker()
     invocation = await calling.admitted(worker)
-    await calling.invocations.record(invocation, said())
+    await calling.invocations.record(invocation, said(), retained=KEPT)
     calling.applying.failing["second"] = RuntimeError("stopped between the two")
     with pytest.raises(RuntimeError):
         await calling.invocations.apply(invocation, worker)
@@ -684,7 +707,7 @@ async def test_a_result_about_a_story_that_has_since_changed_is_not_applied(
     """S3-20.3: revalidated before anything is done with it."""
     worker = await calling.worker()
     invocation = await calling.admitted(worker)
-    await calling.invocations.record(invocation, said())
+    await calling.invocations.record(invocation, said(), retained=KEPT)
 
     await calling.world.answer(await calling.world.ask("S1"))
 
@@ -703,12 +726,10 @@ async def test_the_pass_applies_what_a_worker_that_is_gone_had_already_been_told
     """S3-18.2: a known result is used once, under the grant it was obtained under."""
     worker = await calling.worker()
     invocation = await calling.admitted(worker)
-    await calling.invocations.record(invocation, said())
+    await calling.invocations.record(invocation, said(), retained=KEPT)
     await worker.stop()
 
-    await calling.world.features.start()  # the control plane starting takes nothing back
-    assert await calling.assignment() == ("granted", None, True)
-    await calling.invocations.recover(PROJECT)
+    await calling.world.features.start()  # takes nothing back, and applies what is known
 
     assert await calling.states() == ["applied"]
     assert calling.applying.ran == ["first:1", "second:1"]
@@ -723,9 +744,9 @@ async def test_a_build_that_was_reopened_admits_no_call(calling: Calling) -> Non
 
     await calling.world.behaviours.reopen_red(PROJECT, "B1", "the contract was wrong")
 
-    assert (await calling.invocations.admit(worker, assignment, grant, PREPARED)).outcome == (
-        "finished"
-    )
+    assert (
+        await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
+    ).outcome == ("finished")
     assert await calling.states() == []
 
 
@@ -733,7 +754,9 @@ async def test_a_grant_that_is_not_the_works_current_one_admits_nothing(calling:
     worker = await calling.worker()
     assignment, _ = await calling.claimed(worker)
 
-    stale = await calling.invocations.admit(worker, assignment, uuid.uuid7(), PREPARED)
+    stale = await calling.invocations.admit(
+        worker, assignment, uuid.uuid7(), await calling.prepared()
+    )
 
     assert (stale.outcome, "not the current one" in stale.reason) == ("refused", True)
     assert await calling.states() == []
@@ -741,7 +764,7 @@ async def test_a_grant_that_is_not_the_works_current_one_admits_nothing(calling:
 
 async def test_what_was_recorded_is_not_recorded_over(calling: Calling) -> None:
     invocation = await calling.admitted(await calling.worker())
-    await calling.invocations.record(invocation, said())
+    await calling.invocations.record(invocation, said(), retained=KEPT)
 
     assert await calling.invocations.record(invocation, UNCERTAIN) == "returned"
 
@@ -760,7 +783,7 @@ async def test_a_result_that_arrives_before_anyone_decided_ends_the_waiting(
     await calling.invocations.recover(PROJECT)
     assert len(await calling.invocations.parked(PROJECT)) == 1
 
-    assert await calling.invocations.record(invocation, said()) == "returned"
+    assert await calling.invocations.record(invocation, said(), retained=KEPT) == "returned"
 
     assert await calling.invocations.parked(PROJECT) == []
     assert await calling.assignment() == ("granted", None, True)
@@ -775,7 +798,7 @@ async def test_an_estimate_is_of_the_whole_call_or_it_is_not_given(calling: Call
     envelope["modelUsage"] = {"claude-haiku-5-5": known, "claude-unheard-of": known}
 
     await calling.invocations.record(
-        invocation, ProviderResult(Outcome.RETURNED, Terminal(envelope))
+        invocation, ProviderResult(Outcome.RETURNED, Terminal(envelope)), retained=KEPT
     )
 
     async with calling.world.database.connection() as connection:
@@ -791,9 +814,11 @@ async def test_three_replies_the_service_refused_leave_a_person_to_decide(callin
     assignment, grant = await calling.claimed(worker)
     calling.applying.failing["first"] = ActionRefused("not a descendant of the red")
     for _ in range(3):
-        admission = await calling.invocations.admit(worker, assignment, grant, PREPARED)
+        admission = await calling.invocations.admit(
+            worker, assignment, grant, await calling.prepared()
+        )
         assert admission.invocation_id is not None, admission.reason
-        await calling.invocations.record(admission.invocation_id, said())
+        await calling.invocations.record(admission.invocation_id, said(), retained=KEPT)
         assert await calling.invocations.apply(admission.invocation_id, worker) == "rejected"
 
     assert (await calling.assignment())[1] == "3 calls gave nothing that could be used"
@@ -820,7 +845,7 @@ async def test_a_known_result_for_a_build_that_was_reopened_is_never_applied(
 ) -> None:
     worker = await calling.worker()
     invocation = await calling.admitted(worker)
-    await calling.invocations.record(invocation, said())
+    await calling.invocations.record(invocation, said(), retained=KEPT)
 
     await calling.world.behaviours.reopen_red(PROJECT, "B1", "the contract was wrong")
 
@@ -832,15 +857,20 @@ async def test_a_known_result_for_a_build_that_was_reopened_is_never_applied(
 
 
 async def test_what_an_apply_itself_changes_does_not_stop_the_rest_of_it(calling: Calling) -> None:
-    """Whether a result is still about what there is, is asked before anything is done
-    with it, not between its own effects."""
+    """S3B-S1-1.5: what an effect says it changed is what the next expects to find."""
     worker = await calling.worker()
     invocation = await calling.admitted(worker)
-    await calling.invocations.record(invocation, said())
+    await calling.invocations.record(invocation, said(), retained=KEPT)
 
-    async def adds_to_the_story() -> None:
+    async def adds_to_the_story(_: EffectRun) -> dict[str, Any]:
         async with calling.world.database.connection() as connection:
-            await connection.execute("UPDATE stories SET list_revision = list_revision + 1")
+            row = await (
+                await connection.execute(
+                    "UPDATE stories SET list_revision = list_revision + 1 RETURNING list_revision"
+                )
+            ).fetchone()
+        assert row is not None
+        return {"list_revision": row["list_revision"]}  # and says so
 
     calling.applying.doing["first"] = adds_to_the_story
 
@@ -862,3 +892,285 @@ async def test_hearing_nothing_again_about_a_call_already_given_up_on_changes_no
 
     assert await calling.invocations.parked(PROJECT) == []  # what the person set aside stays so
     assert await calling.states() == ["uncertain"]
+
+
+async def test_an_effect_done_again_after_it_had_committed_is_done_once(calling: Calling) -> None:
+    """3B-S1-1.1: the worker stopped after its effect committed and before it was marked.
+    The effect is named the same on every try, so doing it again is doing it once."""
+    worker = await calling.worker()
+    invocation = await calling.admitted(worker)
+    await calling.invocations.record(invocation, said(), retained=KEPT)
+    async with calling.world.database.connection() as connection:
+        await connection.execute("CREATE TABLE published (effect_id text PRIMARY KEY)")
+    stops = [RuntimeError("stopped after the commit")]
+
+    async def publish(run: EffectRun) -> None:
+        async with calling.world.database.connection() as connection:
+            await connection.execute(
+                "INSERT INTO published VALUES (%s) ON CONFLICT DO NOTHING", (run.effect_id,)
+            )
+        if stops:
+            raise stops.pop()
+
+    calling.applying.doing["first"] = publish
+    with pytest.raises(RuntimeError):
+        await calling.invocations.apply(invocation, worker)
+
+    assert await calling.invocations.apply(invocation, worker) == "applied"
+
+    assert calling.applying.ran == ["first:1", "first:2", "second:1"]
+    assert await calling.world.column("SELECT effect_id FROM published") == [f"{invocation}:first"]
+
+
+async def test_one_process_asked_twice_at_once_carries_an_effect_out_once(calling: Calling) -> None:
+    """3B-S1-1.1: two passes overlapping, in the same process."""
+    worker = await calling.worker()
+    invocation = await calling.admitted(worker)
+    await calling.invocations.record(invocation, said(), retained=KEPT)
+    calling.applying.waiting["first"] = asyncio.Event()
+
+    applying = asyncio.create_task(calling.invocations.apply(invocation, worker))
+    await calling.applying.reached.wait()
+    assert await calling.invocations.apply(invocation, worker) == "busy"
+    calling.applying.waiting["first"].set()
+
+    assert await applying == "applied"
+    assert calling.applying.ran == ["first:1", "second:1"]
+
+
+async def test_what_an_effect_writes_is_written_with_its_being_done_or_not_at_all(
+    calling: Calling,
+) -> None:
+    """3B-S1-1.1: only the try that is still current settles."""
+    one, other = await calling.worker(), await calling.worker()
+    invocation = await calling.admitted(one)
+    await calling.invocations.record(invocation, said(), retained=KEPT)
+    calling.applying.waiting["first:1"] = asyncio.Event()
+    first_try = asyncio.create_task(calling.invocations.apply(invocation, one))
+    await calling.applying.reached.wait()
+    await one.stop()
+
+    assert await calling.invocations.apply(invocation, other) == "applied"
+    calling.applying.waiting["first:1"].set()
+
+    assert await first_try == "superseded"
+    assert calling.applying.settled == ["first:2"]
+
+
+async def test_a_try_that_was_taken_over_cannot_refuse_the_result_either(calling: Calling) -> None:
+    """3B-S1-1.2: the old try is refused by its service while the new one is at work."""
+    one, other = await calling.worker(), await calling.worker()
+    invocation = await calling.admitted(one)
+    await calling.invocations.record(invocation, said(), retained=KEPT)
+    calling.applying.waiting["first:1"] = asyncio.Event()
+    calling.applying.waiting["first:2"] = asyncio.Event()
+    refusing = [ActionRefused("the grant is not the current one")]
+
+    async def refuses_the_first_time(_: EffectRun) -> None:
+        if refusing:
+            raise refusing.pop()
+
+    calling.applying.doing["first"] = refuses_the_first_time
+    first_try = asyncio.create_task(calling.invocations.apply(invocation, one))
+    await calling.applying.reached.wait()
+    await one.stop()
+    calling.applying.reached.clear()
+    second_try = asyncio.create_task(calling.invocations.apply(invocation, other))
+    await calling.applying.reached.wait()
+
+    calling.applying.waiting["first:1"].set()
+
+    assert await first_try == "superseded"
+    assert await calling.states() == ["returned"]
+    calling.applying.waiting["first:2"].set()
+    assert await second_try == "applied"
+    assert await calling.states() == ["applied"]
+
+
+async def test_a_call_prepared_from_what_has_since_changed_is_not_made(calling: Calling) -> None:
+    """3B-S1-1.5: prepared, then a decision and its reconfirmations, then admission."""
+    worker = await calling.worker()
+    assignment, grant = await calling.claimed(worker)
+    first = await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
+    assert first.invocation_id is not None
+    await calling.invocations.record(first.invocation_id, said(), problem="unusable")
+    written_before = await calling.prepared()
+    await calling.world.answer(await calling.world.ask("S1"))
+    await calling.world.reconfirm_everything()
+
+    stale = await calling.invocations.admit(worker, assignment, grant, written_before)
+
+    assert stale.outcome in ("stale", "refused")
+    assert await calling.states() == ["rejected"]
+
+
+async def test_a_decision_between_two_effects_is_not_taken_for_the_first_ones_doing(
+    calling: Calling,
+) -> None:
+    """3B-S1-1.5."""
+    worker = await calling.worker()
+    invocation = await calling.admitted(worker)
+    await calling.invocations.record(invocation, said(), retained=KEPT)
+    calling.applying.failing["second"] = RuntimeError("stopped between the two")
+    with pytest.raises(RuntimeError):
+        await calling.invocations.apply(invocation, worker)
+    del calling.applying.failing["second"]
+
+    await calling.world.answer(await calling.world.ask("S1"))
+    await calling.world.reconfirm_everything()
+
+    assert await calling.invocations.apply(invocation, worker) == "overtaken"
+    assert calling.applying.ran == ["first:1", "second:1"]
+
+
+async def test_a_result_that_arrives_when_the_work_has_been_granted_again_is_used_under_that_grant(
+    calling: Calling,
+) -> None:
+    """3B-S1-1.6: no second call is bought, and nobody acts under a grant that is not
+    the work's."""
+    first = await calling.worker()
+    invocation = await calling.admitted(first)
+    await first.stop()
+    await calling.invocations.recover(PROJECT)
+    await calling.invocations.decide(calling.person(invocation, "retry"))
+    second = await calling.worker()
+    assignment, new_grant = await calling.claimed(second)
+
+    assert await calling.invocations.record(invocation, said(), retained=KEPT) == "returned"
+
+    admission = await calling.invocations.admit(
+        second, assignment, new_grant, await calling.prepared()
+    )
+    assert (admission.outcome, admission.invocation_id) == ("apply", invocation)
+    assert await calling.invocations.apply(invocation, second) == "applied"
+    assert await calling.states() == ["applied"]
+    assert set(calling.applying.grants) == {new_grant}
+    [ran_under] = await calling.world.column("SELECT grant_id FROM invocations")
+    assert ran_under != new_grant  # what it ran under is still on record
+
+
+async def test_a_grant_is_one_callers_one_workers_and_one_roles(calling: Calling) -> None:
+    """3B-S1-1.7."""
+    builder, other, reviewer = (
+        await calling.worker(),
+        await calling.worker(),
+        await calling.worker("qa"),
+    )
+    assignment = await calling.owed()
+
+    with pytest.raises(ActionRefused, match="not the one asking"):
+        await calling.world.claims.claim(builder.principal, assignment, other.worker_id)
+    with pytest.raises(ActionRefused):
+        await calling.world.claims.claim(reviewer.principal, assignment, reviewer.worker_id)
+
+    grant = await calling.world.claims.claim(builder.principal, assignment, builder.worker_id)
+    elsewhere = await calling.invocations.admit(other, assignment, grant, await calling.prepared())
+    assert (elsewhere.outcome, "not this worker's" in elsewhere.reason) == ("refused", True)
+    assert await calling.states() == []
+
+
+async def test_a_grant_with_no_worker_process_behind_it_admits_no_paid_call(
+    calling: Calling,
+) -> None:
+    """3B-S1-1.7: the older way of claiming, for callers inside the control plane."""
+    worker = await calling.worker()
+    assignment = await calling.owed()
+    grant = await calling.world.claims.claim(worker.principal, assignment)
+
+    refused = await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
+
+    assert refused.outcome == "refused"
+    assert await calling.states() == []
+
+
+async def test_a_call_in_flight_for_work_that_was_ended_is_settled_without_asking_anyone(
+    calling: Calling,
+) -> None:
+    """3B-S1-1.8: the build is reopened, then its worker is lost."""
+    worker = await calling.worker()
+    await calling.admitted(worker)
+    await calling.world.behaviours.reopen_red(PROJECT, "B1", "the contract was wrong")
+    await worker.stop()
+
+    await calling.invocations.recover(PROJECT)
+
+    assert await calling.states() == ["uncertain"]  # still not known, and on record as so
+    assert await calling.invocations.parked(PROJECT) == []
+    assert (await calling.assignment())[:2] == ("retired", None)
+
+
+async def test_what_is_learned_of_a_call_for_ended_work_is_kept_and_asks_nothing(
+    calling: Calling,
+) -> None:
+    """3B-S1-1.8, the other order."""
+    worker = await calling.worker()
+    lost = await calling.admitted(worker)
+    await calling.world.behaviours.reopen_red(PROJECT, "B1", "the contract was wrong")
+
+    assert await calling.invocations.record(lost, UNCERTAIN) == "uncertain"
+    assert await calling.invocations.parked(PROJECT) == []
+
+    assert (await calling.assignment())[:2] == ("retired", None)
+
+
+async def test_a_build_that_returned_with_nothing_kept_of_it_is_not_a_result(
+    calling: Calling,
+) -> None:
+    """3B-S1-1.10."""
+    invocation = await calling.admitted(await calling.worker())
+
+    assert await calling.invocations.record(invocation, said()) == "rejected"
+
+    async with calling.world.database.connection() as connection:
+        row = await (await connection.execute("SELECT * FROM invocations")).fetchone()
+    assert row is not None
+    assert row["reason"] == "nothing was kept of what the build made"
+    assert (row["envelope"]["subtype"], row["reply"]) == ("success", None)
+    assert row["provider_cost_usd"] == Decimal("0.0008912")
+
+
+async def test_a_result_the_adapter_says_must_not_be_used_is_kept_and_is_not_a_reply(
+    calling: Calling,
+) -> None:
+    """3B-S1-1.9, at the record."""
+    invocation = await calling.admitted(await calling.worker())
+    unverified = replace(said(), unusable="the run reported a result without saying what it had")
+
+    assert await calling.invocations.record(invocation, unverified, retained=KEPT) == "rejected"
+
+    async with calling.world.database.connection() as connection:
+        row = await (await connection.execute("SELECT * FROM invocations")).fetchone()
+    assert row is not None
+    assert row["reason"] == "the run reported a result without saying what it had"
+    assert (row["reply"], row["provider_cost_usd"]) == (None, Decimal("0.0008912"))
+
+
+async def test_a_worker_registered_for_one_role_cannot_be_claimed_under_as_another(
+    calling: Calling,
+) -> None:
+    """3B-S1-1.7: a caller that names itself after another role's process."""
+    reviewer = await calling.worker("qa")
+    forged = Principal(PrincipalKind.WORKER, f"builder@{reviewer.worker_id}", role="builder")
+
+    with pytest.raises(ActionRefused, match="not the one asking"):
+        await calling.world.claims.claim(forged, await calling.owed(), reviewer.worker_id)
+
+
+async def test_a_result_whose_grant_no_longer_holds_the_work_is_overtaken_not_defective(
+    calling: Calling,
+) -> None:
+    """3B-S1-1.6. No entry point I know of takes a grant back from under a known
+    result, so the grant is moved here by hand: this is the fence, not a history."""
+    worker = await calling.worker()
+    invocation = await calling.admitted(worker)
+    await calling.invocations.record(invocation, said(), retained=KEPT)
+    async with calling.world.database.connection() as connection:
+        await connection.execute(
+            "UPDATE assignments SET grant_id = %s WHERE kind = 'build'", (uuid.uuid7(),)
+        )
+
+    assert await calling.invocations.apply(invocation, worker) == "overtaken"
+
+    assert calling.applying.ran == []
+    assert await calling.world.column("SELECT count(*) FROM invocations") == [1]
+    assert (await calling.assignment())[1] is None  # and nobody is asked about a bad reply

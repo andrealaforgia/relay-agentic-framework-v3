@@ -101,6 +101,8 @@ class ProviderResult:
     reason: str = ""
     process_group: int | None = None
     started: Started | None = None
+    # For a result that arrived: why it must not be used all the same.
+    unusable: str = ""
 
 
 @dataclass(frozen=True)
@@ -231,7 +233,7 @@ class ClaudeAdapter:
                                     on_event(event)
                                 if isinstance(event, Started):
                                     started = event
-                                    reason = _beyond(event, request.confinement)
+                                    reason = _beyond(event, request)
                                 elif isinstance(event, Terminal):
                                     terminal = event
                             if terminal is not None or reason:
@@ -248,7 +250,17 @@ class ClaudeAdapter:
                 await _end(process, group)
             if terminal is not None:
                 outcome = Outcome.RETURNED if terminal.succeeded else Outcome.ERRORED
-                return ProviderResult(outcome, terminal, process_group=group, started=started)
+                return ProviderResult(
+                    outcome,
+                    terminal,
+                    process_group=group,
+                    started=started,
+                    # A result from a run that never said what it had is kept, with what
+                    # it used, and is not a reply.
+                    unusable=""
+                    if started is not None
+                    else "the run reported a result without first saying what it had",
+                )
             complaints.seek(0)
             said = complaints.read()[-2000:].decode(errors="replace").strip()
             reason = reason or "the run ended without reporting a result"
@@ -283,8 +295,15 @@ async def _say(process: asyncio.subprocess.Process, briefing: str) -> None:
     process.stdin.close()
 
 
-def _beyond(started: Started, confinement: Confinement) -> str:
-    """What the run has that it was not given, as a reason to end it; empty if nothing."""
+def _beyond(started: Started, request: Request) -> str:
+    """What the run has that it was not given, as a reason to end it; empty if nothing.
+    This is a check on a run that has already been handed its briefing: what bounds the
+    run is what it was launched with, and this verifies that it took."""
+    confinement = request.confinement
+    if started.session_id != str(request.invocation_id):
+        return "the run was not confined as asked: it is not the session Relay started"
+    if started.tools is None or started.mcp_servers is None:
+        return "the run was not confined as asked: it did not say what tools and servers it has"
     allowed = {*confinement.tools, _STRUCTURED_OUTPUT}
     tools = sorted(set(started.tools) - allowed)
     if not tools and not started.mcp_servers:

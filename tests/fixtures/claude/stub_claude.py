@@ -8,6 +8,7 @@ STUB_HANG     if set, never finish after printing the stream
 STUB_EXIT     the exit status (default 0)
 STUB_HELP     a file to print for --help, in place of the flags Relay asks for
 STUB_STDERR   text to write to standard error
+STUB_KEEP_SESSION  if set, keep the recorded session id instead of the one asked for
 """
 
 import json
@@ -16,6 +17,7 @@ import sys
 import time
 from pathlib import Path
 
+RECORDED_SESSION = "01a1fe00-0000-7000-8000-000000000001"
 FLAGS = """
   --agent <agent>  --agents <json>  --model <model>  --effort <level>  --json-schema <schema>
   --session-id <uuid>  --tools <tools...>  --settings <file-or-json>  --strict-mcp-config
@@ -42,8 +44,13 @@ if os.environ.get("STUB_RECORD"):
 if os.environ.get("STUB_STDERR"):
     sys.stderr.write(os.environ["STUB_STDERR"])
 if os.environ.get("STUB_STREAM"):
+    # As the real CLI does, the run is the session it was asked to be, unless told to
+    # keep the recorded one.
+    asked = sys.argv[sys.argv.index("--session-id") + 1] if "--session-id" in sys.argv else ""
     with open(os.environ["STUB_STREAM"]) as stream:
         for line in stream:
+            if asked and not os.environ.get("STUB_KEEP_SESSION"):
+                line = line.replace(RECORDED_SESSION, asked)
             sys.stdout.write(line)
             sys.stdout.flush()
 if os.environ.get("STUB_HANG"):

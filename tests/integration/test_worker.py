@@ -3,9 +3,11 @@ The provider here is scripted, or is the stand-in for the CLI replaying a real s
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -17,10 +19,16 @@ from relay.application.invocations import Effect, EffectRun, Invocations
 from relay.application.worker import Call, Worker
 from relay.application.workers import WorkerSession
 from relay.domain.story import ActionRefused
-from relay.providers.claude import ClaudeAdapter, Confinement, ProviderResult, Request
+from relay.providers.claude import (
+    ClaudeAdapter,
+    Confinement,
+    ProviderResult,
+    ProviderUnavailable,
+    Request,
+)
 from tests.integration.decision_world import DecisionWorld
 from tests.integration.story_world import STANDARD_RATE
-from tests.integration.test_invocations import NOT_STARTED, PREPARED, UNCERTAIN, said
+from tests.integration.test_invocations import KEPT, NOT_STARTED, PREPARED, UNCERTAIN, said
 from tests.integration.trunk_world import PROJECT
 
 RECORDED = Path(__file__).parent.parent / "fixtures" / "claude"
@@ -29,25 +37,48 @@ RECORDED = Path(__file__).parent.parent / "fixtures" / "claude"
 class Scripted:
     """A provider that gives what it was told to, in order, and remembers what it was asked."""
 
-    def __init__(self, *results: ProviderResult) -> None:
+    def __init__(self, *results: ProviderResult | BaseException, then_waits: bool = False) -> None:
         self._results = list(results)
         self.asked: list[Request] = []
+        # Reports what it has, and then never returns: a run that lingers after its result.
+        self.then_waits = then_waits
+        self.waiting = asyncio.Event()
 
-    async def invoke(self, request: Request) -> ProviderResult:
+    async def invoke(self, request: Request, *, on_event: Any = None) -> ProviderResult:
         self.asked.append(request)
-        return self._results.pop(0)
+        result = self._results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        if result.terminal is not None and on_event is not None:
+            on_event(result.terminal)
+        if self.then_waits:
+            self.waiting.set()
+            await asyncio.Event().wait()
+        return result
 
 
 class Summing:
     """A task whose reply must be a sum, and which refuses a wrong one."""
 
-    def __init__(self, workdir: Path) -> None:
+    def __init__(self, workdir: Path, invocations: Invocations) -> None:
         self._workdir = workdir
+        self._invocations = invocations
         self.problems: list[str | None] = []
+        # Set to make the next preparation read what the work is about too early.
+        self.reads_too_early = False
 
     async def prepare(self, assignment: Mapping[str, Any], last_problem: str | None) -> Call:
         self.problems.append(last_problem)
-        return Call(PREPARED, self._workdir, Confinement((), {}), timeout=30.0)
+        read_on = await self._invocations.as_it_stands(assignment["assignment_id"])
+        if self.reads_too_early:
+            self.reads_too_early = False
+            read_on = {**read_on, "basis": read_on["basis"] - 1}
+        return Call(
+            replace(PREPARED, read_on=read_on), self._workdir, Confinement((), {}), timeout=30.0
+        )
+
+    async def retain(self, assignment: Mapping[str, Any], call: Call) -> str | None:
+        return KEPT
 
     def problem_with(self, reply: Any) -> str | None:
         return None if isinstance(reply.get("sum"), int) else "the reply has no sum"
@@ -56,10 +87,10 @@ class Summing:
 class Bench:
     def __init__(self, world: DecisionWorld, tmp_path: Path) -> None:
         self.world = world
-        self.task = Summing(tmp_path)
         self.applied: list[Any] = []
         self.refusing: list[str] = []
         self.invocations = Invocations(world.database, self._effects)
+        self.task = Summing(tmp_path, self.invocations)
         self.session: WorkerSession | None = None
 
     def _effects(self, invocation: dict[str, Any]) -> list[Effect]:
@@ -251,9 +282,14 @@ async def test_a_result_already_known_is_applied_and_nothing_is_called(bench: Be
     grant = await bench.world.claims.claim(
         bench.session.principal, owed["assignment_id"], bench.session.worker_id
     )
-    admission = await bench.invocations.admit(bench.session, owed["assignment_id"], grant, PREPARED)
+    admission = await bench.invocations.admit(
+        bench.session,
+        owed["assignment_id"],
+        grant,
+        replace(PREPARED, read_on=await bench.invocations.as_it_stands(owed["assignment_id"])),
+    )
     assert admission.invocation_id is not None
-    await bench.invocations.record(admission.invocation_id, said())
+    await bench.invocations.record(admission.invocation_id, said(), retained=KEPT)
 
     assert await worker.carry_out(owed) == "applied"
 
@@ -283,3 +319,65 @@ async def test_with_the_cli_itself_standing_in_a_recorded_run_is_carried_through
     assert await bench.world.column("SELECT estimated_cost_usd FROM invocations") == [
         Decimal("0.0008912")
     ]
+
+
+async def test_a_cli_that_cannot_be_used_is_known_not_to_have_been_called(bench: Bench) -> None:
+    """3B-S1-1.4: established before anything was launched, so nothing was spent and
+    nobody is asked about it, with the worker still alive."""
+    provider = Scripted(ProviderUnavailable("the installed Claude CLI does not offer --tools"))
+    worker = await bench.worker(provider)
+    owed = await bench.owed()
+
+    assert await worker.carry_out(owed) == "not_started"
+
+    assert await bench.states() == ["not_started"]
+    assert await bench.invocations.parked(PROJECT) == []
+    assert await bench.world.column("SELECT state FROM assignments WHERE kind = 'build'") == [
+        "wanted"
+    ]
+
+
+async def test_a_call_cut_short_with_nothing_read_is_recorded_as_not_known(bench: Bench) -> None:
+    """3B-S1-1.4: cancelled after launch. The worker lives, so nobody else would say so."""
+    provider = Scripted(UNCERTAIN, then_waits=True)
+    worker = await bench.worker(provider)
+    carrying = asyncio.create_task(worker.carry_out(await bench.owed()))
+    await provider.waiting.wait()
+
+    carrying.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await carrying
+
+    assert await bench.states() == ["uncertain"]
+    assert len(await bench.invocations.parked(PROJECT)) == 1
+
+
+async def test_a_call_cut_short_after_its_result_was_read_keeps_that_result(bench: Bench) -> None:
+    """3B-S1-1.4: the terminal event had arrived; the process was being waited for."""
+    provider = Scripted(said(), then_waits=True)
+    worker = await bench.worker(provider)
+    carrying = asyncio.create_task(worker.carry_out(await bench.owed()))
+    await provider.waiting.wait()
+
+    carrying.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await carrying
+
+    assert await bench.states() == ["returned"]
+    assert await bench.world.column("SELECT retained FROM invocations") == [KEPT]
+    await bench.invocations.recover(PROJECT)  # the pass carries it on; nothing is called
+    assert (await bench.states(), bench.applied) == (["applied"], [{"sum": 5}])
+    assert len(provider.asked) == 1
+
+
+async def test_a_briefing_written_from_what_has_moved_is_written_again(bench: Bench) -> None:
+    """3B-S1-1.5."""
+    provider = Scripted(said())
+    worker = await bench.worker(provider)
+    bench.task.reads_too_early = True
+
+    assert await worker.carry_out(await bench.owed()) == "applied"
+
+    assert bench.task.problems == [None, None]  # prepared twice, called once
+    assert len(provider.asked) == 1
+    assert await bench.states() == ["applied"]

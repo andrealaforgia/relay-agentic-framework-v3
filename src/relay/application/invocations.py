@@ -24,7 +24,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from relay.application.assignments import CORRECT, RECONFIRM
+from relay.application.assignments import BUILD, CORRECT, RECONFIRM, REMEDIATE
 from relay.application.closure import (
     closure_of_feature,
     feature_basis,
@@ -68,13 +68,17 @@ class Prepared:
     effective_agent_sha256: str
     briefing: str
     schema: Mapping[str, Any]
+    # The revisions and decision basis the briefing was written from, as
+    # `Invocations.as_it_stands` gave them when preparation began.
+    read_on: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
 class Admission:
     """`admitted`: call the provider under this invocation. `apply`: a result is already
     known; apply it, call nothing. `finished`: nothing is left to do for this
-    assignment. `refused`: nothing may be called now, for the reason given."""
+    assignment. `refused`: nothing may be called now, for the reason given. `stale`:
+    what the call was prepared from has changed; prepare it again."""
 
     outcome: str
     invocation_id: uuid.UUID | None = None
@@ -84,20 +88,34 @@ class Admission:
 
 @dataclass(frozen=True)
 class EffectRun:
-    """What an effect is given: the invocation it is an effect of, and the identity of
-    this try of it. An effect names whatever it starts by that identity."""
+    """What an effect is given. `effect_id` is the same for every try of the effect, and
+    is what the effect names whatever it does by, so that doing it again is doing it
+    once. `attempt` says which try this is. `grant_id` is the grant to act under."""
 
     invocation: dict[str, Any]
-    identity: str
+    effect_id: str
+    attempt: int
+    grant_id: uuid.UUID
 
 
 @dataclass(frozen=True)
 class Effect:
-    """One thing that applying a result does. It must be safe to perform again under
-    the same identity: it is performed again if the process stops before it is marked."""
+    """One thing that applying a result does.
+
+    `perform` runs outside any transaction and must be safe to run again under the same
+    `effect_id`: it runs again if the process stops before the effect is marked done. It
+    may return a detail to keep; under the key `stands` it says what it changed of the
+    revisions and decision basis the invocation is about, so that the next effect is
+    not mistaken for having been overtaken by its predecessor.
+
+    `settle`, if given, runs inside the transaction that marks the effect done, after
+    that transaction has established that this try is still the current one. What an
+    effect writes to PostgreSQL belongs there: it commits with the mark or not at all.
+    """
 
     name: str
     perform: Callable[[EffectRun], Awaitable[Mapping[str, Any] | None]]
+    settle: Callable[[Connection, EffectRun], Awaitable[None]] | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +155,10 @@ class Invocations:
                 return Admission("finished")
             if assignment["state"] != "granted" or assignment["grant_id"] != grant_id:
                 return Admission("refused", reason="this grant is not the current one")
+            if assignment["granted_worker"] != worker.worker_id:
+                # Also what refuses a grant with no worker at all: only a worker process,
+                # whose being alive can be asked, may make a paid call.
+                return Admission("refused", reason="this grant is not this worker's")
             latest = await _latest(connection, assignment_id)
             if latest is not None:
                 state = latest["state"]
@@ -155,19 +177,21 @@ class Invocations:
                 await _require_may_start(connection, assignment)
             except ActionRefused as stopped:
                 return Admission("refused", reason=str(stopped))
+            stands = await _as_it_stands(connection, assignment)
+            if dict(prepared.read_on) != stands:
+                # The briefing was written from something that has changed since. The
+                # call is not made on it, and is not recorded as made on what is here now.
+                return Admission("stale", reason="what this was prepared from has changed")
             invocation_id = uuid.uuid7()
             attempt = (latest["attempt"] if latest is not None else 0) + 1
-            admitted_on = {
-                **await _as_it_stands(connection, assignment),
-                "grant_id": str(grant_id),
-                "attempt": attempt,
-            }
+            admitted_on = {**stands, "grant_id": str(grant_id), "attempt": attempt}
             await connection.execute(
                 "INSERT INTO invocations (invocation_id, assignment_id, project_id, grant_id, "
                 "attempt, worker_id, role, provider, model, effort, agent_name, agent_path, "
                 "agent_sha256, agent_revision, agent_dirty, effective_agent_sha256, briefing, "
-                "briefing_sha256, schema_sha256, admitted_on) VALUES "
-                "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "briefing_sha256, schema_sha256, admitted_on, expects) VALUES "
+                "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "%s)",
                 (
                     invocation_id,
                     assignment_id,
@@ -189,6 +213,7 @@ class Invocations:
                     hashlib.sha256(prepared.briefing.encode()).hexdigest(),
                     _digest(prepared.schema),
                     Jsonb(admitted_on),
+                    Jsonb(stands),
                 ),
             )
             # The paid call is the grant's first effect: a pause from here on leaves the
@@ -220,19 +245,33 @@ class Invocations:
             late = invocation["state"] == "uncertain"
             if invocation["state"] not in ("intended", "uncertain"):
                 return str(invocation["state"])
-            state, reason = _ending(result, problem)
+            # Work that has been ended meanwhile (retired, or done by other means) keeps
+            # what is learned about its call, and nothing is asked or owed for it.
+            live = assignment["state"] in ("wanted", "granted")
+            state, reason = _ending(result, problem or result.unusable or None)
             if late and result.terminal is None:
                 return "uncertain"  # nothing more is known than was
+            if state == "returned" and assignment["kind"] in (BUILD, REMEDIATE) and not retained:
+                # What a build returns is a tree. Without the tree kept there is nothing
+                # to apply, whatever the model said about it.
+                state, reason = "rejected", "nothing was kept of what the build made"
             if late and await _has_a_successor(connection, invocation):
                 # Another call was admitted in its place. What this one returned is kept
                 # as evidence, with what it used, and applied to nothing.
                 state, reason = "overtaken", "its result arrived after another call was admitted"
             usage, observed, estimated = self._usage(result)
+            adopted_under = None
+            if late and live and state == "returned" and assignment["state"] == "granted":
+                # The work was granted again before this result arrived, and no call has
+                # been made under that grant. The result is known and paid for: it is
+                # applied under the grant that holds the work now, and its own grant stays
+                # on record as what it ran under.
+                adopted_under = assignment["grant_id"]
             await connection.execute(
                 "UPDATE invocations SET state = %s, reason = %s, envelope = %s, reply = %s, "
                 "retained = %s, usage = %s, provider_cost_usd = %s, estimated_cost_usd = %s, "
-                "price_table = %s, retry_authorised_by = NULL, ended_at = clock_timestamp() "
-                "WHERE invocation_id = %s",
+                "price_table = %s, retry_authorised_by = NULL, applied_under = %s, "
+                "ended_at = clock_timestamp() WHERE invocation_id = %s",
                 (
                     state,
                     reason,
@@ -245,10 +284,11 @@ class Invocations:
                     observed,
                     estimated,
                     self._prices.version if estimated is not None else None,
+                    adopted_under,
                     invocation_id,
                 ),
             )
-            if late and state != "overtaken":
+            if late and live and state != "overtaken":
                 # The result is known after all: the work is no longer waiting on a
                 # person, and if nobody has taken it up since, it is this call's again.
                 await _unpark(connection, assignment)
@@ -263,7 +303,9 @@ class Invocations:
                         assignment["assignment_id"],
                     ),
                 )
-            if state == "not_started":
+            if not live:
+                pass
+            elif state == "not_started":
                 await _release(connection, assignment)
             elif state == "uncertain":
                 await _park(connection, assignment, invocation_id, _UNCERTAIN)
@@ -308,10 +350,23 @@ class Invocations:
         ]
         return reported, result.terminal.provider_cost_usd, estimated
 
+    async def as_it_stands(self, assignment_id: uuid.UUID) -> dict[str, Any]:
+        """The revisions and decision basis of what a piece of work is about, now. A task
+        reads this before it writes its briefing and hands it back in `Prepared`."""
+        async with self._pool.connection() as connection:
+            assignment = await (
+                await connection.execute(
+                    "SELECT * FROM assignments WHERE assignment_id = %s", (assignment_id,)
+                )
+            ).fetchone()
+            if assignment is None:
+                raise LookupError(f"there is no assignment {assignment_id}")
+            return await _as_it_stands(connection, assignment)
+
     async def apply(self, invocation_id: uuid.UUID, worker: WorkerSession) -> str:
         """Carry out the effects of a known result, from the first one not yet done.
         Returns `applied`, or why it went no further: `held` (stopped for now),
-        `overtaken`, `rejected`, `busy` (another live worker is carrying one out), or
+        `overtaken`, `rejected`, `busy` (one of its effects is being carried out), or
         `superseded` (this try was taken over while it ran)."""
         assert self._effects_for is not None, "nothing says how a result is applied"
         async with self._pool.connection() as connection:
@@ -323,14 +378,21 @@ class Invocations:
                 if taken == "done":
                     continue
                 return taken
+            run = EffectRun(
+                invocation,
+                f"{invocation_id}:{effect.name}",
+                taken,
+                invocation["applied_under"] or invocation["grant_id"],
+            )
             try:
-                detail = await effect.perform(
-                    EffectRun(invocation, f"{invocation_id}:{effect.name}:{taken}")
-                )
-            except ActionRefused as refused:
-                return await self._reject(invocation_id, str(refused))
-            if not await self._mark(invocation_id, effect.name, taken, detail):
-                return "superseded"
+                try:
+                    detail = await effect.perform(run)
+                except ActionRefused as refused:
+                    return await self._reject(invocation_id, effect.name, taken, str(refused))
+                if not await self._mark(invocation_id, effect, run, detail):
+                    return "superseded"
+            finally:
+                worker.running.discard((invocation_id, effect.name))
         async with self._pool.connection() as connection, connection.transaction():
             await connection.execute(
                 "UPDATE invocations SET state = 'applied' WHERE invocation_id = %s "
@@ -369,7 +431,7 @@ class Invocations:
             assert effect is not None
             if effect["state"] == "done":
                 return "done"
-            ended = await _ended_for_good(connection, assignment, invocation, first=position == 0)
+            ended = await _ended_for_good(connection, assignment, invocation)
             if ended:
                 await connection.execute(
                     "UPDATE invocations SET state = 'overtaken', reason = %s "
@@ -394,24 +456,38 @@ class Invocations:
                 # Stopped for now. The result is kept, and nothing is done until the
                 # stop is cleared.
                 return "held"
-            if (
-                effect["state"] == "started"
-                and effect["worker_id"] != worker.worker_id
-                and await is_alive(connection, effect["worker_id"])
-            ):
-                return "busy"
+            key = (invocation_id, str(effect["name"]))
+            if effect["state"] == "started":
+                # Somebody started it. If that was this process, it is being carried out
+                # only if this process says so: otherwise it was cut short here. If it
+                # was another process, it is being carried out if that process is alive.
+                being_carried_out = (
+                    key in worker.running
+                    if effect["worker_id"] == worker.worker_id
+                    else await is_alive(connection, effect["worker_id"])
+                )
+                if being_carried_out:
+                    return "busy"
             await connection.execute(
                 "UPDATE invocation_effects SET state = 'started', try = try + 1, worker_id = %s "
                 "WHERE invocation_id = %s AND name = %s",
                 (worker.worker_id, invocation_id, effect["name"]),
             )
+            # Said before this transaction commits: nobody can see the effect as started
+            # by this process and not being carried out by it.
+            worker.running.add(key)
             return int(effect["try"]) + 1
 
     async def _mark(
-        self, invocation_id: uuid.UUID, name: str, attempt: int, detail: Mapping[str, Any] | None
+        self,
+        invocation_id: uuid.UUID,
+        effect: Effect,
+        run: EffectRun,
+        detail: Mapping[str, Any] | None,
     ) -> bool:
         """The effect is done, if this try is still the one that may say so. A try that
-        was taken over while it ran decides nothing."""
+        was taken over while it ran decides nothing: neither that the effect is done,
+        nor anything its `settle` would have written."""
         async with self._pool.connection() as connection, connection.transaction():
             marked = await (
                 await connection.execute(
@@ -421,22 +497,43 @@ class Invocations:
                     (
                         Jsonb(dict(detail)) if detail is not None else None,
                         invocation_id,
-                        name,
-                        attempt,
+                        effect.name,
+                        run.attempt,
                     ),
                 )
             ).fetchone()
-            return marked is not None
+            if marked is None:
+                return False
+            if effect.settle is not None:
+                await effect.settle(connection, run)
+            moved = (detail or {}).get("stands")
+            if moved:
+                # What this effect itself changed is what the next one expects to find.
+                await connection.execute(
+                    "UPDATE invocations SET expects = expects || %s WHERE invocation_id = %s",
+                    (Jsonb(dict(moved)), invocation_id),
+                )
+            return True
 
-    async def _reject(self, invocation_id: uuid.UUID, reason: str) -> str:
+    async def _reject(self, invocation_id: uuid.UUID, name: str, attempt: int, reason: str) -> str:
         """What the model said was refused by the service it was for. A known call, and
-        an attempt: another may be admitted, up to the limit."""
+        an attempt: another may be admitted, up to the limit. Only the current try of
+        the effect may say this: a try that was taken over says nothing."""
         async with self._pool.connection() as connection, connection.transaction():
             located = await _located(connection, invocation_id)
             assignment = await _locked_assignment(connection, located["assignment_id"])
             invocation = await _locked_invocation(connection, invocation_id)
             if invocation["state"] != "returned":
                 return str(invocation["state"])
+            current = await (
+                await connection.execute(
+                    "SELECT 1 FROM invocation_effects WHERE invocation_id = %s AND name = %s "
+                    "AND state = 'started' AND try = %s",
+                    (invocation_id, name, attempt),
+                )
+            ).fetchone()
+            if current is None:
+                return "superseded"
             await connection.execute(
                 "UPDATE invocations SET state = 'rejected', reason = %s WHERE invocation_id = %s",
                 (reason, invocation_id),
@@ -536,13 +633,44 @@ class Invocations:
         return [Parked(**row) for row in rows]
 
     async def recover(self, project_id: str) -> None:
-        """The pass's part. A grant whose worker is gone is dealt with by what its
-        latest call left: nothing (the work is wanted again), a call in flight (nobody
-        will ever read its result: a person is asked), a known result (applied here,
-        under the grant it was obtained under)."""
-        to_apply: list[uuid.UUID] = []
+        """The pass's part.
+
+        A call in flight whose worker is gone will never be read by anyone: it is
+        uncertain, and if the work is still owed a person is asked. A grant whose worker
+        is gone and which has no call to show for it is taken back. And every known
+        result that is not yet applied is taken up here, whoever obtained it and whether
+        or not they are alive: one that was held by a pause is carried on when the pause
+        is cleared, and an effect somebody is carrying out is left to them."""
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id)
+            in_flight = await (
+                await connection.execute(
+                    "SELECT invocation_id, assignment_id, worker_id, attempt FROM invocations "
+                    "WHERE project_id = %s AND state = 'intended' ORDER BY started_at",
+                    (project_id,),
+                )
+            ).fetchall()
+            for call in in_flight:
+                if await is_alive(connection, call["worker_id"]):
+                    continue
+                assignment = await _locked_assignment(connection, call["assignment_id"])
+                still = await _locked_invocation(connection, call["invocation_id"])
+                if still["state"] != "intended":
+                    continue
+                await connection.execute(
+                    "UPDATE invocations SET state = 'uncertain', reason = %s, "
+                    "ended_at = clock_timestamp() WHERE invocation_id = %s",
+                    ("the worker that made the call is gone", call["invocation_id"]),
+                )
+                if assignment["state"] in ("wanted", "granted"):
+                    await _park(connection, assignment, call["invocation_id"], _UNCERTAIN)
+                await _note(
+                    connection,
+                    assignment,
+                    "invocation.uncertain",
+                    call["invocation_id"],
+                    call["attempt"],
+                )
             orphaned = await (
                 await connection.execute(
                     "SELECT * FROM assignments WHERE project_id = %s AND state = 'granted' "
@@ -556,27 +684,18 @@ class Invocations:
                 latest = await _latest(connection, assignment["assignment_id"])
                 if latest is None or latest["state"] in ("errored", "rejected", "not_started"):
                     await _release(connection, assignment)
-                elif latest["state"] == "intended":
-                    await connection.execute(
-                        "UPDATE invocations SET state = 'uncertain', reason = %s, "
-                        "ended_at = clock_timestamp() WHERE invocation_id = %s",
-                        ("the worker that made the call is gone", latest["invocation_id"]),
-                    )
-                    await _park(connection, assignment, latest["invocation_id"], _UNCERTAIN)
-                    await _note(
-                        connection,
-                        assignment,
-                        "invocation.uncertain",
-                        latest["invocation_id"],
-                        latest["attempt"],
-                    )
-                elif latest["state"] == "returned":
-                    to_apply.append(latest["invocation_id"])
-        if to_apply and self._effects_for is not None:
+            known = await (
+                await connection.execute(
+                    "SELECT invocation_id FROM invocations WHERE project_id = %s "
+                    "AND state = 'returned' ORDER BY started_at",
+                    (project_id,),
+                )
+            ).fetchall()
+        if known and self._effects_for is not None:
             if self._session is None:
                 self._session = await WorkerSession.start(self._pool, "control-plane")
-            for invocation_id in to_apply:
-                await self.apply(invocation_id, self._session)
+            for each in known:
+                await self.apply(each["invocation_id"], self._session)
 
     async def close(self) -> None:
         if self._session is not None:
@@ -699,20 +818,22 @@ async def _as_it_stands(connection: Connection, assignment: dict[str, Any]) -> d
 
 
 async def _ended_for_good(
-    connection: Connection, assignment: dict[str, Any], invocation: dict[str, Any], *, first: bool
+    connection: Connection, assignment: dict[str, Any], invocation: dict[str, Any]
 ) -> str:
     """Why the result will never be applied, or empty if it still may be."""
+    # Work that is ended for good (a cancel, a rejection, a reopened red) is retired by
+    # whatever ended it.
     if assignment["state"] == "retired":
         return "the work it was for was ended"
-    # Work that is ended for good (a cancel, a rejection, a reopened red) is retired by
-    # whatever ended it, so that is the one thing to look for.
-    if first:
-        # Before anything has been done with it: is it still about what there is? Its
-        # own later effects may move these, so they are compared only here.
-        now = await _as_it_stands(connection, assignment)
-        was = invocation["admitted_on"]
-        if any(was.get(name) != value for name, value in now.items()):
-            return "what it was about has changed since the call was admitted"
+    under = invocation["applied_under"] or invocation["grant_id"]
+    if assignment["state"] in ("wanted", "granted") and assignment["grant_id"] != under:
+        return "the grant it was to be applied under no longer holds the work"
+    # Is it still about what there is? What it expects moves only by what its own
+    # effects said they changed, so a decision made between two of them is seen.
+    now = await _as_it_stands(connection, assignment)
+    expected = invocation["expects"]
+    if any(expected.get(name) != value for name, value in now.items()):
+        return "what it was about has changed since the call was admitted"
     return ""
 
 
