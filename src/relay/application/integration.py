@@ -288,9 +288,10 @@ class Integration:
             return settled
         return await self._drive(settled)
 
-    async def reconcile(self) -> int:
+    async def reconcile(self, *, then_completions: bool = True) -> int:
         """Settle every authorised integration whose outcome is not yet on record, from
-        what trunk holds now. Run on start and whenever a push went unanswered."""
+        what trunk holds now. Run on start and whenever a push went unanswered. A caller
+        that goes on to take up completions itself says so, and they are left to it."""
         async with self._pool.connection() as connection:
             outstanding = await (
                 await connection.execute(
@@ -305,6 +306,8 @@ class Integration:
             except CheckoutFailed:
                 continue  # nothing learned about this one; the others still get their turn
             settled += receipt.outcome is not Outcome.PENDING
+        if not then_completions:
+            return settled
         # A settlement whose own wake-up was cut short has no outstanding intent left to
         # be found by. What it freed is still on record as owed, and is taken up here.
         async with self._pool.connection() as connection:

@@ -79,33 +79,38 @@ def canonical_repository(repository: str) -> str:
         # Git reads a file URL from this machine whatever host it names, so it is the
         # same place as its path: one trunk is managed by one project, however the
         # address was written when the project was opened.
-        return _local_identity(Path(unquote(urlsplit(repository).path)))
+        return _local_identity(unquote(urlsplit(repository).path))
     if "://" in repository or ":" in head:
         return repository  # a URL, or an scp-style host:path address
-    return _local_identity(Path(repository))
+    return _local_identity(repository)
 
 
-def _local_identity(path: Path) -> str:
+def _local_identity(written: str) -> str:
     """A repository on this machine is known by the directory that holds its refs: a
     work tree, the `.git` inside it and a linked work tree are one set of branches, and
     so is a name Git completes with `.git`. Where there is no repository there is
     nothing to know it by, and it is refused: a path enrolled before its repository
     existed would be known by another name afterwards."""
-    resolved = path.resolve()
-    # As Git itself looks: the path, and then the path with `.git` after it.
-    for candidate in (resolved, resolved.with_name(resolved.name + ".git")):
-        found = subprocess.run(
-            ["git", "-C", os.fspath(candidate), "rev-parse", "--path-format=absolute",
-             "--git-common-dir"],
-            capture_output=True,
-            check=False,
-            # Only this directory is asked, not whatever repository it may happen to be in.
-            env={**_GIT_ENVIRONMENT, "GIT_CEILING_DIRECTORIES": os.fspath(candidate.parent)},
-        )  # fmt: skip
-        if found.returncode == 0:
-            # Exactly Git's own terminator is removed: a name may end in a space.
-            return os.fspath(Path(os.fsdecode(found.stdout.removesuffix(b"\n"))).resolve())
-    raise ValueError("there is no Git repository at that path")
+    if not written:
+        # No path at all is not the directory Relay happens to be running in.
+        raise ValueError("the repository address names no path")
+    resolved = Path(written).resolve()
+    # As Git itself looks: the path, and the path with `.git` after it if there is
+    # nothing at the path. Something there that cannot be read as a repository is
+    # refused: it is not a reason to enrol its neighbour instead.
+    candidate = resolved if resolved.exists() else resolved.with_name(resolved.name + ".git")
+    found = subprocess.run(
+        ["git", "-C", os.fspath(candidate), "rev-parse", "--path-format=absolute",
+         "--git-common-dir"],
+        capture_output=True,
+        check=False,
+        # Only this directory is asked, not whatever repository it may happen to be in.
+        env={**_GIT_ENVIRONMENT, "GIT_CEILING_DIRECTORIES": os.fspath(candidate.parent)},
+    )  # fmt: skip
+    if found.returncode != 0:
+        raise ValueError("there is no Git repository that can be read at that path")
+    # Exactly Git's own terminator is removed: a name may end in a space.
+    return os.fspath(Path(os.fsdecode(found.stdout.removesuffix(b"\n"))).resolve())
 
 
 async def trunk_head(repository: str, trunk: str, *, timeout: float | None = None) -> str:
@@ -181,12 +186,18 @@ async def refs_under(
     return found
 
 
-async def pristine_checkout(repository: str, revision: str, into: Path) -> Path:
+async def pristine_checkout(
+    repository: str, revision: str, into: Path, *, timeout: float | None = None
+) -> Path:
     """The files of one revision and nothing else: no Git metadata, so neither the remote
-    address nor any credential embedded in it is exposed to whatever runs there."""
+    address nor any credential embedded in it is exposed to whatever runs there. With a
+    timeout, a repository that stops answering part-way is given up on."""
     if not FULL_COMMIT_HASH.fullmatch(revision):
         raise CheckoutFailed(f"a revision must be a 40-character commit hash, not {revision!r}")
-    await git("clone", "--quiet", "--no-checkout", "--", repository, str(into), redact=repository)
+    await git(
+        "clone", "--quiet", "--no-checkout", "--", repository, str(into),
+        redact=repository, timeout=timeout,
+    )  # fmt: skip
     await git("-C", str(into), "checkout", "--quiet", "--detach", revision)
     head = await git("-C", str(into), "rev-parse", "HEAD")
     if head != revision:

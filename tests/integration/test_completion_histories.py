@@ -902,3 +902,96 @@ async def test_two_control_planes_settling_one_push_complete_the_feature_once(
     )
     assert await world.column("SELECT count(*) FROM feature_summaries") == [1]
     assert (await world.events()).count("feature.completed") == 1
+
+
+async def test_a_caller_cancelled_again_does_not_take_its_clean_up_with_it(
+    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3AII-S4-3.3. The clean-up waits for a row; the caller is cancelled a second time.
+    The process lives on, and the clean-up is the only thing that will end the batch."""
+    await admitted_and_not_taken_up(world)
+    real_start, real_cut = Completion._start, Completion._cut_short
+    committed, cleaning, go_on = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def committed_and_never_heard_of(self: Completion, *arguments: Any) -> Any:
+        await real_start(self, *arguments)
+        committed.set()
+        await asyncio.Event().wait()
+
+    async def when_told(self: Completion, *arguments: Any) -> None:
+        cleaning.set()
+        await go_on.wait()
+        await real_cut(self, *arguments)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Completion, "_start", committed_and_never_heard_of)
+        patched.setattr(Completion, "_cut_short", when_told)
+        passing = asyncio.create_task(world.features.complete_what_is_owed(PROJECT))
+        await committed.wait()
+        passing.cancel()
+        await cleaning.wait()
+        async with world.database.connection() as held, held.transaction():
+            await held.execute("SELECT 1 FROM projects FOR UPDATE")
+            go_on.set()
+            await world.until_someone_waits_for_a_lock()
+            passing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await passing
+            assert await world.batches() == ["running"]
+        async with asyncio.timeout(30):
+            while await world.batches() != ["interrupted"]:
+                await asyncio.sleep(0.05)
+
+    await world.features.reconcile(PROJECT)
+
+    assert (await world.feature(), await world.batches()) == (
+        "completed",
+        ["interrupted", "completed"],
+    )
+    assert await world.column("SELECT count(*) FROM feature_summaries") == [1]
+
+
+async def test_a_checkout_that_stalls_is_given_up_on_and_the_completion_stays_owed(
+    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3AII-S4-3.4. The final checks fetch the commit with the patience they have for
+    any other exchange with the repository, and the pass goes on to whatever is next."""
+    await admitted_and_not_taken_up(world)
+    deadlines: list[float | None] = []
+
+    async def stalls(*_: Any, timeout: float | None = None) -> Path:
+        deadlines.append(timeout)
+        raise CheckoutFailed("the repository stopped answering")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(final_checks, "pristine_checkout", stalls)
+        await Completion(world.database, world.oracle, remote_timeout=7.0).take_up_what_is_owed(
+            PROJECT
+        )
+
+    assert deadlines == [7.0]
+    assert (await world.batches(), await world.completions_wanted()) == (["interrupted"], 1)
+    await world.features.reconcile(PROJECT)
+    assert await world.feature() == "completed"
+
+
+async def test_one_pass_attempts_a_request_that_is_put_off_once(
+    world: CompletionWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3AII-S4-3.5."""
+    await admitted_and_not_taken_up(world)
+    real = final_checks.trunk_head
+    reads = 0
+
+    async def every_last_read_fails(*arguments: Any, **named: Any) -> str:
+        nonlocal reads
+        reads += 1
+        if reads % 2 == 0:
+            raise CheckoutFailed("the repository did not answer")
+        return await real(*arguments, **named)
+
+    monkeypatch.setattr(final_checks, "trunk_head", every_last_read_fails)
+
+    await world.features.reconcile(PROJECT)
+
+    assert (await world.batches(), await world.completions_wanted()) == (["deferred"], 1)

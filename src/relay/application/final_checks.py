@@ -12,6 +12,7 @@ nothing of Relay's may move trunk between that reading and the commit of the sum
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -59,6 +60,9 @@ class Completion:
         self._pool = pool
         self._oracle = oracle
         self._remote_timeout = remote_timeout
+        # Clean-ups in flight. Each belongs to this object, not to the caller that was
+        # cut short: a caller cancelled a second time must not take its clean-up with it.
+        self._cleaning: set[asyncio.Task[None]] = set()
 
     async def owed(self, project_id: str) -> list[tuple[uuid.UUID, str]]:
         """The completions wanted for a project, each with the request it is for."""
@@ -162,7 +166,12 @@ class Completion:
             # Starting, the checks, or the transaction that would have ended them, was
             # cut short. Nothing was decided if the batch is still running, and nobody
             # else will end it while this process lives.
-            await self._cut_short(owed["project_id"], owed["feature_id"], batch_id)
+            cleaning = asyncio.create_task(
+                self._cut_short(owed["project_id"], owed["feature_id"], batch_id)
+            )
+            self._cleaning.add(cleaning)
+            cleaning.add_done_callback(self._cleaning.discard)
+            await asyncio.shield(cleaning)
             raise
 
     async def _cut_short(self, project_id: str, feature_id: str, batch_id: uuid.UUID) -> None:
@@ -257,8 +266,13 @@ class Completion:
             # A tree of its own for every check: what one run leaves behind must not be
             # what the next one observes.
             with tempfile.TemporaryDirectory(prefix="relay-final-") as scratch:
+                # With the same patience as any other exchange with the repository:
+                # one that stalls must not hold up every other project's turn.
                 workdir = await pristine_checkout(
-                    repository, batch["trunk"], Path(scratch) / "subject"
+                    repository,
+                    batch["trunk"],
+                    Path(scratch) / "subject",
+                    timeout=self._remote_timeout,
                 )
                 execution = await self._oracle.execute(batch["trunk"], workdir, check.launch)
             async with self._pool.connection() as connection, connection.transaction():

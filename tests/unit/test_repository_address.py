@@ -72,3 +72,26 @@ def test_a_path_with_no_repository_at_it_is_refused(tmp_path: Path) -> None:
 def test_an_address_carrying_credentials_is_still_refused() -> None:
     with pytest.raises(ValueError, match="credentials"):
         canonical_repository("https://user:secret@example.com/project.git")
+
+
+@pytest.mark.parametrize("address", ["", "file://", "file://localhost"])
+def test_an_address_that_names_no_path_is_not_the_directory_relay_runs_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, address: str
+) -> None:
+    """3AII-S4-3.1."""
+    monkeypatch.chdir(bare(tmp_path / "here.git"))
+
+    with pytest.raises(ValueError, match="names no path"):
+        canonical_repository(address)
+
+
+def test_a_repository_that_cannot_be_read_is_not_swapped_for_the_one_beside_it(
+    tmp_path: Path,
+) -> None:
+    """3AII-S4-3.2."""
+    damaged = bare(tmp_path / "vat")
+    bare(tmp_path / "vat.git")
+    (damaged / "config").write_text("[core\n")
+
+    with pytest.raises(ValueError, match="can be read"):
+        canonical_repository(str(damaged))

@@ -110,7 +110,8 @@ class Features:
                 await lock_gate(connection, project_id)
                 await lock_project(connection, project_id)
                 await evaluate_completion(connection, project_id, feature["feature_id"])
-        await self._integration.reconcile()
+        # The completions are taken up once, at the end of this pass.
+        await self._integration.reconcile(then_completions=False)
         await self._reviews.publish_candidates()
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id)

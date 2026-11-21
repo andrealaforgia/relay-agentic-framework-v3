@@ -111,3 +111,22 @@ async def test_a_project_is_not_opened_on_a_path_with_no_repository(
     """3AII-S4-2.1: enrolled now, it would be known by another name once it existed."""
     with pytest.raises(ValueError, match="no Git repository"):
         await behaviours.open_project("checkout", str(tmp_path / "not-yet"))
+
+
+@pytest.mark.parametrize("address", ["", "file://"])
+async def test_an_address_that_names_no_path_opens_no_project(
+    behaviours: Behaviours,
+    database: AsyncConnectionPool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    address: str,
+) -> None:
+    """3AII-S4-3.1. Run from inside a repository, which must not be enrolled unnamed."""
+    monkeypatch.chdir(bare(tmp_path / "here.git"))
+
+    with pytest.raises(ValueError, match="names no path"):
+        await behaviours.open_project("checkout", address)
+
+    async with database.connection() as connection:
+        assert await (await connection.execute("SELECT 1 FROM projects")).fetchone() is None
+        assert await (await connection.execute("SELECT 1 FROM events")).fetchone() is None

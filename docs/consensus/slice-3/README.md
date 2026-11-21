@@ -143,6 +143,48 @@ Reservations:
 - **The sibling test** relies on the fixture that puts two candidates of one story in play.
 - **No concurrency test of proposing, deciding and withdrawing**, which all take the gate lock exclusively. The lock order at retirement has one.
 
+## Slice 3a-ii, step 4 as built (completing a feature)
+
+The design went three rounds (31 to 36: eight, six and four findings) and its last amendments were folded into a build contract Astra did not review (`round-37`). The build then went three rounds.
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 38 | CHALLENGE, 5 blocking of 7 | Two local addresses enrolling one trunk; a caller cancelled during settlement stranding a running batch; the pass and an approval taking two features' rows in opposite orders; a deferred completion woken only by the `Integration` instance that was wired; the summary crediting a correction that had been dropped; a replay answering with another generation's receipt; no test of dropping the last planned story |
+| 39 | CHALLENGE, 5 blocking of 5 | Git's `.git` suffix still giving one trunk two names; a name ending in a space redirected to its neighbour; a caller cancelled between a batch's commit and hearing of it; clean-up taking the feature before the project; a wake-up lost after the settlement committed |
+| 40 | CHALLENGE, 4 blocking of 5 | An empty address enrolling the directory Relay runs in; a repository that cannot be read swapped for its neighbour; a second cancellation taking the clean-up with it; a stalled clone holding up every other project; one pass attempting a deferred request twice |
+
+Seventeen findings, all reachable, all fixed. **Step 4 was not accepted by Astra**: round 40 was the third and last round, and Astra has not seen the fixes for its five findings. Astra confirmed rounds 38 and 39 closed for the histories reported. Every finding after the first round was in code written to answer the round before, which is the pattern to expect and the reason the rounds are capped.
+
+Deliberate breakage: 71 breakages before the first submission, of which 52 were caught; 11 survivors were gaps in the tests and got tests, 8 were guards nothing reaches and were removed. Each round's fixes were then broken on purpose (13, 7 and 7 breakages); two survived and got a test or lost a duplicate clause. The last full run is 789 tests, green, on the tree that is committed.
+
+Where the build departs from the contract, as Astra accepted (round 38):
+
+- **`Features.decide` takes up completions; it does not run the whole pass.**
+- **No "latest generation" test and no "cancelled" branch when a batch ends.** A request that ends takes its running generation with it, so a running one is always current.
+- **Take-up does not re-derive the prerequisites under the lock.** That the feature is still ready follows from readiness being settled in every transaction that changes it.
+- **A stopped feature is never newly ready**, so admission does not ask whether it is stopped and a resume does not evaluate. Whether checks may start is asked at take-up.
+- **A completion gate's basis is not recomputed when it is decided.** Nothing reachable changes it while the gate is open.
+- **A roadmap change owed after a failed check cannot be claimed.** It is answered by proposing the roadmap.
+
+Decided during the build:
+
+- **A local repository is known by the directory that holds its refs**, resolved as Git resolves it, and a project cannot be opened on a local path with no readable repository at it. A `file://` URL is its path whatever host it names.
+- **Wake-ups are safe to repeat, not exactly once.** Every `Integration` takes up the completions a settlement frees; reconciling an intent wakes whether it settled it or found it settled; the scan ends by taking up whatever is wanted.
+- **The project's row is taken before any feature's row**, by final checks and by the pass as by gate decisions.
+
+Reservations:
+
+- **Astra has not reviewed the round 40 fixes.**
+- **Two remote addresses for one repository** (SSH and HTTPS, say) are two repositories to Relay. One project per trunk is then the operator's to keep (D-9).
+- **The stalled-clone fix is tested in two halves**: a real clone that stalls is given up on at its deadline, and final checks pass their deadline and leave the completion owed. Two projects in one pass, the first stalled, is not tested as one history.
+- **The lock-order fixes are tested as orders, not as deadlocks**: a test holds one row and requires the other to be free. The pass's per-feature evaluation has the same fix and no test of its own.
+- **A clean-up cut short by the process dying** is put right only when the control plane starts.
+- **The pass as a net** (admitting a ready feature nobody looked at) is reachable only for data from before completion existed. It is kept, and tested by switching the transactional evaluation off.
+- **Tests for the eleven first survivors were written after the code.**
+- **"An old success after a newer failure"** has no test of its own; it rests on the same fence as the reverse order.
+- **The final trunk read holds the project's gate lock exclusively across a network call**, bounded by the deadline. That is the design, and the one place Relay does this.
+- **Usage is `unknown` in every summary** until 3b measures it (PO-9).
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.
