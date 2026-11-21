@@ -211,6 +211,8 @@ class Stories:
             await _locked_project(connection, project_id)
             feature = await _locked_feature(connection, project_id, feature_id)
             require_open(await closure_of_feature(connection, project_id, feature_id))
+            if feature["state"] == "completed":
+                raise ActionRefused("the feature is completed: a new feature is opened instead")
             if feature["state"] in ("checking", "needs_decision"):
                 # A revision and a completion could otherwise be decided against each
                 # other. The Product Owner sends the feature back from its gate first.
@@ -764,10 +766,12 @@ async def close_feature(pool: Pool, project_id: str, action: HumanAction) -> Rec
         pointless = (action.action == "pause" and closed_by == PAUSED) or (
             action.action == "resume" and closed_by != PAUSED
         )
-        if closed_by == CANCELLED or pointless:
-            # Cancelled for good; or pausing what is paused; or resuming what is not.
-            # A paused feature can still be cancelled.
-            receipt = Receipt("stale", f"nothing changed: the feature is {closed_by or 'open'}")
+        finished = feature["state"] == "completed"
+        if closed_by == CANCELLED or finished or pointless:
+            # Cancelled for good, or completed; or pausing what is paused; or resuming
+            # what is not. A paused feature can still be cancelled.
+            standing = "completed" if finished else closed_by or "open"
+            receipt = Receipt("stale", f"nothing changed: the feature is {standing}")
             await _record(connection, action, receipt)
             return receipt
         if action.action == "cancel":

@@ -904,7 +904,8 @@ async def _beyond_changing(connection: Connection, decision: dict[str, Any]) -> 
     govern: replacing it would only owe work nobody can use."""
     row = await (
         await connection.execute(
-            "SELECT f.closed_by, (SELECT s.state FROM stories s WHERE s.project_id = f.project_id "
+            "SELECT f.closed_by, f.state, "
+            "(SELECT s.state FROM stories s WHERE s.project_id = f.project_id "
             "AND s.feature_id = f.feature_id AND s.story_id = %s) AS story_state "
             "FROM features f WHERE f.project_id = %s AND f.feature_id = %s",
             (decision["scope_story"], decision["project_id"], decision["feature_id"]),
@@ -913,6 +914,8 @@ async def _beyond_changing(connection: Connection, decision: dict[str, Any]) -> 
     assert row is not None
     if row["closed_by"] == CANCELLED:
         return "the feature is cancelled"
+    if row["state"] == "completed":
+        return "the feature is completed"
     if row["story_state"] == "approved":
         return f"{decision['scope_story']} is approved, and changing it is a correction"
     return ""
@@ -1026,7 +1029,7 @@ async def _require_scope(
     always allowed."""
     known = await (
         await connection.execute(
-            "SELECT (SELECT s.state FROM stories s WHERE s.project_id = f.project_id "
+            "SELECT f.state, (SELECT s.state FROM stories s WHERE s.project_id = f.project_id "
             "AND s.feature_id = f.feature_id AND s.story_id = %s) AS story_state "
             "FROM features f WHERE f.project_id = %s AND f.feature_id = %s",
             (story_id, project_id, feature_id),
@@ -1034,6 +1037,10 @@ async def _require_scope(
     ).fetchone()
     if known is None:
         raise ActionRefused(f"unknown feature {feature_id!r}")
+    if to_change and known["state"] == "completed":
+        # Its summary records the decisions it was delivered under. Nothing is added
+        # to them afterwards.
+        raise ActionRefused(f"{feature_id} is completed: nothing more is asked or assumed about it")
     if story_id is not None and known["story_state"] is None:
         raise ActionRefused(f"{story_id!r} is not a story of {feature_id!r}")
     if to_change and known["story_state"] in ("rejected", "withdrawn"):

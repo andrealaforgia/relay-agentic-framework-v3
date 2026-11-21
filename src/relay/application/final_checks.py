@@ -526,10 +526,38 @@ async def _summary(
             (project_id, feature_id),
         )
     ).fetchall()
+    earlier = await (
+        await connection.execute(
+            "SELECT revision FROM roadmaps WHERE project_id = %s AND feature_id = %s "
+            "AND state = 'superseded' ORDER BY revision",
+            (project_id, feature_id),
+        )
+    ).fetchall()
+    decisions = await (
+        await connection.execute(
+            "SELECT d.number, d.source, d.text, nullif(d.scope_story, '') AS story_id "
+            "FROM decisions d WHERE d.project_id = %s AND d.feature_id = %s AND NOT EXISTS "
+            "(SELECT 1 FROM decisions n WHERE n.replaces = d.decision_id) ORDER BY d.number",
+            (project_id, feature_id),
+        )
+    ).fetchall()
     return {
         "feature_id": feature_id,
         "problem": feature["problem"],
         "roadmap_revision": batch["snapshot"]["roadmap_revision"],
+        # Revisions that were in force before it. One that was proposed and never
+        # approved was never the roadmap.
+        "earlier_revisions": [each["revision"] for each in earlier],
+        # Those in force, the Product Owner's and a model's told apart.
+        "decisions": decisions,
+        # What a model assumed and no person replaced: delivered on a guess.
+        "assumptions": [each for each in decisions if each["source"] == "model"],
+        "limitations": [
+            limitation
+            for behaviour in behaviours
+            if behaviour["superseded_by"] is None
+            for limitation in await _left_open(connection, project_id, behaviour["behaviour_id"])
+        ],
         "stories": [
             {
                 "story_id": story["story_id"],
@@ -551,6 +579,36 @@ async def _summary(
         # Not measured yet, and never shown as zero.
         "usage": "unknown",
     }
+
+
+async def _left_open(
+    connection: Connection, project_id: str, behaviour_id: str
+) -> list[dict[str, Any]]:
+    """The findings a delivered behaviour still carries: from the review cycle that was
+    integrated, under the policy frozen for that cycle, those that were neither withdrawn
+    nor verified fixed there, and did not block. A finding's status alone does not say
+    this: one whose fix was verified on the delivered candidate can still read open."""
+    cycle = await (
+        await connection.execute(
+            "SELECT i.cycle_id, c.blocking_from FROM integration_intents i "
+            "JOIN review_cycles c USING (cycle_id) WHERE i.project_id = %s "
+            "AND i.behaviour_id = %s AND i.state = 'integrated' "
+            "ORDER BY i.created_at DESC LIMIT 1",
+            (project_id, behaviour_id),
+        )
+    ).fetchone()
+    if cycle is None:
+        return []
+    return await (
+        await connection.execute(
+            "SELECT f.behaviour_id, f.finding_id::text, f.role, f.severity, f.claim "
+            "FROM findings f WHERE f.project_id = %s AND f.behaviour_id = %s "
+            "AND f.status <> 'withdrawn' AND f.severity < %s AND NOT EXISTS "
+            "(SELECT 1 FROM finding_verifications v WHERE v.finding_id = f.finding_id "
+            "AND v.cycle_id = %s) ORDER BY f.finding_id",
+            (project_id, behaviour_id, cycle["blocking_from"], cycle["cycle_id"]),
+        )
+    ).fetchall()
 
 
 async def _close(
