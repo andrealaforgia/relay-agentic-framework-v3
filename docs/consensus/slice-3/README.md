@@ -101,6 +101,24 @@ The build contract is `round-27-claude-3a-ii-step-3-design-v4.md`: design v3 wit
 
 Step 3 is built in two parts, each reviewed: (i) roadmap revisions, rejection, amending a contract in review or parked; (ii) obligations, supersession, and what a story demonstrates.
 
+## Slice 3a-ii, step 3, part (i) as built (roadmap revisions, rejection, amending in review)
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 28 | CHALLENGE, 5 blocking of 7 | A behaviour proposed against a criterion reworded under the same name; a deadlock between a story's reconfirmation and a roadmap write; two features proposing one story name; a ref conflict blocking a cycle after its story was rejected; an interrupted batch reported as held after a rejection |
+| 29 | CHALLENGE, 1 blocking of 4 | The same deadlock reached through reconfirming a proposal; an observation not recorded; a new story shown correcting another feature's rejection; the wrong reason stored at a restart |
+| 30 | **ACCEPT_WITH_RESERVATIONS**, none blocking of 2 | A reviewer told "the feature is cancelled" for a rejected story; no test of approval racing a rejection |
+
+Thirteen findings, all reachable, all fixed. Both of round 30's are fixed too, after the acceptance: the refusal names the story, and `test_a_roadmap_approval_and_a_rejection_in_either_order` covers both orders. Astra has not seen those two changes.
+
+Of the five departures from design v4 listed in `round-28-claude-3a-ii-step-3-part-i-submission.md`, Astra accepted three, and I withdrew one: every roadmap write now takes the gate lock exclusively, as the design said, because taking only the project lock deadlocked against a story's reconfirmation. The fifth (a rejected story reads as cancelled to work in flight) stands, with the record and the refusals now saying what actually ended.
+
+Reservations carried forward:
+
+- **Restarts in the middle of these histories are mostly not exercised.** State is all in PostgreSQL; three tests start a fresh control plane after a rejection.
+- **Work in flight at a rejection** is tested for a red and for a batch of checks, not for a green or a review submission, which rely on the same rule.
+- **A story exists only once its roadmap is approved.** Nothing can be asked or assumed about a story that is only proposed.
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.

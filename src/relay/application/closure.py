@@ -155,6 +155,15 @@ async def require_startable(
     find the reconfirmation that was owed all along."""
     stopped = await closure_of_story(connection, project_id, story_id)
     if stopped == CANCELLED:
+        story = await (
+            await connection.execute(
+                "SELECT state FROM stories WHERE project_id = %s AND story_id = %s",
+                (project_id, story_id),
+            )
+        ).fetchone()
+        if story is not None and story["state"] in ("rejected", "withdrawn"):
+            # The feature is still open, for this story's correction. Say what ended.
+            raise ActionRefused(f"{story_id} was {story['state']}: nothing new starts on it")
         require_open(stopped)
     row = await (
         await connection.execute(

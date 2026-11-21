@@ -342,3 +342,43 @@ async def test_checks_closed_at_a_restart_after_their_story_was_rejected_say_so(
     again = await world.integration.integrate(PROJECT, "B1", "once")
     assert again.outcome is Outcome.SUPERSEDED
     assert "S1 was rejected" in again.reason and "cancelled" not in again.reason
+
+
+async def test_a_reviewer_is_told_the_story_was_rejected_not_that_the_feature_was_cancelled(
+    world: DecisionWorld,
+) -> None:
+    base = await world.awaiting_builder("B1")
+    world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
+    assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
+    assert await world.reviews.publish_candidates() == 1
+    [capability] = await world.column("SELECT capability FROM review_tasks WHERE role = 'qa'")
+    await reject(world)
+
+    with pytest.raises(ActionRefused) as refused:
+        await prepare_review(world.reviews, str(capability), world.tmp_path / "tree")
+
+    assert "S1 was rejected" in str(refused.value) and "cancelled" not in str(refused.value)
+    assert await world.column("SELECT count(*) FROM review_checkouts") == [0]
+
+
+@pytest.mark.parametrize("first", ["the rejection", "the approval"])
+async def test_a_roadmap_approval_and_a_rejection_in_either_order(
+    world: DecisionWorld, first: str
+) -> None:
+    refunds = StoryDraft("S3", "Refunds", "a refund is shown", {"AC1": "120 shows 120"})
+    proposal = await world.revise(Kept("S1"), Kept("S2"), refunds)
+
+    if first == "the rejection":
+        await reject(world)
+        approved = await world.decide(proposal)
+        # The proposal has no correction for what is now rejected.
+        assert approved.disposition == "stale"
+        assert "S1 is rejected and nothing in this roadmap corrects it" in approved.outcome
+        assert (await world.stories.roadmap_of(PROJECT, "F1")).effective == 1
+    else:
+        assert (await world.decide(proposal)).disposition == "effective"
+        await reject(world)
+        assert (await world.stories.roadmap_of(PROJECT, "F1")).effective == 2
+
+    assert await world.column("SELECT state FROM assignments WHERE kind = 'correct'") == ["wanted"]
+    assert await world.story("S2") is StoryState.PLANNED  # ordinary work waits either way
