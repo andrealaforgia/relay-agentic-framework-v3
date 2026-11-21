@@ -119,6 +119,30 @@ Reservations carried forward:
 - **Work in flight at a rejection** is tested for a red and for a batch of checks, not for a green or a review submission, which rely on the same rule.
 - **A story exists only once its roadmap is approved.** Nothing can be asked or assumed about a story that is only proposed.
 
+## Slice 3a-ii, step 3, part (ii) as built (obligations, supersession, what a story demonstrates)
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 32 | CHALLENGE, 5 blocking of 7 | A batch settling under an authority it did not start with, so a replacement reached trunk with nothing retired; a seal written before a retirement accepted after it; retirement and reconfirmation taking a behaviour and its story in opposite orders; an ordinary push leaving a proposal alive; a proposal that did not name the replacement as read; a reconfirmation still owed for a retired behaviour; a seal cleared needlessly |
+| 33 | CHALLENGE, 2 blocking of 3 | A rejected story's proposal left in the inbox; a behaviour declared to be replaced then reconfirmed as standing; a withdrawn command sent again |
+| 34 | CHALLENGE, 1 blocking of 1 | A proposal overtaken by a decision still open to a withdrawal that rewrote why it ended |
+
+Eleven findings, all reachable, all fixed, each with a test that failed first and a deliberate breakage of the fix afterwards. **Part (ii) was not accepted by Astra**: round 34 was the third and last round, its one finding is fixed (`test_a_decision_ends_a_proposal_made_under_the_ones_before_it`), and Astra has not seen that fix. Astra confirmed rounds 32 and 33 closed.
+
+Where the build departs from design v4, as Astra accepted:
+
+- **No policy-version increments for supersession.** At authorisation a batch's regression digest and its authority must both be what is computed then. This replaces v4 section 5's increments.
+- **An authority is voided when its ground goes, in the transaction that removes it** where that is a rejection, a cancellation, a decision or an ordinary push of the replacement; and re-derived wherever one is about to be proposed, decided or used.
+- **A declaration that a behaviour is to be replaced lasts.** If the replacement never reaches trunk the story cannot be sealed; the Product Owner rejects the story or cancels the feature. No later decision asks whether the contract stands after all.
+
+Reservations:
+
+- **The tests for ten of the first survivors of deliberate breakage were written after the code.**
+- **The contract digest and story revision in an authority's basis** are compared at proposal and recorded, but no test changes one without the decision basis changing too: an amendment needs a decision.
+- **A story waiting at its gate that lists a replaced behaviour** is left alone. Astra found no entry point that reaches it: an awaiting story holds the project's place.
+- **The sibling test** relies on the fixture that puts two candidates of one story in play.
+- **No concurrency test of proposing, deciding and withdrawing**, which all take the gate lock exclusively. The lock order at retirement has one.
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.

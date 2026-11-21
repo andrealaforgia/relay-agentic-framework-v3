@@ -51,6 +51,7 @@ from relay.application.stories import (
     revisions_of_roadmap,
     why_a_proposal_cannot_stand,
 )
+from relay.application.supersessions import void_what_no_longer_stands
 from relay.domain.behaviour import BehaviourState, TransitionRefused
 from relay.domain.evidence import ProcessContract
 from relay.domain.story import (
@@ -758,6 +759,9 @@ async def _after_a_decision(connection: Connection, scope: dict[str, Any]) -> No
     ).fetchall()
     in_scope = [story["story_id"] for story in stories]
     await _locked_project(connection, project_id)
+    # A proposal to replace something, made under the decisions before this one, ends
+    # here and says why; it is not left for its author to withdraw as if by choice.
+    await void_what_no_longer_stands(connection, project_id)
     gates = await (
         await connection.execute(
             "SELECT * FROM gates WHERE project_id = %s AND feature_id = %s AND state = 'open' "

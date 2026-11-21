@@ -645,3 +645,20 @@ async def test_ending_the_replacements_story_ends_its_proposal_there_and_then(
     with pytest.raises(ActionRefused, match="no such proposal waiting"):
         await world.supersessions.withdraw(VERIFIER, PROJECT, gate)
     assert await world.column("SELECT state || ': ' || ended_because FROM supersessions") == ended
+
+
+async def test_a_decision_ends_a_proposal_made_under_the_ones_before_it(
+    world: Superseding,
+) -> None:
+    """3AII-S3-II-3.1. Read straight after the answer, before anything else looks."""
+    await world.awaiting_builder("Z", REDUCED_RATE, "S2")
+    gate = await world.propose()
+
+    await world.answer(await world.ask("S2"))
+
+    ended = await world.column("SELECT state || ': ' || ended_because FROM supersessions")
+    assert ended == ["void: what it was proposed on has changed"]
+    assert "supersession" not in [item.kind for item in await world.stories.inbox(PROJECT)]
+    with pytest.raises(ActionRefused, match="no such proposal waiting"):
+        await world.supersessions.withdraw(VERIFIER, PROJECT, gate)
+    assert await world.column("SELECT state || ': ' || ended_because FROM supersessions") == ended
