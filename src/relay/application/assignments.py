@@ -11,6 +11,7 @@ was taken back by a pause, or whose assignment was replaced or withdrawn, starts
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -223,6 +224,26 @@ async def retire_all_of_story(connection: Connection, project_id: str, story_id:
     await _retire(connection, "project_id = %s AND story_id = %s", (project_id, story_id))
 
 
+async def retire_what_a_roadmap_answers(
+    connection: Connection,
+    project_id: str,
+    feature_id: str,
+    *,
+    revisions: Sequence[int],
+    stories: Sequence[str] = (),
+) -> None:
+    """A roadmap revision that is approved, replaced or sent back settles what was owed
+    for it; an approved one also settles what was owed for the revision it supersedes
+    and for the stories it rewords or drops."""
+    await _retire(
+        connection,
+        "project_id = %s AND feature_id = %s AND kind = 'reconfirm' AND ("
+        "(subject = 'roadmap' AND (issued_on->>'revision')::integer = ANY(%s)) "
+        "OR (subject = 'story' AND story_id = ANY(%s)))",
+        (project_id, feature_id, list(revisions), list(stories)),
+    )
+
+
 async def retire_reconfirmations(
     connection: Connection, project_id: str, feature_id: str, story_id: str | None
 ) -> None:
@@ -237,7 +258,12 @@ async def retire_reconfirmations(
 
 
 async def complete_reconfirmation(
-    connection: Connection, grant_id: uuid.UUID, project_id: str, subject: str, subject_id: str
+    connection: Connection,
+    grant_id: uuid.UUID,
+    project_id: str,
+    subject: str,
+    subject_id: str,
+    revision: int | None = None,
 ) -> None:
     """A reconfirmation, or the amendment that stands in its place, is done under the
     grant that holds exactly this work now: this subject, of this project (a behaviour's
@@ -249,8 +275,11 @@ async def complete_reconfirmation(
             "UPDATE assignments SET state = 'done', first_effect_at = now() "
             "WHERE grant_id = %s AND state = 'granted' AND kind = 'reconfirm' "
             "AND project_id = %s AND subject = %s "
-            "AND coalesce(behaviour_id, story_id, feature_id) = %s RETURNING assignment_id",
-            (grant_id, project_id, subject, subject_id),
+            "AND coalesce(behaviour_id, story_id, feature_id) = %s "
+            # A feature can owe two for its roadmap: the one in force, and a proposal.
+            "AND (%s::integer IS NULL OR (issued_on->>'revision')::integer = %s) "
+            "RETURNING assignment_id",
+            (grant_id, project_id, subject, subject_id, revision, revision),
         )
     ).fetchone()
     if done is None:

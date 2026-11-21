@@ -236,12 +236,22 @@ def test_a_red_launched_for_a_contract_that_was_then_amended_changes_nothing() -
     ).is_valid
 
 
-def test_a_contract_is_amended_only_before_its_behaviour_goes_to_review() -> None:
+def test_a_contract_is_amended_until_its_behaviour_is_on_trunk() -> None:
     behaviour = implementing()
     behaviour.amend_contract(CONTRACT)
     assert behaviour.state is BehaviourState.VALIDATING_RED
 
     in_review = implementing()
     in_review.record_green_run(PASSES, RED, RED, candidate_descends_from_red=True, still_owed=True)
+    in_review.amend_contract(CONTRACT)  # the review is set aside with the old contract
+    assert in_review.state is BehaviourState.VALIDATING_RED
+
+    parked = implementing()
+    parked.state = BehaviourState.BLOCKED
+    parked.amend_contract(CONTRACT)
+    assert parked.state is BehaviourState.VALIDATING_RED
+
+    on_trunk = implementing()
+    on_trunk.state = BehaviourState.INTEGRATED
     with pytest.raises(TransitionRefused):
-        in_review.amend_contract(CONTRACT)
+        on_trunk.amend_contract(CONTRACT)

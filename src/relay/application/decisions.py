@@ -48,8 +48,10 @@ from relay.application.stories import (
     lock_story,
     release_next,
     reopen_roadmap_gate,
+    revisions_of_roadmap,
+    why_a_proposal_cannot_stand,
 )
-from relay.domain.behaviour import TransitionRefused
+from relay.domain.behaviour import BehaviourState, TransitionRefused
 from relay.domain.evidence import ProcessContract
 from relay.domain.story import (
     ON_A_DECISION,
@@ -368,9 +370,12 @@ class Decisions:
         basis: int,
         revision: int,
     ) -> None:
-        """The Analyst states that the roadmap stands under the decisions now in force.
-        One already approved needs no new approval; one still proposed is put to the
-        Product Owner again, showing those decisions."""
+        """The Analyst states that one revision of the roadmap stands under the
+        decisions now in force. The roadmap in force and a proposal still waiting are
+        each owed separately. For the one in force, that lets its stories be released
+        again. For a proposal, it puts the same stored proposal to the Product Owner
+        again with those decisions shown; but a proposal that rewords or drops a story
+        whose basis has moved cannot be made approvable this way, and has to be replaced."""
         _require_role(principal, "analyst")
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id)
@@ -378,16 +383,18 @@ class Decisions:
             statement = {"roadmap": feature_id, "basis": basis, "revision": revision}
             if not await _said_already(connection, project_id, grant, statement):
                 require_basis(basis, await feature_basis(connection, project_id, feature_id))
-                roadmap = await (
-                    await connection.execute(
-                        "SELECT revision FROM roadmaps WHERE project_id = %s AND feature_id = %s "
-                        "AND state IN ('approved', 'proposed') ORDER BY revision DESC LIMIT 1 FOR UPDATE",
-                        (project_id, feature_id),
-                    )
-                ).fetchone()
-                if roadmap is None or roadmap["revision"] != revision:
+                effective, proposed = await revisions_of_roadmap(connection, project_id, feature_id)
+                if revision not in (effective, proposed):
                     raise ActionRefused(f"revision {revision} is not {feature_id}'s roadmap")
-                await complete_reconfirmation(connection, grant, project_id, "roadmap", feature_id)
+                if revision == proposed:
+                    why = await why_a_proposal_cannot_stand(
+                        connection, project_id, feature_id, revision
+                    )
+                    if why:
+                        raise ActionRefused(f"{why}: the proposal has to be replaced")
+                await complete_reconfirmation(
+                    connection, grant, project_id, "roadmap", feature_id, revision
+                )
                 await connection.execute(
                     "UPDATE roadmaps SET current_on = %s WHERE project_id = %s "
                     "AND feature_id = %s AND revision = %s",
@@ -397,7 +404,8 @@ class Decisions:
                     connection, project_id, principal, grant, "roadmap", feature_id, basis,
                     statement,
                 )  # fmt: skip
-                await reopen_roadmap_gate(connection, project_id, feature_id)
+                if revision == proposed:
+                    await reopen_roadmap_gate(connection, project_id, feature_id)
                 await release_next(connection, project_id)
         await self._features.reconcile(project_id)
 
@@ -517,6 +525,14 @@ class Decisions:
                 await require_current(connection, project_id, row["story_id"])
                 if behaviour.contract is None or behaviour.contract.digest != replaces:
                     raise ActionRefused(f"that is not the contract {behaviour_id} has now")
+                if contract.digest == replaces:
+                    # Otherwise this would be a way to send a candidate the repository
+                    # refused round again without the Product Owner's retry.
+                    raise ActionRefused(
+                        "that is the same contract: an amendment changes it, and a "
+                        "contract that stands is reconfirmed"
+                    )
+                set_aside = behaviour.state in (BehaviourState.REVIEW, BehaviourState.BLOCKED)
                 try:
                     behaviour.amend_contract(contract)
                 except TransitionRefused:
@@ -528,6 +544,15 @@ class Decisions:
                     connection, grant, project_id, "behaviour", behaviour_id
                 )
                 await retire_all_of_behaviour(connection, project_id, behaviour_id)
+                if set_aside:
+                    # The candidate and its review were for the old contract. Findings
+                    # are the behaviour's, not the cycle's: they stay as they stand,
+                    # for the role that raised each to settle on a later candidate.
+                    await connection.execute(
+                        "UPDATE review_cycles SET state = 'superseded' WHERE project_id = %s "
+                        "AND behaviour_id = %s AND state IN ('open', 'satisfied', 'blocked')",
+                        (project_id, behaviour_id),
+                    )
                 await save_behaviour(connection, project_id, behaviour)
                 await connection.execute(
                     "UPDATE behaviours SET current_on = %s, red_execution_id = NULL "
@@ -682,21 +707,18 @@ async def _after_a_decision(connection: Connection, scope: dict[str, Any]) -> No
     await revoke_unstarted_grants(connection, project_id, feature_id, story_scope)
     await retire_reconfirmations(connection, project_id, feature_id, story_scope)
     if story_scope is None:
-        roadmap = await (
-            await connection.execute(
-                "SELECT 1 FROM roadmaps WHERE project_id = %s AND feature_id = %s "
-                "AND state IN ('approved', 'proposed') LIMIT 1",
-                (project_id, feature_id),
-            )
-        ).fetchone()
-        if roadmap is not None:
-            await _owe_reconfirmation(
-                connection,
-                project_id,
-                feature_id,
-                "analyst",
-                await feature_basis(connection, project_id, feature_id),
-            )
+        # The roadmap in force and a proposal still waiting are separate things to stand
+        # behind, and each is owed on its own.
+        for revision in await revisions_of_roadmap(connection, project_id, feature_id):
+            if revision is not None:
+                await _owe_reconfirmation(
+                    connection,
+                    project_id,
+                    feature_id,
+                    "analyst",
+                    await feature_basis(connection, project_id, feature_id),
+                    revision=revision,
+                )
     for story in stories:
         await _owe_reconfirmation(
             connection,
@@ -734,8 +756,9 @@ async def _owe_reconfirmation(
     *,
     story_id: str | None = None,
     behaviour_id: str | None = None,
+    revision: int | None = None,
 ) -> None:
-    subject = behaviour_id or story_id or feature_id
+    subject = behaviour_id or story_id or f"{feature_id}@{revision}"
     await owe(
         connection,
         RECONFIRM,
@@ -751,7 +774,7 @@ async def _owe_reconfirmation(
             behaviour_id=behaviour_id,
             payload={"basis": basis, "feature_id": feature_id},
         ),
-        issued_on={"basis": basis},
+        issued_on={"basis": basis} | ({"revision": revision} if revision is not None else {}),
         feature_id=feature_id,
     )
 

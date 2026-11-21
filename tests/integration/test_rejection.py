@@ -231,6 +231,9 @@ async def test_a_correction_that_is_stopped_does_not_start_and_nothing_ordinary_
     )
     assert await world.story("T1") is StoryState.RELEASED  # the other feature has the place
     await world.decide(await world.revise(Kept("S1"), Kept("S2"), CORRECTION))
+    with pytest.raises(ActionRefused, match="S1 is rejected and nothing in this roadmap corrects"):
+        # The only correction of a rejection cannot be dropped.
+        await world.revise(Kept("S1"), Kept("S2"), Dropped("C1", story_revision=1, story_basis=0))
     question = await world.ask("C1")
 
     await world.close("cancel", feature="F2", reason="dropped")  # the place falls free

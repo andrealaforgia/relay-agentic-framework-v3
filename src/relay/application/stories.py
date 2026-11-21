@@ -22,6 +22,7 @@ from relay.application.assignments import (
     owe,
     retire_all_of_feature,
     retire_all_of_story,
+    retire_what_a_roadmap_answers,
     revoke_unstarted_grants,
 )
 from relay.application.closure import (
@@ -978,6 +979,23 @@ async def _end_proposal(
     ).fetchall()
     for gate in gates:
         await _close_gate(connection, gate, "superseded", "superseded")
+    await retire_what_a_roadmap_answers(connection, project_id, feature_id, revisions=[revision])
+
+
+async def why_a_proposal_cannot_stand(
+    connection: Connection, project_id: str, feature_id: str, revision: int
+) -> str:
+    """Why a waiting proposal cannot simply be reconfirmed after a decision, or an empty
+    string: one of its edits was written about a story on a basis that has since moved."""
+    return await _why_an_edit_is_out_of_date(
+        connection, project_id, await _entries(connection, project_id, feature_id, revision)
+    )
+
+
+async def revisions_of_roadmap(
+    connection: Connection, project_id: str, feature_id: str
+) -> tuple[int | None, int | None]:
+    return await _revisions_of(connection, project_id, feature_id)
 
 
 async def release_next(connection: Connection, project_id: str) -> None:
@@ -1178,6 +1196,9 @@ async def _settle_roadmap(connection: Connection, gate: Mapping[str, Any], outco
             "AND revision = %s",
             (project_id, feature_id, revision),
         )
+        await retire_what_a_roadmap_answers(
+            connection, project_id, feature_id, revisions=[revision]
+        )
         return True
     effective, _ = await _revisions_of(connection, project_id, feature_id)
     entries = await _entries(connection, project_id, feature_id, revision)
@@ -1236,6 +1257,13 @@ async def _settle_roadmap(connection: Connection, gate: Mapping[str, Any], outco
                 (project_id, entry["story_id"]),
             )
             await retire_all_of_story(connection, project_id, entry["story_id"])
+    await retire_what_a_roadmap_answers(
+        connection,
+        project_id,
+        feature_id,
+        revisions=[revision, *([effective] if effective is not None else [])],
+        stories=[e["story_id"] for e in entries if e["kind"] in ("reworded", "dropped")],
+    )
     # The Analyst owed a correction for each rejection this revision now answers.
     await connection.execute(
         "UPDATE assignments SET state = 'done', grant_id = NULL, granted_to = NULL "

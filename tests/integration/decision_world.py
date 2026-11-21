@@ -67,7 +67,8 @@ class DecisionWorld(StoryWorld):
             return await (
                 await connection.execute(
                     "SELECT assignment_id, subject, feature_id, story_id, behaviour_id, role, "
-                    "(issued_on->>'basis')::integer AS basis FROM assignments "
+                    "(issued_on->>'basis')::integer AS basis, "
+                    "(issued_on->>'revision')::integer AS revision FROM assignments "
                     "WHERE project_id = %s AND kind = 'reconfirm' AND state IN ('wanted', 'granted') "
                     "ORDER BY created_at",
                     (self.project,),
@@ -82,7 +83,12 @@ class DecisionWorld(StoryWorld):
         basis = owed["basis"]
         if owed["subject"] == "roadmap":
             await self.decisions.reconfirm_roadmap(
-                worker, self.project, owed["feature_id"], grant=grant, basis=basis, revision=1
+                worker,
+                self.project,
+                owed["feature_id"],
+                grant=grant,
+                basis=basis,
+                revision=owed["revision"],
             )
         elif owed["subject"] == "story":
             revision, _ = await self.stories.revisions_of(self.project, owed["story_id"])

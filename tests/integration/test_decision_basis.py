@@ -254,12 +254,10 @@ async def test_an_amendment_under_a_grant_that_was_taken_back_changes_nothing(
         )
 
 
-async def test_a_contract_past_implementation_cannot_be_amended_only_reconfirmed(
+async def test_a_contract_on_trunk_cannot_be_amended_only_reconfirmed(
     world: DecisionWorld,
 ) -> None:
-    base = await world.awaiting_builder("B1")
-    world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
-    assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
+    await world.deliver("B1")
     await decided(world)
     await world.reconfirm(await owed_for(world, "story"))
     owed = await owed_for(world, "behaviour")
@@ -270,9 +268,9 @@ async def test_a_contract_past_implementation_cannot_be_amended_only_reconfirmed
             VERIFIER, PROJECT, "B1", REDUCED_RATE, grant=grant, basis=1, replaces=CONTRACT.digest
         )
 
-    assert await world.state("B1") is BehaviourState.REVIEW
+    assert await world.state("B1") is BehaviourState.INTEGRATED
     kept = await world.decisions.evidence_of(PROJECT, "B1")
-    assert kept.red and kept.green and kept.cycle and kept.integration is None
+    assert kept.red and kept.green and kept.cycle and kept.integration
     await world.decisions.reconfirm_contract(
         VERIFIER, PROJECT, "B1", grant=grant, basis=1, contract_digest=CONTRACT.digest,
         evidence=kept,

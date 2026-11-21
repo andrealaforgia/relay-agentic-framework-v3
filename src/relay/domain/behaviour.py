@@ -159,7 +159,15 @@ class Behaviour:
         """The Verifier replaces the contract, because a decision changed what the
         behaviour should show. The pairing with the old red ends: a fresh red is needed,
         and a red still in flight for the old contract will find the cycle has moved."""
-        self._require("amend_contract", BehaviourState.VALIDATING_RED, BehaviourState.IMPLEMENTING)
+        self._require(
+            "amend_contract",
+            BehaviourState.VALIDATING_RED,
+            BehaviourState.IMPLEMENTING,
+            # In review, or parked after a push the repository refused: the candidate
+            # and its review are set aside with the contract they were made for.
+            BehaviourState.REVIEW,
+            BehaviourState.BLOCKED,
+        )
         self.contract = contract
         self.state = BehaviourState.VALIDATING_RED
         self.red_cycle += 1

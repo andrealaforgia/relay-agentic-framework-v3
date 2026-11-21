@@ -4,12 +4,14 @@ until a person approves it; then it replaces the roadmap in force, all at once."
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
+from relay.application import stories as stories_module
 from relay.application.stories import Dropped, Kept, Reworded, StoryDraft
 from relay.domain.story import ActionRefused, StoryState
 from tests.integration.fixtures import ANALYST
@@ -205,3 +207,32 @@ async def test_an_approval_is_stale_if_what_the_proposal_changes_has_started_mea
     assert receipt.disposition == "stale"
     assert await text_of(world, "S2") == ("Greeting", 1)
     assert (await world.stories.roadmap_of(PROJECT, "F1")).effective == 1
+
+
+async def test_a_revision_and_the_release_of_the_story_it_rewords_do_not_cross(
+    world: StoryWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The proposal's approval has the project and is held there. Story 1's approval,
+    which would release story 2 as it stands, waits; then releases it as reworded."""
+    story_gate, _ = await at_the_story_gate(world)
+    proposal = await world.revise(Kept("S1"), POLITER)
+    holding, go_on = asyncio.Event(), asyncio.Event()
+    real = stories_module._locked_project
+
+    async def held_with_the_project(*arguments: Any) -> None:
+        await real(*arguments)
+        if not holding.is_set():
+            holding.set()
+            await go_on.wait()
+
+    monkeypatch.setattr(stories_module, "_locked_project", held_with_the_project)
+    revising = asyncio.create_task(world.decide(proposal))
+    await holding.wait()
+    approving = asyncio.create_task(world.decide(story_gate))
+    await world.until_someone_waits_for_a_lock()
+    go_on.set()
+
+    assert (await revising).disposition == "effective"
+    assert (await approving).disposition == "effective"
+    assert await world.story("S2") is StoryState.RELEASED
+    assert await text_of(world, "S2") == ("A warmer greeting", 2)
