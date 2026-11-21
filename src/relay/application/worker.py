@@ -64,8 +64,15 @@ class Task(Protocol):
 
 class Provider(Protocol):
     async def invoke(
-        self, request: Request, *, on_result: Callable[[ProviderResult], None] | None = None
-    ) -> ProviderResult: ...
+        self,
+        request: Request,
+        *,
+        on_result: Callable[[ProviderResult], None] | None = None,
+        on_start: Callable[[int], None] | None = None,
+    ) -> ProviderResult:
+        """`on_start` is called when the provider has launched the call, and not before;
+        `on_result` when it knows how the call ended, as it classified it."""
+        ...
 
 
 class Worker:
@@ -135,6 +142,7 @@ class Worker:
         that it never started, that it ended with this result, or that nobody can say.
         Returns the state the call was recorded in."""
         heard: list[ProviderResult] = []
+        launched: list[int] = []
         try:
             result = await self._provider.invoke(
                 Request(
@@ -150,6 +158,7 @@ class Worker:
                     budget_usd=call.budget_usd,
                 ),
                 on_result=heard.append,
+                on_start=launched.append,
             )
         except ProviderUnavailable as unavailable:
             # Established before anything was launched: nothing was spent.
@@ -158,13 +167,18 @@ class Worker:
             # Cancelled, or failed in a way nobody planned for, after the call may have
             # been launched. If the provider had already said how it ended, that is its
             # result, as the provider classified it.
-            known = (
-                heard[-1]
-                if heard
-                else ProviderResult(
+            if heard:
+                known = heard[-1]
+            elif launched:
+                known = ProviderResult(
                     Outcome.UNCERTAIN, reason=f"the call was cut short: {cut_short!r}"
                 )
-            )
+            else:
+                # Cut short before the provider said it had launched anything: nothing
+                # was spent, and nobody needs asking.
+                known = ProviderResult(
+                    Outcome.NOT_STARTED, reason=f"cut short before the call began: {cut_short!r}"
+                )
             await self._recorded(invocation_id, task, assignment, call, known)
             raise
         return await self._recorded(invocation_id, task, assignment, call, result)
@@ -192,7 +206,12 @@ class Worker:
         call: Call,
         result: ProviderResult,
     ) -> str:
-        problem = _problem(task, result)
+        try:
+            problem = _problem(task, result)
+        except Exception as fault:  # noqa: BLE001 - a fault in the check loses no result
+            # The reply arrived and the check of it failed, which is not the same as the
+            # reply failing the check. Either way the call and what it used are recorded.
+            problem = f"the reply could not be checked: {fault!r}"
         retained = None
         if result.outcome is Outcome.RETURNED and problem is None and not result.unusable:
             try:

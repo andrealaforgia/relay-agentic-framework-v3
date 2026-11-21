@@ -185,6 +185,51 @@ Reservations:
 - **The final trunk read holds the project's gate lock exclusively across a network call**, bounded by the deadline. That is the design, and the one place Relay does this.
 - **Usage is `unknown` in every summary** until 3b measures it (PO-9).
 
+## Slice 3b: workers and the Claude adapter
+
+### The design
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 41 | CHALLENGE, 10 blocking of 10 | A duplicate delivery buying a second call; startup invalidating the grant a known result needs; a pause not stopping a paid call; an apply of several effects that could not be resumed; terminal errors and structured output not told apart; no enforced boundary around the model's process; no trigger for a behaviour's first integration; transitions with no worker to carry them on; a question losing the work that asked it; usage that could not be priced |
+| 42 | CHALLENGE, 9 blocking of 9 | An assignment owed twice refused for ever after its first call; a retry that could not wake parked work; a claimed grant orphaned before any call; two deliveries both running one effect; a build returned with its tree lost; the wrong base for a remediation; a confinement pass keyed to too little and trusting the model's account; the first integration with nobody to retry it; two more transitions with no worker |
+| 43 | CHALLENGE, 8 blocking of 8 | Who carries out an authorised retry; which oracle try may settle; a known result during a pause; lock order at admission; what each confinement probe can observe; a successor not owed while paused; a behaviour left without a contract; one red request owned twice |
+
+Twenty-seven findings. **The design was not accepted.** Round 43's eight findings are folded into the build contract (`round-44`), which Astra did not review. Astra accepted along the way: the assignment as one occasion with successors; keeping a build's tree before it is `returned`; the recorded remediation base; the control plane owning the first integration; leaving the provider's own transcript out of recovery; and D-5 staying deferred **only if** the boundary around the model's process is demonstrated and attestable.
+
+### Step 1 as built: records and the adapter
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 45 | CHALLENGE, 10 blocking of 10 | An effect redone under a new identity; a superseded try rejecting the result; a held result never carried on; an unusable CLI or a cancelled call left as "in flight"; a call recorded as prepared on what it was not; a late result applied across grants; a grant not bound to its caller, worker and role; calls in flight for ended work never settled; an inventory that was missing read as empty; a build returned with nothing kept |
+| 46 | CHALLENGE, 5 blocking and 5 lesser | The handoff from provider to record lost to cancellation; the adapter's classification lost on cancellation; a pause taking back an adopting grant; a dead grant hidden behind an earlier call; a decision during an effect still settling, and a lock inversion; a refusal in `settle` escaping; an effect left taken after cancellation; no liveness check at admission; a parked call outliving its work; two recovery sessions |
+| 47 | CHALLENGE, 2 blocking and 6 lesser | An effect that changes the story unable to use `settle`, and a pass overtaking a running effect; an effect left "busy" on record by a live worker; a faulting validator losing the result; a refusal after the work ended blamed on the reply; parked work finished by other means still retryable; recovery locking the project before assignments; a liveness probe that impersonated the worker; a cancelled preflight recorded as a paid call |
+
+Twenty-eight findings, all reachable, all fixed. **Step 1 was not accepted**: round 47 was the third and last round and Astra has not seen the fixes for its eight findings. Two of those eight were checks I had removed as redundant after a breakage survived, on reasoning that held for the tests I had and not for histories I had not thought of (a pass overtaking a running effect; work finished without being retired). Both are back, each with the history that needs it.
+
+Deliberate breakage, since every test of this step was written with its code: 24 breakages of the provider modules, 47 of the records, 10 of the runner, then 29, 18 and 13 against the three rounds of fixes. The last full run is 934 tests, green; one test was added after it and passes with its file. Survivors were given a test or, where they showed code that did nothing, the code was removed.
+
+Decided during the build:
+
+- **Every apply is a list of effects**, each with one identity for all its tries. What an effect writes to PostgreSQL it writes in `settle`, in the transaction that marks it done.
+- **An effect that changes what the invocation is about does so in `settle`** and says what it left. `perform` must not.
+- **A parked call is its own kind of inbox item**, listed by `Invocations.parked` and decided by `Invocations.decide`. One view over gates and calls is 3c's.
+- **A grant with no worker process** can still be claimed, by callers inside the control plane, and admits no paid call.
+- **Liveness is read from `pg_locks`.** Nothing is taken to find out.
+- **The start event verifies** that the bounds a run was launched with took. It does not stop a run before its briefing is read.
+
+Reservations:
+
+- **Astra has not reviewed the round 47 fixes.**
+- **One check has no test that needs it.** When an effect is marked done, the invocation must still be `returned`. A breakage of that check survives, because the check beside it (has the work ended or changed) catches the one history I have. I removed it once for that reason and Astra showed a history that needed it; the history has since been closed another way (a pass leaves a running effect to its carrier). I keep the check and say here that nothing proves it.
+- **Recovery's lock order** (one transaction per candidate, the assignment before the ledger) is by construction; no test would have deadlocked before.
+- **Work finished by other means** is tested by finishing a build's assignment directly, not by the correction-and-approval history that reaches it.
+- **An effect whose service finishes the assignment in `perform`**, cut short before its mark, is recorded `overtaken` when taken up again, though it did happen. Finishing belongs in `settle`.
+- **The lock order with `reopen_red`** is tested one after the other, not raced.
+- **A worker whose connection drops while its process lives** is tested by stopping its session.
+- **The stand-in CLI** shows how Relay calls the CLI and reads it, and nothing about what the real CLI enforces. That is step 2's suite, and D-5's condition.
+- **No time-based lease** until slice 5: a worker that hangs with its connection open keeps its grant.
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.

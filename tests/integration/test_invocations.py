@@ -75,6 +75,8 @@ class Applying:
         self.grants: list[uuid.UUID] = []
         self.settled: list[str] = []
         self.settling_refused: list[str] = []
+        # What the first effect writes where it settles, returning what it changed.
+        self.writing: Any = None
         self.reached = asyncio.Event()
 
     def effects_for(self, _: dict[str, Any]) -> list[Effect]:
@@ -83,10 +85,11 @@ class Applying:
             Effect("second", self._perform("second")),
         ]
 
-    async def _settle(self, connection: Any, run: EffectRun) -> None:
+    async def _settle(self, connection: Any, run: EffectRun) -> Mapping[str, Any] | None:
         if self.settling_refused:
             raise ActionRefused(self.settling_refused.pop())
         self.settled.append(f"{run.effect_id.rsplit(':', 1)[1]}:{run.attempt}")
+        return await self.writing(connection) if self.writing is not None else None
 
     def _perform(self, name: str) -> Any:
         async def perform(run: EffectRun) -> Mapping[str, Any] | None:
@@ -99,8 +102,9 @@ class Applying:
                     await self.waiting[held].wait()
             if name in self.failing:
                 raise self.failing[name]
-            moved = await self.doing[name](run) if name in self.doing else None
-            return {"did": name, **({"stands": moved} if moved else {})}
+            if name in self.doing:
+                await self.doing[name](run)
+            return {"did": name}
 
         return perform
 
@@ -859,25 +863,45 @@ async def test_a_known_result_for_a_build_that_was_reopened_is_never_applied(
     ]
 
 
-async def test_what_an_apply_itself_changes_does_not_stop_the_rest_of_it(calling: Calling) -> None:
-    """S3B-S1-1.5: what an effect says it changed is what the next expects to find."""
+async def test_what_an_effect_changes_where_it_settles_does_not_stop_the_rest(
+    calling: Calling,
+) -> None:
+    """3B-S1-3.1: the change, what it leaves the story at, and the mark commit together,
+    and the next effect expects what the first left."""
     worker = await calling.worker()
     invocation = await calling.admitted(worker)
     await calling.invocations.record(invocation, said(), retained=KEPT)
 
-    async def adds_to_the_story(_: EffectRun) -> dict[str, Any]:
-        async with calling.world.database.connection() as connection:
-            row = await (
-                await connection.execute(
-                    "UPDATE stories SET list_revision = list_revision + 1 RETURNING list_revision"
-                )
-            ).fetchone()
-        assert row is not None
-        return {"list_revision": row["list_revision"]}  # and says so
+    async def adds_to_the_story(connection: Any) -> dict[str, Any]:
+        row = await (
+            await connection.execute(
+                "UPDATE stories SET list_revision = list_revision + 1 RETURNING list_revision"
+            )
+        ).fetchone()
+        return {"list_revision": row["list_revision"]}
 
-    calling.applying.doing["first"] = adds_to_the_story
+    calling.applying.writing = adds_to_the_story
 
     assert await calling.invocations.apply(invocation, worker) == "applied"
+    assert calling.applying.ran == ["first:1", "second:1"]
+
+
+async def test_a_pass_that_comes_while_an_effect_runs_leaves_it_to_its_carrier(
+    calling: Calling,
+) -> None:
+    """3B-S1-3.1: an effect being carried out is its carrier's to dispose of."""
+    worker = await calling.worker()
+    invocation = await calling.admitted(worker)
+    await calling.invocations.record(invocation, said(), retained=KEPT)
+    calling.applying.waiting["first"] = asyncio.Event()
+    applying = asyncio.create_task(calling.invocations.apply(invocation, worker))
+    await calling.applying.reached.wait()
+
+    await calling.invocations.recover(PROJECT)
+    assert await calling.states() == ["returned"]
+    calling.applying.waiting["first"].set()
+
+    assert await applying == "applied"
     assert calling.applying.ran == ["first:1", "second:1"]
 
 
@@ -1359,3 +1383,154 @@ async def test_two_passes_at_once_recover_through_one_session(
     ) == [1]
     assert await calling.states() == ["applied"]
     assert calling.applying.ran == ["first:1", "second:1"]
+
+
+async def test_an_apply_cut_short_in_a_worker_that_lives_on_is_finished_by_the_pass(
+    calling: Calling, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S1-3.2: the pass is another session, and can only ask whether the worker is
+    alive. So the worker gives the effect up on record when it stops carrying it out."""
+    worker = await calling.worker()
+    invocation = await calling.admitted(worker)
+    await calling.invocations.record(invocation, said(), retained=KEPT)
+    real = Invocations._take
+    taken = asyncio.Event()
+
+    async def taken_and_never_heard_of(self: Invocations, *arguments: Any) -> Any:
+        await real(self, *arguments)
+        taken.set()
+        await asyncio.Event().wait()
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Invocations, "_take", taken_and_never_heard_of)
+        applying = asyncio.create_task(calling.invocations.apply(invocation, worker))
+        await taken.wait()
+        applying.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await applying
+
+    await calling.invocations.recover(PROJECT)
+
+    assert await calling.states() == ["applied"]
+    assert calling.applying.ran == ["first:2", "second:1"]
+    assert await calling.world.column("SELECT count(*) FROM invocations") == [1]
+
+
+async def test_a_refusal_that_comes_after_the_work_was_ended_blames_no_reply(
+    calling: Calling,
+) -> None:
+    """3B-S1-3.4: the third attempt, its effect running, and the red reopened under it."""
+    worker = await calling.worker()
+    assignment, grant = await calling.claimed(worker)
+    for _ in range(2):
+        admission = await calling.invocations.admit(
+            worker, assignment, grant, await calling.prepared()
+        )
+        assert admission.invocation_id is not None
+        await calling.invocations.record(admission.invocation_id, said(), problem="unusable")
+    third = await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
+    assert third.invocation_id is not None
+    await calling.invocations.record(third.invocation_id, said(), retained=KEPT)
+    calling.applying.waiting["first"] = asyncio.Event()
+    calling.applying.failing["first"] = ActionRefused("this grant is not the current one")
+    applying = asyncio.create_task(calling.invocations.apply(third.invocation_id, worker))
+    await calling.applying.reached.wait()
+
+    await calling.world.behaviours.reopen_red(PROJECT, "B1", "the contract was wrong")
+    calling.applying.waiting["first"].set()
+
+    assert await applying == "overtaken"
+    assert await calling.states() == ["rejected", "rejected", "overtaken"]
+    assert await calling.invocations.parked(PROJECT) == []
+    assert await calling.world.column(
+        "SELECT count(*) FROM inbox_items WHERE kind = 'invocation'"
+    ) == [0]
+
+
+async def test_work_finished_by_other_means_is_not_retried_and_its_late_result_does_nothing(
+    calling: Calling,
+) -> None:
+    """3B-S1-3.5. The reachable history is a correction parked on a call and then
+    settled by a roadmap approval, which finishes the assignment without retiring it.
+    Here the same state is reached on the build by finishing it directly: what is under
+    test is that finished work is neither retried nor acted on."""
+    worker = await calling.worker()
+    invocation = await calling.admitted(worker)
+    await worker.stop()
+    await calling.invocations.recover(PROJECT)
+    assert len(await calling.invocations.parked(PROJECT)) == 1
+    async with calling.world.database.connection() as connection:
+        await connection.execute("UPDATE assignments SET state = 'done' WHERE kind = 'build'")
+
+    assert await calling.invocations.parked(PROJECT) == []
+    assert (await calling.invocations.decide(calling.person(invocation, "retry"))).disposition == (
+        "stale"
+    )
+    assert await calling.invocations.record(invocation, said(), retained=KEPT) == "returned"
+    assert await calling.invocations.apply(invocation, await calling.worker()) == "overtaken"
+    assert calling.applying.ran == []
+    assert await calling.world.column("SELECT reason FROM invocations") == [
+        "the work it was for was finished by other means"
+    ]
+
+
+async def test_asking_whether_a_worker_is_alive_takes_nothing(calling: Calling) -> None:
+    """3B-S1-3.7: many observers at once of a worker that is gone, and of one that is not."""
+    gone, here = await calling.worker(), await calling.worker()
+    await gone.stop()
+
+    async def ask(worker: WorkerSession) -> bool:
+        async with calling.world.database.connection() as connection:
+            return await is_alive(connection, worker.worker_id)
+
+    assert await asyncio.gather(*(ask(gone) for _ in range(6))) == [False] * 6
+    assert await asyncio.gather(*(ask(here) for _ in range(6))) == [True] * 6
+    assert await ask(gone) is False
+
+
+async def test_a_call_given_up_on_and_then_found_never_to_have_started_cost_nothing(
+    calling: Calling,
+) -> None:
+    """3B-S1-3.8: recovery said uncertain; the adapter then established there was no launch."""
+    worker = await calling.worker()
+    invocation = await calling.admitted(worker)
+    await worker.stop()
+    await calling.invocations.recover(PROJECT)
+    assert len(await calling.invocations.parked(PROJECT)) == 1
+
+    assert await calling.invocations.record(invocation, NOT_STARTED) == "not_started"
+
+    assert await calling.invocations.parked(PROJECT) == []
+    assert await calling.assignment() == ("wanted", None, False)
+
+
+async def test_giving_an_effect_up_does_not_take_it_from_whoever_took_it_over(
+    calling: Calling,
+) -> None:
+    """3B-S1-3.2: the worker was taken for gone, another took its effect over, and then
+    its own call was cut short. What it gives up is what is still its own."""
+    one, other = await calling.worker(), await calling.worker()
+    invocation = await calling.admitted(one)
+    await calling.invocations.record(invocation, said(), retained=KEPT)
+    calling.applying.waiting["first:1"] = asyncio.Event()
+    calling.applying.waiting["first:2"] = asyncio.Event()
+    first_try = asyncio.create_task(calling.invocations.apply(invocation, one))
+    await calling.applying.reached.wait()
+    await one.stop()
+    calling.applying.reached.clear()
+    second_try = asyncio.create_task(calling.invocations.apply(invocation, other))
+    await calling.applying.reached.wait()
+
+    first_try.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_try
+
+    assert await calling.world.column(
+        "SELECT state, worker_id FROM invocation_effects WHERE name = 'first'"
+    ) == ["started"]
+    assert await calling.world.column(
+        "SELECT worker_id FROM invocation_effects WHERE name = 'first'"
+    ) == [other.worker_id]
+    calling.applying.waiting["first:2"].set()
+    assert await second_try == "applied"
+    assert calling.applying.ran == ["first:1", "first:2", "second:1"]

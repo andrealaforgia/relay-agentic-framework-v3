@@ -58,17 +58,21 @@ class WorkerSession:
 
 
 async def is_alive(connection: Connection, worker_id: uuid.UUID) -> bool:
-    """Whether the worker still holds its lock. Asked on any connection but its own."""
-    key = _lock_key(worker_id)
-    taken = await (
-        await connection.execute("SELECT pg_try_advisory_lock(%s) AS free", (key,))
+    """Whether some session holds the worker's lock, read from PostgreSQL's own table of
+    locks. Nothing is taken to find out: an observer that took the lock for a moment
+    would itself look like the worker to the next observer."""
+    key = _lock_key(worker_id) & 0xFFFFFFFFFFFFFFFF
+    held = await (
+        await connection.execute(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND granted "
+            "AND objsubid = 1 AND classid = %s::bigint::oid AND objid = %s::bigint::oid "
+            "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())) "
+            "AS held",
+            (key >> 32, key & 0xFFFFFFFF),
+        )
     ).fetchone()
-    assert taken is not None
-    if not taken["free"]:
-        return True
-    # It was free, so its owner is gone. Give back what was only taken to find out.
-    await connection.execute("SELECT pg_advisory_unlock(%s)", (key,))
-    return False
+    assert held is not None
+    return bool(held["held"])
 
 
 def _lock_key(worker_id: uuid.UUID) -> int:

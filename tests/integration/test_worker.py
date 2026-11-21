@@ -43,12 +43,21 @@ class Scripted:
         # Reports what it has, and then never returns: a run that lingers after its result.
         self.then_waits = then_waits
         self.waiting = asyncio.Event()
+        # Never gets as far as launching anything: a check of the CLI that hangs.
+        self.waits_before_launch = False
 
-    async def invoke(self, request: Request, *, on_result: Any = None) -> ProviderResult:
+    async def invoke(
+        self, request: Request, *, on_result: Any = None, on_start: Any = None
+    ) -> ProviderResult:
         self.asked.append(request)
+        if self.waits_before_launch:
+            self.waiting.set()
+            await asyncio.Event().wait()
         result = self._results.pop(0)
         if isinstance(result, BaseException):
             raise result
+        if on_start is not None:
+            on_start(4242)
         if result.terminal is not None and on_result is not None:
             on_result(result)
         if self.then_waits:
@@ -503,3 +512,42 @@ async def test_a_worker_that_lost_its_connection_while_preparing_makes_no_call(
     assert left.startswith("refused") and "no longer known to be running" in left
     assert provider.asked == []
     assert await bench.states() == []
+
+
+async def test_a_reply_the_check_itself_cannot_cope_with_is_still_recorded(bench: Bench) -> None:
+    """3B-S1-3.3: a list where an object was asked for. The check faults; the call and
+    what it used are on record all the same, as a reply that gave nothing."""
+    odd = said()
+    assert odd.terminal is not None
+    odd.terminal.envelope["structured_output"] = []
+    worker = await bench.worker(Scripted(odd, UNCERTAIN))
+
+    await worker.carry_out(await bench.owed())
+
+    async with bench.world.database.connection() as connection:
+        row = await (
+            await connection.execute("SELECT * FROM invocations WHERE attempt = 1")
+        ).fetchone()
+    assert row is not None
+    assert row["state"] == "rejected"
+    assert row["reason"].startswith("the reply could not be checked: AttributeError")
+    assert row["envelope"]["subtype"] == "success" and row["provider_cost_usd"] is not None
+
+
+async def test_a_call_cut_short_before_anything_was_launched_cost_nothing(bench: Bench) -> None:
+    """3B-S1-3.8: cancelled while the CLI was still being checked."""
+    provider = Scripted(said())
+    provider.waits_before_launch = True
+    worker = await bench.worker(provider)
+    carrying = asyncio.create_task(worker.carry_out(await bench.owed()))
+    await provider.waiting.wait()
+
+    carrying.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await carrying
+
+    assert await bench.states() == ["not_started"]
+    assert await bench.invocations.parked(PROJECT) == []
+    assert await bench.world.column("SELECT state FROM assignments WHERE kind = 'build'") == [
+        "wanted"
+    ]
