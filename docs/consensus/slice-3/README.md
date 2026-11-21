@@ -89,6 +89,18 @@ Reservations carried forward:
 
 What this step showed: I wrote the largest increment's code before its tests, and it showed twice. Deliberate breakage caught only 29 of 52 cases at first, against 25 of 27 for the increment I had written test-first. And Astra's first round found six blocking defects in it, including a grant that worked across projects, which no test of mine had two projects to notice. From round 20 on every fix was test-first.
 
+## Slice 3a-ii, step 3, design (corrections)
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 24 | CHALLENGE, 9 blocking of 10 | A release rule that stranded the first correcting story; an edit to a story overtaken by a decision about it; a proposal with no existence apart from its gate; no way to return an active story; findings lost when a contract in review is amended; an authorised push and a voided authority contradicting each other; and four more on supersession |
+| 25 | CHALLENGE, 9 blocking of 10 | Placement of a correction deciding whether ordinary work deadlocks or escapes; a correction dropped or duplicated by a later proposal; a delayed draft restoring an old order; one reconfirmation serving both the effective roadmap and a proposal; a direct rejection landing on a later revision; and four more on supersession |
+| 26 | CHALLENGE, 4 blocking of 6 | A second correction added once the first is approved; an identical "amendment" sending a refused candidate round again without the Product Owner's retry; a supersession proposal with no way to end; an approved story reopened by a later retirement |
+
+The build contract is `round-27-claude-3a-ii-step-3-design-v4.md`: design v3 with round 26's six findings folded in. **Astra has not reviewed v4.** It said part (i) could be built once two of them were folded in, with no further design round.
+
+Step 3 is built in two parts, each reviewed: (i) roadmap revisions, rejection, amending a contract in review or parked; (ii) obligations, supersession, and what a story demonstrates.
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.
