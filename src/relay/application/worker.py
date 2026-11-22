@@ -48,15 +48,20 @@ class Call:
 class Task(Protocol):
     """One kind of work, for one role."""
 
-    async def prepare(self, assignment: Mapping[str, Any], last_problem: str | None) -> Call:
-        """The call to make. `last_problem` is why the last reply could not be used."""
+    async def prepare(
+        self, assignment: Mapping[str, Any], grant: uuid.UUID, last_problem: str | None
+    ) -> Call:
+        """The call to make, under this grant. `last_problem` is why the last reply
+        could not be used."""
         ...
 
     def problem_with(self, reply: Any) -> str | None:
         """Why a reply that arrived cannot be used, or None if it can."""
         ...
 
-    async def retain(self, assignment: Mapping[str, Any], call: Call) -> str | None:
+    async def retain(
+        self, assignment: Mapping[str, Any], call: Call, invocation_id: uuid.UUID
+    ) -> str | None:
         """Make durable whatever the call left outside its reply, before the reply is
         recorded as usable, and name it: for a build, the commit its workspace was kept
         as. None for work whose reply is all there is."""
@@ -117,7 +122,7 @@ class Worker:
         problem: str | None = None
         stale = 0
         while True:
-            call = await task.prepare(assignment, problem)
+            call = await task.prepare(assignment, grant, problem)
             boundary = boundary_digest(call.confinement, self._runtime)
             if not await self._boundaries.holds(boundary):
                 # No call is made within bounds nobody has seen hold here: not on a new
@@ -233,7 +238,7 @@ class Worker:
         retained = None
         if result.outcome is Outcome.RETURNED and problem is None and not result.unusable:
             try:
-                retained = await task.retain(assignment, call)
+                retained = await task.retain(assignment, call, invocation_id)
             except Exception as failure:  # noqa: BLE001 - whatever stopped it is recorded
                 # The reply arrived and what it left could not be kept. That is known,
                 # and is recorded with what the call used.

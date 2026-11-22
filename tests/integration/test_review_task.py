@@ -1,0 +1,259 @@
+"""A review carried out by a worker: QA and Sentinel are each handed their own export of
+the pinned candidate, briefed from the record, and their replies become recorded reviews.
+The provider is scripted; what is real is everything around it."""
+
+from __future__ import annotations
+
+import os
+import uuid
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+from psycopg_pool import AsyncConnectionPool
+
+from relay.application.invocations import Invocations
+from relay.application.tasks import Profile, ReviewTask, Tasks, Workspaces
+from relay.application.worker import Worker
+from relay.application.workers import WorkerSession
+from relay.providers.claude import Outcome, ProviderResult, Request
+from relay.providers.stream import Terminal
+from tests.integration.decision_world import DecisionWorld
+from tests.integration.fixtures import VAT_APPLIES_STANDARD_RATE, run_green
+from tests.integration.story_world import STANDARD_RATE
+from tests.integration.test_worker import RUNTIME, SeenToHold
+from tests.integration.trunk_world import PROJECT
+
+NOTHING_FOUND = {"findings": [], "carried": []}
+NO_USAGE_MESSAGE = {
+    "severity": "low",
+    "claim": "no usage message",
+    "evidence": "vat.py line 1",
+    "remediation": "print usage on bad input",
+}
+
+
+def replying(reply: Any) -> ProviderResult:
+    return ProviderResult(
+        Outcome.RETURNED,
+        Terminal(
+            {"type": "result", "subtype": "success", "is_error": False, "structured_output": reply}
+        ),
+    )
+
+
+class Reviewer:
+    """A provider that looks at what it was handed before it replies."""
+
+    def __init__(self, *replies: Any) -> None:
+        self._replies = list(replies)
+        self.asked: list[Request] = []
+        self.found: list[dict[str, str]] = []
+
+    async def invoke(self, request: Request, **_: Any) -> ProviderResult:
+        self.asked.append(request)
+        self.found.append(
+            {
+                str(path.relative_to(request.workdir)): path.read_text()
+                for path in sorted(request.workdir.rglob("*"))
+                if path.is_file()
+            }
+        )
+        return replying(self._replies.pop(0))
+
+
+class Reviewing:
+    def __init__(self, world: DecisionWorld, tmp_path: Path) -> None:
+        self.world = world
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        for name in ("alf-test-design-reviewer", "alf-security-assessor"):
+            (agents / f"{name}.md").write_text(f"---\nname: {name}\ntools: Bash\n---\nReview.\n")
+        self.invocations = Invocations(world.database)
+        self.task = ReviewTask(
+            world.database,
+            world.reviews,
+            self.invocations,
+            Workspaces(tmp_path.resolve() / "workspaces"),
+            [agents],
+            Profile("claude-sonnet-5-5"),
+        )
+        self.invocations._effects_for = Tasks({"review": self.task}).effects_for
+        self.sessions: list[WorkerSession] = []
+        self.candidate = ""
+
+    async def worker(self, role: str, provider: Any) -> Worker:
+        session = await WorkerSession.start(self.world.database, role)
+        self.sessions.append(session)
+        return Worker(
+            session,
+            self.world.claims,
+            self.invocations,
+            provider,
+            {"review": self.task},
+            SeenToHold(),
+            RUNTIME,
+        )
+
+    async def owed(self, role: str) -> dict[str, Any]:
+        async with self.world.database.connection() as connection:
+            row = await (
+                await connection.execute(
+                    "SELECT * FROM assignments WHERE kind = 'review' AND role = %s "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (role,),
+                )
+            ).fetchone()
+        assert row is not None
+        return row
+
+
+@pytest.fixture
+async def reviewing(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> AsyncIterator[Reviewing]:
+    world = DecisionWorld(database, tmp_path, runner_image)
+    world.base = await world.open()
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    base = await world.awaiting_builder("B1")
+    reviewing = Reviewing(world, tmp_path)
+    reviewing.candidate = world.publish_attempt(
+        "B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base
+    )
+    assert (await run_green(world.behaviours, PROJECT, "B1", world.attempts["B1"])).is_valid
+    assert await world.reviews.publish_candidates() == 1
+    yield reviewing
+    await reviewing.invocations.close()
+    for session in reviewing.sessions:
+        await session.stop()
+
+
+async def test_a_reviewer_is_handed_the_candidate_and_its_reply_becomes_a_review(
+    reviewing: Reviewing,
+) -> None:
+    provider = Reviewer({"findings": [NO_USAGE_MESSAGE], "carried": []})
+    worker = await reviewing.worker("qa", provider)
+
+    assert await worker.carry_out(await reviewing.owed("qa")) == "applied"
+
+    [asked] = provider.asked
+    [tree] = provider.found
+    assert tree["vat.py"] == VAT_APPLIES_STANDARD_RATE
+    assert not any(name.startswith(".git") for name in tree)  # the tree, and no metadata
+    assert asked.confinement.tools == ("Read", "Grep", "Glob")
+    assert asked.definition.name == "alf-test-design-reviewer"
+    assert asked.model == "claude-sonnet-5-5"
+    assert reviewing.candidate in asked.briefing
+    async with reviewing.world.database.connection() as connection:
+        finding = await (await connection.execute("SELECT * FROM findings")).fetchone()
+        submitted = await (
+            await connection.execute("SELECT disposition FROM review_submissions")
+        ).fetchall()
+    assert finding is not None
+    assert (finding["role"], finding["severity"], finding["claim"]) == ("qa", 1, "no usage message")
+    assert [each["disposition"] for each in submitted] == ["effective"]
+    assert (await reviewing.owed("qa"))["state"] == "done"
+
+
+async def test_the_briefing_says_what_is_being_reviewed_and_for_what(reviewing: Reviewing) -> None:
+    provider = Reviewer(NOTHING_FOUND)
+    await (await reviewing.worker("sentinel", provider)).carry_out(await reviewing.owed("sentinel"))
+
+    briefing = provider.asked[0].briefing
+    assert "security" in briefing
+    assert "behaviour B1" in briefing and "story S1" in briefing
+    assert "AC1" in briefing
+    assert "the gross amount printed" in briefing  # the contract, as registered
+    assert "no earlier findings" in briefing
+    assert provider.asked[0].definition.name == "alf-security-assessor"
+
+
+async def test_the_two_reviewers_each_get_their_own_copy_of_the_same_commit(
+    reviewing: Reviewing,
+) -> None:
+    """S3-1.10: neither can leave anything for the other in the tree."""
+    qa, sentinel = Reviewer(NOTHING_FOUND), Reviewer(NOTHING_FOUND)
+
+    await (await reviewing.worker("qa", qa)).carry_out(await reviewing.owed("qa"))
+    await (await reviewing.worker("sentinel", sentinel)).carry_out(await reviewing.owed("sentinel"))
+
+    assert qa.found == sentinel.found
+    assert qa.found[0]["vat.py"] == VAT_APPLIES_STANDARD_RATE
+    assert qa.asked[0].workdir != sentinel.asked[0].workdir
+    assert await reviewing.world.column("SELECT state FROM review_cycles") == ["satisfied"]
+
+
+async def test_a_reply_that_is_not_a_review_is_asked_for_again(reviewing: Reviewing) -> None:
+    not_a_review = {"findings": [{**NO_USAGE_MESSAGE, "severity": "enormous"}], "carried": []}
+    provider = Reviewer(not_a_review, NOTHING_FOUND)
+    worker = await reviewing.worker("qa", provider)
+
+    assert await worker.carry_out(await reviewing.owed("qa")) == "applied"
+
+    assert await reviewing.world.column("SELECT state FROM invocations ORDER BY attempt") == [
+        "rejected",
+        "applied",
+    ]
+    assert "could not be used" in provider.asked[1].briefing
+    assert await reviewing.world.column("SELECT count(*) FROM findings") == [0]
+
+
+async def test_a_verdict_on_a_finding_that_is_not_the_reviewers_own_is_refused_by_the_service(
+    reviewing: Reviewing,
+) -> None:
+    """The reply is well formed; the review service refuses it. That is a reply that gave
+    nothing, and the next briefing says why."""
+    sentinel = Reviewer({"findings": [NO_USAGE_MESSAGE], "carried": []})
+    await (await reviewing.worker("sentinel", sentinel)).carry_out(await reviewing.owed("sentinel"))
+    [theirs] = await reviewing.world.column("SELECT finding_id FROM findings")
+    overreaching = {
+        "findings": [],
+        "carried": [{"finding_id": theirs, "verdict": "verified_fixed"}],
+    }
+    provider = Reviewer(overreaching, NOTHING_FOUND)
+
+    worker = await reviewing.worker("qa", provider)
+    assert await worker.carry_out(await reviewing.owed("qa")) == "applied"
+
+    assert await reviewing.world.column(
+        "SELECT state FROM invocations WHERE role = 'qa' ORDER BY attempt"
+    ) == ["rejected", "applied"]
+    assert await reviewing.world.column("SELECT count(*) FROM finding_verifications") == [0]
+
+
+async def test_a_review_whose_worker_went_after_it_replied_is_submitted_by_the_pass_once(
+    reviewing: Reviewing,
+) -> None:
+    """S3-18.2: under its original grant, from its original checkout."""
+    provider = Reviewer({"findings": [NO_USAGE_MESSAGE], "carried": []})
+    worker = await reviewing.worker("qa", provider)
+    real = reviewing.invocations.apply
+
+    async def the_worker_stops(*_: Any) -> str:
+        raise KeyboardInterrupt
+
+    reviewing.invocations.apply = the_worker_stops  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        await worker.carry_out(await reviewing.owed("qa"))
+    reviewing.invocations.apply = real  # type: ignore[method-assign]
+    await reviewing.sessions[-1].stop()
+
+    await reviewing.invocations.recover(PROJECT)
+    await reviewing.invocations.recover(PROJECT)
+
+    assert await reviewing.world.column("SELECT state FROM invocations") == ["applied"]
+    assert await reviewing.world.column("SELECT count(*) FROM findings") == [1]
+    assert await reviewing.world.column("SELECT count(*) FROM review_checkouts") == [1]
+    assert len(provider.asked) == 1
+
+
+async def test_a_reviewers_workspace_is_one_the_bounds_hold_for(reviewing: Reviewing) -> None:
+    provider = Reviewer(NOTHING_FOUND)
+    await (await reviewing.worker("qa", provider)).carry_out(await reviewing.owed("qa"))
+
+    workdir = provider.asked[0].workdir
+    assert workdir.is_absolute() and workdir.name == "tree"
+    assert not workdir.is_relative_to(Path.home())
+    assert uuid.UUID(workdir.parent.name)  # a directory of its own
+    assert os.listdir(workdir.parent) == ["tree"]

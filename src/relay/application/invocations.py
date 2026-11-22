@@ -847,7 +847,10 @@ class Invocations:
 async def _located(connection: Connection, invocation_id: uuid.UUID) -> dict[str, Any]:
     row = await (
         await connection.execute(
-            "SELECT * FROM invocations WHERE invocation_id = %s", (invocation_id,)
+            # With the kind of work it is a call for: how a result is applied goes by it.
+            "SELECT v.*, a.kind FROM invocations v JOIN assignments a USING (assignment_id) "
+            "WHERE v.invocation_id = %s",
+            (invocation_id,),
         )
     ).fetchone()
     if row is None:
@@ -966,19 +969,12 @@ async def _ended_for_good(
     # whatever ended it.
     if assignment["state"] == "retired":
         return "the work it was for was ended"
-    if assignment["state"] == "done":
-        # Finished. By an effect of this apply, and the rest goes on; by anything else
-        # (a roadmap approved meanwhile, say), and this result has nothing left to do.
-        done_here = await (
-            await connection.execute(
-                "SELECT 1 FROM invocation_effects WHERE invocation_id = %s AND state = 'done' "
-                "LIMIT 1",
-                (invocation["invocation_id"],),
-            )
-        ).fetchone()
-        if done_here is None:
-            return "the work it was for was finished by other means"
     under = invocation["applied_under"] or invocation["grant_id"]
+    if assignment["state"] == "done" and assignment["grant_id"] != under:
+        # Finished, and not under the grant this result acts under: by a roadmap approved
+        # meanwhile, say. Work finished under that grant was finished by this apply, or by
+        # the same hands, and the rest of it goes on.
+        return "the work it was for was finished by other means"
     if assignment["state"] in ("wanted", "granted") and assignment["grant_id"] != under:
         return "the grant it was to be applied under no longer holds the work"
     # Is it still about what there is? What it expects moves only by what its own

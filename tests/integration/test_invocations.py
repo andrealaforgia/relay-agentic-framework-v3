@@ -1460,6 +1460,7 @@ async def test_work_finished_by_other_means_is_not_retried_and_its_late_result_d
     await calling.invocations.recover(PROJECT)
     assert len(await calling.invocations.parked(PROJECT)) == 1
     async with calling.world.database.connection() as connection:
+        # As a roadmap approval finishes a parked correction: done, with no grant on it.
         await connection.execute("UPDATE assignments SET state = 'done' WHERE kind = 'build'")
 
     assert await calling.invocations.parked(PROJECT) == []

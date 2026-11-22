@@ -96,7 +96,9 @@ class Summing:
         self.at_keeping = asyncio.Event()
         self.during_preparation: Any = None
 
-    async def prepare(self, assignment: Mapping[str, Any], last_problem: str | None) -> Call:
+    async def prepare(
+        self, assignment: Mapping[str, Any], grant: uuid.UUID, last_problem: str | None
+    ) -> Call:
         self.problems.append(last_problem)
         if self.during_preparation is not None:
             await self.during_preparation()
@@ -108,7 +110,9 @@ class Summing:
             replace(PREPARED, read_on=read_on), self._workdir, Confinement((), {}), timeout=30.0
         )
 
-    async def retain(self, assignment: Mapping[str, Any], call: Call) -> str | None:
+    async def retain(
+        self, assignment: Mapping[str, Any], call: Call, invocation_id: uuid.UUID
+    ) -> str | None:
         if self.keeping is not None:
             self.at_keeping.set()
             await self.keeping.wait()
