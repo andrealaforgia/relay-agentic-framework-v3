@@ -9,6 +9,7 @@ commit from this mirror by its recorded hash, never by resolving a name again.
 
 from __future__ import annotations
 
+import tempfile
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -136,6 +137,37 @@ class Mirror:
             raise CheckoutFailed("the checked-out revision is not the pinned commit")
         await leave_only_the_tracked_files(into)
         return into
+
+    async def retain(self, workspace: Path, base: str, ref: str) -> str:
+        """Keep what is in a workspace as a commit on top of `base`, under `ref`, and pin
+        it. The supervisor makes this commit: whoever worked in the workspace was given
+        no Git metadata and is trusted with none. A workspace that has grown some is
+        refused, since it would be read as a repository of its own.
+
+        Everything in the workspace becomes the tree: what was added, changed and
+        removed since `base`. A link is kept as a link and never followed."""
+        _require_hash(base)
+        for found in workspace.rglob(".git"):
+            raise CheckoutFailed(
+                f"the workspace contains Git metadata at {found.relative_to(workspace)}"
+            )
+        if not await self.holds(base):
+            raise CheckoutFailed("the commit the workspace was made from is not held")
+        with tempfile.TemporaryDirectory(prefix="relay-retain-") as scratch:
+            clone = str(Path(scratch) / "clone")
+            await git("clone", "--quiet", "--no-checkout", "--", str(self._path), clone)
+            await git("-C", clone, "fetch", "--quiet", "origin", f"{_PINS}/{base}")
+            # The index starts empty, so the tree is exactly what is in the workspace:
+            # what the base had and the workspace lacks is not in it.
+            await git("-C", clone, f"--work-tree={workspace}", "add", "--all", "--", ".")
+            tree = await git("-C", clone, "write-tree")
+            commit = await git(
+                "-C", clone, "-c", "user.name=Relay", "-c", "user.email=relay@localhost",
+                "commit-tree", tree, "-p", base, "-m", "candidate built by a worker",
+            )  # fmt: skip
+            await self._git("fetch", "--quiet", "--no-tags", "--", clone, f"+{commit}:{ref}")
+        await self._git("update-ref", f"{_PINS}/{commit}", commit)
+        return commit
 
     async def publish(
         self, repository: str, commit: str, ref: str, timeout: float | None = None

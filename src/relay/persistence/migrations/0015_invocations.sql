@@ -103,3 +103,15 @@ CREATE TABLE boundary_passes (
     passed_at    timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 CREATE INDEX boundary_passes_by_digest ON boundary_passes (digest, passed_at DESC);
+
+-- The attempt number a call's candidate is published under. One sequence per behaviour
+-- across builds and remediations, allocated once per call: asked again, a call is given
+-- the number it has.
+CREATE TABLE build_attempts (
+    project_id    text NOT NULL,
+    behaviour_id  text NOT NULL,
+    attempt       integer NOT NULL,
+    invocation_id uuid NOT NULL UNIQUE REFERENCES invocations,
+    PRIMARY KEY (project_id, behaviour_id, attempt),
+    FOREIGN KEY (project_id, behaviour_id) REFERENCES behaviours
+);

@@ -15,11 +15,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from relay.application.behaviours import Behaviours
 from relay.application.invocations import Effect, EffectRun, Invocations, Prepared
 from relay.application.reviews import NewFinding, Review, Reviews
 from relay.application.worker import Call
 from relay.domain.review import Carried, Severity, SubmissionRefused
 from relay.domain.story import ActionRefused
+from relay.git.checkout import RemoteRejected, attempt_ref, resolve_ref
+from relay.git.mirror import Mirror
 from relay.persistence.database import Pool
 from relay.providers.confinement import confinement_for, effective_agent_sha256
 from relay.providers.definitions import DEFAULT_DEFINITIONS, find_definition
@@ -292,3 +295,266 @@ class Tasks:
     def effects_for(self, invocation: dict[str, Any]) -> Sequence[Effect]:
         effects: Sequence[Effect] = self.by_kind[invocation["kind"]].effects(invocation)
         return effects
+
+
+BUILD_REPLY = {
+    "type": "object",
+    "properties": {"note": {"type": "string"}},
+    "required": ["note"],
+    "additionalProperties": False,
+}
+
+
+class BuildTask:
+    """The Builder: it is handed the tree to start from, changes it until the behaviour's
+    acceptance contract would pass, and says what it did. It makes no commit, publishes
+    nothing and judges nothing. The supervisor keeps its workspace as a commit, publishes
+    that under a fresh attempt, and Relay itself observes whether it is green."""
+
+    def __init__(
+        self,
+        pool: Pool,
+        behaviours: Behaviours,
+        invocations: Invocations,
+        workspaces: Workspaces,
+        mirrors: Path,
+        definitions: Sequence[Path],
+        profile: Profile,
+        remote_timeout: float = 120.0,
+    ) -> None:
+        self._pool = pool
+        self._behaviours = behaviours
+        self._invocations = invocations
+        self._workspaces = workspaces
+        self._mirrors = mirrors
+        self._definitions = definitions
+        self._profile = profile
+        self._remote_timeout = remote_timeout
+        # The commit each workspace in use was exported from.
+        self._bases: dict[Path, str] = {}
+
+    def _mirror(self, project_id: str) -> Mirror:
+        return Mirror(self._mirrors / f"{project_id}.git")
+
+    async def prepare(
+        self, assignment: Mapping[str, Any], grant: uuid.UUID, last_problem: str | None
+    ) -> Call:
+        read_on = await self._invocations.as_it_stands(assignment["assignment_id"])
+        about = await self._about(assignment["assignment_id"])
+        base = str(about["command"]["base_revision"])
+        mirror = self._mirror(about["project_id"])
+        # The red's revision for a build, the candidate being repaired for a remediation:
+        # whichever the command recorded. It is on trunk or under one of the behaviour's
+        # own attempt refs.
+        if not await mirror.recover(
+            about["repository"],
+            base,
+            [f"refs/heads/{about['trunk']}", *about["attempt_refs"]],
+            timeout=self._remote_timeout,
+        ):
+            raise ActionRefused("the commit to build on can no longer be obtained")
+        workspace = self._workspaces.fresh()
+        workspace.parent.mkdir(parents=True)
+        await mirror.export(base, workspace)
+        self._bases[workspace] = base
+        definition = find_definition(DEFAULT_DEFINITIONS["builder"], self._definitions)
+        bounds = confinement_for("builder", workspace, withheld=[self._mirrors])
+        return Call(
+            Prepared(
+                provider="claude",
+                model=self._profile.model,
+                effort=self._profile.effort,
+                definition=definition,
+                effective_agent_sha256=effective_agent_sha256(definition, bounds.tools),
+                briefing=_build_briefing(about, last_problem),
+                schema=BUILD_REPLY,
+                read_on=read_on,
+            ),
+            workspace,
+            bounds,
+            self._profile.timeout,
+        )
+
+    def problem_with(self, reply: Any) -> str | None:
+        if not isinstance(reply, dict) or not isinstance(reply.get("note"), str):
+            return "the reply is a note saying what was done"
+        return None
+
+    async def retain(
+        self, assignment: Mapping[str, Any], call: Call, invocation_id: uuid.UUID
+    ) -> str | None:
+        """Keep the workspace as a commit on the base it was exported from, before the
+        reply is recorded as usable: a result with no tree behind it is no result."""
+        base = self._bases.pop(call.workdir)
+        return await self._mirror(str(assignment["project_id"])).retain(
+            call.workdir, base, f"refs/relay/invocations/{invocation_id}"
+        )
+
+    def effects(self, invocation: Mapping[str, Any]) -> list[Effect]:
+        return [Effect("publish", self._publish), Effect("green", self._green)]
+
+    async def _attempt(self, invocation: Mapping[str, Any]) -> int:
+        """The attempt number of this call's candidate: one more than the behaviour has
+        had, across builds and remediations, and the same however often it is asked."""
+        about = await self._about(invocation["assignment_id"])
+        async with self._pool.connection() as connection, connection.transaction():
+            await connection.execute(
+                "SELECT 1 FROM behaviours WHERE project_id = %s AND behaviour_id = %s FOR UPDATE",
+                (about["project_id"], about["behaviour_id"]),
+            )
+            row = await (
+                await connection.execute(
+                    "INSERT INTO build_attempts (project_id, behaviour_id, attempt, invocation_id) "
+                    "SELECT %s, %s, 1 + greatest("
+                    "coalesce((SELECT max(attempt) FROM build_attempts WHERE project_id = %s "
+                    "AND behaviour_id = %s), 0), "
+                    "coalesce((SELECT max(g.attempt) FROM green_runs g JOIN assignments a "
+                    "USING (assignment_id) WHERE a.project_id = %s AND a.behaviour_id = %s), 0)), "
+                    "%s ON CONFLICT (invocation_id) DO UPDATE SET attempt = build_attempts.attempt "
+                    "RETURNING attempt",
+                    (
+                        about["project_id"],
+                        about["behaviour_id"],
+                        about["project_id"],
+                        about["behaviour_id"],
+                        about["project_id"],
+                        about["behaviour_id"],
+                        invocation["invocation_id"],
+                    ),
+                )
+            ).fetchone()
+        assert row is not None
+        return int(row["attempt"])
+
+    async def _publish(self, run: EffectRun) -> Mapping[str, Any]:
+        """Publish the kept commit under this call's attempt ref, with the supervisor's
+        own access to the repository. An attempt ref already at that commit is done."""
+        about = await self._about(run.invocation["assignment_id"])
+        commit = str(run.invocation["retained"])
+        attempt = await self._attempt(run.invocation)
+        ref = attempt_ref(about["project_id"], about["behaviour_id"], attempt)
+        try:
+            there = await resolve_ref(about["repository"], ref, timeout=self._remote_timeout)
+            if there is None:
+                await self._mirror(about["project_id"]).publish(
+                    about["repository"], commit, ref, timeout=self._remote_timeout
+                )
+            elif there != commit:
+                raise ActionRefused(f"attempt {attempt} is already another candidate")
+        except RemoteRejected as rejected:
+            raise ActionRefused(f"the repository refused the candidate: {rejected}") from None
+        return {"attempt": attempt, "ref": ref, "commit": commit}
+
+    async def _green(self, run: EffectRun) -> Mapping[str, Any]:
+        """Have Relay observe the candidate. A candidate that is not green is a reply
+        that gave nothing: the next call is told what was observed."""
+        about = await self._about(run.invocation["assignment_id"])
+        attempt = await self._attempt(run.invocation)
+        async with self._pool.connection() as connection:
+            judged = await (
+                await connection.execute(
+                    "SELECT 1 FROM green_runs WHERE assignment_id = %s AND attempt = %s "
+                    "AND state = 'finished'",
+                    (run.invocation["assignment_id"], attempt),
+                )
+            ).fetchone()
+        if judged is not None:
+            return {"attempt": attempt, "green": "already judged"}
+        verdict = await self._behaviours.run_green(
+            about["project_id"], about["behaviour_id"], attempt, run.grant_id
+        )
+        if not verdict.is_valid:
+            raise ActionRefused(f"the candidate is not green: {verdict.reason}")
+        return {"attempt": attempt, "green": "accepted"}
+
+    async def _about(self, assignment_id: uuid.UUID) -> dict[str, Any]:
+        async with self._pool.connection() as connection:
+            row = await (
+                await connection.execute(
+                    "SELECT a.project_id, a.kind, b.behaviour_id, b.summary, b.contract, "
+                    "s.story_id, s.title, s.outcome, s.criteria, p.repository, p.trunk, "
+                    "o.envelope->'payload' AS command FROM assignments a "
+                    "JOIN behaviours b ON b.project_id = a.project_id "
+                    "AND b.behaviour_id = a.behaviour_id "
+                    "JOIN stories s ON s.project_id = b.project_id AND s.story_id = b.story_id "
+                    "JOIN projects p ON p.project_id = a.project_id "
+                    "JOIN outbox o ON o.message_id = a.command_message_id "
+                    "WHERE a.assignment_id = %s",
+                    (assignment_id,),
+                )
+            ).fetchone()
+            if row is None:
+                raise ActionRefused("there is no build behind this work")
+            attempts = await (
+                await connection.execute(
+                    "SELECT attempt FROM build_attempts WHERE project_id = %s AND behaviour_id = %s",
+                    (row["project_id"], row["behaviour_id"]),
+                )
+            ).fetchall()
+            row["attempt_refs"] = [
+                attempt_ref(row["project_id"], row["behaviour_id"], each["attempt"])
+                for each in attempts
+            ]
+            row["findings"] = await (
+                await connection.execute(
+                    "SELECT finding_id, role, severity, claim, evidence, remediation FROM findings "
+                    "WHERE project_id = %s AND behaviour_id = %s AND finding_id = ANY(%s) "
+                    "ORDER BY finding_id",
+                    (
+                        row["project_id"],
+                        row["behaviour_id"],
+                        list(row["command"].get("remediate_findings", [])),
+                    ),
+                )
+            ).fetchall()
+        return row
+
+
+def _build_briefing(about: Mapping[str, Any], last_problem: str | None) -> str:
+    lines = [
+        (
+            "You are the Builder. Make the smallest change to the code in your working "
+            "directory that makes one behaviour pass its acceptance contract."
+        ),
+        "",
+        f"Behaviour {about['behaviour_id']}: {about['summary']}",
+        f"of story {about['story_id']}, {about['title']}: {about['outcome']}",
+        "Acceptance criteria of the story:",
+        *(f"  {name}: {text}" for name, text in sorted(about["criteria"].items())),
+        "",
+        (
+            "The acceptance contract. Relay launches exactly this, in a container, on what you "
+            "leave in your working directory, and compares what it observes with what is "
+            "expected. The contract is not yours to change: there is no file of it here."
+        ),
+        json.dumps(about["contract"], indent=2, sort_keys=True),
+        "",
+        (
+            "Work test-first inside your own change where that helps. You have a shell with no "
+            "network. Do not use Git: there is no repository here, and what you leave in this "
+            "directory is what is kept, the whole tree of it. Leave nothing behind that is "
+            "not part of the change."
+        ),
+        "",
+        "When you are done, reply with a short note of what you changed and why.",
+    ]
+    if about["kind"] == "remediate":
+        lines += ["", "This is a repair of a candidate that was sent back."]
+        if about["findings"]:
+            lines += [
+                "The findings to put right:",
+                *(
+                    f"  {each['finding_id']} ({each['role']}, severity "
+                    f"{Severity(each['severity']).name.lower()}): {each['claim']} "
+                    f"Evidence: {each['evidence']} Remedy: {each['remediation']}"
+                    for each in about["findings"]
+                ),
+            ]
+        if about["command"].get("failed_checks"):
+            lines += [
+                "Checks every candidate must pass, which this one did not: "
+                + ", ".join(about["command"]["failed_checks"])
+            ]
+    if last_problem:
+        lines += ["", f"Your last attempt could not be used: {last_problem}"]
+    return "\n".join(lines) + "\n"

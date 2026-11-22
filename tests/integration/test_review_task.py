@@ -197,6 +197,11 @@ async def test_a_reply_that_is_not_a_review_is_asked_for_again(reviewing: Review
     ]
     assert "could not be used" in provider.asked[1].briefing
     assert await reviewing.world.column("SELECT count(*) FROM findings") == [0]
+    # Turned away when it was recorded, before any of it was applied.
+    assert await reviewing.world.column(
+        "SELECT count(*) FROM invocation_effects e JOIN invocations v USING (invocation_id) "
+        "WHERE v.attempt = 1"
+    ) == [0]
 
 
 async def test_a_verdict_on_a_finding_that_is_not_the_reviewers_own_is_refused_by_the_service(
@@ -257,3 +262,34 @@ async def test_a_reviewers_workspace_is_one_the_bounds_hold_for(reviewing: Revie
     assert not workdir.is_relative_to(Path.home())
     assert uuid.UUID(workdir.parent.name)  # a directory of its own
     assert os.listdir(workdir.parent) == ["tree"]
+
+
+async def test_a_reviewer_is_asked_how_its_earlier_findings_stand_and_its_answer_is_recorded(
+    reviewing: Reviewing,
+) -> None:
+    """A second candidate after the first was sent back: the reviewer's own finding is in
+    its briefing, and what it says of it is what the gate goes by."""
+    world = reviewing.world
+    blocker = {**NO_USAGE_MESSAGE, "severity": "high", "claim": "the amount is passed to eval"}
+    await (
+        await reviewing.worker("qa", Reviewer({"findings": [blocker], "carried": []}))
+    ).carry_out(await reviewing.owed("qa"))
+    await (await reviewing.worker("sentinel", Reviewer(NOTHING_FOUND))).carry_out(
+        await reviewing.owed("sentinel")
+    )
+    [raised] = await world.column("SELECT finding_id FROM findings")
+    world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE + "# parsed\n"}, on=world.base)
+    assert (await run_green(world.behaviours, PROJECT, "B1", world.attempts["B1"])).is_valid
+    assert await world.reviews.publish_candidates() == 1
+    provider = Reviewer(
+        {"findings": [], "carried": [{"finding_id": raised, "verdict": "verified_fixed"}]}
+    )
+
+    assert await (await reviewing.worker("qa", provider)).carry_out(await reviewing.owed("qa")) == (
+        "applied"
+    )
+
+    briefing = provider.asked[0].briefing
+    assert str(raised) in briefing and "the amount is passed to eval" in briefing
+    assert "verified_fixed, still_present, or withdrawn" in briefing
+    assert await world.column("SELECT finding_id FROM finding_verifications") == [raised]
