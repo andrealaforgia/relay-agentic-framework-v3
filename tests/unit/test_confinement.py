@@ -124,20 +124,27 @@ def test_the_definition_as_handed_over_is_hashed_with_the_tools_it_was_given() -
 
 
 def test_what_a_pass_is_a_pass_of_does_not_depend_on_which_workspace_it_was() -> None:
-    """S3-19.7: bound to the role's bounds and the runtime, not to one directory."""
+    """S3-19.7: bound to the bounds and the runtime, not to one directory."""
     one = confinement_for("builder", ROOT / "inv-1" / "tree")
-    other = confinement_for("builder", ROOT / "inv-2" / "tree")
+    other = confinement_for("builder", ROOT / "inv-2" / "another-tree")
     runtime = {"cli": "2.1.330", "os": "Darwin 25.5.0"}
 
-    assert boundary_digest("builder", one, runtime) == boundary_digest("builder", other, runtime)
-    assert boundary_digest("builder", one, runtime) != boundary_digest(
-        "builder", one, {**runtime, "cli": "2.1.331"}
-    )
-    assert boundary_digest("builder", one, runtime) != boundary_digest(
-        "qa", confinement_for("qa", ROOT / "inv-1" / "tree"), runtime
+    assert boundary_digest(one, runtime) == boundary_digest(other, runtime)
+    assert boundary_digest(one, runtime) != boundary_digest(one, {**runtime, "cli": "2.1.331"})
+    assert boundary_digest(one, runtime) != boundary_digest(
+        confinement_for("qa", ROOT / "inv-1" / "tree"), runtime
     )
     withheld = confinement_for("builder", ROOT / "inv-1" / "tree", withheld=[Path("/srv/x")])
-    assert boundary_digest("builder", one, runtime) != boundary_digest("builder", withheld, runtime)
+    assert boundary_digest(one, runtime) != boundary_digest(withheld, runtime)
+
+
+def test_roles_with_the_same_bounds_are_within_the_same_boundary() -> None:
+    """It is the bounds that were seen to hold, whoever is in them."""
+    runtime = {"cli": "2.1.330"}
+
+    assert boundary_digest(confinement_for("qa", ROOT / "a" / "tree"), runtime) == boundary_digest(
+        confinement_for("analyst", ROOT / "b" / "tree"), runtime
+    )
 
 
 def test_every_role_with_a_definition_has_bounds() -> None:

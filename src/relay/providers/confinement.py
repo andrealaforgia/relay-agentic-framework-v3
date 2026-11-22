@@ -116,17 +116,17 @@ def effective_agent_sha256(definition: AgentDefinition, tools: Sequence[str]) ->
     return hashlib.sha256(json.dumps(handed_over, sort_keys=True).encode()).hexdigest()
 
 
-def boundary_digest(role: str, bounds: Confinement, runtime: Mapping[str, str]) -> str:
-    """What a confinement pass is a pass of: the role, its tools and settings with the
-    workspace's own path taken out, and the runtime they were tried on. A change to any
-    of these is another boundary, with no pass."""
+def boundary_digest(bounds: Confinement, runtime: Mapping[str, str]) -> str:
+    """What a confinement pass is a pass of: the tools and settings with the workspace's
+    own path taken out, and the runtime they were tried on. A change to any of these is
+    another boundary, with no pass. Two roles with the same bounds have the same
+    boundary: it is the bounds that were seen to hold, not the name of who is in them."""
     settings = json.dumps(dict(bounds.settings), sort_keys=True)
     filesystem = dict(bounds.settings).get("sandbox", {}).get("filesystem", {})
     for workspace in filesystem.get("allowRead", []):
         settings = settings.replace(json.dumps(workspace)[1:-1], "<workspace>")
         settings = settings.replace(json.dumps(str(Path(workspace).parent))[1:-1], "<root>")
     bound = {
-        "role": role,
         "tools": list(bounds.tools),
         "settings": settings,
         "runtime": dict(sorted(runtime.items())),

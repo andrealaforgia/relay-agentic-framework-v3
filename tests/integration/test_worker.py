@@ -26,12 +26,28 @@ from relay.providers.claude import (
     ProviderUnavailable,
     Request,
 )
+from relay.providers.confinement import boundary_digest
 from tests.integration.decision_world import DecisionWorld
 from tests.integration.story_world import STANDARD_RATE
 from tests.integration.test_invocations import KEPT, NOT_STARTED, PREPARED, UNCERTAIN, said
 from tests.integration.trunk_world import PROJECT
 
 RECORDED = Path(__file__).parent.parent / "fixtures" / "claude"
+
+
+RUNTIME = {"cli": "9.9.9 (stub)", "os": "test"}
+
+
+class SeenToHold:
+    """Stands in for the record of boundary passes: every boundary holds, until told not."""
+
+    def __init__(self) -> None:
+        self.holding = True
+        self.asked: list[str] = []
+
+    async def holds(self, digest: str) -> bool:
+        self.asked.append(digest)
+        return self.holding
 
 
 class Scripted:
@@ -112,6 +128,7 @@ class Bench:
         self.invocations = Invocations(world.database, self._effects)
         self.task = Summing(tmp_path, self.invocations)
         self.session: WorkerSession | None = None
+        self.boundaries = SeenToHold()
 
     def _effects(self, invocation: dict[str, Any]) -> list[Effect]:
         async def use(run: EffectRun) -> None:
@@ -124,7 +141,13 @@ class Bench:
     async def worker(self, provider: Any) -> Worker:
         self.session = self.session or await WorkerSession.start(self.world.database, "builder")
         return Worker(
-            self.session, self.world.claims, self.invocations, provider, {"build": self.task}
+            self.session,
+            self.world.claims,
+            self.invocations,
+            provider,
+            {"build": self.task},
+            self.boundaries,
+            RUNTIME,
         )
 
     async def owed(self) -> dict[str, Any]:
@@ -551,3 +574,21 @@ async def test_a_call_cut_short_before_anything_was_launched_cost_nothing(bench:
     assert await bench.world.column("SELECT state FROM assignments WHERE kind = 'build'") == [
         "wanted"
     ]
+
+
+async def test_no_call_is_made_within_bounds_that_have_not_been_shown_to_hold(
+    bench: Bench,
+) -> None:
+    """S3-18.6 and S3-19.7."""
+    provider = Scripted(said())
+    worker = await bench.worker(provider)
+    bench.boundaries.holding = False
+
+    left = await worker.carry_out(await bench.owed())
+
+    assert left == "refused: the bounds of this run have not been shown to hold on this host"
+    assert provider.asked == []
+    assert await bench.states() == []
+    assert bench.boundaries.asked == [
+        boundary_digest(Confinement((), {}), RUNTIME)
+    ]  # asked about exactly the bounds the call would have had

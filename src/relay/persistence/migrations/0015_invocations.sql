@@ -90,3 +90,16 @@ CREATE TABLE invocation_effects (
 );
 
 ALTER TABLE inbox_items ADD COLUMN invocation_id uuid REFERENCES invocations;
+
+-- A boundary around a model's process that was shown to hold: a role's tools and
+-- settings, on one runtime, tried against the real CLI. A run with tools is made only
+-- under a boundary with a recent pass.
+CREATE TABLE boundary_passes (
+    pass_id      uuid PRIMARY KEY,
+    digest       text NOT NULL,
+    role         text NOT NULL,
+    runtime      jsonb NOT NULL,
+    observations jsonb NOT NULL,
+    passed_at    timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX boundary_passes_by_digest ON boundary_passes (digest, passed_at DESC);

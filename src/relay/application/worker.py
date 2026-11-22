@@ -27,6 +27,7 @@ from relay.providers.claude import (
     ProviderUnavailable,
     Request,
 )
+from relay.providers.confinement import boundary_digest
 
 # How often a call is prepared again because what it was prepared from moved.
 _PREPARATIONS = 3
@@ -75,6 +76,12 @@ class Provider(Protocol):
         ...
 
 
+class Shown(Protocol):
+    async def holds(self, digest: str) -> bool:
+        """Whether this boundary has been shown to hold on this host, recently."""
+        ...
+
+
 class Worker:
     def __init__(
         self,
@@ -83,12 +90,17 @@ class Worker:
         invocations: Invocations,
         provider: Provider,
         tasks: Mapping[str, Task],
+        boundaries: Shown,
+        runtime: Mapping[str, str],
     ) -> None:
         self._session = session
         self._claims = claims
         self._invocations = invocations
         self._provider = provider
         self._tasks = tasks
+        self._boundaries = boundaries
+        # What the provider's CLI and this host are, as a pass of a boundary names them.
+        self._runtime = runtime
         self._recording: set[asyncio.Task[str]] = set()
 
     async def carry_out(self, assignment: Mapping[str, Any]) -> str:
@@ -106,6 +118,12 @@ class Worker:
         stale = 0
         while True:
             call = await task.prepare(assignment, problem)
+            boundary = boundary_digest(call.confinement, self._runtime)
+            if not await self._boundaries.holds(boundary):
+                # No call is made within bounds nobody has seen hold here: not on a new
+                # version of the CLI, not under changed settings, not after a pass has
+                # gone stale.
+                return "refused: the bounds of this run have not been shown to hold on this host"
             admission = await self._invocations.admit(
                 self._session, assignment_id, grant, call.prepared
             )
