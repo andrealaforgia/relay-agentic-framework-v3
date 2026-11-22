@@ -327,6 +327,15 @@ class Assignments:
     def __init__(self, pool: Pool) -> None:
         self._pool = pool
 
+    async def of(self, assignment_id: uuid.UUID) -> dict[str, Any] | None:
+        """The work a command announces, as it stands now; None if there is none."""
+        async with self._pool.connection() as connection:
+            return await (
+                await connection.execute(
+                    "SELECT * FROM assignments WHERE assignment_id = %s", (assignment_id,)
+                )
+            ).fetchone()
+
     async def claim(
         self, principal: Principal, assignment_id: uuid.UUID, worker: uuid.UUID | None = None
     ) -> uuid.UUID:

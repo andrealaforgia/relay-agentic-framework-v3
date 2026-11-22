@@ -28,6 +28,7 @@ from relay.providers.claude import (
     Request,
 )
 from relay.providers.confinement import boundary_digest
+from relay.transport.streams import Streams
 
 # How often a call is prepared again because what it was prepared from moved.
 _PREPARATIONS = 3
@@ -107,6 +108,41 @@ class Worker:
         # What the provider's CLI and this host are, as a pass of a boundary names them.
         self._runtime = runtime
         self._recording: set[asyncio.Task[str]] = set()
+
+    async def serve_once(
+        self, streams: Streams, project_id: str, *, abandoned_after_ms: int = 300_000
+    ) -> list[str]:
+        """Read this role's commands for a project and carry out what they announce.
+        Returns where each was left.
+
+        The stream is only the announcement. What is owed is in PostgreSQL, and the pass
+        announces again whatever is still wanted. So a command is acknowledged once this
+        worker has dealt with it, whatever came of it; one whose worker failed part-way
+        stays unacknowledged, and is taken over by whichever worker reads next after it
+        has lain long enough."""
+        stream = f"relay:{project_id}:cmd:{self._session.role}"
+        group, consumer = self._session.role, str(self._session.worker_id)
+        deliveries = [
+            *await streams.claim_abandoned(
+                stream, group=group, consumer=consumer, idle_for_ms=abandoned_after_ms
+            ),
+            *await streams.read(stream, group=group, consumer=consumer),
+        ]
+        left = []
+        for delivery in deliveries:
+            left.append(await self._serve(delivery.envelope))
+            await streams.acknowledge(stream, group, delivery)
+        return left
+
+    async def _serve(self, command: Mapping[str, Any]) -> str:
+        try:
+            assignment_id = uuid.UUID(str(command.get("payload", {}).get("assignment_id")))
+        except ValueError:
+            return "not a command for work"
+        assignment = await self._claims.of(assignment_id)
+        if assignment is None or assignment["kind"] not in self._tasks:
+            return "not work this worker does"
+        return await self.carry_out(assignment)
 
     async def carry_out(self, assignment: Mapping[str, Any]) -> str:
         """Do what can be done for this work now, and say where that left it: `applied`,
