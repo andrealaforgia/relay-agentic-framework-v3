@@ -25,6 +25,7 @@ from relay.persistence.outbox import OutboxPublisher
 from relay.transport.streams import Streams
 from tests.integration.fixtures import (
     ANALYST,
+    BUILDER,
     CONTRACT,
     PRODUCT_OWNER,
     VAT_APPLIES_STANDARD_RATE,
@@ -578,7 +579,7 @@ async def test_a_finding_cannot_change_behind_the_review_a_person_is_looking_at(
     minor = await blocker_fixed_on_a_second_candidate(world)
 
     with pytest.raises(ActionRefused, match="awaiting approval"):
-        await world.reviews.dispute(PROJECT, minor, "it is fine as it is")
+        await world.reviews.dispute(BUILDER, PROJECT, minor, "it is fine as it is")
 
     assert await world.column("SELECT status FROM findings WHERE severity = 1") == ["open"]
     assert (await world.decide(await world.gate())).disposition == "effective"

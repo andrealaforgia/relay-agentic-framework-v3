@@ -24,7 +24,7 @@ from relay.providers.claude import Outcome, ProviderResult
 from relay.providers.definitions import AgentDefinition
 from relay.providers.stream import Terminal, read_stream
 from tests.integration.decision_world import DecisionWorld
-from tests.integration.fixtures import PRODUCT_OWNER
+from tests.integration.fixtures import PRODUCT_OWNER, VERIFIER
 from tests.integration.story_world import STANDARD_RATE
 from tests.integration.trunk_world import PROJECT
 
@@ -749,7 +749,7 @@ async def test_a_build_that_was_reopened_admits_no_call(calling: Calling) -> Non
     worker = await calling.worker()
     assignment, grant = await calling.claimed(worker)
 
-    await calling.world.behaviours.reopen_red(PROJECT, "B1", "the contract was wrong")
+    await calling.world.behaviours.reopen_red(VERIFIER, PROJECT, "B1", "the contract was wrong")
 
     assert (
         await calling.invocations.admit(worker, assignment, grant, await calling.prepared())
@@ -854,7 +854,7 @@ async def test_a_known_result_for_a_build_that_was_reopened_is_never_applied(
     invocation = await calling.admitted(worker)
     await calling.invocations.record(invocation, said(), retained=KEPT)
 
-    await calling.world.behaviours.reopen_red(PROJECT, "B1", "the contract was wrong")
+    await calling.world.behaviours.reopen_red(VERIFIER, PROJECT, "B1", "the contract was wrong")
 
     assert await calling.invocations.apply(invocation, worker) == "overtaken"
     assert calling.applying.ran == []
@@ -1118,7 +1118,7 @@ async def test_a_call_in_flight_for_work_that_was_ended_is_settled_without_askin
     """3B-S1-1.8: the build is reopened, then its worker is lost."""
     worker = await calling.worker()
     await calling.admitted(worker)
-    await calling.world.behaviours.reopen_red(PROJECT, "B1", "the contract was wrong")
+    await calling.world.behaviours.reopen_red(VERIFIER, PROJECT, "B1", "the contract was wrong")
     await worker.stop()
 
     await calling.invocations.recover(PROJECT)
@@ -1134,7 +1134,7 @@ async def test_what_is_learned_of_a_call_for_ended_work_is_kept_and_asks_nothing
     """3B-S1-1.8, the other order."""
     worker = await calling.worker()
     lost = await calling.admitted(worker)
-    await calling.world.behaviours.reopen_red(PROJECT, "B1", "the contract was wrong")
+    await calling.world.behaviours.reopen_red(VERIFIER, PROJECT, "B1", "the contract was wrong")
 
     assert await calling.invocations.record(lost, UNCERTAIN) == "uncertain"
     assert await calling.invocations.parked(PROJECT) == []
@@ -1349,7 +1349,7 @@ async def test_ending_the_work_takes_its_parked_call_out_of_the_inbox(calling: C
     await calling.invocations.record(invocation, UNCERTAIN)
     assert len(await calling.invocations.parked(PROJECT)) == 1
 
-    await calling.world.behaviours.reopen_red(PROJECT, "B1", "the contract was wrong")
+    await calling.world.behaviours.reopen_red(VERIFIER, PROJECT, "B1", "the contract was wrong")
 
     assert await calling.invocations.parked(PROJECT) == []
     assert (await calling.invocations.decide(calling.person(invocation, "retry"))).disposition == (
@@ -1436,7 +1436,7 @@ async def test_a_refusal_that_comes_after_the_work_was_ended_blames_no_reply(
     applying = asyncio.create_task(calling.invocations.apply(third.invocation_id, worker))
     await calling.applying.reached.wait()
 
-    await calling.world.behaviours.reopen_red(PROJECT, "B1", "the contract was wrong")
+    await calling.world.behaviours.reopen_red(VERIFIER, PROJECT, "B1", "the contract was wrong")
     calling.applying.waiting["first"].set()
 
     assert await applying == "overtaken"

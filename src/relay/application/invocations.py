@@ -19,7 +19,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
@@ -57,6 +57,12 @@ ON_A_PARKED_CALL = {"retry": frozenset[str](), "set_aside": frozenset[str]()}
 _UNCERTAIN = "a paid call may have completed and its result was not received"
 
 
+class Overtaken(Exception):
+    """Raised by an effect that finds its result can no longer be applied through no
+    fault of the reply: the review it was of is closed, or the evidence it was written
+    from is no longer the grant's. The invocation is overtaken, and blamed for nothing."""
+
+
 @dataclass(frozen=True)
 class Prepared:
     """Everything about a call that is decided before it is admitted."""
@@ -72,6 +78,8 @@ class Prepared:
     # The revisions and decision basis the briefing was written from, as
     # `Invocations.as_it_stands` gave them when preparation began.
     read_on: Mapping[str, Any]
+    # What the model was handed besides the briefing, recorded with the call.
+    evidence: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -198,9 +206,9 @@ class Invocations:
                 "INSERT INTO invocations (invocation_id, assignment_id, project_id, grant_id, "
                 "attempt, worker_id, role, provider, model, effort, agent_name, agent_path, "
                 "agent_sha256, agent_revision, agent_dirty, effective_agent_sha256, briefing, "
-                "briefing_sha256, schema_sha256, admitted_on, expects) VALUES "
+                "briefing_sha256, schema_sha256, admitted_on, expects, schema, evidence) VALUES "
                 "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "%s)",
+                "%s, %s, %s)",
                 (
                     invocation_id,
                     assignment_id,
@@ -223,6 +231,8 @@ class Invocations:
                     _digest(prepared.schema),
                     Jsonb(admitted_on),
                     Jsonb(stands),
+                    Jsonb(dict(prepared.schema)),
+                    Jsonb(dict(prepared.evidence)),
                 ),
             )
             # The paid call is the grant's first effect: a pause from here on leaves the
@@ -408,6 +418,11 @@ class Invocations:
                 try:
                     detail = await effect.perform(run)
                     marked = await self._mark(invocation_id, effect, run, detail)
+                except Overtaken as overtaken:
+                    settled = True
+                    return await self._reject(
+                        invocation_id, effect.name, taken, str(overtaken), blameless=True
+                    )
                 except ActionRefused as refused:
                     # By the service, in `perform`, or in `settle`, whose transaction
                     # has been rolled back by now.
@@ -609,7 +624,15 @@ class Invocations:
                 )
             return "done"
 
-    async def _reject(self, invocation_id: uuid.UUID, name: str, attempt: int, reason: str) -> str:
+    async def _reject(
+        self,
+        invocation_id: uuid.UUID,
+        name: str,
+        attempt: int,
+        reason: str,
+        *,
+        blameless: bool = False,
+    ) -> str:
         """What the model said was refused by the service it was for. A known call, and
         an attempt: another may be admitted, up to the limit. Only the current try of
         the effect may say this: a try that was taken over says nothing."""
@@ -628,7 +651,9 @@ class Invocations:
             ).fetchone()
             if current is None:
                 return "superseded"
-            ended = await _ended_for_good(connection, assignment, invocation)
+            ended = (
+                reason if blameless else await _ended_for_good(connection, assignment, invocation)
+            )
             if ended:
                 # The work ended or changed while the effect ran. Whatever the service
                 # then refused, the reply was not at fault: nobody is asked about it.
@@ -728,6 +753,32 @@ class Invocations:
             await record_receipt(connection, action, receipt)
             return receipt
 
+    @staticmethod
+    async def is_current_try(
+        connection: Connection, invocation_id: uuid.UUID, name: str, attempt: int
+    ) -> bool:
+        """Whether this try of an effect is still the one that may decide. Asked inside
+        a transaction that is about to accept what the try did."""
+        row = await (
+            await connection.execute(
+                "SELECT 1 FROM invocation_effects e JOIN invocations v USING (invocation_id) "
+                "WHERE e.invocation_id = %s AND e.name = %s AND e.state = 'started' "
+                "AND e.try = %s AND v.state = 'returned'",
+                (invocation_id, name, attempt),
+            )
+        ).fetchone()
+        return row is not None
+
+    async def last_problem(self, assignment_id: uuid.UUID) -> str | None:
+        """Why the last call for this work gave nothing usable, if that is how it ended:
+        whoever takes the work up next briefs the model with it, whoever made that call."""
+        async with self._pool.connection() as connection:
+            latest = await _latest(connection, assignment_id)
+        if latest is None or latest["state"] not in ("rejected", "errored"):
+            return None
+        reason: str | None = latest["reason"]
+        return reason
+
     async def reason_of(self, invocation_id: uuid.UUID) -> str | None:
         """Why a call gave nothing usable, for the briefing of the next."""
         async with self._pool.connection() as connection:
@@ -796,6 +847,23 @@ class Invocations:
                     call["invocation_id"],
                     call["attempt"],
                 )
+        async with self._pool.connection() as connection:
+            known = await (
+                await connection.execute(
+                    "SELECT invocation_id FROM invocations WHERE project_id = %s "
+                    "AND state = 'returned' ORDER BY started_at",
+                    (project_id,),
+                )
+            ).fetchall()
+        if known and self._effects_for is not None:
+            async with self._starting:
+                # One session for this object's recoveries, however many passes ask at once.
+                if self._session is None:
+                    self._session = await WorkerSession.start(self._pool, "control-plane")
+            for each in known:
+                await self.apply(each["invocation_id"], self._session)
+        # Last, so that a grant whose known result was just found unusable is taken back
+        # in this same pass, and not left for the next one.
         for each in granted:
             async with self._pool.connection() as connection, connection.transaction():
                 assignment = await _locked_assignment(connection, each["assignment_id"])
@@ -822,21 +890,6 @@ class Invocations:
                 ).fetchone()
                 if own is None or own["state"] in ("errored", "rejected", "not_started"):
                     await _release(connection, assignment)
-        async with self._pool.connection() as connection:
-            known = await (
-                await connection.execute(
-                    "SELECT invocation_id FROM invocations WHERE project_id = %s "
-                    "AND state = 'returned' ORDER BY started_at",
-                    (project_id,),
-                )
-            ).fetchall()
-        if known and self._effects_for is not None:
-            async with self._starting:
-                # One session for this object's recoveries, however many passes ask at once.
-                if self._session is None:
-                    self._session = await WorkerSession.start(self._pool, "control-plane")
-            for each in known:
-                await self.apply(each["invocation_id"], self._session)
 
     async def close(self) -> None:
         if self._session is not None:

@@ -28,6 +28,7 @@ from tests.integration.fixtures import (
     CONTRACT,
     PRODUCT_OWNER,
     VAT_APPLIES_STANDARD_RATE,
+    VERIFIER,
     HeldAtABarrier,
     held_at_the_barrier,
     run_green,
@@ -101,7 +102,7 @@ async def test_a_build_whose_red_was_reopened_can_no_longer_be_claimed(world: St
     await world.awaiting_builder("B1")
     build = await the_build(world)
 
-    await world.behaviours.reopen_red(PROJECT, "B1", "the runner was upgraded")
+    await world.behaviours.reopen_red(VERIFIER, PROJECT, "B1", "the runner was upgraded")
 
     assert await assignments(world) == ["build:retired"]
     with pytest.raises(ActionRefused, match="no longer wanted"):

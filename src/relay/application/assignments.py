@@ -327,6 +327,35 @@ class Assignments:
     def __init__(self, pool: Pool) -> None:
         self._pool = pool
 
+    async def give_back(self, assignment_id: uuid.UUID, grant_id: uuid.UUID) -> None:
+        """A worker that will not, after all, do anything under its grant hands it back:
+        the work is wanted again and is announced again. Only a grant under which no
+        call was admitted can be handed back; one with a call to its name is dealt with
+        by what that call left."""
+        async with self._pool.connection() as connection, connection.transaction():
+            known = await (
+                await connection.execute(
+                    "SELECT project_id FROM assignments WHERE assignment_id = %s",
+                    (assignment_id,),
+                )
+            ).fetchone()
+            if known is None:
+                return
+            await lock_gate(connection, known["project_id"])
+            await _revoke(
+                connection,
+                known["project_id"],
+                "assignment_id = %s AND grant_id = %s AND NOT EXISTS (SELECT 1 FROM invocations v "
+                "WHERE v.assignment_id = assignments.assignment_id AND v.grant_id = %s)",
+                (assignment_id, grant_id, grant_id),
+            )
+            await connection.execute(
+                "UPDATE outbox SET published_at = NULL WHERE message_id = "
+                "(SELECT command_message_id FROM assignments WHERE assignment_id = %s "
+                "AND state = 'wanted' AND parked IS NULL)",
+                (assignment_id,),
+            )
+
     async def of(self, assignment_id: uuid.UUID) -> dict[str, Any] | None:
         """The work a command announces, as it stands now; None if there is none."""
         async with self._pool.connection() as connection:

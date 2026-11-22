@@ -50,7 +50,7 @@ from relay.domain.review import (
     judge_gate,
     require_authority_over,
 )
-from relay.domain.story import ActionRefused
+from relay.domain.story import ActionRefused, Principal, PrincipalKind
 from relay.git.checkout import (
     CheckoutFailed,
     RemoteRejected,
@@ -570,9 +570,13 @@ class Reviews:
                 raise SubmissionRefused("no tree was prepared for this review under this grant")
             return await self._accept(connection, task, review)
 
-    async def dispute(self, project_id: str, finding_id: str, evidence: str) -> None:
+    async def dispute(
+        self, principal: Principal, project_id: str, finding_id: str, evidence: str
+    ) -> None:
         """The Builder disagrees, with evidence. The finding stays blocking: only the role
         that raised it can settle it."""
+        if principal.kind is not PrincipalKind.WORKER or principal.role != "builder":
+            raise ActionRefused("disputing a finding is for the builder to do")
         if not evidence.strip():
             raise SubmissionRefused("a dispute needs evidence")
         async with self._pool.connection() as connection, connection.transaction():

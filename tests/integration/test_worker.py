@@ -35,7 +35,7 @@ from tests.integration.trunk_world import PROJECT
 RECORDED = Path(__file__).parent.parent / "fixtures" / "claude"
 
 
-RUNTIME = {"cli": "9.9.9 (stub)", "os": "test"}
+RUNTIME = {"cli": "9.9.9 (stub)", "os": "test", "remote_policy": "none, says the operator"}
 
 
 class SeenToHold:
@@ -91,6 +91,8 @@ class Summing:
         self.problems: list[str | None] = []
         # Set to make the next preparation read what the work is about too early.
         self.reads_too_early = False
+        self.schema: dict[str, Any] = {"type": "object"}
+        self.check_faults = False
         self.cannot_keep: Exception | None = None
         self.keeping: asyncio.Event | None = None
         self.at_keeping = asyncio.Event()
@@ -107,7 +109,10 @@ class Summing:
             self.reads_too_early = False
             read_on = {**read_on, "basis": read_on["basis"] - 1}
         return Call(
-            replace(PREPARED, read_on=read_on), self._workdir, Confinement((), {}), timeout=30.0
+            replace(PREPARED, read_on=read_on, schema=self.schema),
+            self._workdir,
+            Confinement((), {}),
+            timeout=30.0,
         )
 
     async def retain(
@@ -121,6 +126,8 @@ class Summing:
         return KEPT
 
     def problem_with(self, reply: Any) -> str | None:
+        if self.check_faults:
+            raise RuntimeError("the check is broken")
         return None if isinstance(reply.get("sum"), int) else "the reply has no sum"
 
 
@@ -133,6 +140,10 @@ class Bench:
         self.task = Summing(tmp_path, self.invocations)
         self.session: WorkerSession | None = None
         self.boundaries = SeenToHold()
+        self.stated: dict[str, str] = dict(RUNTIME)
+
+    def runtime(self) -> dict[str, str]:
+        return self.stated
 
     def _effects(self, invocation: dict[str, Any]) -> list[Effect]:
         async def use(run: EffectRun) -> None:
@@ -151,7 +162,7 @@ class Bench:
             provider,
             {"build": self.task},
             self.boundaries,
-            RUNTIME,
+            self.runtime,
         )
 
     async def owed(self) -> dict[str, Any]:
@@ -542,12 +553,11 @@ async def test_a_worker_that_lost_its_connection_while_preparing_makes_no_call(
 
 
 async def test_a_reply_the_check_itself_cannot_cope_with_is_still_recorded(bench: Bench) -> None:
-    """3B-S1-3.3: a list where an object was asked for. The check faults; the call and
-    what it used are on record all the same, as a reply that gave nothing."""
-    odd = said()
-    assert odd.terminal is not None
-    odd.terminal.envelope["structured_output"] = []
-    worker = await bench.worker(Scripted(odd, UNCERTAIN))
+    """3B-S1-3.3: the task's own check of the reply raises. The call and what it used are
+    on record all the same, as a reply that gave nothing, and the reason says it was the
+    check that failed."""
+    bench.task.check_faults = True
+    worker = await bench.worker(Scripted(said(), UNCERTAIN))
 
     await worker.carry_out(await bench.owed())
 
@@ -557,7 +567,7 @@ async def test_a_reply_the_check_itself_cannot_cope_with_is_still_recorded(bench
         ).fetchone()
     assert row is not None
     assert row["state"] == "rejected"
-    assert row["reason"].startswith("the reply could not be checked: AttributeError")
+    assert row["reason"].startswith("the reply could not be checked: RuntimeError")
     assert row["envelope"]["subtype"] == "success" and row["provider_cost_usd"] is not None
 
 
@@ -596,3 +606,78 @@ async def test_no_call_is_made_within_bounds_that_have_not_been_shown_to_hold(
     assert bench.boundaries.asked == [
         boundary_digest(Confinement((), {}), RUNTIME)
     ]  # asked about exactly the bounds the call would have had
+
+
+async def test_no_call_is_made_until_someone_has_stated_the_policy_this_host_is_given(
+    bench: Bench,
+) -> None:
+    """3B-S2-1.1: asked at the launch, not when the worker started."""
+    provider = Scripted(said())
+    worker = await bench.worker(provider)
+    del bench.stated["remote_policy"]
+
+    left = await worker.carry_out(await bench.owed())
+
+    assert left == "refused: nobody has stated what policy this host is given from elsewhere"
+    assert provider.asked == [] and bench.boundaries.asked == []
+
+
+async def test_a_runtime_that_changed_since_the_worker_started_is_asked_about_as_it_is_now(
+    bench: Bench,
+) -> None:
+    """3B-S2-1.1: a policy file that changed is another boundary, with no pass."""
+    worker = await bench.worker(Scripted(said(), said()))
+    owed = await bench.owed()
+    await worker.carry_out(owed)
+    bench.stated["local_policy"] = "a digest that was not there before"
+
+    await worker.carry_out(owed)
+
+    first, second = bench.boundaries.asked
+    assert first != second
+
+
+async def test_work_refused_before_any_call_is_handed_back_to_be_taken_up_later(
+    bench: Bench,
+) -> None:
+    """3B-S2-1.6: the bounds had no pass. The grant is given back, so that when they have
+    one the work is announced and claimed again, with the same worker still alive."""
+    provider = Scripted(said())
+    worker = await bench.worker(provider)
+    bench.boundaries.holding = False
+    owed = await bench.owed()
+
+    await worker.carry_out(owed)
+
+    assert await bench.world.column(
+        "SELECT state || ':' || (grant_id IS NULL)::text FROM assignments WHERE kind = 'build'"
+    ) == ["wanted:true"]
+    assert await bench.world.column(
+        "SELECT published_at IS NULL FROM outbox o JOIN assignments a "
+        "ON a.command_message_id = o.message_id WHERE a.kind = 'build'"
+    ) == [True]  # to be announced again
+    bench.boundaries.holding = True
+    assert await worker.carry_out(owed) == "applied"
+
+
+async def test_a_reply_that_does_not_satisfy_its_recorded_schema_is_not_handed_to_the_task(
+    bench: Bench,
+) -> None:
+    """3B-S2-1.11."""
+    strict = {
+        "type": "object",
+        "properties": {"sum": {"type": "integer"}},
+        "required": ["sum"],
+        "additionalProperties": False,
+    }
+    bench.task.schema = strict
+    wrong = said()
+    assert wrong.terminal is not None
+    wrong.terminal.envelope["structured_output"] = {"sum": "five", "also": 1}
+    worker = await bench.worker(Scripted(wrong, said()))
+
+    assert await worker.carry_out(await bench.owed()) == "applied"
+
+    assert await bench.states() == ["rejected", "applied"]
+    assert bench.task.problems[1] == "the reply has also, which was not asked for"
+    assert await bench.world.column("SELECT schema FROM invocations WHERE attempt = 1") == [strict]

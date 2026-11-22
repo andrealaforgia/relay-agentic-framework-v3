@@ -41,6 +41,11 @@ CREATE TABLE invocations (
     briefing        text NOT NULL,
     briefing_sha256 text NOT NULL,
     schema_sha256   text NOT NULL,
+    -- The schema itself: what came back is checked against exactly this.
+    schema          jsonb NOT NULL,
+    -- What preparation handed the model besides the briefing, by which what it replies
+    -- is later tied to what it saw: for a review, the receipt of its checkout.
+    evidence        jsonb NOT NULL DEFAULT '{}',
     -- What the call was admitted under: the grant, the attempt, and the revisions and
     -- decision basis of what it is about.
     admitted_on     jsonb NOT NULL,
@@ -100,6 +105,9 @@ CREATE TABLE boundary_passes (
     role         text NOT NULL,
     runtime      jsonb NOT NULL,
     observations jsonb NOT NULL,
+    -- Every run of the suite is kept, whichever way it went. The latest one of a
+    -- boundary is what is true of it.
+    passed       boolean NOT NULL,
     passed_at    timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 CREATE INDEX boundary_passes_by_digest ON boundary_passes (digest, passed_at DESC);

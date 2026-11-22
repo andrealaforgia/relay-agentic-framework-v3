@@ -24,6 +24,7 @@ from tests.integration.fixtures import (
     CONTRACT,
     VAT_APPLIES_STANDARD_RATE,
     VAT_RETURNS_NET,
+    VERIFIER,
     CountingLaunches,
     HeldAtABarrier,
     build_grant,
@@ -360,7 +361,7 @@ async def test_after_a_runtime_change_the_red_can_be_reopened_and_the_work_compl
     stuck = await run_green(behaviours, PROJECT, "B1", attempt=1)
     assert stuck.rejection is GreenRejection.RUNTIME_CHANGED
 
-    await behaviours.reopen_red(PROJECT, "B1", reason="runner image upgraded")
+    await behaviours.reopen_red(VERIFIER, PROJECT, "B1", reason="runner image upgraded")
 
     reopened = await last_event(database)
     assert reopened.event_type == "behaviour.red_reopened"
@@ -380,7 +381,7 @@ async def test_reopening_a_red_needs_a_reason(
     behaviours, _ = await released_to_builder(database, tmp_path / "subject", runner_image)
 
     with pytest.raises(ValueError, match="reason"):
-        await behaviours.reopen_red(PROJECT, "B1", reason="  ")
+        await behaviours.reopen_red(VERIFIER, PROJECT, "B1", reason="  ")
 
     assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
 
@@ -397,7 +398,7 @@ async def test_a_green_in_flight_when_its_red_is_superseded_does_not_reach_revie
     )
     await held_at_the_barrier(in_flight, held)
 
-    await behaviours.reopen_red(PROJECT, "B1", reason="trunk moved")
+    await behaviours.reopen_red(VERIFIER, PROJECT, "B1", reason="trunk moved")
     second_red = commit(repository, {"README.md": "trunk moved on; VAT still wrong"})
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
     held.release.set()
@@ -437,7 +438,7 @@ async def test_a_red_in_flight_when_the_red_is_reopened_cannot_fill_the_new_cycl
     await held_at_the_barrier(late, held)
 
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
-    await behaviours.reopen_red(PROJECT, "B1", reason="trunk moved")
+    await behaviours.reopen_red(VERIFIER, PROJECT, "B1", reason="trunk moved")
     commit(repository, {"README.md": "trunk moved on"})
     held.release.set()
     verdict = await late
@@ -456,7 +457,7 @@ async def test_a_fresh_red_issues_a_build_request_with_a_new_idempotency_key(
     database: AsyncConnectionPool, tmp_path: Path, runner_image: str
 ) -> None:
     behaviours, _ = await released_to_builder(database, tmp_path / "subject", runner_image)
-    await behaviours.reopen_red(PROJECT, "B1", reason="runner image upgraded")
+    await behaviours.reopen_red(VERIFIER, PROJECT, "B1", reason="runner image upgraded")
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
 
     first, second = await pending_messages(database)
@@ -491,7 +492,7 @@ async def test_a_green_released_after_reopening_but_before_the_new_red_is_still_
     )
     await held_at_the_barrier(in_flight, held)
 
-    await behaviours.reopen_red(PROJECT, "B1", reason="trunk moved")
+    await behaviours.reopen_red(VERIFIER, PROJECT, "B1", reason="trunk moved")
     held.release.set()
     verdict = await in_flight
 
@@ -528,7 +529,7 @@ async def test_a_red_released_after_the_replacement_red_was_accepted_is_still_re
     await held_at_the_barrier(late, held)
 
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
-    await behaviours.reopen_red(PROJECT, "B1", reason="trunk moved")
+    await behaviours.reopen_red(VERIFIER, PROJECT, "B1", reason="trunk moved")
     new_trunk = commit(repository, {"README.md": "trunk moved on"})
     assert (await behaviours.run_red(PROJECT, "B1")).is_valid
     held.release.set()

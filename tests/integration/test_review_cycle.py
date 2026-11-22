@@ -28,6 +28,7 @@ from relay.persistence.receipts import act_once
 from relay.testing.oracle import ContainerIsolation, ProcessOracle
 from relay.transport.streams import Streams
 from tests.integration.fixtures import (
+    BUILDER,
     CONTRACT,
     VAT_APPLIES_STANDARD_RATE,
     VAT_RETURNS_NET,
@@ -304,7 +305,9 @@ async def test_a_disputed_finding_still_blocks_until_its_reviewer_withdraws_it_w
     _, first = await world.candidate_under_review()
     await world.review(first["qa"], APPROVE)
     [finding] = (await world.review(first["sentinel"], Review(findings=(INJECTION,)))).finding_ids
-    await world.reviews.dispute(PROJECT, finding, "the argument is parsed with int(), not eval")
+    await world.reviews.dispute(
+        BUILDER, PROJECT, finding, "the argument is parsed with int(), not eval"
+    )
     _, second = await world.candidate_under_review("unchanged")
     await world.review(second["qa"], APPROVE)
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,7 @@ from relay.domain.evidence import (
     refuse_isolation,
 )
 from relay.domain.identifiers import require_identifier
+from relay.domain.story import ActionRefused, Principal, PrincipalKind
 from relay.git.checkout import (
     CheckoutFailed,
     attempt_head,
@@ -284,7 +285,14 @@ class Behaviours:
             return verdict
 
     async def run_green(
-        self, project_id: str, behaviour_id: str, attempt: int, grant: uuid.UUID
+        self,
+        project_id: str,
+        behaviour_id: str,
+        attempt: int,
+        grant: uuid.UUID,
+        *,
+        expecting: str | None = None,
+        still_heard: Callable[[Connection], Awaitable[bool]] | None = None,
     ) -> GreenVerdict:
         """Observe the contract on the candidate a Builder published for this attempt.
 
@@ -294,6 +302,11 @@ class Behaviours:
         result with that red. That this run began is committed before anything is
         launched, and the run answers that one assignment: if the work is replaced or
         withdrawn while the run is in flight, what it observed is kept and changes nothing.
+
+        `expecting` is the commit the attempt was published as: if the attempt ref names
+        another by now, nothing is observed. `still_heard` is asked in the transaction
+        that would accept the verdict: a caller that has been taken over meanwhile has
+        its run kept as evidence, and decides nothing.
         """
         attempt_ref(project_id, behaviour_id, attempt)  # refuse a malformed attempt first
         async with self._changing(project_id, behaviour_id, starts="evidence") as (
@@ -321,6 +334,8 @@ class Behaviours:
         assert red is not None
         try:
             candidate = await attempt_head(repository, project_id, behaviour_id, attempt)
+            if expecting is not None and candidate != expecting:
+                raise CheckoutFailed("the attempt no longer names the candidate that was kept")
             # Pin the candidate before anything depends on it: the Builder may move the
             # attempt ref at any time, and this commit is about to become evidence.
             mirror = self._mirror(project_id)
@@ -337,11 +352,24 @@ class Behaviours:
             )
             raise
         return await self._record_green(
-            project_id, behaviour_id, attempt, execution, red, run, contract, descends=descends
+            project_id,
+            behaviour_id,
+            attempt,
+            execution,
+            red,
+            run,
+            contract,
+            descends=descends,
+            still_heard=still_heard,
         )
 
-    async def reopen_red(self, project_id: str, behaviour_id: str, reason: str) -> None:
-        """Send a behaviour back for a fresh red and drop the old pairing, on the record."""
+    async def reopen_red(
+        self, principal: Principal, project_id: str, behaviour_id: str, reason: str
+    ) -> None:
+        """Send a behaviour back for a fresh red and drop the old pairing, on the record.
+        The Verifier's to do: it owns the contract the red is a red of."""
+        if principal.kind is not PrincipalKind.WORKER or principal.role != "verifier":
+            raise ActionRefused("reopening a red is for the verifier to do")
         if not reason.strip():
             raise ValueError("reopening a red needs a stated reason")
         async with self._changing(project_id, behaviour_id, starts="evidence") as (
@@ -403,6 +431,7 @@ class Behaviours:
         observed: ProcessContract,
         *,
         descends: bool,
+        still_heard: Callable[[Connection], Awaitable[bool]] | None = None,
     ) -> GreenVerdict:
         """`observed` is the contract the run was launched to observe. The record says
         that one, whatever the behaviour's contract has become meanwhile."""
@@ -412,7 +441,8 @@ class Behaviours:
                 red,
                 await _paired_red(connection, project_id, behaviour_id),
                 candidate_descends_from_red=descends,
-                still_owed=await finish_green_run(connection, run),
+                still_owed=await finish_green_run(connection, run)
+                and (still_heard is None or await still_heard(connection)),
                 basis_moved=run.basis
                 != await story_basis(
                     connection, project_id, await _story_of(connection, project_id, behaviour_id)

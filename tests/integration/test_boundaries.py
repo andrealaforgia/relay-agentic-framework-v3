@@ -49,6 +49,26 @@ async def test_a_run_of_the_suite_that_failed_is_not_a_pass(database: AsyncConne
         await boundaries.record(leaked)
 
     assert not await boundaries.holds("d" * 64)
+    async with database.connection() as connection:
+        row = await (await connection.execute("SELECT passed FROM boundary_passes")).fetchone()
+    assert row is not None and row["passed"] is False  # kept, as what was seen
+
+
+async def test_a_later_failure_takes_an_earlier_pass_away_until_it_passes_again(
+    database: AsyncConnectionPool,
+) -> None:
+    """3B-S2-1.2: the latest run of the suite is what is true of a boundary."""
+    boundaries = Boundaries(database)
+    failing = suite("d" * 64, Observation("the shell is refused the network", False, "200"))
+    await boundaries.record(suite())
+    assert await boundaries.holds("d" * 64)
+
+    with pytest.raises(BoundaryNotShown):
+        await boundaries.record(failing)
+    assert not await boundaries.holds("d" * 64)
+
+    await boundaries.record(suite())
+    assert await boundaries.holds("d" * 64)
 
 
 async def test_a_suite_that_observed_nothing_is_not_a_pass(database: AsyncConnectionPool) -> None:

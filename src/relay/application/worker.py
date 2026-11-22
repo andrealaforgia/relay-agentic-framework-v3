@@ -19,7 +19,9 @@ from typing import Any, Protocol
 from relay.application.assignments import Assignments
 from relay.application.invocations import Invocations, Prepared
 from relay.application.workers import WorkerSession
+from relay.domain.schema import problem_with as schema_problem
 from relay.domain.story import ActionRefused
+from relay.providers.boundary_suite import UNATTESTED
 from relay.providers.claude import (
     Confinement,
     Outcome,
@@ -97,7 +99,7 @@ class Worker:
         provider: Provider,
         tasks: Mapping[str, Task],
         boundaries: Shown,
-        runtime: Mapping[str, str],
+        runtime: Callable[[], Mapping[str, str]],
     ) -> None:
         self._session = session
         self._claims = claims
@@ -106,6 +108,8 @@ class Worker:
         self._tasks = tasks
         self._boundaries = boundaries
         # What the provider's CLI and this host are, as a pass of a boundary names them.
+        # Asked at every launch: a policy file that changed since the worker started is
+        # another runtime, with no pass.
         self._runtime = runtime
         self._recording: set[asyncio.Task[str]] = set()
 
@@ -155,15 +159,25 @@ class Worker:
             )
         except ActionRefused as refused:
             return f"refused: {refused}"
-        problem: str | None = None
+        # A call for this work may already have given nothing, under this grant or an
+        # earlier one: the next briefing says what was wrong with it.
+        problem = await self._invocations.last_problem(assignment_id)
         stale = 0
         while True:
             call = await task.prepare(assignment, grant, problem)
-            boundary = boundary_digest(call.confinement, self._runtime)
+            runtime = self._runtime()
+            if runtime.get("remote_policy", UNATTESTED) == UNATTESTED:
+                # Part of what bounds a run is policy this host may be given from
+                # elsewhere, which Relay cannot read. Until the operator has stated what
+                # it is, nothing is launched.
+                await self._claims.give_back(assignment_id, grant)
+                return "refused: nobody has stated what policy this host is given from elsewhere"
+            boundary = boundary_digest(call.confinement, runtime)
             if not await self._boundaries.holds(boundary):
                 # No call is made within bounds nobody has seen hold here: not on a new
                 # version of the CLI, not under changed settings, not after a pass has
-                # gone stale.
+                # gone stale or a later run of the suite has failed.
+                await self._claims.give_back(assignment_id, grant)
                 return "refused: the bounds of this run have not been shown to hold on this host"
             admission = await self._invocations.admit(
                 self._session, assignment_id, grant, call.prepared
@@ -173,6 +187,10 @@ class Worker:
                 stale += 1
                 continue
             if admission.outcome in ("refused", "stale"):
+                # Nothing will be done under this grant now. If nothing was ever called
+                # under it, it is handed back, so that the work can be taken up again
+                # when whatever refused it has cleared.
+                await self._claims.give_back(assignment_id, grant)
                 return f"refused: {admission.reason}"
             if admission.outcome == "finished":
                 return "finished"
@@ -266,7 +284,7 @@ class Worker:
         result: ProviderResult,
     ) -> str:
         try:
-            problem = _problem(task, result)
+            problem = _problem(task, result, call.prepared.schema)
         except Exception as fault:  # noqa: BLE001 - a fault in the check loses no result
             # The reply arrived and the check of it failed, which is not the same as the
             # reply failing the check. Either way the call and what it used are recorded.
@@ -284,10 +302,12 @@ class Worker:
         )
 
 
-def _problem(task: Task, result: ProviderResult) -> str | None:
+def _problem(task: Task, result: ProviderResult, schema: Mapping[str, Any]) -> str | None:
     if result.outcome is not Outcome.RETURNED or result.terminal is None:
         return None
     reply = result.terminal.structured_output
     if reply is None:
         return "the reply did not carry the structured answer it was asked for"
-    return task.problem_with(reply)
+    # Against the schema that was recorded with the call, before the task reads any of
+    # it: asking the provider to enforce the schema is not its having done so.
+    return schema_problem(reply, dict(schema)) or task.problem_with(reply)

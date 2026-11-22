@@ -211,7 +211,7 @@ async def test_reopening_a_red_does_not_remove_the_reconfirmation_it_would_need(
     await world.reconfirm(await owed_for(world, "story"))
 
     with pytest.raises(ActionRefused, match="the contract of B1 is not current"):
-        await world.behaviours.reopen_red(PROJECT, "B1", "the answer changes the amount")
+        await world.behaviours.reopen_red(VERIFIER, PROJECT, "B1", "the answer changes the amount")
 
     owed = await owed_for(world, "behaviour")
     grant = await world.claims.claim(VERIFIER, owed["assignment_id"])

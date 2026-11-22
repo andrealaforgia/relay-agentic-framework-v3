@@ -107,3 +107,26 @@ async def test_what_is_executable_in_the_workspace_is_executable_in_the_commit(
     kept = await mirror.retain(workspace, base, "refs/relay/invocations/one")
 
     assert git(tmp_path / "mirror.git", "ls-tree", kept, "run.sh").startswith("100755")
+
+
+async def test_a_file_the_base_tracks_stays_though_an_ignore_rule_names_it(tmp_path: Path) -> None:
+    """3B-S2-1.8: a tree can track a file its own .gitignore matches. A build that
+    changes nothing there must not delete it."""
+    origin = tmp_path / "origin"
+    commit(origin, {"vat.py": "print(100)\n"})
+    (origin / "generated.txt").write_text("delivered, and ignored\n")
+    (origin / ".gitignore").write_text("generated.txt\n")
+    git(origin, "add", "-f", "generated.txt", ".gitignore")
+    git(origin, "commit", "-q", "-m", "a tracked file that is also ignored")
+    base = git(origin, "rev-parse", "HEAD")
+    mirror = Mirror(tmp_path / "mirror.git")
+    await mirror.pin_from(str(origin), "refs/heads/main", base)
+    workspace = await mirror.export(base, tmp_path / "ws" / "tree")
+
+    kept = await mirror.retain(workspace, base, "refs/relay/invocations/one")
+
+    held = tmp_path / "mirror.git"
+    assert git(held, "rev-parse", f"{kept}^{{tree}}") == git(held, "rev-parse", f"{base}^{{tree}}")
+    (workspace / "vat.py").write_text("print(120)\n")
+    changed = await mirror.retain(workspace, base, "refs/relay/invocations/two")
+    assert "generated.txt" in git(held, "ls-tree", "--name-only", changed).split()

@@ -27,32 +27,34 @@ class Boundaries:
         self._good_for = good_for
 
     async def record(self, result: SuiteResult) -> None:
-        """Record a pass. A run of the suite that did not pass is not recorded as
-        anything: it is an error, naming what failed."""
-        if not result.passed:
-            failed = [each.probe for each in result.observations if not each.passed]
-            raise BoundaryNotShown(f"the bounds of a {result.role} did not hold: {failed}")
+        """Record what a run of the suite found, whichever way it went, and raise if the
+        boundary did not hold. A failure is kept: it takes away an earlier pass."""
         async with self._pool.connection() as connection, connection.transaction():
             await connection.execute(
-                "INSERT INTO boundary_passes (pass_id, digest, role, runtime, observations) "
-                "VALUES (%s, %s, %s, %s, %s)",
+                "INSERT INTO boundary_passes (pass_id, digest, role, runtime, observations, "
+                "passed) VALUES (%s, %s, %s, %s, %s, %s)",
                 (
                     uuid.uuid7(),
                     result.digest,
                     result.role,
                     Jsonb(result.runtime),
                     Jsonb(as_recorded(result)),
+                    result.passed,
                 ),
             )
+        if not result.passed:
+            failed = [each.probe for each in result.observations if not each.passed]
+            raise BoundaryNotShown(f"the bounds of a {result.role} did not hold: {failed}")
 
     async def holds(self, digest: str) -> bool:
-        """Whether this exact boundary has a pass that is not stale."""
+        """Whether the latest run of the suite on this exact boundary passed, and not too
+        long ago."""
         async with self._pool.connection() as connection:
             row = await (
                 await connection.execute(
-                    "SELECT 1 FROM boundary_passes WHERE digest = %s "
-                    "AND passed_at > clock_timestamp() - %s LIMIT 1",
-                    (digest, self._good_for),
+                    "SELECT passed AND passed_at > clock_timestamp() - %s AS holds "
+                    "FROM boundary_passes WHERE digest = %s ORDER BY passed_at DESC LIMIT 1",
+                    (self._good_for, digest),
                 )
             ).fetchone()
-        return row is not None
+        return bool(row and row["holds"])

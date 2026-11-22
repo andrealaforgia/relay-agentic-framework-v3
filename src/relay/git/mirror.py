@@ -157,8 +157,10 @@ class Mirror:
             clone = str(Path(scratch) / "clone")
             await git("clone", "--quiet", "--no-checkout", "--", str(self._path), clone)
             await git("-C", clone, "fetch", "--quiet", "origin", f"{_PINS}/{base}")
-            # The index starts empty, so the tree is exactly what is in the workspace:
-            # what the base had and the workspace lacks is not in it.
+            # The index starts as the base's tree. What the base tracked stays tracked
+            # though an ignore rule in the tree names it, and what the workspace lacks
+            # of it is removed.
+            await git("-C", clone, "read-tree", base)
             await git("-C", clone, f"--work-tree={workspace}", "add", "--all", "--", ".")
             tree = await git("-C", clone, "write-tree")
             commit = await git(

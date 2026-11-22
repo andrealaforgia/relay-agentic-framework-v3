@@ -16,14 +16,14 @@ from pathlib import Path
 from typing import Any
 
 from relay.application.behaviours import Behaviours
-from relay.application.invocations import Effect, EffectRun, Invocations, Prepared
+from relay.application.invocations import Effect, EffectRun, Invocations, Overtaken, Prepared
 from relay.application.reviews import NewFinding, Review, Reviews
 from relay.application.worker import Call
 from relay.domain.review import Carried, Severity, SubmissionRefused
 from relay.domain.story import ActionRefused
 from relay.git.checkout import RemoteRejected, attempt_ref, resolve_ref
 from relay.git.mirror import Mirror
-from relay.persistence.database import Pool
+from relay.persistence.database import Connection, Pool
 from relay.providers.confinement import confinement_for, effective_agent_sha256
 from relay.providers.definitions import DEFAULT_DEFINITIONS, find_definition
 
@@ -137,9 +137,9 @@ class ReviewTask:
         about = await self._about(assignment["assignment_id"])
         workspace = self._workspaces.fresh()
         workspace.parent.mkdir(parents=True)
-        # The checkout is the grant's first effect, and its receipt is what the review
-        # will be submitted from.
-        await self._reviews.prepare_review(about["capability"], workspace, grant)
+        # The checkout is the grant's first effect. Its receipt is recorded with the call:
+        # what the model replies is a review of this tree and of no other.
+        checkout = await self._reviews.prepare_review(about["capability"], workspace, grant)
         role = str(assignment["role"])
         definition = find_definition(DEFAULT_DEFINITIONS[role], self._definitions)
         bounds = confinement_for(role, workspace)
@@ -153,6 +153,7 @@ class ReviewTask:
                 briefing=_review_briefing(role, about, last_problem),
                 schema=REVIEW_REPLY,
                 read_on=read_on,
+                evidence={"checkout": str(checkout.receipt)},
             ),
             workspace,
             bounds,
@@ -175,41 +176,41 @@ class ReviewTask:
         return [Effect("submit", self._submit)]
 
     async def _submit(self, run: EffectRun) -> Mapping[str, Any]:
-        """Submit the review under the grant that holds the work, from a checkout made
-        under that grant. Doing this again is doing it once: a review already accepted
-        from the same content is answered with the receipt it has."""
+        """Submit the review from the checkout the model was handed, under the grant that
+        checkout was made under. Doing this again is doing it once: a review already
+        accepted from the same content is answered with the receipt it has.
+
+        A reply that has been adopted under another grant cannot be submitted: the
+        review service takes a review only from a checkout made under the grant that
+        holds the work, and this reply was written from another. That is nobody's
+        defect. And only a submission the service accepts as the effective one is an
+        applied review: one that arrives when the cycle has closed, or after another
+        was accepted, is overtaken."""
         about = await self._about(run.invocation["assignment_id"])
-        async with self._pool.connection() as connection:
-            held = await (
-                await connection.execute(
-                    "SELECT receipt_id FROM review_checkouts WHERE task_id = %s AND grant_id = %s "
-                    "ORDER BY prepared_at DESC, receipt_id DESC LIMIT 1",
-                    (about["task_id"], run.grant_id),
-                )
-            ).fetchone()
+        if run.grant_id != run.invocation["grant_id"]:
+            raise Overtaken(
+                "the review was written from a checkout made under a grant that no longer "
+                "holds the work"
+            )
         try:
-            if held is None:
-                # The result was adopted under a grant that has no checkout of its own.
-                # It makes one, of the same pinned commit, and discards the tree.
-                scratch = self._workspaces.fresh()
-                scratch.parent.mkdir(parents=True)
-                receipt = (
-                    await self._reviews.prepare_review(about["capability"], scratch, run.grant_id)
-                ).receipt
-            else:
-                receipt = held["receipt_id"]
             accepted = await self._reviews.submit_review(
-                about["capability"], review_from(run.invocation["reply"]), run.grant_id, receipt
+                about["capability"],
+                review_from(run.invocation["reply"]),
+                run.grant_id,
+                uuid.UUID(run.invocation["evidence"]["checkout"]),
             )
         except SubmissionRefused as refused:
             raise ActionRefused(str(refused)) from None
-        return {"submission_id": str(accepted.submission_id), "disposition": accepted.disposition}
+        if accepted.disposition != "effective":
+            raise Overtaken(f"the review arrived {accepted.disposition}: it decides nothing")
+        return {"submission_id": str(accepted.submission_id)}
 
     async def _about(self, assignment_id: uuid.UUID) -> dict[str, Any]:
         async with self._pool.connection() as connection:
             row = await (
                 await connection.execute(
-                    "SELECT t.task_id, t.capability, t.role, c.candidate_revision, b.behaviour_id, "
+                    "SELECT t.task_id, t.capability, t.role, c.project_id, c.candidate_revision, "
+                    "b.behaviour_id, "
                     "b.summary, b.contract, s.story_id, s.title, s.outcome, s.criteria "
                     "FROM review_tasks t JOIN review_cycles c USING (cycle_id) "
                     "JOIN behaviours b USING (project_id, behaviour_id) "
@@ -222,9 +223,10 @@ class ReviewTask:
             row["earlier"] = await (
                 await connection.execute(
                     "SELECT f.finding_id, f.severity, f.claim, f.status FROM findings f "
-                    "JOIN review_tasks t ON t.task_id = %s WHERE f.behaviour_id = %s "
-                    "AND f.role = t.role AND f.status <> 'withdrawn' ORDER BY f.finding_id",
-                    (row["task_id"], row["behaviour_id"]),
+                    "JOIN review_tasks t ON t.task_id = %s WHERE f.project_id = %s "
+                    "AND f.behaviour_id = %s AND f.role = t.role AND f.status <> 'withdrawn' "
+                    "ORDER BY f.finding_id",
+                    (row["task_id"], row["project_id"], row["behaviour_id"]),
                 )
             ).fetchall()
         return row
@@ -446,25 +448,53 @@ class BuildTask:
         return {"attempt": attempt, "ref": ref, "commit": commit}
 
     async def _green(self, run: EffectRun) -> Mapping[str, Any]:
-        """Have Relay observe the candidate. A candidate that is not green is a reply
-        that gave nothing: the next call is told what was observed."""
+        """Have Relay observe the candidate that was kept. A candidate that is not green
+        is a reply that gave nothing: the next call is told what was observed.
+
+        If this attempt has already been judged (the worker stopped after the verdict
+        was recorded and before the effect was marked), the verdict that is on record
+        is what is replayed, whichever way it went: nothing is observed twice, and a
+        candidate that was found not green is not taken for one that was."""
         about = await self._about(run.invocation["assignment_id"])
         attempt = await self._attempt(run.invocation)
         async with self._pool.connection() as connection:
             judged = await (
                 await connection.execute(
-                    "SELECT 1 FROM green_runs WHERE assignment_id = %s AND attempt = %s "
-                    "AND state = 'finished'",
-                    (run.invocation["assignment_id"], attempt),
+                    "SELECT event_type, payload->>'reason' AS reason FROM events "
+                    "WHERE project_id = %s AND subject_id = %s AND event_type IN "
+                    "('behaviour.green_verified', 'behaviour.green_rejected') "
+                    "AND payload->>'attempt' = %s AND payload->>'candidate_revision' = %s "
+                    "ORDER BY sequence DESC LIMIT 1",
+                    (
+                        about["project_id"],
+                        about["behaviour_id"],
+                        str(attempt),
+                        str(run.invocation["retained"]),
+                    ),
                 )
             ).fetchone()
-        if judged is not None:
-            return {"attempt": attempt, "green": "already judged"}
-        verdict = await self._behaviours.run_green(
-            about["project_id"], about["behaviour_id"], attempt, run.grant_id
-        )
-        if not verdict.is_valid:
-            raise ActionRefused(f"the candidate is not green: {verdict.reason}")
+        if judged is None:
+            invocation_id, try_ = run.invocation["invocation_id"], run.attempt
+
+            async def still_heard(connection: Connection) -> bool:
+                # Asked where the verdict is accepted: a try that was taken over while
+                # the oracle ran has its run kept, and opens no review.
+                return await Invocations.is_current_try(connection, invocation_id, "green", try_)
+
+            verdict = await self._behaviours.run_green(
+                about["project_id"],
+                about["behaviour_id"],
+                attempt,
+                run.grant_id,
+                # The commit that was kept and published, and no other the ref may name.
+                expecting=str(run.invocation["retained"]),
+                still_heard=still_heard,
+            )
+            accepted, reason = verdict.is_valid, verdict.reason
+        else:
+            accepted, reason = judged["event_type"] == "behaviour.green_verified", judged["reason"]
+        if not accepted:
+            raise ActionRefused(f"the candidate is not green: {reason}")
         return {"attempt": attempt, "green": "accepted"}
 
     async def _about(self, assignment_id: uuid.UUID) -> dict[str, Any]:

@@ -41,7 +41,11 @@ _SHARED_BY_EVERY_SANDBOX = (Path("/tmp"), Path("/private/tmp"))
 
 def confinement_for(role: str, workspace: Path, *, withheld: Sequence[Path] = ()) -> Confinement:
     """The bounds of one run of a role in one workspace. `withheld` names directories of
-    the supervisor's own that a shell must not read: its mirrors, its configuration."""
+    the supervisor's own that a shell must not read: its mirrors, its configuration.
+
+    A workspace is `<root>/<a directory of its own>/tree`. The whole root is kept from a
+    shell, and the workspace alone given back: every other run's workspace is under the
+    same root."""
     if role not in ROLE_TOOLS:
         raise LookupError(f"there are no bounds for a {role} to run within")
     _require_a_workspace_the_bounds_hold_for(workspace)
@@ -68,7 +72,11 @@ def confinement_for(role: str, workspace: Path, *, withheld: Sequence[Path] = ()
                 "autoAllowBashIfSandboxed": True,
                 "network": {"allowedDomains": []},
                 "filesystem": {
-                    "denyRead": ["~/", str(workspace.parent), *(str(each) for each in withheld)],
+                    "denyRead": [
+                        "~/",
+                        str(workspace.parent.parent),
+                        *(str(each) for each in withheld),
+                    ],
                     "allowRead": [str(workspace)],
                 },
             },
@@ -124,8 +132,8 @@ def boundary_digest(bounds: Confinement, runtime: Mapping[str, str]) -> str:
     settings = json.dumps(dict(bounds.settings), sort_keys=True)
     filesystem = dict(bounds.settings).get("sandbox", {}).get("filesystem", {})
     for workspace in filesystem.get("allowRead", []):
-        settings = settings.replace(json.dumps(workspace)[1:-1], "<workspace>")
-        settings = settings.replace(json.dumps(str(Path(workspace).parent))[1:-1], "<root>")
+        settings = settings.replace(json.dumps(workspace)[1:-1], "<root>/<run>/<tree>")
+        settings = settings.replace(json.dumps(str(Path(workspace).parent.parent))[1:-1], "<root>")
     bound = {
         "tools": list(bounds.tools),
         "settings": settings,

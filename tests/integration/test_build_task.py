@@ -21,10 +21,12 @@ from relay.application.worker import Worker
 from relay.application.workers import WorkerSession
 from relay.domain.behaviour import BehaviourState
 from relay.domain.review import Severity
+from relay.domain.story import ActionRefused
+from relay.git.checkout import CheckoutFailed
 from relay.git.mirror import Mirror
 from relay.providers.claude import ProviderResult, Request
 from tests.integration.decision_world import DecisionWorld
-from tests.integration.fixtures import VAT_APPLIES_STANDARD_RATE, VAT_RETURNS_NET
+from tests.integration.fixtures import BUILDER, VAT_APPLIES_STANDARD_RATE, VAT_RETURNS_NET
 from tests.integration.story_world import STANDARD_RATE
 from tests.integration.test_review_task import replying
 from tests.integration.test_worker import RUNTIME, SeenToHold
@@ -97,7 +99,7 @@ class Building:
             provider,
             {"build": self.task, "remediate": self.task},
             SeenToHold(),
-            RUNTIME,
+            lambda: RUNTIME,
         )
 
     async def owed(self) -> dict[str, Any]:
@@ -305,7 +307,7 @@ async def test_a_reply_that_says_nothing_of_what_was_done_is_asked_for_again(
     assert await worker.carry_out(await building.owed()) == "applied"
 
     assert await building.states() == ["rejected", "applied"]
-    assert "a note saying what was done" in provider.asked[1].briefing
+    assert "the reply has no note" in provider.asked[1].briefing
     assert await building.world.column(
         "SELECT retained IS NULL FROM invocations ORDER BY started_at"
     ) == [True, False]  # nothing was kept of the reply that was not one
@@ -379,3 +381,76 @@ async def test_a_candidate_already_judged_is_not_judged_again(building: Building
     assert await building.states() == ["applied"]
     assert await building.world.column("SELECT state FROM green_runs") == ["finished"]
     assert len(provider.asked) == 1
+
+
+async def test_a_candidate_found_not_green_is_not_taken_for_green_when_taken_up_again(
+    building: Building,
+) -> None:
+    """3B-S2-1.3: the oracle rejected the candidate, the verdict was recorded, and the
+    worker stopped before the invocation heard of it. The verdict on record is what is
+    replayed, and the next call is told why."""
+    provider = Builder(WRONG, RIGHT)
+    worker = await building.worker(provider)
+    real = building.task._green
+
+    async def judged_and_then_the_worker_stops(run: Any) -> Any:
+        with pytest.raises(ActionRefused):
+            await real(run)
+        raise KeyboardInterrupt
+
+    building.task._green = judged_and_then_the_worker_stops  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        await worker.carry_out(await building.owed())
+    building.task._green = real  # type: ignore[method-assign]
+    await building.sessions[-1].stop()
+
+    await building.invocations.recover(PROJECT)
+
+    assert await building.states() == ["rejected"]
+    assert await building.world.column("SELECT count(*) FROM green_runs") == [1]  # not run again
+    [reason] = await building.world.column("SELECT reason FROM invocations")
+    assert isinstance(reason, str) and reason.startswith("the candidate is not green")
+    again = await building.worker(provider)
+    assert await again.carry_out(await building.owed()) == "applied"
+    assert "not green" in provider.asked[1].briefing
+
+
+async def test_a_green_run_whose_caller_has_been_taken_over_opens_no_review(
+    building: Building,
+) -> None:
+    """3B-S2-1.4: asked in the transaction that would accept the verdict."""
+    world = building.world
+    world.publish_attempt("B1", RIGHT, on=world.base)
+    grant = await world.claims.claim(BUILDER, (await building.owed())["assignment_id"])
+
+    async def taken_over(_: Any) -> bool:
+        return False
+
+    await world.behaviours.run_green(PROJECT, "B1", 1, grant, still_heard=taken_over)
+
+    assert await world.column("SELECT count(*) FROM review_cycles") == [0]
+    assert await world.state("B1") is BehaviourState.IMPLEMENTING
+    assert (await building.owed())["state"] == "granted"  # still owed: nothing was decided
+
+
+async def test_a_green_run_is_of_the_candidate_that_was_kept_and_of_no_other(
+    building: Building,
+) -> None:
+    """3B-S2-1.4: the attempt ref is read again at the run; it has to name the same commit."""
+    world = building.world
+    published = world.publish_attempt("B1", RIGHT, on=world.base)
+    grant = await world.claims.claim(BUILDER, (await building.owed())["assignment_id"])
+
+    with pytest.raises(CheckoutFailed, match="no longer names the candidate"):
+        await world.behaviours.run_green(PROJECT, "B1", 1, grant, expecting="a" * 40)
+
+    assert await world.column("SELECT count(*) FROM review_cycles") == [0]
+    assert (await world.behaviours.run_green(PROJECT, "B1", 1, grant, expecting=published)).is_valid
+
+
+async def test_only_the_verifier_reopens_a_red(building: Building) -> None:
+    """3B-S2-1.10."""
+    with pytest.raises(ActionRefused, match="for the verifier"):
+        await building.world.behaviours.reopen_red(BUILDER, PROJECT, "B1", "I would like another")
+
+    assert (await building.owed())["state"] == "wanted"

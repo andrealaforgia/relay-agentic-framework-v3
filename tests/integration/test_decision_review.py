@@ -543,7 +543,7 @@ async def test_a_refusal_names_the_question_the_story_and_the_contract_together(
     revision, listed = await world.stories.revisions_of(PROJECT, "S1")
 
     for refused_start in (
-        world.behaviours.reopen_red(PROJECT, "B1", "the answer changes it"),
+        world.behaviours.reopen_red(VERIFIER, PROJECT, "B1", "the answer changes it"),
         world.reviews.prepare_review(str(capability), world.tmp_path / "tree", uuid.uuid7()),
     ):
         with pytest.raises(ActionRefused) as refused:

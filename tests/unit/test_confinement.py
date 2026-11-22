@@ -54,9 +54,10 @@ def test_the_builder_has_a_shell_that_is_sandboxed_with_no_way_out_and_no_networ
     assert sandbox["network"] == {"allowedDomains": []}
     # Deny wins over allow for writes, so nothing is said about writes: outside the
     # workspace they are refused by the sandbox itself. For reads, the home directory and
-    # everything beside the workspace are denied, and the workspace alone given back.
+    # the whole root that every run's workspace is under are denied, and this workspace
+    # alone given back.
     assert sandbox["filesystem"] == {
-        "denyRead": ["~/", str(workspace.parent), "/srv/relay/mirrors"],
+        "denyRead": ["~/", str(ROOT), "/srv/relay/mirrors"],
         "allowRead": [str(workspace)],
     }
 

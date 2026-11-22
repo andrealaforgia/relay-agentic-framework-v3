@@ -14,13 +14,16 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from relay.application.invocations import Invocations
+from relay.application.reviews import NewFinding, Review
 from relay.application.tasks import Profile, ReviewTask, Tasks, Workspaces
 from relay.application.worker import Worker
 from relay.application.workers import WorkerSession
+from relay.domain.review import Severity
+from relay.domain.story import ActionRefused
 from relay.providers.claude import Outcome, ProviderResult, Request
 from relay.providers.stream import Terminal
 from tests.integration.decision_world import DecisionWorld
-from tests.integration.fixtures import VAT_APPLIES_STANDARD_RATE, run_green
+from tests.integration.fixtures import VAT_APPLIES_STANDARD_RATE, VERIFIER, run_green
 from tests.integration.story_world import STANDARD_RATE
 from tests.integration.test_worker import RUNTIME, SeenToHold
 from tests.integration.trunk_world import PROJECT
@@ -93,7 +96,7 @@ class Reviewing:
             provider,
             {"review": self.task},
             SeenToHold(),
-            RUNTIME,
+            lambda: RUNTIME,
         )
 
     async def owed(self, role: str) -> dict[str, Any]:
@@ -101,8 +104,8 @@ class Reviewing:
             row = await (
                 await connection.execute(
                     "SELECT * FROM assignments WHERE kind = 'review' AND role = %s "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (role,),
+                    "AND project_id = %s ORDER BY created_at DESC LIMIT 1",
+                    (role, PROJECT),
                 )
             ).fetchone()
         assert row is not None
@@ -293,3 +296,124 @@ async def test_a_reviewer_is_asked_how_its_earlier_findings_stand_and_its_answer
     assert str(raised) in briefing and "the amount is passed to eval" in briefing
     assert "verified_fixed, still_present, or withdrawn" in briefing
     assert await world.column("SELECT finding_id FROM finding_verifications") == [raised]
+
+
+async def test_a_review_is_submitted_from_the_checkout_the_model_was_handed(
+    reviewing: Reviewing,
+) -> None:
+    """3B-S2-1.7: the receipt is recorded with the call, and a later checkout under the
+    same grant does not take its place."""
+    provider = Reviewer(NOTHING_FOUND)
+    worker = await reviewing.worker("qa", provider)
+    real = reviewing.invocations.apply
+
+    async def the_worker_stops(*_: Any) -> str:
+        raise KeyboardInterrupt
+
+    reviewing.invocations.apply = the_worker_stops  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        await worker.carry_out(await reviewing.owed("qa"))
+    reviewing.invocations.apply = real  # type: ignore[method-assign]
+    [handed] = await reviewing.world.column("SELECT receipt_id FROM review_checkouts")
+    owed = await reviewing.owed("qa")
+    # Another checkout under the same grant, as a duplicate preparation would make.
+    await reviewing.task.prepare(owed, owed["grant_id"], None)
+
+    await reviewing.invocations.recover(PROJECT)
+
+    assert await reviewing.world.column("SELECT evidence->>'checkout' FROM invocations") == [
+        str(handed)
+    ]
+    assert await reviewing.world.column("SELECT state FROM invocations") == ["applied"]
+    assert await reviewing.world.column(
+        "SELECT count(*) FROM review_submissions WHERE disposition = 'effective'"
+    ) == [1]
+
+
+async def test_a_review_that_arrives_when_another_was_accepted_is_overtaken_and_blamed_for_nothing(
+    reviewing: Reviewing,
+) -> None:
+    """3B-S2-1.7: the service keeps it as what was said and it decides nothing. That is
+    not an applied review, and not a defective reply either."""
+    provider = Reviewer({"findings": [NO_USAGE_MESSAGE], "carried": []})
+    worker = await reviewing.worker("qa", provider)
+    real = reviewing.invocations.apply
+
+    async def the_worker_stops(*_: Any) -> str:
+        raise KeyboardInterrupt
+
+    reviewing.invocations.apply = the_worker_stops  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        await worker.carry_out(await reviewing.owed("qa"))
+    reviewing.invocations.apply = real  # type: ignore[method-assign]
+    owed = await reviewing.owed("qa")
+    [capability] = await reviewing.world.column(
+        "SELECT capability FROM review_tasks WHERE role = 'qa'"
+    )
+    [receipt] = await reviewing.world.column("SELECT receipt_id FROM review_checkouts")
+    # Another review of the same task is accepted first, with other content.
+    await reviewing.world.reviews.submit_review(
+        str(capability), Review(), owed["grant_id"], receipt
+    )
+
+    await reviewing.invocations.recover(PROJECT)
+
+    assert await reviewing.world.column("SELECT state FROM invocations") == ["overtaken"]
+    assert await reviewing.world.column("SELECT count(*) FROM findings") == [0]
+    assert await reviewing.invocations.parked(PROJECT) == []
+
+
+async def test_a_reviewer_is_not_briefed_on_another_projects_findings(
+    reviewing: Reviewing, database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    """3B-S2-1.5: two projects each have a behaviour called B1."""
+    elsewhere = DecisionWorld(database, tmp_path / "elsewhere", runner_image)
+    elsewhere.project = "billing"
+    (tmp_path / "elsewhere").mkdir()
+    elsewhere.base = await elsewhere.open()
+    await elsewhere.decide(await elsewhere.roadmap(STANDARD_RATE))
+    base = await elsewhere.awaiting_builder("B1")
+    theirs = NewFinding(Severity.HIGH, "billing leaks card numbers", "pay.py", "mask them")
+    await elsewhere.reviewed("B1", on=base, reviews={"qa": Review(findings=(theirs,))})
+    provider = Reviewer(NOTHING_FOUND)
+
+    await (await reviewing.worker("qa", provider)).carry_out(await reviewing.owed("qa"))
+
+    briefing = provider.asked[0].briefing
+    assert "billing leaks card numbers" not in briefing
+    assert "no earlier findings" in briefing
+
+
+async def test_a_reply_with_the_wrong_kinds_of_value_in_it_becomes_no_finding(
+    reviewing: Reviewing,
+) -> None:
+    """3B-S2-1.11: a number for a claim, nothing for the evidence, true for the remedy."""
+    malformed = {
+        "findings": [{"severity": "high", "claim": 17, "evidence": None, "remediation": True}],
+        "carried": [],
+    }
+    provider = Reviewer(malformed, NOTHING_FOUND)
+    worker = await reviewing.worker("qa", provider)
+
+    assert await worker.carry_out(await reviewing.owed("qa")) == "applied"
+
+    assert await reviewing.world.column("SELECT state FROM invocations ORDER BY attempt") == [
+        "rejected",
+        "applied",
+    ]
+    assert await reviewing.world.column("SELECT count(*) FROM findings") == [0]
+    assert await reviewing.world.column(
+        "SELECT envelope IS NOT NULL FROM invocations WHERE attempt = 1"
+    ) == [True]  # the paid call is kept
+
+
+async def test_only_the_builder_disputes_a_finding(reviewing: Reviewing) -> None:
+    """3B-S2-1.10: enforced where the service is called, whoever holds the service."""
+    provider = Reviewer({"findings": [NO_USAGE_MESSAGE], "carried": []})
+    await (await reviewing.worker("qa", provider)).carry_out(await reviewing.owed("qa"))
+    [raised] = await reviewing.world.column("SELECT finding_id FROM findings")
+
+    with pytest.raises(ActionRefused, match="for the builder"):
+        await reviewing.world.reviews.dispute(VERIFIER, PROJECT, str(raised), "it is fine")
+
+    assert await reviewing.world.column("SELECT status FROM findings") == ["open"]
