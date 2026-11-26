@@ -61,7 +61,7 @@ There is no data migration: old ledgers are Redis streams with a different envel
 
 **Provider execution boundary.** Not yet proven. Each adapter gets a written contract (mounts, environment, credentials, subprocess permissions, network) and must pass canary probes on the real CLI before it is eligible for a role. A canary passes only when the probe attempted the operation and the enforcement layer denied it.
 
-**Review capabilities are bearer secrets.** A reviewer acts on a task by presenting a capability sent only in its review command. Those capabilities sit in plaintext in the review task table, the outbox and the Redis command streams, so all three must be readable only by trusted principals. A dashboard or reporting account may read workflow state but must never be shown command payloads; any operational view redacts them.
+**No secret stands for a review (D-11).** A reviewer acts on a review by holding the grant on the review's assignment, which a claim gives to one enrolled worker process of the review's role. A review command names the review and carries nothing that grants it, so nothing in the review tables, the outbox or the command streams lets its reader act as a reviewer. Grants are not secrets and are in the ledger. When an API exposes review operations, it authenticates the caller as the worker a grant was given to.
 
 **Consensus.** Immutable proposals identified by (project, logical id, revision, sha256). Responses bind to the exact revision. Escalation is a blocked state with a named owner, never agreement. Counterpart outcome is recorded as `disabled`, `unavailable`, `substituted` or `completed`.
 

@@ -236,10 +236,27 @@ class GreenRejection(StrEnum):
     EXPECTATION_NOT_MET = "expectation_not_met"
 
 
+# A run that ended this way was kept as what was seen and decides nothing: it was
+# overtaken while in flight, and says nothing about the candidate it observed.
+DECIDES_NOTHING = frozenset(
+    {
+        GreenRejection.RED_SUPERSEDED,
+        GreenRejection.ASSIGNMENT_SUPERSEDED,
+        GreenRejection.BASIS_SUPERSEDED,
+    }
+)
+
+
 @dataclass(frozen=True)
 class GreenVerdict:
     rejection: GreenRejection | None
     reason: str
+
+    @property
+    def judges_the_candidate(self) -> bool:
+        """Whether this is a verdict on the candidate, green or not, by a run that was
+        still the one to decide when it ended."""
+        return self.rejection not in DECIDES_NOTHING
 
     @property
     def is_valid(self) -> bool:

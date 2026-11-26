@@ -141,6 +141,7 @@ async def held_at_the_barrier(run: asyncio.Task[Any], barrier: HeldAtABarrier) -
 PRODUCT_OWNER = Principal(PrincipalKind.HUMAN, "product-owner")
 ANALYST = Principal(PrincipalKind.WORKER, "worker-analyst", role="analyst")
 VERIFIER = Principal(PrincipalKind.WORKER, "worker-verifier", role="verifier")
+RELAY_ITSELF = Principal(PrincipalKind.CONTROL_PLANE, "relay/control-plane")
 
 
 async def in_a_story(behaviours: Behaviours, project: str) -> None:
@@ -196,16 +197,17 @@ async def run_green(
     return await behaviours.run_green(project, behaviour, attempt, grant)
 
 
-async def prepare_review(reviews: Reviews, capability: str, into: Path) -> Path:
+async def prepare_review(reviews: Reviews, task_id: str | uuid.UUID, into: Path) -> Path:
     """What a reviewer's worker does on receiving its command: claim the review, then
     ask for the tree under that grant. Where the review cannot be claimed, a grant
     nobody was given, as a stray caller would have."""
     pool = reviews._pool
+    task_id = uuid.UUID(str(task_id))
     async with pool.connection() as connection:
         task = await (
             await connection.execute(
-                "SELECT assignment_id, role FROM review_tasks WHERE capability = %s",
-                (capability,),
+                "SELECT assignment_id, role FROM review_tasks WHERE task_id = %s",
+                (task_id,),
             )
         ).fetchone()
     grant = uuid.uuid7()
@@ -213,7 +215,7 @@ async def prepare_review(reviews: Reviews, capability: str, into: Path) -> Path:
         reviewer = Principal(PrincipalKind.WORKER, f"worker-{task['role']}", role=task["role"])
         with contextlib.suppress(ActionRefused):
             grant = await Assignments(pool).claim(reviewer, task["assignment_id"])
-    return (await reviews.prepare_review(capability, into, grant)).tree
+    return (await reviews.prepare_review(task_id, into, grant)).tree
 
 
 async def announce_wanted_work_again(pool: AsyncConnectionPool, project: str) -> int:
@@ -221,9 +223,12 @@ async def announce_wanted_work_again(pool: AsyncConnectionPool, project: str) ->
         return await announce_again(connection, project)
 
 
-async def submit_review(reviews: Reviews, capability: str, review: Review) -> SubmissionReceipt:
+async def submit_review(
+    reviews: Reviews, task_id: str | uuid.UUID, review: Review
+) -> SubmissionReceipt:
     """Submit as the worker that holds the review now would: under its current grant, and
     from the tree it was last handed. Where there is neither, identifiers nobody was given."""
+    task_id = uuid.UUID(str(task_id))
     async with reviews._pool.connection() as connection:
         held = await (
             await connection.execute(
@@ -231,10 +236,10 @@ async def submit_review(reviews: Reviews, capability: str, review: Review) -> Su
                 "WHERE c.task_id = t.task_id AND c.grant_id = a.grant_id "
                 "ORDER BY c.prepared_at DESC, c.receipt_id DESC LIMIT 1) AS receipt "
                 "FROM review_tasks t JOIN assignments a USING (assignment_id) "
-                "WHERE t.capability = %s AND a.grant_id IS NOT NULL",
-                (capability,),
+                "WHERE t.task_id = %s AND a.grant_id IS NOT NULL",
+                (task_id,),
             )
         ).fetchone()
     grant = held["grant_id"] if held else uuid.uuid7()
     receipt = (held["receipt"] if held else None) or uuid.uuid7()
-    return await reviews.submit_review(capability, review, grant, receipt)
+    return await reviews.submit_review(task_id, review, grant, receipt)

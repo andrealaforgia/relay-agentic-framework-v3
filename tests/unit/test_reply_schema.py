@@ -5,7 +5,7 @@ having done so."""
 import pytest
 
 from relay.application.tasks import BUILD_REPLY, REVIEW_REPLY
-from relay.domain.schema import problem_with
+from relay.domain.schema import problem_with, require_checkable
 
 FINDING = {"severity": "high", "claim": "c", "evidence": "e", "remediation": "r"}
 
@@ -55,3 +55,15 @@ def test_a_schema_relay_cannot_check_in_full_is_refused_and_not_half_checked() -
         problem_with("x", {"type": "string", "pattern": "^a"})
     with pytest.raises(ValueError, match="null"):
         problem_with(None, {"type": "null"})
+
+
+def test_a_schema_is_refused_whole_before_any_reply_is_paid_for() -> None:
+    """3B-S2-2.6: what Relay does not check may be anywhere in it, and is found without
+    a reply to walk through."""
+    require_checkable(REVIEW_REPLY)
+    require_checkable({"type": "object"})
+    deep = {"type": "object", "properties": {"each": {"type": "array", "items": {"oneOf": []}}}}
+    with pytest.raises(ValueError, match="oneOf"):
+        require_checkable(deep)
+    with pytest.raises(ValueError, match="null"):
+        require_checkable({"type": "array", "items": {"type": "null"}})

@@ -1,16 +1,17 @@
 """Review of a verified green: one cycle per green, one task per required reviewer.
 
-Reviewers are callers of this API. Nothing here trusts what a caller says about who it
-is or what it looked at: authority comes from a capability delivered only in the review
-command, and what was reviewed is a tree this code prepared from the pinned commit.
+Reviewers are callers of this API. Nothing here trusts what a caller says about what it
+looked at: what was reviewed is a tree this code prepared from the pinned commit. What
+lets a caller act on a review is the grant that holds the review's assignment now, which
+`claim` gives to one enrolled worker process of the review's role. There is no secret
+that stands for a review: nothing is stored, delivered or shown that would let whoever
+read it act as a reviewer.
 """
 
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
-import secrets
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -137,8 +138,8 @@ class Checkout:
     receipt: uuid.UUID
 
 
-class UnknownCapability(Exception):
-    """The caller presented nothing that identifies a review task."""
+class UnknownReview(Exception):
+    """The caller named no review task there is."""
 
 
 def candidate_ref(project_id: str, behaviour_id: str, cycle_id: uuid.UUID) -> str:
@@ -158,8 +159,8 @@ async def open_cycle(
     candidate: str,
 ) -> uuid.UUID:
     """Called in the transaction that accepts a green. Creates the cycle and its tasks.
-    Nothing is announced yet: review commands carry a capability, and are only enqueued
-    once the candidate is published."""
+    Nothing is announced yet: review commands are only enqueued, and the work they
+    announce only owed, once the candidate is published."""
     policy = await (
         await connection.execute(
             "SELECT required_reviewers, blocking_from FROM projects WHERE project_id = %s",
@@ -308,10 +309,7 @@ class Reviews:
                 )
             ).fetchall()
             for task in tasks:
-                capability = secrets.token_urlsafe(32)
-                command = _review_command(
-                    cycle, task["task_id"], task["role"], capability, published.event_id
-                )
+                command = _review_command(cycle, task["task_id"], task["role"], published.event_id)
                 assignment_id = await owe(
                     connection,
                     REVIEW,
@@ -322,9 +320,9 @@ class Reviews:
                     },
                 )
                 await connection.execute(
-                    "UPDATE review_tasks SET capability = %s, command_message_id = %s, "
-                    "assignment_id = %s WHERE task_id = %s",
-                    (capability, command.message_id, assignment_id, task["task_id"]),
+                    "UPDATE review_tasks SET command_message_id = %s, assignment_id = %s "
+                    "WHERE task_id = %s",
+                    (command.message_id, assignment_id, task["task_id"]),
                 )
         return 1
 
@@ -486,12 +484,12 @@ class Reviews:
             timeout=self._remote_timeout,
         )
 
-    async def prepare_review(self, capability: str, into: Path, grant: uuid.UUID) -> Checkout:
+    async def prepare_review(self, task_id: uuid.UUID, into: Path, grant: uuid.UUID) -> Checkout:
         """Give a reviewer the tree to review: exactly the cycle's commit, from the control
         plane's pinned copy, after confirming the published ref still names that commit.
-        The caller names the grant it was given for this review, and the checkout receipt
-        is that grant's first effect."""
-        task = await self._task(capability)
+        The caller names the review and the grant it was given for it: naming the review
+        alone gets nothing. The checkout receipt is that grant's first effect."""
+        task = await self._task(task_id)
         if task["state"] != "open" or task["publication"] != "published":
             raise SubmissionRefused("this review is no longer open")
         async with self._pool.connection() as connection:
@@ -533,13 +531,13 @@ class Reviews:
         return Checkout(tree, receipt)
 
     async def submit_review(
-        self, capability: str, review: Review, grant: uuid.UUID, checkout: uuid.UUID
+        self, task_id: uuid.UUID, review: Review, grant: uuid.UUID, checkout: uuid.UUID
     ) -> Receipt:
         """Record one reviewer's review. Every request gets exactly one answer however often
         it is retried, and only the first accepted submission of a task has any effect.
         That first submission names the checkout it was written from: one made under the
         grant that holds the review now, and under the decisions in force now."""
-        task_id = (await self._task(capability))["task_id"]
+        await self._task(task_id)
         async with self._pool.connection() as connection, connection.transaction():
             task = await _locked_task(connection, task_id)
             closed_by = await closure_of_behaviour(
@@ -747,13 +745,13 @@ class Reviews:
                 issued_on={"cycle_id": str(cycle_id)},
             )
 
-    async def _task(self, capability: str) -> dict[str, Any]:
+    async def _task(self, task_id: uuid.UUID) -> dict[str, Any]:
         async with self._pool.connection() as connection:
             row = await (
-                await connection.execute(_TASK_QUERY + " WHERE t.capability = %s", (capability,))
+                await connection.execute(_TASK_QUERY + " WHERE t.task_id = %s", (task_id,))
             ).fetchone()
-        if row is None or not hmac.compare_digest(row["capability"], capability):
-            raise UnknownCapability("no review task answers to that capability")
+        if row is None:
+            raise UnknownReview("there is no such review")
         return row
 
     async def _stop_publication(self, cycle: dict[str, Any], reason: str) -> None:
@@ -905,7 +903,7 @@ async def _accepted_green(
 
 
 _TASK_QUERY = (
-    "SELECT t.task_id, t.role, t.capability, t.assignment_id, c.cycle_id, c.project_id, c.behaviour_id, c.state, "
+    "SELECT t.task_id, t.role, t.assignment_id, c.cycle_id, c.project_id, c.behaviour_id, c.state, "
     "c.publication, c.candidate_revision, c.candidate_ref, c.required_roles, c.blocking_from, "
     "p.repository FROM review_tasks t JOIN review_cycles c USING (cycle_id) "
     "JOIN projects p USING (project_id)"
@@ -1055,7 +1053,6 @@ def _review_command(
     cycle: dict[str, Any],
     task_id: uuid.UUID,
     role: str,
-    capability: str,
     cause: uuid.UUID,
 ) -> Envelope:
     return Envelope(
@@ -1070,7 +1067,6 @@ def _review_command(
         causation_id=cause,
         payload={
             "task_id": str(task_id),
-            "capability": capability,
             "candidate_revision": cycle["candidate_revision"],
             "candidate_ref": cycle["candidate_ref"],
         },

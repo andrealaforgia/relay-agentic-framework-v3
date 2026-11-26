@@ -22,6 +22,7 @@ from relay.persistence.outbox import pending_messages
 from relay.testing.oracle import ContainerIsolation, NativeIsolation, ProcessOracle
 from tests.integration.fixtures import (
     CONTRACT,
+    RELAY_ITSELF,
     VAT_APPLIES_STANDARD_RATE,
     VAT_RETURNS_NET,
     VERIFIER,
@@ -55,11 +56,18 @@ async def released_to_builder(
     await behaviours.open_project(PROJECT, str(repository))
     await in_a_story(behaviours, PROJECT)
     await behaviours.propose(
-        PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0, story_revision=1
+        VERIFIER,
+        PROJECT,
+        "S1",
+        "B1",
+        "standard VAT rate is applied",
+        ["AC1"],
+        basis=0,
+        story_revision=1,
     )
-    await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
-    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    await behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    await behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
+    assert (await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
     return behaviours, trunk
 
 
@@ -194,10 +202,17 @@ async def test_green_cannot_be_run_before_red(
     await behaviours.open_project(PROJECT, str(repository))
     await in_a_story(behaviours, PROJECT)
     await behaviours.propose(
-        PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0, story_revision=1
+        VERIFIER,
+        PROJECT,
+        "S1",
+        "B1",
+        "standard VAT rate is applied",
+        ["AC1"],
+        basis=0,
+        story_revision=1,
     )
-    await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
+    await behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    await behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
     publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=trunk)
 
     with pytest.raises(TransitionRefused):
@@ -266,11 +281,18 @@ async def test_another_projects_candidate_on_the_same_repository_is_not_this_pro
     await behaviours.open_project("other-team", str(repository), trunk="release")
     await in_a_story(behaviours, "other-team")
     await behaviours.propose(
-        "other-team", "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0, story_revision=1
+        VERIFIER,
+        "other-team",
+        "S1",
+        "B1",
+        "standard VAT rate is applied",
+        ["AC1"],
+        basis=0,
+        story_revision=1,
     )
-    await behaviours.begin_test_design("other-team", "B1")
-    await behaviours.register_acceptance_test("other-team", "B1", CONTRACT, basis=0)
-    assert (await behaviours.run_red("other-team", "B1")).is_valid
+    await behaviours.begin_test_design(VERIFIER, "other-team", "B1")
+    await behaviours.register_acceptance_test(VERIFIER, "other-team", "B1", CONTRACT, basis=0)
+    assert (await behaviours.run_red(RELAY_ITSELF, "other-team", "B1")).is_valid
     publish_attempt(repository, "B1", 1, {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=red_revision)
 
     with pytest.raises(CheckoutFailed, match="attempt 1"):
@@ -298,11 +320,18 @@ async def test_a_candidate_that_hangs_is_reported_as_a_timeout(
     await behaviours.open_project(PROJECT, str(repository))
     await in_a_story(behaviours, PROJECT)
     await behaviours.propose(
-        PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0, story_revision=1
+        VERIFIER,
+        PROJECT,
+        "S1",
+        "B1",
+        "standard VAT rate is applied",
+        ["AC1"],
+        basis=0,
+        story_revision=1,
     )
-    await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", quick, basis=0)
-    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    await behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    await behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", quick, basis=0)
+    assert (await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
     publish_attempt(repository, "B1", 1, {"vat.py": "import time\ntime.sleep(60)\n"}, on=trunk)
 
     verdict = await run_green(behaviours, PROJECT, "B1", attempt=1)
@@ -370,7 +399,7 @@ async def test_after_a_runtime_change_the_red_can_be_reopened_and_the_work_compl
     async with database.connection() as connection:
         row = await (await connection.execute("SELECT red_execution_id FROM behaviours")).fetchone()
     assert row == {"red_execution_id": None}, "the superseded red must no longer be paired"
-    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
     assert (await run_green(behaviours, PROJECT, "B1", attempt=1)).is_valid
     assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.REVIEW
 
@@ -400,7 +429,7 @@ async def test_a_green_in_flight_when_its_red_is_superseded_does_not_reach_revie
 
     await behaviours.reopen_red(VERIFIER, PROJECT, "B1", reason="trunk moved")
     second_red = commit(repository, {"README.md": "trunk moved on; VAT still wrong"})
-    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
     held.release.set()
     verdict = await in_flight
 
@@ -427,17 +456,26 @@ async def test_a_red_in_flight_when_the_red_is_reopened_cannot_fill_the_new_cycl
     await behaviours.open_project(PROJECT, str(repository))
     await in_a_story(behaviours, PROJECT)
     await behaviours.propose(
-        PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0, story_revision=1
+        VERIFIER,
+        PROJECT,
+        "S1",
+        "B1",
+        "standard VAT rate is applied",
+        ["AC1"],
+        basis=0,
+        story_revision=1,
     )
-    await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
+    await behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    await behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
     held = HeldAtABarrier(ContainerIsolation(runner_image))
     late = asyncio.create_task(
-        Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)).run_red(PROJECT, "B1")
+        Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)).run_red(
+            RELAY_ITSELF, PROJECT, "B1"
+        )
     )
     await held_at_the_barrier(late, held)
 
-    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
     await behaviours.reopen_red(VERIFIER, PROJECT, "B1", reason="trunk moved")
     commit(repository, {"README.md": "trunk moved on"})
     held.release.set()
@@ -458,7 +496,7 @@ async def test_a_fresh_red_issues_a_build_request_with_a_new_idempotency_key(
 ) -> None:
     behaviours, _ = await released_to_builder(database, tmp_path / "subject", runner_image)
     await behaviours.reopen_red(VERIFIER, PROJECT, "B1", reason="runner image upgraded")
-    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
 
     first, second = await pending_messages(database)
 
@@ -518,20 +556,29 @@ async def test_a_red_released_after_the_replacement_red_was_accepted_is_still_re
     await behaviours.open_project(PROJECT, str(repository))
     await in_a_story(behaviours, PROJECT)
     await behaviours.propose(
-        PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0, story_revision=1
+        VERIFIER,
+        PROJECT,
+        "S1",
+        "B1",
+        "standard VAT rate is applied",
+        ["AC1"],
+        basis=0,
+        story_revision=1,
     )
-    await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
+    await behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    await behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
     held = HeldAtABarrier(ContainerIsolation(runner_image))
     late = asyncio.create_task(
-        Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)).run_red(PROJECT, "B1")
+        Behaviours(database, tmp_path / "mirrors", ProcessOracle(held)).run_red(
+            RELAY_ITSELF, PROJECT, "B1"
+        )
     )
     await held_at_the_barrier(late, held)
 
-    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
     await behaviours.reopen_red(VERIFIER, PROJECT, "B1", reason="trunk moved")
     new_trunk = commit(repository, {"README.md": "trunk moved on"})
-    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
     held.release.set()
     verdict = await late
 

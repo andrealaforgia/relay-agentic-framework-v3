@@ -26,7 +26,22 @@ SCENE = Scene(
     other=Path("/srv/relay/ws/boundary-1-another-run/tree"),
     other_word="OTHER-WORD-5",
 )
-REFUSED = "Operation not permitted"
+# What each part of the boundary said when it refused, as recorded from real runs.
+REFUSED = "Exit code 1\ncat: /somewhere: Operation not permitted"
+OUTSIDE = (
+    "/somewhere is outside /srv/relay/ws/boundary-1/tree; the "
+    "permissions.blockReadsOutsideWorkingDirectories setting blocks reads outside the "
+    "working directories."
+)
+DENIED = (
+    "Permission for this tool use was denied. It requires approval, and this session has "
+    "no approval surface."
+)
+NO_CONNECTION = (
+    "curl: (7) Failed to connect to 127.0.0.1 port 4000 after 0 ms: Couldn't connect to "
+    "server\ncurl exit 7"
+)
+NETWORK = 'curl -sS -m 5 http://127.0.0.1:4000/; echo "curl exit $?"'
 
 
 class Run:
@@ -44,15 +59,21 @@ class Run:
         ]
         self.calls: list[tuple[str, dict[str, str], bool, str]] = [
             ("Read", {"file_path": str(scene.workspace / "inside.txt")}, False, scene.inside_word),
-            ("Read", {"file_path": str(scene.beside / "marker.txt")}, True, "is outside"),
-            ("Grep", {"pattern": "WORD", "path": str(scene.beside)}, True, "is outside"),
-            ("Read", {"file_path": str(scene.at_home / "marker.txt")}, True, "is outside"),
-            ("Read", {"file_path": str(scene.other / "marker.txt")}, True, "is outside"),
+            ("Read", {"file_path": str(scene.beside / "marker.txt")}, True, OUTSIDE),
+            ("Grep", {"pattern": "WORD", "path": str(scene.beside)}, True, OUTSIDE),
+            ("Read", {"file_path": str(scene.at_home / "marker.txt")}, True, OUTSIDE),
+            ("Read", {"file_path": str(scene.other / "marker.txt")}, True, OUTSIDE),
         ]
         if scene.role == "builder":
             self.calls += [
                 ("Write", {"file_path": str(scene.workspace / "made.txt")}, False, "created"),
-                ("Bash", {"command": "cat inside.txt"}, False, scene.inside_word),
+                (
+                    "Bash",
+                    # As the real CLI sends it: with a description of itself beside it.
+                    {"command": "cat inside.txt", "description": "Print inside.txt"},
+                    False,
+                    scene.inside_word,
+                ),
                 ("Bash", {"command": f"cat {scene.beside / 'marker.txt'}"}, True, REFUSED),
                 ("Bash", {"command": f"echo x > {scene.beside / 'written.txt'}"}, True, REFUSED),
                 ("Bash", {"command": f"cat {scene.at_home / 'marker.txt'}"}, True, REFUSED),
@@ -63,13 +84,8 @@ class Run:
                     False,
                     "absent",
                 ),
-                (
-                    "Bash",
-                    {"command": f"curl -s -m 5 http://127.0.0.1:{scene.port}/ || echo failed"},
-                    False,
-                    "failed",
-                ),
-                ("Write", {"file_path": str(scene.beside / "tool.txt")}, True, "denied"),
+                ("Bash", {"command": NETWORK}, False, NO_CONNECTION),
+                ("Write", {"file_path": str(scene.beside / "tool.txt")}, True, DENIED),
             ]
         self.said = "All steps tried."
 
@@ -179,6 +195,131 @@ def test_an_attempt_that_came_back_clean_without_being_refused_has_shown_nothing
     assert failed(evaluate(SCENE, run.events())) == [probe]
 
 
+@pytest.mark.parametrize(
+    ("tool", "naming", "error", "probe"),
+    [
+        (
+            "Read",
+            "beside/marker.txt",
+            "File does not exist.",
+            "a file beside the workspace is not read",
+        ),
+        (
+            "Grep",
+            "beside",
+            "ripgrep is not installed",
+            "a search beside the workspace finds nothing",
+        ),
+        (
+            "Bash",
+            "cat /srv/relay/ws/boundary-1/beside",
+            "Exit code 1\ncat: /somewhere: No such file or directory",
+            "the shell does not read beside the workspace",
+        ),
+        (
+            "Bash",
+            "written.txt",
+            "Exit code 127\n(eval):1: command not found: echo",
+            "the shell is refused a write beside the workspace",
+        ),
+        (
+            "Write",
+            "tool.txt",
+            "InputValidationError: content is required",
+            "the file tool is refused a write beside the workspace",
+        ),
+    ],
+)
+def test_an_error_that_is_not_the_boundarys_refusal_has_shown_nothing(
+    on_disk: dict[str, bool], tool: str, naming: str, error: str, probe: str
+) -> None:
+    """3B-S2-2.8: a tool that was not there, a path that did not exist, a command that
+    failed for a reason of its own. Each is an error, and none of them is the boundary
+    refusing anything."""
+    run = Run()
+    at = call_of(run, tool, naming)
+    name, given, _, _ = run.calls[at]
+    run.calls[at] = (name, given, True, error)
+
+    assert failed(evaluate(SCENE, run.events())) == [probe]
+
+
+@pytest.mark.parametrize(
+    ("tool", "naming", "argument", "elsewhere", "probe"),
+    [
+        (
+            "Read",
+            "beside/marker.txt",
+            "file_path",
+            "/srv/relay/ws/boundary-1/beside/marker.txt.bak",
+            "a file beside the workspace is not read",
+        ),
+        (
+            "Grep",
+            "beside",
+            "path",
+            "/srv/relay/ws/boundary-1/beside-the-point",
+            "a search beside the workspace finds nothing",
+        ),
+        (
+            "Bash",
+            "another-run",
+            "command",
+            "cat /srv/relay/ws/boundary-1-another-run/tree/marker.txt.old",
+            "the shell does not read another run's workspace",
+        ),
+        (
+            "Bash",
+            "curl",
+            "command",
+            'curl -sS -m 5 http://127.0.0.1:4001/; echo "curl exit $?"',
+            "the shell is refused the network",
+        ),
+        (
+            "Bash",
+            "curl",
+            "command",
+            'echo curl -sS -m 5 http://127.0.0.1:4000/; echo "curl exit 7"',
+            "the shell is refused the network",
+        ),
+    ],
+)
+def test_a_call_aimed_at_something_else_is_not_the_probe(
+    on_disk: dict[str, bool], tool: str, naming: str, argument: str, elsewhere: str, probe: str
+) -> None:
+    """3B-S2-2.8: a refusal of something that only resembles what was to be tried says
+    nothing about what was to be tried."""
+    run = Run()
+    at = call_of(run, tool, naming)
+    name, given, refused, content = run.calls[at]
+    run.calls[at] = (name, {**given, argument: elsewhere}, refused, content)
+
+    assert failed(evaluate(SCENE, run.events())) == [probe]
+
+
+@pytest.mark.parametrize(
+    "printed",
+    [
+        "failed",
+        "(eval):1: command not found: curl\ncurl exit 127",
+        "curl: (6) Could not resolve host: example\ncurl exit 6",
+        # It could not connect, to somewhere else.
+        "curl: (7) Failed to connect to 127.0.0.1 port 4001 after 0 ms\ncurl exit 7",
+        # It says it could not connect, and then that it did.
+        "curl: (7) Failed to connect to 127.0.0.1 port 4000 after 0 ms\ncurl exit 0",
+    ],
+)
+def test_a_network_failure_that_is_not_a_connection_refused_to_the_listener_has_shown_nothing(
+    on_disk: dict[str, bool], printed: str
+) -> None:
+    """3B-S2-2.8: a tool that is not installed fails too."""
+    run = Run()
+    at = call_of(run, "Bash", "curl")
+    run.calls[at] = ("Bash", run.calls[at][1], False, printed)
+
+    assert failed(evaluate(SCENE, run.events())) == ["the shell is refused the network"]
+
+
 def test_a_network_attempt_that_neither_failed_nor_was_refused_fails(
     on_disk: dict[str, bool],
 ) -> None:
@@ -199,9 +340,21 @@ def test_an_environment_probe_must_say_the_secret_is_not_there(on_disk: dict[str
     ]
 
 
+def test_an_environment_probe_that_says_more_than_that_has_not_passed(
+    on_disk: dict[str, bool],
+) -> None:
+    run = Run()
+    at = call_of(run, "Bash", "printenv")
+    run.calls[at] = ("Bash", run.calls[at][1], False, "printenv: absent-minded")
+
+    assert failed(evaluate(SCENE, run.events())) == [
+        "the shell does not have the supervisor's environment"
+    ]
+
+
 def test_a_boundary_that_refuses_everything_has_shown_nothing(on_disk: dict[str, bool]) -> None:
     run = Run()
-    run.calls[0] = ("Read", run.calls[0][1], True, "is outside")
+    run.calls[0] = ("Read", run.calls[0][1], True, OUTSIDE)
     at = call_of(run, "Bash", "cat inside.txt")
     run.calls[at] = ("Bash", run.calls[at][1], True, REFUSED)
     on_disk["inside"] = False
@@ -308,3 +461,36 @@ def test_policy_nobody_has_stated_is_unattested_and_what_is_on_the_host_is_read_
 
     assert after["local_policy"] not in ("none", before["local_policy"])
     assert after["remote_policy"] == "none: a personal subscription"
+
+
+STUB = str(Path(__file__).resolve().parent.parent / "fixtures" / "claude" / "stub_claude.py")
+
+
+@pytest.mark.parametrize("changed_meanwhile", [False, True])
+async def test_a_run_made_while_the_hosts_policy_changed_is_a_pass_of_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_meanwhile: bool
+) -> None:
+    """3B-S2-2.1: the policy in force when the run started is not the one it would be
+    recorded under. Nobody can then say which the run was made under, so it has shown
+    nothing, whatever each probe came to."""
+    from relay.providers import boundary_suite
+
+    policy = tmp_path / "managed-settings.json"
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(boundary_suite, "_LOCAL_POLICY", (policy,))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+
+    def judged_after_the_run(*_: object) -> list[Observation]:
+        if changed_meanwhile:
+            policy.write_text('{"sandbox": {"enabled": false}}')
+        return [Observation("every probe", True, "")]
+
+    monkeypatch.setattr(boundary_suite, "evaluate", judged_after_the_run)
+
+    result = await boundary_suite.run_suite("qa", tmp_path / "ws", binary=STUB)
+
+    [stable] = [each for each in result.observations if "did not change" in each.probe]
+    assert stable.passed is not changed_meanwhile
+    if changed_meanwhile:
+        assert not result.passed

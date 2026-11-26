@@ -21,6 +21,7 @@ from tests.integration.fixtures import (
     ANALYST,
     BUILDER,
     CONTRACT,
+    RELAY_ITSELF,
     VERIFIER,
     HeldAtABarrier,
     held_at_the_barrier,
@@ -57,32 +58,32 @@ async def test_a_proposal_names_the_basis_it_was_written_on_and_needs_a_current_
 
     with pytest.raises(ActionRefused, match="S1 is not current"):
         await world.behaviours.propose(
-            PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=1, story_revision=1
+            VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=1, story_revision=1
         )
     await world.reconfirm_everything()
     with pytest.raises(ActionRefused, match="written on decision basis 0"):
         await world.behaviours.propose(
-            PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+            VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
         )
 
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=1, story_revision=1
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=1, story_revision=1
     )
 
 
 async def test_a_contract_names_the_basis_it_was_written_on(world: DecisionWorld) -> None:
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
     )
-    await world.behaviours.begin_test_design(PROJECT, "B1")
+    await world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
     await decided(world)
     await world.reconfirm_everything()
 
     with pytest.raises(ActionRefused, match="written on decision basis 0"):
-        await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
+        await world.behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
 
-    await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=1)
-    assert (await world.behaviours.run_red(PROJECT, "B1")).is_valid
+    await world.behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=1)
+    assert (await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
 
 
 async def test_a_seal_names_its_basis_and_vouches_only_for_contracts_that_are_current(
@@ -129,13 +130,13 @@ async def test_a_red_in_flight_when_a_decision_lands_is_evidence_only_even_if_al
     world: DecisionWorld,
 ) -> None:
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
     )
-    await world.behaviours.begin_test_design(PROJECT, "B1")
-    await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
+    await world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    await world.behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
     barrier = HeldAtABarrier(ContainerIsolation(world.image))
     slow = Behaviours(world.database, world.mirrors, ProcessOracle(barrier))
-    running = asyncio.create_task(slow.run_red(PROJECT, "B1"))
+    running = asyncio.create_task(slow.run_red(RELAY_ITSELF, PROJECT, "B1"))
     await held_at_the_barrier(running, barrier)
     await decided(world)
     await world.reconfirm_everything()
@@ -144,7 +145,7 @@ async def test_a_red_in_flight_when_a_decision_lands_is_evidence_only_even_if_al
 
     assert (await running).rejection is RedRejection.SUPERSEDED
     assert await world.column("SELECT count(*) FROM assignments WHERE kind = 'build'") == [0]
-    assert (await world.behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
 
 
 async def test_a_decision_made_without_a_question_takes_back_grants_that_have_done_nothing(

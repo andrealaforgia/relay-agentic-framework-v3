@@ -17,9 +17,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from relay.application.assignments import Assignments
-from relay.application.invocations import Invocations, Prepared
+from relay.application.invocations import Invocations, Prepared, reply_problem
 from relay.application.workers import WorkerSession
-from relay.domain.schema import problem_with as schema_problem
 from relay.domain.story import ActionRefused
 from relay.providers.boundary_suite import UNATTESTED
 from relay.providers.claude import (
@@ -303,11 +302,11 @@ class Worker:
 
 
 def _problem(task: Task, result: ProviderResult, schema: Mapping[str, Any]) -> str | None:
-    if result.outcome is not Outcome.RETURNED or result.terminal is None:
+    if result.outcome is not Outcome.RETURNED:
         return None
-    reply = result.terminal.structured_output
-    if reply is None:
-        return "the reply did not carry the structured answer it was asked for"
-    # Against the schema that was recorded with the call, before the task reads any of
-    # it: asking the provider to enforce the schema is not its having done so.
-    return schema_problem(reply, dict(schema)) or task.problem_with(reply)
+    # Against the schema of the call, before the task reads any of the reply. The record
+    # makes the same check against the schema it stored, whoever brings it a result.
+    found = reply_problem(result, schema)
+    if found is not None or result.terminal is None:
+        return found
+    return task.problem_with(result.terminal.structured_output)

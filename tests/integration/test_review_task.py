@@ -19,12 +19,11 @@ from relay.application.tasks import Profile, ReviewTask, Tasks, Workspaces
 from relay.application.worker import Worker
 from relay.application.workers import WorkerSession
 from relay.domain.review import Severity
-from relay.domain.story import ActionRefused, HumanAction
+from relay.domain.story import ActionRefused
 from relay.providers.claude import Outcome, ProviderResult, Request
 from relay.providers.stream import Terminal
 from tests.integration.decision_world import DecisionWorld
 from tests.integration.fixtures import (
-    PRODUCT_OWNER,
     VAT_APPLIES_STANDARD_RATE,
     VERIFIER,
     run_green,
@@ -352,14 +351,10 @@ async def test_a_review_that_arrives_when_another_was_accepted_is_overtaken_and_
         await worker.carry_out(await reviewing.owed("qa"))
     reviewing.invocations.apply = real  # type: ignore[method-assign]
     owed = await reviewing.owed("qa")
-    [capability] = await reviewing.world.column(
-        "SELECT capability FROM review_tasks WHERE role = 'qa'"
-    )
+    [task_id] = await reviewing.world.column("SELECT task_id FROM review_tasks WHERE role = 'qa'")
     [receipt] = await reviewing.world.column("SELECT receipt_id FROM review_checkouts")
     # Another review of the same task is accepted first, with other content.
-    await reviewing.world.reviews.submit_review(
-        str(capability), Review(), owed["grant_id"], receipt
-    )
+    await reviewing.world.reviews.submit_review(task_id, Review(), owed["grant_id"], receipt)
 
     await reviewing.invocations.recover(PROJECT)
 
@@ -424,38 +419,33 @@ async def test_only_the_builder_disputes_a_finding(reviewing: Reviewing) -> None
     assert await reviewing.world.column("SELECT status FROM findings") == ["open"]
 
 
-async def test_a_review_adopted_under_another_grant_is_overtaken_and_done_again(
+async def test_a_malformed_review_handed_straight_to_the_record_becomes_no_finding(
     reviewing: Reviewing,
 ) -> None:
-    """3B-S2-1.7: the first reviewer's call was given up on, a retry was allowed and
-    claimed, and then its reply arrived. The reply was written from a checkout made
-    under a grant that no longer holds the work, and the review service takes a review
-    only from one made under the grant that does. Nothing is submitted from it, nobody
-    is blamed, and the work is done again."""
-    first = await reviewing.worker("qa", Reviewer())
+    """3B-S2-2.6: a result that reaches the record by other hands than the worker's is
+    checked there, against the schema stored with its call. What it used is kept; no
+    finding is made of it, by the pass or by anyone."""
+    await reviewing.worker("qa", Reviewer())
+    session = reviewing.sessions[-1]
     owed = await reviewing.owed("qa")
-    one = reviewing.sessions[-1]
-    grant = await reviewing.world.claims.claim(one.principal, owed["assignment_id"], one.worker_id)
-    call = await reviewing.task.prepare(owed, grant, None)
-    admission = await reviewing.invocations.admit(one, owed["assignment_id"], grant, call.prepared)
-    assert admission.invocation_id is not None
-    await one.stop()
-    await reviewing.invocations.recover(PROJECT)
-    reviewing_requests = HumanAction(
-        PRODUCT_OWNER, "retry-the-review", str(admission.invocation_id), "retry", {}
+    grant = await reviewing.world.claims.claim(
+        session.principal, owed["assignment_id"], session.worker_id
     )
-    await reviewing.invocations.decide(reviewing_requests)
-    provider = Reviewer(NOTHING_FOUND)
-    second = await reviewing.worker("qa", provider)
-    two = reviewing.sessions[-1]
-    await reviewing.world.claims.claim(two.principal, owed["assignment_id"], two.worker_id)
-    assert first is not second
+    call = await reviewing.task.prepare(owed, grant, None)
+    admission = await reviewing.invocations.admit(
+        session, owed["assignment_id"], grant, call.prepared
+    )
+    assert admission.invocation_id is not None
+    malformed = replying({"findings": [{**NO_USAGE_MESSAGE, "claim": 7}], "carried": []})
 
-    late = replying({"findings": [NO_USAGE_MESSAGE], "carried": []})
-    assert await reviewing.invocations.record(admission.invocation_id, late) == "returned"
-    assert await second.carry_out(await reviewing.owed("qa")) == "overtaken"
+    assert await reviewing.invocations.record(admission.invocation_id, malformed) == "rejected"
+    await reviewing.invocations.recover(PROJECT)
 
     assert await reviewing.world.column("SELECT count(*) FROM findings") == [0]
-    assert await reviewing.invocations.parked(PROJECT) == []
-    assert await second.carry_out(await reviewing.owed("qa")) == "applied"
-    assert len(provider.asked) == 1
+    assert await reviewing.world.column("SELECT count(*) FROM review_submissions") == [0]
+    [reason] = await reviewing.world.column("SELECT reason FROM invocations")
+    assert reason == "claim of item 1 of findings of the reply is not a string"
+    [kept] = await reviewing.world.column(
+        "SELECT envelope->'structured_output'->'findings'->0->>'claim' FROM invocations"
+    )
+    assert kept == "7"

@@ -21,6 +21,7 @@ from relay.domain.evidence import (
     ProcessObservation,
     RedRejection,
 )
+from relay.domain.story import ActionRefused
 from relay.git.checkout import CheckoutFailed
 from relay.persistence.ledger import read_events
 from relay.persistence.outbox import pending_messages
@@ -31,10 +32,14 @@ from relay.testing.oracle import (
     ProcessOracle,
 )
 from tests.integration.fixtures import (
+    BUILDER,
     CONTRACT,
+    PRODUCT_OWNER,
+    RELAY_ITSELF,
     STORY_SET_UP,
     VAT_APPLIES_STANDARD_RATE,
     VAT_RETURNS_NET,
+    VERIFIER,
     CountingLaunches,
     commit,
     in_a_story,
@@ -63,10 +68,17 @@ async def awaiting_red(
     await behaviours.open_project(PROJECT, str(repository))
     await in_a_story(behaviours, PROJECT)
     await behaviours.propose(
-        PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0, story_revision=1
+        VERIFIER,
+        PROJECT,
+        "S1",
+        "B1",
+        "standard VAT rate is applied",
+        ["AC1"],
+        basis=0,
+        story_revision=1,
     )
-    await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", contract, basis=0)
+    await behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    await behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", contract, basis=0)
     return behaviours
 
 
@@ -83,7 +95,7 @@ async def test_the_wrong_business_value_releases_exactly_one_build_request(
         database, tmp_path / "subject", ContainerIsolation(runner_image)
     )
 
-    verdict = await behaviours.run_red(PROJECT, "B1")
+    verdict = await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
 
     assert verdict.is_valid
     assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
@@ -105,7 +117,7 @@ async def test_the_evidence_is_recorded_with_what_produced_it(
         database, tmp_path / "subject", ContainerIsolation(runner_image)
     )
 
-    await behaviours.run_red(PROJECT, "B1")
+    await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
 
     verified = (await read_events(database, PROJECT))[-1]
     assert verified.payload["revision"] == trunk
@@ -176,7 +188,7 @@ async def test_anything_else_keeps_the_builder_blocked_and_says_why(
         database, tmp_path / "subject", ContainerIsolation(runner_image), contract
     )
 
-    verdict = await behaviours.run_red(PROJECT, "B1")
+    verdict = await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
 
     assert verdict.rejection is rejection
     assert await builder_is_blocked(behaviours, database)
@@ -195,7 +207,7 @@ async def test_an_older_commit_cannot_be_substituted_for_a_trunk_that_already_pa
         database, tmp_path / "subject", ContainerIsolation(runner_image)
     )
 
-    verdict = await behaviours.run_red(PROJECT, "B1")
+    verdict = await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
 
     assert verdict.rejection is RedRejection.ALREADY_PASSES
     assert (await read_events(database, PROJECT))[-1].payload["revision"] == trunk
@@ -209,7 +221,7 @@ async def test_native_execution_is_refused_before_anything_is_launched(
     native = CountingLaunches(NativeIsolation())
     behaviours = await awaiting_red(database, tmp_path / "subject", native)
 
-    verdict = await behaviours.run_red(PROJECT, "B1")
+    verdict = await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
 
     assert verdict.rejection is RedRejection.ISOLATION_NOT_ADMISSIBLE
     assert native.launches == 0
@@ -227,11 +239,11 @@ async def test_a_released_behaviour_is_not_run_again(
     commit(tmp_path / "subject", {"vat.py": VAT_RETURNS_NET})
     container = CountingLaunches(ContainerIsolation(runner_image))
     behaviours = await awaiting_red(database, tmp_path / "subject", container)
-    await behaviours.run_red(PROJECT, "B1")
+    await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
     before = await read_events(database, PROJECT)
 
     with pytest.raises(TransitionRefused):
-        await behaviours.run_red(PROJECT, "B1")
+        await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
 
     assert container.launches == 1
     assert await read_events(database, PROJECT) == before
@@ -247,13 +259,20 @@ async def test_a_failed_checkout_is_on_the_ledger_and_the_builder_stays_blocked(
     await behaviours.open_project(PROJECT, str(tmp_path / "subject"), trunk="no-such-branch")
     await in_a_story(behaviours, PROJECT)
     await behaviours.propose(
-        PROJECT, "S1", "B1", "standard VAT rate is applied", ["AC1"], basis=0, story_revision=1
+        VERIFIER,
+        PROJECT,
+        "S1",
+        "B1",
+        "standard VAT rate is applied",
+        ["AC1"],
+        basis=0,
+        story_revision=1,
     )
-    await behaviours.begin_test_design(PROJECT, "B1")
-    await behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
+    await behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    await behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
 
     with pytest.raises(CheckoutFailed):
-        await behaviours.run_red(PROJECT, "B1")
+        await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
 
     assert container.launches == 0
     failed = (await read_events(database, PROJECT))[-1]
@@ -269,9 +288,9 @@ async def test_the_ledger_is_gap_free_and_in_order(
     behaviours = await awaiting_red(
         database, tmp_path / "subject", ContainerIsolation(runner_image)
     )
-    await behaviours.run_red(PROJECT, "B1")
+    await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
     commit(tmp_path / "subject", {"vat.py": VAT_RETURNS_NET})
-    await behaviours.run_red(PROJECT, "B1")
+    await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
 
     events = await read_events(database, PROJECT)
 
@@ -304,7 +323,7 @@ async def test_state_ledger_and_outbox_commit_together_or_not_at_all(
 
     monkeypatch.setattr("relay.application.assignments.enqueue", crash)
     with pytest.raises(RuntimeError):
-        await behaviours.run_red(PROJECT, "B1")
+        await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
 
     assert await read_events(database, PROJECT) == before
     assert await builder_is_blocked(behaviours, database)
@@ -344,9 +363,9 @@ async def test_a_caller_cannot_supply_the_observation_or_the_source(
         {"repository": str(tmp_path / "elsewhere")},
     ):
         with pytest.raises(TypeError):
-            await run_red(PROJECT, "B1", **supplied)
+            await run_red(RELAY_ITSELF, PROJECT, "B1", **supplied)
     with pytest.raises(TypeError):
-        await run_red(PROJECT, "B1", forged)
+        await run_red(RELAY_ITSELF, PROJECT, "B1", forged)
 
     assert await read_events(database, PROJECT) == before
     assert await builder_is_blocked(behaviours, database)
@@ -418,7 +437,7 @@ async def test_a_failure_does_not_copy_the_repository_address_into_the_ledger(
     shutil.rmtree(missing)  # it was there when the project was opened, and is gone
 
     with pytest.raises(CheckoutFailed) as failure:
-        await behaviours.run_red(PROJECT, "B1")
+        await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
 
     failed = (await read_events(database, PROJECT))[-1]
     assert failed.event_type == "behaviour.red_preparation_failed"
@@ -437,6 +456,7 @@ async def test_a_behaviour_id_relay_could_never_build_is_refused_when_proposed(
 
     with pytest.raises(ValueError, match="behaviour id"):
         await behaviours.propose(
+            VERIFIER,
             PROJECT,
             "S1",
             behaviour_id,
@@ -459,3 +479,39 @@ async def test_a_project_id_that_could_reshape_a_ref_is_refused(
 
     with pytest.raises(ValueError, match="project id"):
         await behaviours.open_project("vat/../../heads", str(tmp_path / "subject"))
+
+
+async def test_a_behaviour_and_its_contract_are_the_verifiers_and_a_red_is_relays_to_observe(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    """3B-S2-2.5: a story revision and a decision basis say that a caller read what is
+    current. They do not say who it is. Every other input here is one that would be
+    accepted."""
+    commit(tmp_path / "subject", {"vat.py": VAT_RETURNS_NET})
+    behaviours = Behaviours(
+        database, tmp_path / "mirrors", ProcessOracle(ContainerIsolation(runner_image))
+    )
+    await behaviours.open_project(PROJECT, str(tmp_path / "subject"))
+    await in_a_story(behaviours, PROJECT)
+    proposal: Any = ("S1", "B1", "standard VAT rate is applied", ["AC1"])
+    not_the_verifier = (BUILDER, PRODUCT_OWNER, RELAY_ITSELF)
+
+    for other in not_the_verifier:
+        with pytest.raises(ActionRefused, match="for the verifier"):
+            await behaviours.propose(other, PROJECT, *proposal, basis=0, story_revision=1)
+    await behaviours.propose(VERIFIER, PROJECT, *proposal, basis=0, story_revision=1)
+    for other in not_the_verifier:
+        with pytest.raises(ActionRefused, match="for the verifier"):
+            await behaviours.begin_test_design(other, PROJECT, "B1")
+    await behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    for other in not_the_verifier:
+        with pytest.raises(ActionRefused, match="for the verifier"):
+            await behaviours.register_acceptance_test(other, PROJECT, "B1", CONTRACT, basis=0)
+    await behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
+    before = await read_events(database, PROJECT)
+    for other in (VERIFIER, BUILDER, PRODUCT_OWNER):
+        with pytest.raises(ActionRefused, match="for the control plane"):
+            await behaviours.run_red(other, PROJECT, "B1")
+
+    assert await read_events(database, PROJECT) == before
+    assert (await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid

@@ -31,6 +31,7 @@ from tests.integration.fixtures import (
     ANALYST,
     CONTRACT,
     PRODUCT_OWNER,
+    RELAY_ITSELF,
     VAT_APPLIES_STANDARD_RATE,
     VERIFIER,
     HeldAtABarrier,
@@ -283,17 +284,17 @@ async def test_a_gate_already_superseded_is_stale_whatever_else_is_waiting(
 
 async def test_a_refusal_names_every_reason_the_closure_first(world: DecisionWorld) -> None:
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
     )
-    await world.behaviours.begin_test_design(PROJECT, "B1")
-    await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
+    await world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    await world.behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
     await decided(world)
     await world.reconfirm(await owed_for(world, "story"))
     again = await world.ask("S1")
     owed = await owed_for(world, "behaviour")
 
     with pytest.raises(ActionRefused) as refused:
-        await world.behaviours.run_red(PROJECT, "B1")
+        await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
 
     said = str(refused.value)
     assert f"question {again}" in said and "the contract of B1 is not current" in said
@@ -352,7 +353,7 @@ async def test_a_decision_waits_for_work_that_was_admitted_before_it(
     world: DecisionWorld, monkeypatch: pytest.MonkeyPatch, decision: str
 ) -> None:
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
     )
     assumed = await world.decisions.assume(ANALYST, PROJECT, "F1", story_id="S1", text="pounds")
     about_the_other_story = await world.ask("S2")
@@ -365,7 +366,7 @@ async def test_a_decision_waits_for_work_that_was_admitted_before_it(
         await go_on.wait()
 
     monkeypatch.setattr(behaviours_module, "require_story_at_work", held_once_admitted)
-    starting = asyncio.create_task(world.behaviours.begin_test_design(PROJECT, "B1"))
+    starting = asyncio.create_task(world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1"))
     await admitted.wait()
     deciding = asyncio.create_task(
         world.answer(about_the_other_story)
@@ -537,14 +538,14 @@ async def test_a_refusal_names_the_question_the_story_and_the_contract_together(
     world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
     assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
     assert await world.reviews.publish_candidates() == 1
-    [capability] = await world.column("SELECT capability FROM review_tasks WHERE role = 'qa'")
+    [task_id] = await world.column("SELECT task_id FROM review_tasks WHERE role = 'qa'")
     await decided(world)
     again = await world.ask("S1")
     revision, listed = await world.stories.revisions_of(PROJECT, "S1")
 
     for refused_start in (
         world.behaviours.reopen_red(VERIFIER, PROJECT, "B1", "the answer changes it"),
-        world.reviews.prepare_review(str(capability), world.tmp_path / "tree", uuid.uuid7()),
+        world.reviews.prepare_review(task_id, world.tmp_path / "tree", uuid.uuid7()),
     ):
         with pytest.raises(ActionRefused) as refused:
             await refused_start
@@ -609,7 +610,7 @@ async def test_a_conflict_seen_while_a_decision_lands_blocks_nothing_until_it_is
     world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
     assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
     assert await world.reviews.publish_candidates() == 1
-    [capability] = await world.column("SELECT capability FROM review_tasks WHERE role = 'qa'")
+    [task_id] = await world.column("SELECT task_id FROM review_tasks WHERE role = 'qa'")
     assumed = await world.decisions.assume(ANALYST, PROJECT, "F1", story_id="S1", text="pounds")
     real_resolve = reviews_module.resolve_ref
     wrong: list[str] = []
@@ -623,16 +624,16 @@ async def test_a_conflict_seen_while_a_decision_lands_blocks_nothing_until_it_is
     with monkeypatch.context() as patched:
         patched.setattr(reviews_module, "resolve_ref", moved)
         with pytest.raises((SubmissionRefused, ActionRefused)):
-            await prepare_review(world.reviews, str(capability), world.tmp_path / "tree")
+            await prepare_review(world.reviews, task_id, world.tmp_path / "tree")
         assert await world.column("SELECT state FROM review_cycles") == ["open"]
         assert await world.state("B1") is BehaviourState.REVIEW
         await world.reconfirm_everything()
         if afterwards == "the ref is still wrong":
             with pytest.raises(SubmissionRefused, match="no longer names"):
-                await prepare_review(world.reviews, str(capability), world.tmp_path / "again")
+                await prepare_review(world.reviews, task_id, world.tmp_path / "again")
             assert await world.column("SELECT state FROM review_cycles") == ["blocked"]
             return
-    await prepare_review(world.reviews, str(capability), world.tmp_path / "again")
+    await prepare_review(world.reviews, task_id, world.tmp_path / "again")
     assert await world.column("SELECT count(*) FROM review_checkouts") == [1]
 
 
@@ -642,10 +643,10 @@ async def test_a_seal_is_refused_once_with_the_question_the_story_and_every_stal
     await world.deliver("B1")
     greeting = replace(CONTRACT, contract_id="B2-greeting")
     await world.behaviours.propose(
-        PROJECT, "S1", "B2", "a greeting", ["AC1"], basis=0, story_revision=1
+        VERIFIER, PROJECT, "S1", "B2", "a greeting", ["AC1"], basis=0, story_revision=1
     )
-    await world.behaviours.begin_test_design(PROJECT, "B2")
-    await world.behaviours.register_acceptance_test(PROJECT, "B2", greeting, basis=0)
+    await world.behaviours.begin_test_design(VERIFIER, PROJECT, "B2")
+    await world.behaviours.register_acceptance_test(VERIFIER, PROJECT, "B2", greeting, basis=0)
     await decided(world)
     again = await world.ask("S1")
     revision, listed = await world.stories.revisions_of(PROJECT, "S1")

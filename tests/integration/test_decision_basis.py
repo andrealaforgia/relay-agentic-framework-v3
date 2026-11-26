@@ -29,6 +29,7 @@ from tests.integration.decision_world import DecisionWorld
 from tests.integration.fixtures import (
     ANALYST,
     CONTRACT,
+    RELAY_ITSELF,
     VAT_APPLIES_STANDARD_RATE,
     VERIFIER,
     CountingLaunches,
@@ -71,10 +72,10 @@ def held(world: DecisionWorld) -> tuple[HeldAtABarrier, Behaviours]:
 
 async def registered(world: DecisionWorld) -> None:
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
     )
-    await world.behaviours.begin_test_design(PROJECT, "B1")
-    await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
+    await world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    await world.behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
 
 
 async def test_a_decision_owes_each_owner_a_reconfirmation_and_a_later_one_replaces_them(
@@ -112,7 +113,7 @@ async def test_a_decision_owes_each_owner_a_reconfirmation_and_a_later_one_repla
         await world.claims.claim(ANALYST, first[1]["assignment_id"])
     assert await world.reconfirm_everything() == 4
     assert await world.owed() == []
-    assert (await world.behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
 
 
 async def test_reconfirming_is_the_owners_and_is_about_what_stands_now(
@@ -170,11 +171,11 @@ async def test_red_is_not_run_on_a_contract_nobody_has_reconfirmed(world: Decisi
     behaviours = Behaviours(world.database, world.mirrors, ProcessOracle(counting))
 
     with pytest.raises(ActionRefused, match="the contract of B1 is not current"):
-        await behaviours.run_red(PROJECT, "B1")
+        await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
 
     assert counting.launches == 0
     await world.reconfirm(await owed_for(world, "behaviour"))
-    assert (await behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
 
 
 async def test_a_red_overtaken_by_a_decision_and_an_amended_contract_is_evidence_only(
@@ -182,7 +183,7 @@ async def test_a_red_overtaken_by_a_decision_and_an_amended_contract_is_evidence
 ) -> None:
     await registered(world)
     barrier, behaviours = held(world)
-    running = asyncio.create_task(behaviours.run_red(PROJECT, "B1"))
+    running = asyncio.create_task(behaviours.run_red(RELAY_ITSELF, PROJECT, "B1"))
     await held_at_the_barrier(running, barrier)
     await decided(world)
     await world.reconfirm(await owed_for(world, "story"))
@@ -199,7 +200,7 @@ async def test_a_red_overtaken_by_a_decision_and_an_amended_contract_is_evidence
     assert await world.state("B1") is BehaviourState.VALIDATING_RED
     assert await world.contract_digest("B1") == REDUCED_RATE.digest
     assert await world.owed() == []
-    assert (await world.behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
     assert await world.column("SELECT count(*) FROM executions WHERE purpose = 'red'") == [2]
 
 
@@ -312,29 +313,27 @@ async def test_a_review_written_from_a_tree_handed_over_before_the_decision_is_n
     async with world.database.connection() as connection:
         task = await (
             await connection.execute(
-                "SELECT capability, assignment_id FROM review_tasks WHERE role = 'qa'"
+                "SELECT task_id, assignment_id FROM review_tasks WHERE role = 'qa'"
             )
         ).fetchone()
     assert task is not None
-    capability = task["capability"]
+    task_id = task["task_id"]
     qa = Principal(PrincipalKind.WORKER, "worker-qa", role="qa")
     grant = await world.claims.claim(qa, task["assignment_id"])
-    before = await world.reviews.prepare_review(capability, world.tmp_path / "before", grant)
+    before = await world.reviews.prepare_review(task_id, world.tmp_path / "before", grant)
     await decided(world)
 
     with pytest.raises(ActionRefused, match="not current"):
-        await world.reviews.prepare_review(capability, world.tmp_path / "too-soon", grant)
+        await world.reviews.prepare_review(task_id, world.tmp_path / "too-soon", grant)
     assert not (world.tmp_path / "too-soon").exists()  # refused before any tree is fetched
     await world.reconfirm_everything()
-    after = await world.reviews.prepare_review(capability, world.tmp_path / "after", grant)
+    after = await world.reviews.prepare_review(task_id, world.tmp_path / "after", grant)
 
     with pytest.raises(SubmissionRefused, match="no tree was prepared"):
-        await world.reviews.submit_review(capability, Review(), grant, before.receipt)
-    accepted = await world.reviews.submit_review(capability, Review(), grant, after.receipt)
+        await world.reviews.submit_review(task_id, Review(), grant, before.receipt)
+    accepted = await world.reviews.submit_review(task_id, Review(), grant, after.receipt)
     assert accepted.disposition == "effective"
-    assert (
-        await world.reviews.submit_review(capability, Review(), grant, before.receipt) == accepted
-    )
+    assert await world.reviews.submit_review(task_id, Review(), grant, before.receipt) == accepted
 
 
 async def test_checks_overtaken_by_a_decision_authorise_nothing_and_are_run_again(

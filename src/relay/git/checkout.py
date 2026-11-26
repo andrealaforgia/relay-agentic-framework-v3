@@ -38,7 +38,8 @@ class CheckoutFailed(Exception):
 
 class CandidateMoved(CheckoutFailed):
     """The ref an attempt was published under names another commit than the one that
-    was to be observed. Nothing was observed."""
+    was to be observed, or the repository answered that there is no such ref. Nothing
+    was observed. A repository that did not answer is not this: it may yet."""
 
 
 class RemoteUnavailable(CheckoutFailed):
@@ -141,7 +142,12 @@ def attempt_ref(project_id: str, behaviour_id: str, attempt: int) -> str:
 
 async def attempt_head(repository: str, project_id: str, behaviour_id: str, attempt: int) -> str:
     ref = attempt_ref(project_id, behaviour_id, attempt)
-    return await _resolve(repository, ref, f"candidate for attempt {attempt} of {behaviour_id}")
+    revision = await resolve_ref(repository, ref)
+    if revision is None:
+        raise CandidateMoved(
+            f"the repository has no candidate for attempt {attempt} of {behaviour_id}"
+        )
+    return revision
 
 
 async def _resolve(

@@ -27,6 +27,7 @@ from relay.persistence.outbox import pending_messages
 from relay.testing.oracle import ContainerIsolation, Isolation, NativeIsolation, Run
 from tests.integration.fixtures import (
     CONTRACT,
+    RELAY_ITSELF,
     VAT_APPLIES_STANDARD_RATE,
     CountingLaunches,
     HeldAtABarrier,
@@ -464,7 +465,7 @@ async def test_of_two_behaviours_reviewed_on_one_trunk_the_second_to_finish_star
     assert "superseded" in await world.column(
         "SELECT state FROM review_cycles WHERE behaviour_id = 'B1'"
     )
-    assert (await world.behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
     assert await world.state("B1") is BehaviourState.IMPLEMENTING
     rebuilt = await world.reviewed(on=second)
     assert (await world.integrate("B1")).outcome is Outcome.INTEGRATED
@@ -479,7 +480,7 @@ async def test_a_moved_trunk_that_already_does_what_was_asked_is_put_to_the_prod
 
     receipt = await world.integrate(request="once")
     again = await world.integrate(request="once")
-    verdict = await world.behaviours.run_red(PROJECT, "B1")
+    verdict = await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
 
     assert (receipt.outcome, again) == (Outcome.BASE_MOVED, receipt)
     assert verdict.rejection is RedRejection.ALREADY_PASSES

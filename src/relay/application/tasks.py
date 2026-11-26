@@ -139,7 +139,7 @@ class ReviewTask:
         workspace.parent.mkdir(parents=True)
         # The checkout is the grant's first effect. Its receipt is recorded with the call:
         # what the model replies is a review of this tree and of no other.
-        checkout = await self._reviews.prepare_review(about["capability"], workspace, grant)
+        checkout = await self._reviews.prepare_review(about["task_id"], workspace, grant)
         role = str(assignment["role"])
         definition = find_definition(DEFAULT_DEFINITIONS[role], self._definitions)
         bounds = confinement_for(role, workspace)
@@ -194,7 +194,7 @@ class ReviewTask:
             )
         try:
             accepted = await self._reviews.submit_review(
-                about["capability"],
+                about["task_id"],
                 review_from(run.invocation["reply"]),
                 run.grant_id,
                 uuid.UUID(run.invocation["evidence"]["checkout"]),
@@ -209,7 +209,7 @@ class ReviewTask:
         async with self._pool.connection() as connection:
             row = await (
                 await connection.execute(
-                    "SELECT t.task_id, t.capability, t.role, c.project_id, c.candidate_revision, "
+                    "SELECT t.task_id, t.role, c.project_id, c.candidate_revision, "
                     "b.behaviour_id, "
                     "b.summary, b.contract, s.story_id, s.title, s.outcome, s.criteria "
                     "FROM review_tasks t JOIN review_cycles c USING (cycle_id) "
@@ -454,7 +454,8 @@ class BuildTask:
         If this attempt has already been judged (the worker stopped after the verdict
         was recorded and before the effect was marked), the verdict that is on record
         is what is replayed, whichever way it went: nothing is observed twice, and a
-        candidate that was found not green is not taken for one that was."""
+        candidate that was found not green is not taken for one that was. What a try
+        saw after it had been taken over is not a judgement, and is not replayed."""
         about = await self._about(run.invocation["assignment_id"])
         attempt = await self._attempt(run.invocation)
         async with self._pool.connection() as connection:
@@ -464,7 +465,9 @@ class BuildTask:
                     "WHERE project_id = %s AND subject_id = %s AND event_type IN "
                     "('behaviour.green_verified', 'behaviour.green_rejected') "
                     "AND payload->>'attempt' = %s AND payload->>'candidate_revision' = %s "
-                    "ORDER BY sequence DESC LIMIT 1",
+                    # What a try that had been taken over saw is on record too, and is
+                    # no verdict: only a run that was still the one to decide judged it.
+                    "AND (payload->>'judged')::boolean ORDER BY sequence DESC LIMIT 1",
                     (
                         about["project_id"],
                         about["behaviour_id"],
@@ -492,8 +495,8 @@ class BuildTask:
                     still_heard=still_heard,
                 )
             except CandidateMoved as moved:
-                # Somebody moved the attempt ref after it was published. The reply is
-                # not at fault, and there is nothing of it left to observe.
+                # Somebody moved the attempt ref after it was published, or removed it.
+                # The reply is not at fault, and there is nothing of it left to observe.
                 raise Overtaken(str(moved)) from None
             accepted, reason = verdict.is_valid, verdict.reason
         else:

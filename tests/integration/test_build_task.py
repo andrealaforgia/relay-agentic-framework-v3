@@ -5,6 +5,7 @@ as a model with a shell would, and replies."""
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import subprocess
 from collections.abc import AsyncIterator
@@ -14,6 +15,7 @@ from typing import Any
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
+from relay.application import behaviours as behaviours_module
 from relay.application.invocations import Invocations
 from relay.application.reviews import NewFinding, Review
 from relay.application.tasks import BuildTask, Profile, Tasks, Workspaces
@@ -22,7 +24,7 @@ from relay.application.workers import WorkerSession
 from relay.domain.behaviour import BehaviourState
 from relay.domain.review import Severity
 from relay.domain.story import ActionRefused
-from relay.git.checkout import CheckoutFailed
+from relay.git.checkout import CheckoutFailed, RemoteUnavailable
 from relay.git.mirror import Mirror
 from relay.providers.claude import ProviderResult, Request
 from tests.integration.decision_world import DecisionWorld
@@ -456,35 +458,132 @@ async def test_only_the_verifier_reopens_a_red(building: Building) -> None:
     assert (await building.owed())["state"] == "wanted"
 
 
-async def test_an_attempt_that_was_moved_after_it_was_published_is_not_observed(
-    building: Building,
+@pytest.mark.parametrize("what_became_of_it", ["moved", "removed"])
+async def test_an_attempt_that_is_no_longer_the_candidate_is_not_observed_and_is_built_again(
+    building: Building, what_became_of_it: str
 ) -> None:
-    """3B-S2-1.4: the build task has Relay observe the commit it kept, and no other the
-    ref may come to name. That is nobody's defective reply."""
-    provider = Builder(RIGHT)
+    """3B-S2-1.4 and 3B-S2-2.9: the build task has Relay observe the commit it kept, and
+    no other the ref may come to name. A ref that names another commit, and one the
+    repository says is not there at all, are the same thing: nothing of the reply is
+    left to observe, and that is nobody's defective reply. The work is still owed, so it
+    is wanted again, and is done again under a new attempt."""
+    provider = Builder(RIGHT, RIGHT)
     worker = await building.worker(provider)
     real = building.task._publish
 
-    def move(ref: str) -> None:
-        # Somebody with access to the repository points the attempt at another commit.
+    def interfere(ref: str) -> None:
+        # Somebody with access to the repository points the attempt at another commit,
+        # or deletes it.
+        pushed = f"{building.world.base}:{ref}" if what_became_of_it == "moved" else f":{ref}"
         subprocess.run(
-            ["git", "-C", str(building.world.builder), "push", "-q", "-f", "origin",
-             f"{building.world.base}:{ref}"],
+            ["git", "-C", str(building.world.builder), "push", "-q", "-f", "origin", pushed],
             check=True,
-        )  # fmt: skip
+        )
 
-    async def published_and_then_moved(run: Any) -> Any:
+    async def published_and_then_interfered_with(run: Any) -> Any:
         done = await real(run)
-        move(done["ref"])
+        if done["attempt"] == 1:
+            interfere(done["ref"])
         return done
 
-    building.task._publish = published_and_then_moved  # type: ignore[method-assign]
+    building.task._publish = published_and_then_interfered_with  # type: ignore[method-assign]
 
     assert await worker.carry_out(await building.owed()) == "overtaken"
 
     assert await building.states() == ["overtaken"]
     assert await building.world.column("SELECT count(*) FROM review_cycles") == [0]
     assert await building.invocations.parked(PROJECT) == []
+    assert (await building.owed())["state"] == "wanted"
+    await building.invocations.recover(PROJECT)  # nothing is left for the pass to retry
+    assert await building.states() == ["overtaken"]
+    assert await worker.carry_out(await building.owed()) == "applied"
+    assert await building.states() == ["overtaken", "applied"]
+    assert await building.world.column("SELECT attempt FROM build_attempts ORDER BY attempt") == [
+        1,
+        2,
+    ]
+
+
+async def test_a_repository_that_does_not_answer_is_not_a_candidate_that_is_gone(
+    building: Building, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S2-2.9: nothing is concluded from a repository that could not be asked. The
+    result is kept, and is applied when it can be."""
+    provider = Builder(RIGHT)
+    worker = await building.worker(provider)
+    real = behaviours_module.attempt_head
+    asked = 0
+
+    async def unreachable_once(*arguments: Any) -> str:
+        nonlocal asked
+        asked += 1
+        if asked == 1:
+            raise RemoteUnavailable("the repository did not answer")
+        return await real(*arguments)
+
+    monkeypatch.setattr(behaviours_module, "attempt_head", unreachable_once)
+
+    with pytest.raises(RemoteUnavailable):
+        await worker.carry_out(await building.owed())
+
+    assert await building.states() == ["returned"]
+    await building.invocations.recover(PROJECT)
+    assert await building.states() == ["applied"]
+    assert len(provider.asked) == 1
+
+
+@pytest.mark.parametrize("the_first_try_ends", ["before the second reads the record", "last"])
+async def test_what_a_try_saw_after_it_was_taken_over_is_nobodys_verdict(
+    building: Building, the_first_try_ends: str
+) -> None:
+    """3B-S2-2.2: the first try of the green effect is still observing when its worker is
+    taken for gone, and the pass takes the effect over. Whenever the first try then
+    ends, what it saw is kept as what was seen and judges nothing: the second try does
+    not take it for a verdict, and observes for itself."""
+    provider = Builder(RIGHT)
+    worker = await building.worker(provider)
+    oracle = building.world.behaviours._oracle
+    observe, observed = oracle.execute, 0
+    first_is_observing, first_may_end = asyncio.Event(), asyncio.Event()
+
+    async def execute(*arguments: Any) -> Any:
+        nonlocal observed
+        observed += 1
+        mine = observed
+        execution = await observe(*arguments)
+        if mine == 1:
+            first_is_observing.set()
+            await first_may_end.wait()
+        return execution
+
+    oracle.execute = execute  # type: ignore[method-assign]
+    first = asyncio.create_task(worker.carry_out(await building.owed()))
+    await first_is_observing.wait()
+    await building.sessions[-1].stop()  # gone, to everyone else; its run goes on
+    attempt_of = building.task._attempt
+
+    async def as_the_second_try_is_about_to_read_the_record(invocation: Any) -> int:
+        number = await attempt_of(invocation)
+        if the_first_try_ends != "last" and not first_may_end.is_set():
+            first_may_end.set()
+            assert await first == "superseded"
+        return number
+
+    building.task._attempt = as_the_second_try_is_about_to_read_the_record  # type: ignore[method-assign]
+
+    await building.invocations.recover(PROJECT)
+    first_may_end.set()
+    await first
+
+    assert observed == 2
+    assert await building.states() == ["applied"]
+    assert await building.world.state("B1") is BehaviourState.REVIEW
+    assert await building.world.column("SELECT count(*) FROM review_cycles") == [1]
+    judged = await building.world.column(
+        "SELECT (payload->>'judged')::boolean FROM events WHERE event_type IN "
+        "('behaviour.green_verified', 'behaviour.green_rejected') ORDER BY sequence"
+    )
+    assert sorted(judged) == [False, True]
 
 
 async def test_the_build_task_asks_for_its_own_commit_and_stays_answerable_for_its_try(

@@ -17,7 +17,7 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from relay.application.features import Features
-from relay.application.invocations import Effect, EffectRun, Invocations, Prepared
+from relay.application.invocations import Effect, EffectRun, Invocations, Overtaken, Prepared
 from relay.application.workers import WorkerSession, is_alive
 from relay.domain.story import ActionRefused, HumanAction, Principal, PrincipalKind, Receipt
 from relay.providers.claude import Outcome, ProviderResult
@@ -1202,7 +1202,8 @@ async def test_a_result_whose_grant_no_longer_holds_the_work_is_overtaken_not_de
 
     assert calling.applying.ran == []
     assert await calling.world.column("SELECT count(*) FROM invocations") == [1]
-    assert (await calling.assignment())[1] is None  # and nobody is asked about a bad reply
+    # Nobody is asked about a bad reply, and whoever holds the work now keeps it.
+    assert await calling.assignment() == ("granted", None, True)
 
 
 async def test_a_result_adopted_under_a_new_grant_is_held_by_a_pause_and_not_lost_to_it(
@@ -1534,4 +1535,192 @@ async def test_giving_an_effect_up_does_not_take_it_from_whoever_took_it_over(
     ) == [other.worker_id]
     calling.applying.waiting["first:2"].set()
     assert await second_try == "applied"
+    assert calling.applying.ran == ["first:1", "first:2", "second:1"]
+
+
+async def test_an_effect_being_let_go_is_not_taken_again_until_it_is_free_on_record(
+    calling: Calling, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S2-2.7: a call that was cut short lets its effect go, which takes a moment. A
+    second call of the same process that took the effect in that moment would have its
+    own try set free by the first one's letting go, while it was carrying it out."""
+    worker = await calling.worker()
+    invocation = await calling.admitted(worker)
+    await calling.invocations.record(invocation, said(), retained=KEPT)
+    calling.applying.waiting["first:1"] = asyncio.Event()
+    letting_go, may_let_go = asyncio.Event(), asyncio.Event()
+    real = Invocations._give_up
+
+    async def slowly(self: Invocations, *arguments: Any) -> None:
+        letting_go.set()
+        await may_let_go.wait()
+        await real(self, *arguments)
+
+    monkeypatch.setattr(Invocations, "_give_up", slowly)
+    first = asyncio.create_task(calling.invocations.apply(invocation, worker))
+    await calling.applying.reached.wait()
+    first.cancel()
+    await letting_go.wait()
+
+    assert await calling.invocations.apply(invocation, worker) == "busy"
+
+    may_let_go.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert await calling.invocations.apply(invocation, worker) == "applied"
+    assert calling.applying.ran == ["first:1", "first:2", "second:1"]
+
+
+STRICT = {
+    "type": "object",
+    "properties": {"sum": {"type": "string"}},
+    "required": ["sum"],
+    "additionalProperties": False,
+}
+
+
+async def test_a_result_is_checked_against_the_schema_stored_with_its_call_whoever_brings_it(
+    calling: Calling,
+) -> None:
+    """3B-S2-2.6: the record takes nobody's word that a reply was checked. A result
+    handed straight to it, late or by other hands than the worker's, is held to the
+    schema that was stored when its call was admitted."""
+    worker = await calling.worker()
+    assignment, grant = await calling.claimed(worker)
+    admission = await calling.invocations.admit(
+        worker, assignment, grant, replace(await calling.prepared(), schema=STRICT)
+    )
+    assert admission.invocation_id is not None
+
+    assert await calling.invocations.record(admission.invocation_id, said(), retained=KEPT) == (
+        "rejected"
+    )
+
+    async with calling.world.database.connection() as connection:
+        row = await (await connection.execute("SELECT * FROM invocations")).fetchone()
+    assert row is not None
+    assert row["reason"] == "sum of the reply is not a string"
+    assert row["reply"] is None and row["usage"] and row["envelope"]["structured_output"]
+    await calling.invocations.recover(PROJECT)
+    assert calling.applying.ran == []
+
+
+async def test_a_call_that_returned_no_structured_answer_is_not_a_result(calling: Calling) -> None:
+    """3B-S2-2.6."""
+    invocation = await calling.admitted(await calling.worker())
+    nothing = ProviderResult(
+        Outcome.RETURNED, Terminal({"type": "result", "subtype": "success", "is_error": False})
+    )
+
+    assert await calling.invocations.record(invocation, nothing, retained=KEPT) == "rejected"
+
+    [reason] = await calling.world.column("SELECT reason FROM invocations")
+    assert reason == "the reply did not carry the structured answer it was asked for"
+
+
+async def test_no_call_is_admitted_on_a_schema_its_reply_could_not_be_checked_against(
+    calling: Calling,
+) -> None:
+    """3B-S2-2.6: found before anything is paid for, not when the reply arrives."""
+    worker = await calling.worker()
+    assignment, grant = await calling.claimed(worker)
+    unchecked = {"type": "object", "properties": {"sum": {"type": "integer", "minimum": 0}}}
+
+    with pytest.raises(ValueError, match="minimum"):
+        await calling.invocations.admit(
+            worker, assignment, grant, replace(await calling.prepared(), schema=unchecked)
+        )
+
+    assert await calling.states() == []
+
+
+async def test_work_overtaken_through_nobodys_fault_is_wanted_again_until_a_person_is_asked(
+    calling: Calling,
+) -> None:
+    """3B-S2-2.3: a result that is applied to nothing, for work that is still owed and
+    still held by the grant the result acted under, does not leave the work there. It
+    is wanted again and announced again. And after as many calls as a person is asked
+    after, a person is asked: nobody's fault is still somebody's money."""
+    worker = await calling.worker()
+    calling.applying.failing["first"] = Overtaken("what it was written from is gone")
+    announced_again = (
+        "SELECT count(*) FROM outbox o JOIN assignments a ON a.command_message_id = o.message_id "
+        "WHERE a.kind = 'build' AND o.published_at IS NULL"
+    )
+
+    for call in (1, 2, 3):
+        invocation = await calling.admitted(worker)
+        await calling.invocations.record(invocation, said(), retained=KEPT)
+        async with calling.world.database.connection() as connection:
+            await connection.execute("UPDATE outbox SET published_at = now()")  # delivered
+
+        assert await calling.invocations.apply(invocation, worker) == "overtaken"
+
+        if call < 3:
+            assert await calling.assignment() == ("wanted", None, False)
+            assert await calling.world.column(announced_again) == [1]
+
+    assert await calling.states() == ["overtaken", "overtaken", "overtaken"]
+    assert await calling.assignment() == (
+        "wanted",
+        "3 calls gave nothing that could be used",
+        False,
+    )
+    assert len(await calling.invocations.parked(PROJECT)) == 1
+    assert await calling.world.column(announced_again) == [0]  # not announced: it is parked
+
+
+async def test_a_grant_hands_back_only_what_it_does_not_own(calling: Calling) -> None:
+    """3B-S2-2.4: what a grant owns is asked now, not whether it ever made a call. With
+    a known result waiting under it, its own or one it adopted, it keeps the work. With
+    a last call that gave nothing, it owns nothing, and the work goes back."""
+    one = await calling.worker()
+    invocation = await calling.admitted(one)
+    assignment, first_grant = await calling.claimed(one)
+    await calling.world.claims.give_back(assignment, first_grant)  # with its call in flight
+    assert await calling.assignment() == ("granted", None, True)
+    await calling.invocations.record(invocation, UNCERTAIN)
+    await calling.invocations.decide(calling.person(invocation, "retry"))
+    two = await calling.worker()
+    assignment, second_grant = await calling.claimed(two)
+    await calling.invocations.record(invocation, said(), retained=KEPT)  # adopted under it
+
+    await calling.world.claims.give_back(assignment, second_grant)
+
+    assert await calling.assignment() == ("granted", None, True)
+    calling.applying.failing["first"] = ActionRefused("the service would not have it")
+    assert await calling.invocations.apply(invocation, two) == "rejected"
+
+    await calling.world.claims.give_back(assignment, second_grant)
+
+    assert await calling.assignment() == ("wanted", None, False)
+
+
+async def test_an_effect_that_could_not_be_let_go_on_record_is_not_busy_for_ever(
+    calling: Calling, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why the call's claim in its own process is dropped whatever became of the record:
+    if the record could not be written, the effect is still on record as started by
+    this process, and only this process not claiming it lets anyone take it again."""
+    worker = await calling.worker()
+    invocation = await calling.admitted(worker)
+    await calling.invocations.record(invocation, said(), retained=KEPT)
+    calling.applying.waiting["first:1"] = asyncio.Event()
+    real = Invocations._give_up
+
+    async def with_the_database_gone(self: Invocations, *arguments: Any) -> None:
+        pool, self._pool = self._pool, None  # type: ignore[assignment]
+        try:
+            await real(self, *arguments)
+        finally:
+            self._pool = pool
+
+    monkeypatch.setattr(Invocations, "_give_up", with_the_database_gone)
+    first = asyncio.create_task(calling.invocations.apply(invocation, worker))
+    await calling.applying.reached.wait()
+    first.cancel()
+    with pytest.raises(AttributeError):
+        await first
+
+    assert await calling.invocations.apply(invocation, worker) == "applied"
     assert calling.applying.ran == ["first:1", "first:2", "second:1"]

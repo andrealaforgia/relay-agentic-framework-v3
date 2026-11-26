@@ -358,7 +358,7 @@ async def test_a_review_checked_out_by_a_process_that_died_is_granted_afresh_and
     async with world.database.connection() as connection:
         task = await (
             await connection.execute(
-                "SELECT capability, assignment_id FROM review_tasks WHERE role = 'qa'"
+                "SELECT task_id, assignment_id FROM review_tasks WHERE role = 'qa'"
             )
         ).fetchone()
     assert task is not None
@@ -366,21 +366,21 @@ async def test_a_review_checked_out_by_a_process_that_died_is_granted_afresh_and
     claims = Assignments(world.database)
     before = await claims.claim(qa, task["assignment_id"])
     handed_over = await world.reviews.prepare_review(
-        task["capability"], world.tmp_path / "tree", before
+        task["task_id"], world.tmp_path / "tree", before
     )
 
     await restarted(world).start()
 
     with pytest.raises(SubmissionRefused, match="no tree was prepared"):
         # The tree was handed over under a grant that holds nothing now.
-        await world.reviews.submit_review(task["capability"], Review(), before, handed_over.receipt)
+        await world.reviews.submit_review(task["task_id"], Review(), before, handed_over.receipt)
     with pytest.raises(ActionRefused, match="not the current one"):
-        await world.reviews.prepare_review(task["capability"], world.tmp_path / "late", before)
+        await world.reviews.prepare_review(task["task_id"], world.tmp_path / "late", before)
     after = await claims.claim(
         Principal(PrincipalKind.WORKER, "worker-qa-2", role="qa"), task["assignment_id"]
     )
-    await world.reviews.prepare_review(task["capability"], world.tmp_path / "again", after)
-    assert (await submit_review(world.reviews, task["capability"], Review())).disposition == (
+    await world.reviews.prepare_review(task["task_id"], world.tmp_path / "again", after)
+    assert (await submit_review(world.reviews, task["task_id"], Review())).disposition == (
         "effective"
     )
     assert await world.column("SELECT count(*) FROM review_checkouts") == [2]

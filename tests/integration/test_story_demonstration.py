@@ -18,7 +18,7 @@ from relay.domain.behaviour import BehaviourState
 from relay.domain.story import ActionRefused, SealRefused, StoryState
 from relay.git.checkout import RemoteUnavailable
 from relay.git.mirror import Mirror
-from tests.integration.fixtures import ANALYST, CONTRACT, VERIFIER
+from tests.integration.fixtures import ANALYST, CONTRACT, RELAY_ITSELF, VERIFIER
 from tests.integration.story_world import GREETS, STANDARD_RATE
 from tests.integration.test_supersession import (
     REDUCED_RATE,
@@ -41,15 +41,15 @@ async def world(database: AsyncConnectionPool, tmp_path: Path, runner_image: str
 
 async def z_awaiting_builder(world: Superseding, demonstrates: list[str]) -> str:
     """Z, in story 1 beside B1, with the contract that contradicts it. Returns trunk."""
-    await world.behaviours.propose(
+    await world.behaviours.propose(VERIFIER, 
         PROJECT, "S1", "Z", "the reduced rate", demonstrates,
         basis=await world.basis("S1"), story_revision=await world.revision("S1"),
     )  # fmt: skip
-    await world.behaviours.begin_test_design(PROJECT, "Z")
+    await world.behaviours.begin_test_design(VERIFIER, PROJECT, "Z")
     await world.behaviours.register_acceptance_test(
-        PROJECT, "Z", REDUCED_RATE, basis=await world.basis("S1")
+        VERIFIER, PROJECT, "Z", REDUCED_RATE, basis=await world.basis("S1")
     )
-    assert (await world.behaviours.run_red(PROJECT, "Z")).is_valid
+    assert (await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "Z")).is_valid
     return world.trunk()
 
 

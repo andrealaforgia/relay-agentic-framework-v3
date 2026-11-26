@@ -61,6 +61,14 @@ from relay.transport.envelope import Envelope, MessageKind
 CONTROL_PLANE = "relay/control-plane"
 
 
+def _require_verifier(principal: Principal, to: str) -> None:
+    """A behaviour, its test design and its contract are the Verifier's. A story's
+    revision and a decision basis say that a caller read what is current; they do not
+    say who it is."""
+    if principal.kind is not PrincipalKind.WORKER or principal.role != "verifier":
+        raise ActionRefused(f"{to} is for the verifier to do")
+
+
 class Behaviours:
     def __init__(self, pool: Pool, mirrors: Path, oracle: ProcessOracle) -> None:
         """`mirrors` is a directory on the control plane's own disk where every commit
@@ -97,6 +105,7 @@ class Behaviours:
 
     async def propose(
         self,
+        principal: Principal,
         project_id: str,
         story_id: str,
         behaviour_id: str,
@@ -111,6 +120,7 @@ class Behaviours:
         proposal names the story revision and decision basis its author read: a
         criterion keeps its name when it is reworded, and work must not start from the
         old wording."""
+        _require_verifier(principal, "proposing a behaviour")
         behaviour = Behaviour.propose(behaviour_id, summary)
         # Read once, before anything is awaited: what is checked, stored and written to
         # the ledger is this, whatever the caller does to its own list meanwhile.
@@ -149,7 +159,10 @@ class Behaviours:
                 correlation_id=correlation_id,
             )
 
-    async def begin_test_design(self, project_id: str, behaviour_id: str) -> None:
+    async def begin_test_design(
+        self, principal: Principal, project_id: str, behaviour_id: str
+    ) -> None:
+        _require_verifier(principal, "designing a behaviour's test")
         async with self._changing(project_id, behaviour_id, starts="design") as (
             connection,
             behaviour,
@@ -165,9 +178,16 @@ class Behaviours:
             )
 
     async def register_acceptance_test(
-        self, project_id: str, behaviour_id: str, contract: ProcessContract, *, basis: int
+        self,
+        principal: Principal,
+        project_id: str,
+        behaviour_id: str,
+        contract: ProcessContract,
+        *,
+        basis: int,
     ) -> None:
         """The Verifier's contract, with the decision basis it was written on."""
+        _require_verifier(principal, "registering an acceptance contract")
         async with self._changing(project_id, behaviour_id, starts="work") as (
             connection,
             behaviour,
@@ -189,13 +209,16 @@ class Behaviours:
                 correlation_id=correlation,
             )
 
-    async def run_red(self, project_id: str, behaviour_id: str) -> RedVerdict:
+    async def run_red(self, principal: Principal, project_id: str, behaviour_id: str) -> RedVerdict:
         """Observe the registered contract on the project's own trunk and judge the result.
 
         This is the only way a behaviour reaches the Builder. The caller chooses neither the
         source nor the observation: Relay reads the trunk head itself, launches the subject
-        itself, and records the run, the verdict and any release in one transaction.
+        itself, and records the run, the verdict and any release in one transaction. It is
+        the control plane's to ask for: no worker starts the oracle.
         """
+        if principal.kind is not PrincipalKind.CONTROL_PLANE:
+            raise ActionRefused("observing a red is for the control plane to ask for")
         async with self._changing(project_id, behaviour_id, starts="evidence") as (
             connection,
             behaviour,
@@ -456,6 +479,10 @@ class Behaviours:
             )
             evidence: dict[str, Any] = {
                 "attempt": attempt,
+                # Whether this is a judgement of the candidate, or only what a run that
+                # was overtaken in flight happened to see. Whoever takes the work up
+                # again replays the first and never the second.
+                "judged": verdict.judges_the_candidate,
                 "reason": verdict.reason,
                 "contract_digest": contract.digest,
                 "red_revision": red.revision,

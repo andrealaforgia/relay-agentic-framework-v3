@@ -24,6 +24,7 @@ from tests.integration.fixtures import (
     ANALYST,
     CONTRACT,
     PRODUCT_OWNER,
+    RELAY_ITSELF,
     VAT_APPLIES_STANDARD_RATE,
     VERIFIER,
     HeldAtABarrier,
@@ -46,7 +47,7 @@ async def world(database: AsyncConnectionPool, tmp_path: Path, runner_image: str
 async def test_nothing_new_starts_on_a_paused_feature_by_any_route(world: StoryWorld) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
     )
     revision, listed = await world.stories.revisions_of(PROJECT, "S1")
 
@@ -54,11 +55,11 @@ async def test_nothing_new_starts_on_a_paused_feature_by_any_route(world: StoryW
 
     for start in (
         world.behaviours.propose(
-            PROJECT, "S1", "B2", "one more", ["AC1"], basis=0, story_revision=1
+            VERIFIER, PROJECT, "S1", "B2", "one more", ["AC1"], basis=0, story_revision=1
         ),
-        world.behaviours.begin_test_design(PROJECT, "B1"),
-        world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0),
-        world.behaviours.run_red(PROJECT, "B1"),
+        world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1"),
+        world.behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0),
+        world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1"),
         run_green(world.behaviours, PROJECT, "B1", 1),
         world.behaviours.reopen_red(VERIFIER, PROJECT, "B1", "runner upgraded"),
         world.integrate("B1"),
@@ -73,7 +74,7 @@ async def test_nothing_new_starts_on_a_paused_feature_by_any_route(world: StoryW
     assert await world.behaviours.state_of(PROJECT, "B1") is BehaviourState.PROPOSED
 
     assert await world.close("resume") == Receipt("effective", "resumed")
-    await world.behaviours.begin_test_design(PROJECT, "B1")
+    await world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
 
 
 async def test_a_gate_waits_through_a_pause_and_is_then_decided_once(world: StoryWorld) -> None:
@@ -221,7 +222,7 @@ async def test_a_push_authorised_before_a_pause_still_lands_and_opens_no_gate_un
     assert (await world.events())[-2:] == ["feature.resumed", "story.gate_opened"]
 
 
-async def test_a_review_cannot_be_started_on_a_paused_feature_even_with_its_capability(
+async def test_a_review_cannot_be_started_on_a_paused_feature_by_whoever_holds_it(
     world: StoryWorld, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
@@ -229,8 +230,8 @@ async def test_a_review_cannot_be_started_on_a_paused_feature_even_with_its_capa
     world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
     assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
     assert await world.reviews.publish_candidates() == 1
-    [capability, _] = await world.column(
-        "SELECT envelope->'payload'->>'capability' FROM outbox "
+    [task_id, _] = await world.column(
+        "SELECT envelope->'payload'->>'task_id' FROM outbox "
         "WHERE envelope->>'event_type' = 'review.requested' ORDER BY position"
     )
     real = Mirror.export
@@ -243,9 +244,9 @@ async def test_a_review_cannot_be_started_on_a_paused_feature_even_with_its_capa
     with monkeypatch.context() as patched:
         patched.setattr(Mirror, "export", paused_during_the_export)
         with pytest.raises(ActionRefused, match="paused"):
-            await prepare_review(world.reviews, str(capability), world.tmp_path / "tree-1")
+            await prepare_review(world.reviews, task_id, world.tmp_path / "tree-1")
     with pytest.raises(ActionRefused, match="paused"):
-        await prepare_review(world.reviews, str(capability), world.tmp_path / "tree-2")
+        await prepare_review(world.reviews, task_id, world.tmp_path / "tree-2")
 
     assert await world.column("SELECT count(*) FROM review_checkouts") == [0]
     assert not (world.tmp_path / "tree-2").exists()  # refused before any tree is fetched
@@ -254,7 +255,7 @@ async def test_a_review_cannot_be_started_on_a_paused_feature_even_with_its_capa
     assert await announce_wanted_work_again(world.database, PROJECT) == 0
     await world.close("resume")
     assert await announce_wanted_work_again(world.database, PROJECT) == 2
-    await prepare_review(world.reviews, str(capability), world.tmp_path / "tree-3")
+    await prepare_review(world.reviews, task_id, world.tmp_path / "tree-3")
     assert await world.column("SELECT count(*) FROM review_checkouts") == [1]
 
 
@@ -307,7 +308,7 @@ async def test_a_pause_and_the_release_of_a_story_cannot_cross(
     assert (await world.events())[-2:] == ["story.released", "feature.paused"]
     with pytest.raises(ActionRefused, match="paused"):
         await world.behaviours.propose(
-            PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+            VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
         )
 
 
@@ -349,7 +350,7 @@ async def test_a_pause_waits_for_work_that_was_admitted_before_it(
     pause does, or it would begin work after the pause was in force."""
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
     )
     admitted, go_on = asyncio.Event(), asyncio.Event()
     real = behaviours_module.require_story_at_work
@@ -360,7 +361,7 @@ async def test_a_pause_waits_for_work_that_was_admitted_before_it(
         await go_on.wait()
 
     monkeypatch.setattr(behaviours_module, "require_story_at_work", held_once_admitted)
-    starting = asyncio.create_task(world.behaviours.begin_test_design(PROJECT, "B1"))
+    starting = asyncio.create_task(world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1"))
     await admitted.wait()
     pausing = asyncio.create_task(world.close("pause", reason="stop"))
     await world.until_someone_waits_for_a_lock()
@@ -464,7 +465,7 @@ async def test_a_pause_waits_for_a_retry_that_was_admitted_before_it(
     the feature as open commits, or fails, before the pause can."""
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
     )
     admitted, go_on = asyncio.Event(), asyncio.Event()
     real = integration_module.closure_of_behaviour

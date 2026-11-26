@@ -8,6 +8,7 @@ from relay.domain.evidence import (
     Execution,
     Expected,
     GreenRejection,
+    GreenVerdict,
     Launch,
     PairedRed,
     ProcessContract,
@@ -255,3 +256,18 @@ def test_a_contract_is_amended_until_its_behaviour_is_on_trunk() -> None:
     on_trunk.state = BehaviourState.INTEGRATED
     with pytest.raises(TransitionRefused):
         on_trunk.amend_contract(CONTRACT)
+
+
+def test_a_run_that_was_overtaken_in_flight_judges_nothing_and_every_other_verdict_does() -> None:
+    """3B-S2-2.2: what a run saw after its red, its work or the decisions it began under
+    had moved on is kept, and is not a verdict on the candidate. Whoever takes the work
+    up again replays verdicts, and observes for itself where there is none."""
+    kept_only = {
+        GreenRejection.RED_SUPERSEDED,
+        GreenRejection.ASSIGNMENT_SUPERSEDED,
+        GreenRejection.BASIS_SUPERSEDED,
+    }
+
+    assert GreenVerdict(None, "green").judges_the_candidate
+    for rejection in GreenRejection:
+        assert GreenVerdict(rejection, "why").judges_the_candidate is (rejection not in kept_only)

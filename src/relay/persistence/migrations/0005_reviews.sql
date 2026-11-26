@@ -32,12 +32,12 @@ CREATE TABLE review_cycles (
 CREATE UNIQUE INDEX one_live_cycle_per_behaviour
     ON review_cycles (project_id, behaviour_id) WHERE state IN ('open', 'satisfied');
 
--- The capability is what lets a reviewer act on a task; the task id alone grants nothing.
+-- Naming a task grants nothing: what lets a reviewer act on one is the grant that holds
+-- its assignment. No secret stands for a review, so none is stored here.
 CREATE TABLE review_tasks (
     task_id    uuid PRIMARY KEY,
     cycle_id   uuid NOT NULL REFERENCES review_cycles,
     role       text NOT NULL,
-    capability text UNIQUE,
     -- The one command that announces this task. Announcing again re-sends this same
     -- message, so a consumer that has already acted on it does nothing new.
     command_message_id uuid,

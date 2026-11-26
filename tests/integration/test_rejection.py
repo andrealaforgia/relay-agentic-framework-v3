@@ -24,6 +24,8 @@ from tests.integration.fixtures import (
     ANALYST,
     CONTRACT,
     PRODUCT_OWNER,
+    RELAY_ITSELF,
+    VERIFIER,
     HeldAtABarrier,
     held_at_the_barrier,
     run_green,
@@ -299,13 +301,13 @@ async def test_a_red_that_finishes_after_its_story_was_set_aside_is_evidence_onl
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
     )
-    await world.behaviours.begin_test_design(PROJECT, "B1")
-    await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
+    await world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    await world.behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
     barrier = HeldAtABarrier(ContainerIsolation(world.image))
     slow = Behaviours(world.database, world.mirrors, ProcessOracle(barrier))
-    running = asyncio.create_task(slow.run_red(PROJECT, "B1"))
+    running = asyncio.create_task(slow.run_red(RELAY_ITSELF, PROJECT, "B1"))
     await held_at_the_barrier(running, barrier)
 
     await reject(world, "S1")

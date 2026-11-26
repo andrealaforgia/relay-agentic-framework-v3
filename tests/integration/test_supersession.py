@@ -465,7 +465,7 @@ async def test_a_replacement_is_proposed_only_for_work_that_can_go_on(world: Sup
 
 
 async def test_a_behaviour_with_no_contract_yet_replaces_nothing(world: Superseding) -> None:
-    await world.behaviours.propose(
+    await world.behaviours.propose(VERIFIER, 
         PROJECT, "S2", "Z", "the reduced rate", ["AC1"],
         basis=await world.basis("S2"), story_revision=await world.revision("S2"),
     )  # fmt: skip

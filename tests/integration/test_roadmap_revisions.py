@@ -14,7 +14,7 @@ from psycopg_pool import AsyncConnectionPool
 from relay.application import stories as stories_module
 from relay.application.stories import Dropped, Kept, Reworded, StoryDraft
 from relay.domain.story import ActionRefused, StoryState
-from tests.integration.fixtures import ANALYST
+from tests.integration.fixtures import ANALYST, VERIFIER
 from tests.integration.story_world import GREETS, STANDARD_RATE, StoryWorld, at_the_story_gate
 from tests.integration.trunk_world import PROJECT
 
@@ -144,7 +144,7 @@ async def test_a_dropped_story_is_withdrawn_and_an_added_one_takes_its_turn(
     assert (await world.stories.roadmap_of(PROJECT, "F1")).stories == ("S3", "S1")
     with pytest.raises(ActionRefused, match="not being worked on"):
         await world.behaviours.propose(
-            PROJECT, "S2", "B9", "too late", ["AC1"], basis=0, story_revision=1
+            VERIFIER, PROJECT, "S2", "B9", "too late", ["AC1"], basis=0, story_revision=1
         )
 
 

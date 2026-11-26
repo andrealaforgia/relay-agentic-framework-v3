@@ -12,12 +12,21 @@ import pytest
 import redis.asyncio as redis
 from psycopg_pool import AsyncConnectionPool
 
+from relay.application.worker import Worker
+from relay.domain.story import HumanAction
 from relay.persistence.outbox import OutboxPublisher
+from relay.providers.claude import ProviderResult, Request
 from relay.transport.streams import Streams
 from tests.integration.decision_world import DecisionWorld
-from tests.integration.fixtures import VAT_APPLIES_STANDARD_RATE, run_green
+from tests.integration.fixtures import PRODUCT_OWNER, VAT_APPLIES_STANDARD_RATE, run_green
 from tests.integration.story_world import STANDARD_RATE
-from tests.integration.test_review_task import NOTHING_FOUND, Reviewer, Reviewing
+from tests.integration.test_review_task import (
+    NO_USAGE_MESSAGE,
+    NOTHING_FOUND,
+    Reviewer,
+    Reviewing,
+    replying,
+)
 from tests.integration.trunk_world import PROJECT
 
 
@@ -107,3 +116,81 @@ async def test_a_command_for_work_a_worker_does_not_do_is_set_aside(served: Serv
 
     assert await worker.serve_once(served.streams, PROJECT) == ["not work this worker does"]
     assert (await served.owed("qa"))["state"] == "wanted"
+
+
+async def test_a_review_adopted_under_another_grant_is_done_again_from_its_announcement(
+    served: Served,
+) -> None:
+    """3B-S1-1.7 and 3B-S2-2.3: the first reviewer's call was given up on, a retry was
+    allowed and the work claimed again, and then the first call's reply arrived. It was
+    written from a checkout made under a grant that no longer holds the work, so
+    nothing is submitted from it and nobody is blamed. The reviewer that holds the work
+    is alive and has been told nothing: so the work is wanted again and announced again,
+    and is done from that announcement, with nobody calling for it by hand."""
+    await served.worker("qa", Reviewer())
+    one = served.sessions[-1]
+    owed = await served.owed("qa")
+    grant = await served.world.claims.claim(one.principal, owed["assignment_id"], one.worker_id)
+    call = await served.task.prepare(owed, grant, None)
+    admission = await served.invocations.admit(one, owed["assignment_id"], grant, call.prepared)
+    assert admission.invocation_id is not None
+    await one.stop()
+    await served.invocations.recover(PROJECT)
+    await served.invocations.decide(
+        HumanAction(PRODUCT_OWNER, "retry-the-review", str(admission.invocation_id), "retry", {})
+    )
+    provider = Reviewer(NOTHING_FOUND)
+    second = await served.worker("qa", provider)
+    two = served.sessions[-1]
+    await served.world.claims.claim(two.principal, owed["assignment_id"], two.worker_id)
+    # Every announcement so far has been read and dealt with by somebody.
+    await served.publisher.publish_pending()
+    stream = f"relay:{PROJECT}:cmd:qa"
+    for delivery in await served.streams.read(stream, group="qa", consumer="somebody"):
+        await served.streams.acknowledge(stream, "qa", delivery)
+    late = replying({"findings": [NO_USAGE_MESSAGE], "carried": []})
+    assert await served.invocations.record(admission.invocation_id, late) == "returned"
+
+    await served.invocations.recover(PROJECT)  # the pass finds the result and applies it
+
+    assert await served.world.column("SELECT state FROM invocations") == ["overtaken"]
+    assert (await served.owed("qa"))["state"] == "wanted"
+    assert await served.invocations.parked(PROJECT) == []
+    await served.publisher.publish_pending()
+    assert await second.serve_once(served.streams, PROJECT) == ["applied"]
+    assert (await served.owed("qa"))["state"] == "done"
+    assert await served.world.column("SELECT count(*) FROM findings") == [0]
+    assert len(provider.asked) == 1
+
+
+async def test_a_reviewer_whose_bounds_stop_holding_after_a_reply_it_could_not_use_goes_on_later(
+    served: Served,
+) -> None:
+    """3B-S2-2.4, through the stream: the first reply is not a review, and the boundary's
+    pass has gone by the time the next call would be made. The command is acknowledged,
+    so the work must not be left with this worker: it is announced again, and done when
+    the boundary holds."""
+    worker: Worker
+
+    class LosesItsPass(Reviewer):
+        async def invoke(self, request: Request, **named: Any) -> ProviderResult:
+            if not self.asked:
+                worker._boundaries.holding = False  # type: ignore[attr-defined]
+            return await super().invoke(request, **named)
+
+    provider = LosesItsPass({"findings": "none", "carried": []}, NOTHING_FOUND)
+    worker = await served.worker("qa", provider)
+
+    [left] = await worker.serve_once(served.streams, PROJECT)
+
+    assert left.startswith("refused: the bounds of this run")
+    assert (await served.owed("qa"))["state"] == "wanted"
+    assert await worker.serve_once(served.streams, PROJECT) == []
+    worker._boundaries.holding = True  # type: ignore[attr-defined]
+    await served.publisher.publish_pending()
+    assert await worker.serve_once(served.streams, PROJECT) == ["applied"]
+    assert await served.world.column("SELECT state FROM invocations ORDER BY attempt") == [
+        "rejected",
+        "applied",
+    ]
+    assert "findings of the reply is not a array" in provider.asked[1].briefing

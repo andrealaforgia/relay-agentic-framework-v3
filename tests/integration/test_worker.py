@@ -685,3 +685,55 @@ async def test_a_reply_that_does_not_satisfy_its_recorded_schema_is_not_handed_t
     assert await bench.states() == ["rejected", "applied"]
     assert bench.task.problems[1] == "the reply has also, which was not asked for"
     assert await bench.world.column("SELECT schema FROM invocations WHERE attempt = 1") == [strict]
+
+
+async def test_a_reply_that_does_not_satisfy_its_schema_is_not_shown_to_the_task(
+    bench: Bench,
+) -> None:
+    """3B-S2-1.11 and 3B-S2-2.6: checked before the task reads any of it. Here the
+    task's own check would fault on being asked at all."""
+    bench.task.schema = {"type": "object", "properties": {"sum": {"type": "string"}}}
+    bench.task.check_faults = True
+    worker = await bench.worker(Scripted(said(), UNCERTAIN))
+
+    await worker.carry_out(await bench.owed())
+
+    reasons = await bench.world.column("SELECT reason FROM invocations ORDER BY attempt")
+    assert reasons[0] == "sum of the reply is not a string"
+
+
+async def test_work_whose_last_call_gave_nothing_is_handed_back_when_the_bounds_stop_holding(
+    bench: Bench,
+) -> None:
+    """3B-S2-2.4: the first reply could not be used, and before the next call the pass
+    of the boundary has gone. The worker will make no call, and the grant has nothing
+    of its own to keep: the work is wanted and announced again, and is done when the
+    boundary has been shown to hold."""
+    provider = Scripted(said(), said())
+    worker = await bench.worker(provider)
+    bench.refusing.append("the service would not have it")
+    prepared = 0
+
+    async def the_pass_goes_before_the_second_call() -> None:
+        nonlocal prepared
+        prepared += 1
+        if prepared == 2:
+            bench.boundaries.holding = False
+
+    bench.task.during_preparation = the_pass_goes_before_the_second_call
+    async with bench.world.database.connection() as connection:
+        await connection.execute("UPDATE outbox SET published_at = now()")  # it was delivered
+
+    left = await worker.carry_out(await bench.owed())
+
+    assert left == "refused: the bounds of this run have not been shown to hold on this host"
+    owed = await bench.owed()
+    assert (owed["state"], owed["grant_id"]) == ("wanted", None)
+    assert await bench.world.column(
+        "SELECT count(*) FROM outbox o JOIN assignments a ON a.command_message_id = o.message_id "
+        "WHERE a.kind = 'build' AND o.published_at IS NULL"
+    ) == [1]
+    bench.boundaries.holding = True
+    assert await worker.carry_out(await bench.owed()) == "applied"
+    assert await bench.states() == ["rejected", "applied"]
+    assert bench.task.problems[-1] == "the service would not have it"

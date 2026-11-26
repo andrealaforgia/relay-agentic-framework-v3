@@ -24,6 +24,7 @@ from tests.integration.fixtures import (
     BUILDER,
     CONTRACT,
     PRODUCT_OWNER,
+    RELAY_ITSELF,
     VERIFIER,
     HeldAtABarrier,
     held_at_the_barrier,
@@ -44,15 +45,15 @@ async def test_an_open_question_stops_its_story_and_the_answer_becomes_shared_co
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
     )
-    await world.behaviours.begin_test_design(PROJECT, "B1")
-    await world.behaviours.register_acceptance_test(PROJECT, "B1", CONTRACT, basis=0)
+    await world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    await world.behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
 
     question = await world.ask("S1")
 
     with pytest.raises(ActionRefused, match=f"question {question}"):
-        await world.behaviours.run_red(PROJECT, "B1")
+        await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
     [waiting] = await world.decisions.open_questions(PROJECT)
     assert (waiting.question_id, waiting.text, waiting.why, waiting.options) == (
         question,
@@ -72,13 +73,13 @@ async def test_an_open_question_stops_its_story_and_the_answer_becomes_shared_co
     assert context.basis == 1
     assert (await world.decisions.context_for(PROJECT, "F1", "S2")).basis == 0
     with pytest.raises(ActionRefused, match="S1 is not current"):
-        await world.behaviours.run_red(PROJECT, "B1")
+        await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
     assert [(each["role"], each["subject"]) for each in await world.owed()] == [
         ("analyst", "story"),
         ("verifier", "behaviour"),
     ]
     await world.reconfirm_everything()
-    assert (await world.behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
     assert (await world.events()).count("question.asked") == 1
     assert "question.answered" in await world.events()
 
@@ -231,7 +232,7 @@ async def test_a_pause_and_a_question_each_stop_the_story_until_each_is_cleared(
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
     )
     feature_wide = await world.ask(story=None)
     about_the_story = await world.ask("S1")
@@ -239,16 +240,16 @@ async def test_a_pause_and_a_question_each_stop_the_story_until_each_is_cleared(
 
     await world.answer(about_the_story)
     with pytest.raises(ActionRefused, match="paused"):
-        await world.behaviours.begin_test_design(PROJECT, "B1")
+        await world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
     await world.close("resume")
     with pytest.raises(ActionRefused, match=f"question {feature_wide}"):
-        await world.behaviours.begin_test_design(PROJECT, "B1")
+        await world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
     await world.answer(feature_wide)
     with pytest.raises(ActionRefused, match="not current"):
-        await world.behaviours.begin_test_design(PROJECT, "B1")
+        await world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
     await world.reconfirm_everything()
 
-    await world.behaviours.begin_test_design(PROJECT, "B1")
+    await world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
 
 
 async def test_cancelling_a_feature_withdraws_its_questions(world: DecisionWorld) -> None:
@@ -312,7 +313,7 @@ async def test_a_question_waits_for_work_that_was_admitted_before_it(
 ) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
     )
     admitted, go_on = asyncio.Event(), asyncio.Event()
     real = behaviours_module.require_story_at_work
@@ -323,7 +324,7 @@ async def test_a_question_waits_for_work_that_was_admitted_before_it(
         await go_on.wait()
 
     monkeypatch.setattr(behaviours_module, "require_story_at_work", held_once_admitted)
-    starting = asyncio.create_task(world.behaviours.begin_test_design(PROJECT, "B1"))
+    starting = asyncio.create_task(world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1"))
     await admitted.wait()
     asking = asyncio.create_task(world.ask("S1"))
     await world.until_someone_waits_for_a_lock()

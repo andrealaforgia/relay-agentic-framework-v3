@@ -37,6 +37,8 @@ from relay.application.closure import (
 from relay.application.stories import _record as record_receipt
 from relay.application.stories import _recorded as recorded_receipt
 from relay.application.workers import WorkerSession, is_alive
+from relay.domain.schema import problem_with as schema_problem
+from relay.domain.schema import require_checkable
 from relay.domain.story import (
     ActionRefused,
     HumanAction,
@@ -201,6 +203,9 @@ class Invocations:
                 # The briefing was written from something that has changed since. The
                 # call is not made on it, and is not recorded as made on what is here now.
                 return Admission("stale", reason="what this was prepared from has changed")
+            # Before anything is paid for: a reply could not be checked against a schema
+            # that asks for what Relay does not check.
+            require_checkable(dict(prepared.schema))
             invocation_id = uuid.uuid7()
             attempt = (latest["attempt"] if latest is not None else 0) + 1
             admitted_on = {**stands, "grant_id": str(grant_id), "attempt": attempt}
@@ -269,7 +274,13 @@ class Invocations:
             # Work that has been ended meanwhile (retired, or done by other means) keeps
             # what is learned about its call, and nothing is asked or owed for it.
             live = assignment["state"] in ("wanted", "granted")
-            state, reason = _ending(result, problem or result.unusable or None)
+            # Whoever hands a result over, it is checked here against the schema that was
+            # stored with the call: a late result delivered by other hands than the
+            # worker's is read as nothing either until it has been.
+            state, reason = _ending(
+                result,
+                problem or result.unusable or reply_problem(result, invocation["schema"]),
+            )
             if late and result.terminal is None and result.outcome is not Outcome.NOT_STARTED:
                 return "uncertain"  # nothing more is known than was
             if state == "returned" and assignment["kind"] in (BUILD, REMEDIATE) and not retained:
@@ -439,10 +450,11 @@ class Invocations:
                 # record as started by a process that is alive and not carrying it out
                 # would be busy to everyone for ever.
                 if worker.running.get(key) is mine:
-                    del worker.running[key]
-                    if not settled:
+                    if settled:
+                        del worker.running[key]
+                    else:
                         giving_up = asyncio.create_task(
-                            self._give_up(invocation_id, effect.name, worker)
+                            self._give_up(invocation_id, effect.name, worker, mine)
                         )
                         self._giving_up.add(giving_up)
                         giving_up.add_done_callback(self._giving_up.discard)
@@ -455,18 +467,28 @@ class Invocations:
             )
         return "applied"
 
-    async def _give_up(self, invocation_id: uuid.UUID, name: str, worker: WorkerSession) -> None:
+    async def _give_up(
+        self, invocation_id: uuid.UUID, name: str, worker: WorkerSession, mine: object
+    ) -> None:
         """This process took the effect and is no longer carrying it out, which it knows
         because the call that took it is the one saying so. If the effect is still on
         record as started by this process, it is free again. One that has been done, or
         taken over by another process since, is not touched. Which try it was does not
-        matter, and the call may have been cut short before it learned."""
-        async with self._pool.connection() as connection, connection.transaction():
-            await connection.execute(
-                "UPDATE invocation_effects SET state = 'pending' WHERE invocation_id = %s "
-                "AND name = %s AND state = 'started' AND worker_id = %s",
-                (invocation_id, name, worker.worker_id),
-            )
+        matter, and the call may have been cut short before it learned.
+
+        The call's own claim to the effect in this process is let go only once that is
+        on record. Until then the effect is busy to every other call here: one that took
+        it in between would have its own try set free by this."""
+        try:
+            async with self._pool.connection() as connection, connection.transaction():
+                await connection.execute(
+                    "UPDATE invocation_effects SET state = 'pending' WHERE invocation_id = %s "
+                    "AND name = %s AND state = 'started' AND worker_id = %s",
+                    (invocation_id, name, worker.worker_id),
+                )
+        finally:
+            if worker.running.get((invocation_id, name)) is mine:
+                del worker.running[(invocation_id, name)]
 
     async def _take(
         self,
@@ -515,18 +537,7 @@ class Invocations:
                     return "busy"
             ended = await _ended_for_good(connection, assignment, invocation)
             if ended:
-                await connection.execute(
-                    "UPDATE invocations SET state = 'overtaken', reason = %s "
-                    "WHERE invocation_id = %s",
-                    (ended, invocation_id),
-                )
-                await _note(
-                    connection,
-                    assignment,
-                    "invocation.overtaken",
-                    invocation_id,
-                    invocation["attempt"],
-                )
+                await _overtake(connection, assignment, invocation, ended)
                 return "overtaken"
             stopped = await closure_of_feature(
                 connection,
@@ -582,18 +593,7 @@ class Invocations:
             # visible yet, since what it changes it changes in `settle`, below.
             ended = await _ended_for_good(connection, assignment, invocation)
             if ended:
-                await connection.execute(
-                    "UPDATE invocations SET state = 'overtaken', reason = %s "
-                    "WHERE invocation_id = %s",
-                    (ended, invocation_id),
-                )
-                await _note(
-                    connection,
-                    assignment,
-                    "invocation.overtaken",
-                    invocation_id,
-                    invocation["attempt"],
-                )
+                await _overtake(connection, assignment, invocation, ended)
                 return "overtaken"
             if (
                 await closure_of_feature(
@@ -659,18 +659,7 @@ class Invocations:
             if ended:
                 # The work ended or changed while the effect ran. Whatever the service
                 # then refused, the reply was not at fault: nobody is asked about it.
-                await connection.execute(
-                    "UPDATE invocations SET state = 'overtaken', reason = %s "
-                    "WHERE invocation_id = %s",
-                    (ended, invocation_id),
-                )
-                await _note(
-                    connection,
-                    assignment,
-                    "invocation.overtaken",
-                    invocation_id,
-                    invocation["attempt"],
-                )
+                await _overtake(connection, assignment, invocation, ended)
                 return "overtaken"
             await connection.execute(
                 "UPDATE invocations SET state = 'rejected', reason = %s WHERE invocation_id = %s",
@@ -1041,6 +1030,45 @@ async def _ended_for_good(
     return ""
 
 
+async def _overtake(
+    connection: Connection, assignment: dict[str, Any], invocation: dict[str, Any], reason: str
+) -> None:
+    """The result will be applied to nothing, through no fault of the reply.
+
+    If the work is still owed, and is held by the grant this result acted under, it is
+    not left there: whoever holds that grant has been answered, and nobody would come
+    back for it. It is wanted again and announced again. When as many calls have been
+    made for it as a person is asked after, it is parked instead: being nobody's fault
+    does not make a fourth paid call free."""
+    await connection.execute(
+        "UPDATE invocations SET state = 'overtaken', reason = %s WHERE invocation_id = %s",
+        (reason, invocation["invocation_id"]),
+    )
+    await _note(
+        connection,
+        assignment,
+        "invocation.overtaken",
+        invocation["invocation_id"],
+        invocation["attempt"],
+    )
+    under = invocation["applied_under"] or invocation["grant_id"]
+    if assignment["state"] != "granted" or assignment["grant_id"] != under:
+        return
+    if await _calls_made(connection, assignment["assignment_id"]) >= ATTEMPTS_BEFORE_ASKING:
+        await _park(
+            connection,
+            assignment,
+            invocation["invocation_id"],
+            f"{ATTEMPTS_BEFORE_ASKING} calls gave nothing that could be used",
+        )
+        return
+    await _release(connection, assignment)
+    await connection.execute(
+        "UPDATE outbox SET published_at = NULL WHERE message_id = %s",
+        (assignment["command_message_id"],),
+    )
+
+
 async def _release(connection: Connection, assignment: dict[str, Any]) -> None:
     """Take the grant back: the work is wanted again, by whoever is alive to do it."""
     if assignment["state"] != "granted":
@@ -1118,6 +1146,18 @@ async def _note(
 
 def _subject(assignment: dict[str, Any]) -> str:
     return str(assignment["behaviour_id"] or assignment["story_id"] or assignment["feature_id"])
+
+
+def reply_problem(result: ProviderResult, schema: Mapping[str, Any]) -> str | None:
+    """Why what a call returned is not the structured answer it was asked for, or None
+    if it is, or if the call returned nothing to check. Asking the provider to enforce a
+    schema is not its having done so."""
+    if result.outcome is not Outcome.RETURNED:
+        return None
+    reply = result.terminal.structured_output if result.terminal is not None else None
+    if reply is None:
+        return "the reply did not carry the structured answer it was asked for"
+    return schema_problem(reply, dict(schema))
 
 
 def _ending(result: ProviderResult, problem: str | None) -> tuple[str, str | None]:

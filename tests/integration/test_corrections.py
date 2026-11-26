@@ -20,6 +20,7 @@ from tests.integration.decision_world import DecisionWorld
 from tests.integration.fixtures import (
     ANALYST,
     CONTRACT,
+    RELAY_ITSELF,
     VAT_APPLIES_STANDARD_RATE,
     VERIFIER,
     prepare_review,
@@ -79,12 +80,12 @@ async def test_amending_a_contract_in_review_sets_the_review_aside_and_keeps_its
     assert await world.reviews.publish_candidates() == 1
     async with world.database.connection() as connection:
         tasks = await (
-            await connection.execute("SELECT role, capability FROM review_tasks")
+            await connection.execute("SELECT role, task_id FROM review_tasks")
         ).fetchall()
-    capability = {task["role"]: task["capability"] for task in tasks}
-    await prepare_review(world.reviews, capability["sentinel"], world.tmp_path / "sentinel")
-    await submit_review(world.reviews, capability["sentinel"], Review(findings=(INJECTION,)))
-    await prepare_review(world.reviews, capability["qa"], world.tmp_path / "qa")
+    review_of = {task["role"]: task["task_id"] for task in tasks}
+    await prepare_review(world.reviews, review_of["sentinel"], world.tmp_path / "sentinel")
+    await submit_review(world.reviews, review_of["sentinel"], Review(findings=(INJECTION,)))
+    await prepare_review(world.reviews, review_of["qa"], world.tmp_path / "qa")
     await decided(world)
 
     await amend(world, await verifier_grant(world))
@@ -92,11 +93,11 @@ async def test_amending_a_contract_in_review_sets_the_review_aside_and_keeps_its
     assert await world.state("B1") is BehaviourState.VALIDATING_RED
     assert await world.contract_digest("B1") == REDUCED_RATE.digest
     assert await world.column("SELECT state FROM review_cycles") == ["superseded"]
-    late = await submit_review(world.reviews, capability["qa"], Review())
+    late = await submit_review(world.reviews, review_of["qa"], Review())
     assert late.disposition == "stale"
     assert await world.column("SELECT status FROM findings") == ["open"]
 
-    assert (await world.behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
     await world.reviewed(
         "B1", {"vat.py": VAT_APPLIES_REDUCED_RATE}, on=base, reviews={"sentinel": Review()}
     )
@@ -147,7 +148,7 @@ async def test_a_candidate_the_repository_refused_is_not_sent_round_again_by_an_
     assert await world.state("B1") is BehaviourState.VALIDATING_RED
     assert await world.column("SELECT state FROM review_cycles") == ["superseded"]
     assert await world.column("SELECT state FROM integration_intents") == ["rejected"]
-    assert (await world.behaviours.run_red(PROJECT, "B1")).is_valid
+    assert (await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
 
 
 async def test_a_proposal_that_edits_a_story_cannot_be_reconfirmed_once_that_storys_basis_moves(
@@ -244,7 +245,7 @@ async def test_sending_a_proposal_back_leaves_what_is_owed_for_the_roadmap_in_fo
     ]
     assert await world.reconfirm_everything() == 3
     await world.behaviours.propose(
-        PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=1, story_revision=1
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=1, story_revision=1
     )
 
 

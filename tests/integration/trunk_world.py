@@ -20,8 +20,10 @@ from relay.persistence.outbox import pending_messages
 from relay.testing.oracle import ContainerIsolation, Isolation, ProcessOracle
 from tests.integration.fixtures import (
     CONTRACT,
+    RELAY_ITSELF,
     VAT_APPLIES_STANDARD_RATE,
     VAT_RETURNS_NET,
+    VERIFIER,
     in_a_story,
     prepare_review,
     run_green,
@@ -143,6 +145,7 @@ class TrunkWorld:
         """A behaviour with a verified red on the current trunk. Returns that revision."""
         basis = await self.basis(story)
         await self.behaviours.propose(
+            VERIFIER,
             self.project,
             story,
             behaviour,
@@ -159,11 +162,11 @@ class TrunkWorld:
                 await connection.execute(
                     "UPDATE behaviours SET position = 1 WHERE project_id = %s", (self.project,)
                 )
-        await self.behaviours.begin_test_design(self.project, behaviour)
+        await self.behaviours.begin_test_design(VERIFIER, self.project, behaviour)
         await self.behaviours.register_acceptance_test(
-            self.project, behaviour, contract, basis=basis
+            VERIFIER, self.project, behaviour, contract, basis=basis
         )
-        assert (await self.behaviours.run_red(self.project, behaviour)).is_valid
+        assert (await self.behaviours.run_red(RELAY_ITSELF, self.project, behaviour)).is_valid
         return self.trunk()
 
     def publish_attempt(self, behaviour: str, files: dict[str, str], *, on: str) -> str:
@@ -199,12 +202,12 @@ class TrunkWorld:
         assert await self.reviews.publish_candidates() == 1
         for message in await pending_messages(self.database):
             payload = message.envelope["payload"]
-            if payload.get("candidate_revision") == candidate and "capability" in payload:
-                tree = self.tmp_path / f"review-{payload['capability'][:8]}"
+            if payload.get("candidate_revision") == candidate and "task_id" in payload:
+                tree = self.tmp_path / f"review-{payload['task_id'][:8]}"
                 shutil.rmtree(tree, ignore_errors=True)
-                await prepare_review(self.reviews, payload["capability"], tree)
+                await prepare_review(self.reviews, payload["task_id"], tree)
                 said = (reviews or {}).get(message.envelope["recipient"], Review())
-                await submit_review(self.reviews, payload["capability"], said)
+                await submit_review(self.reviews, payload["task_id"], said)
         return candidate
 
     async def integrate(

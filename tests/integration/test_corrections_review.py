@@ -23,6 +23,7 @@ from tests.integration.fixtures import (
     ANALYST,
     PRODUCT_OWNER,
     VAT_APPLIES_STANDARD_RATE,
+    VERIFIER,
     HeldAtABarrier,
     held_at_the_barrier,
     prepare_review,
@@ -73,7 +74,7 @@ async def test_a_behaviour_is_proposed_against_the_story_revision_its_author_rea
     before = await world.events()
 
     with pytest.raises(ActionRefused, match="has moved on"):
-        await world.behaviours.propose(
+        await world.behaviours.propose(VERIFIER, 
             PROJECT, "S2", "B1", "prints hello", ["AC1"], basis=0,
             story_revision=read_by_the_verifier,
         )  # fmt: skip
@@ -81,7 +82,7 @@ async def test_a_behaviour_is_proposed_against_the_story_revision_its_author_rea
     assert await world.column("SELECT count(*) FROM behaviours") == [0]
     assert await world.events() == before
     await world.behaviours.propose(
-        PROJECT, "S2", "B1", "prints hello, Ada", ["AC1"], basis=0, story_revision=2
+        VERIFIER, PROJECT, "S2", "B1", "prints hello, Ada", ["AC1"], basis=0, story_revision=2
     )
 
 
@@ -148,7 +149,7 @@ async def test_a_conflict_seen_as_a_story_is_rejected_blocks_nothing(
     world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
     assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
     assert await world.reviews.publish_candidates() == 1
-    [capability] = await world.column("SELECT capability FROM review_tasks WHERE role = 'qa'")
+    [task_id] = await world.column("SELECT task_id FROM review_tasks WHERE role = 'qa'")
     real_resolve = reviews_module.resolve_ref
     rejected: list[bool] = []
 
@@ -161,7 +162,7 @@ async def test_a_conflict_seen_as_a_story_is_rejected_blocks_nothing(
 
     monkeypatch.setattr(reviews_module, "resolve_ref", moved_while_the_story_is_rejected)
     with pytest.raises(Exception, match="no longer names|cancelled|not being worked on"):
-        await prepare_review(world.reviews, str(capability), world.tmp_path / "tree")
+        await prepare_review(world.reviews, task_id, world.tmp_path / "tree")
 
     assert await world.column("SELECT state FROM review_cycles") == ["open"]
     assert await world.state("B1") is BehaviourState.REVIEW
@@ -351,11 +352,11 @@ async def test_a_reviewer_is_told_the_story_was_rejected_not_that_the_feature_wa
     world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
     assert (await run_green(world.behaviours, PROJECT, "B1", 1)).is_valid
     assert await world.reviews.publish_candidates() == 1
-    [capability] = await world.column("SELECT capability FROM review_tasks WHERE role = 'qa'")
+    [task_id] = await world.column("SELECT task_id FROM review_tasks WHERE role = 'qa'")
     await reject(world)
 
     with pytest.raises(ActionRefused) as refused:
-        await prepare_review(world.reviews, str(capability), world.tmp_path / "tree")
+        await prepare_review(world.reviews, task_id, world.tmp_path / "tree")
 
     assert "S1 was rejected" in str(refused.value) and "cancelled" not in str(refused.value)
     assert await world.column("SELECT count(*) FROM review_checkouts") == [0]

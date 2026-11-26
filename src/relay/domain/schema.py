@@ -21,17 +21,32 @@ _TYPES: dict[str, tuple[type, ...]] = {
 }
 
 
-def problem_with(value: Any, schema: dict[str, Any], at: str = "the reply") -> str | None:
-    """Why the value does not satisfy the schema, or None if it does."""
+def require_checkable(schema: dict[str, Any]) -> None:
+    """Refuse a schema, the whole of it, that asks for anything Relay does not check:
+    asked before a call is made on it, so that no reply is paid for that could not then
+    be checked."""
+    _require_understood(schema)
+    for inner in schema.get("properties", {}).values():
+        require_checkable(inner)
+    if "items" in schema:
+        require_checkable(schema["items"])
+
+
+def _require_understood(schema: dict[str, Any]) -> None:
     beyond = set(schema) - _UNDERSTOOD
     if beyond:
         raise ValueError(f"a reply schema uses {sorted(beyond)}, which Relay does not check")
+    if "type" in schema and schema["type"] not in _TYPES:
+        raise ValueError(f"a reply schema asks for a {schema['type']}, which Relay does not check")
+
+
+def problem_with(value: Any, schema: dict[str, Any], at: str = "the reply") -> str | None:
+    """Why the value does not satisfy the schema, or None if it does."""
+    _require_understood(schema)
     if "enum" in schema and value not in schema["enum"]:
         return f"{at} is {value!r}, not one of {schema['enum']}"
     wanted = schema.get("type")
     if wanted is not None:
-        if wanted not in _TYPES:
-            raise ValueError(f"a reply schema asks for a {wanted}, which Relay does not check")
         # A boolean is an integer to Python and is not one to JSON.
         is_a_boolean_where_a_number_is_wanted = isinstance(value, bool) and wanted != "boolean"
         if not isinstance(value, _TYPES[wanted]) or is_a_boolean_where_a_number_is_wanted:
