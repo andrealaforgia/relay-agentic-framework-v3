@@ -141,3 +141,38 @@ def test_a_reply_its_task_would_not_take_is_applied_as_a_refusal_whoever_recorde
 
     with pytest.raises(ActionRefused, match="no note of work done"):
         asyncio.run(effect.perform(None))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("task", "reply", "says"),
+    [
+        (
+            ReviewTask,
+            {
+                "outcome": "delivered",
+                "assumptions": [],
+                "delivered": {"findings": "", "carried": {}},
+            },
+            "is not a array",
+        ),
+        (
+            BuildTask,
+            {"outcome": "delivered", "delivered": {"note": "done", "question": QUESTION}},
+            "within it",
+        ),
+        (BuildTask, {"delivered": {"note": "done"}, "note": "also"}, "beside it"),
+        (BuildTask, {"outcome": "delivered", "delivered": "done"}, "is an object"),
+        (ReviewTask, {"delivered": {"findings": [], "carried": [], "extra": 1}}, "not asked for"),
+    ],
+)
+def test_what_a_reply_delivers_is_held_to_its_whole_schema_in_either_form(
+    task: Any, reply: dict[str, Any], says: str
+) -> None:
+    """3B-S3-3.1: neither a review of nothing nor a build that also asks."""
+    found = task.problem_with(None, reply)
+
+    assert found is not None and says in found
+    [effect] = Tasks({"work": task.__new__(task)}).effects_for(
+        {"kind": "work", "role": "any", "reply": reply}
+    )
+    assert effect.name == "read"  # and so no effect of the work itself

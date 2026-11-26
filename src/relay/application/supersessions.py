@@ -113,8 +113,19 @@ class Supersessions:
                 )
             ).fetchone()
             if proposal is None:
-                raise ActionRefused("there is no such proposal waiting")
-            await _end(connection, proposal, "withdrawn", "withdrawn by the verifier")
+                withdrawn = await (
+                    await connection.execute(
+                        "SELECT 1 FROM supersessions WHERE gate_id = %s AND project_id = %s "
+                        "AND state = 'withdrawn'",
+                        (gate_id, project_id),
+                    )
+                ).fetchone()
+                if withdrawn is None:
+                    raise ActionRefused("there is no such proposal waiting")
+                # Withdrawn already, by this request the first time it came: what
+                # follows a withdrawal is done again, which changes nothing if it was.
+            else:
+                await _end(connection, proposal, "withdrawn", "withdrawn by the verifier")
         if self.then is not None:
             # The red that waited for this proposal to be decided waits no longer, and
             # nobody is about to apply anything: the control plane looks now.

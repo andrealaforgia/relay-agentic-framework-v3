@@ -963,6 +963,12 @@ async def test_a_roadmap_in_force_that_no_longer_stands_is_revised_by_the_analys
     [asked] = briefings(roles["analyst"], "You propose the roadmap")
     assert "the roadmap in force no longer stands" in asked
     assert "the greeting is to be in French" in asked
+    # 3B-S3-3.9: each briefing says what is so. No final check failed here.
+    assert "final check" not in asked
+    assert (
+        "you will be asked for a revision of it"
+        in (briefings(roles["analyst"], "You are asked whether")[0])
+    )
     await world.decide(proposal.gate_id)
     assert await world.column("SELECT title FROM stories WHERE story_id = 'S2'") == [
         "Greeting in French"
@@ -1194,3 +1200,167 @@ async def test_a_revision_of_the_roadmap_in_force_is_owed_once(
     assert await world.column(
         "SELECT issued_on->>'reason' FROM assignments WHERE kind = 'revise'"
     ) == ["it no longer stands"]
+
+
+async def test_a_reply_to_an_invalid_red_that_only_names_a_replacement_rewrites_nothing(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-3.3: what is owed is the contract, written again."""
+    at = delivering_world
+    passes_already = delivering(**{**B1["delivered"], "contract": ALREADY_PASSES})
+    only_replaces = delivering(demonstrated=False, replaces="B1", replaces_because="x")
+    rewritten = delivering(demonstrated=False, contract=STANDARD_RATE_CONTRACT)
+    roles = await released(
+        at,
+        verifier__You_decide_how_a_user_story_is_shown=[passes_already, only_replaces, rewritten],
+    )
+    at.workers.pop("builder")
+
+    await at.work()
+
+    assert (
+        "what is asked for is the contract, written again"
+        in (briefings(roles["verifier"], "You decide how")[2])
+    )
+    assert await at.world.column("SELECT count(*) FROM supersessions") == [0]
+    assert await at.world.state("B1") is BehaviourState.IMPLEMENTING
+
+
+async def test_a_verifier_may_say_a_voided_replacement_is_not_proposed_again_and_the_build_goes_on(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-3.5: past its red, with no contract to write again."""
+    at = delivering_world
+    quarter = {
+        **STANDARD_RATE_CONTRACT,
+        "contract_id": "B2-quarter",
+        "expect_stdout": "125\n",
+        "baseline_stdout": "120\n",
+    }
+    b2 = delivering(
+        demonstrated=False,
+        behaviour_id="B2",
+        summary="the rate is a quarter",
+        demonstrates=["AC1"],
+        contract=quarter,
+        replaces="B1",
+        replaces_because="the rate is 25%",
+    )
+    declines = delivering(demonstrated=False, no_longer_replaces=True)
+    await released(
+        at,
+        verifier__You_decide_how_a_user_story_is_shown=[B1, b2, declines],
+        verifier__You_are_asked_whether=[STANDS, STANDS],
+    )
+    await at.work()
+    await at.world.decide(await at.world.gate())  # approved; its red is observed
+    assert await at.world.state("B2") is BehaviourState.IMPLEMENTING
+    at.workers.pop("builder")
+
+    await at.world.answer(await at.world.ask(), "the rate stays as it is")
+    await at.work()
+
+    assert await at.world.column("SELECT state FROM supersessions") == ["void"]
+    assert await at.world.column("SELECT state FROM obligations WHERE behaviour_id = 'B1'") == [
+        "active"
+    ]
+    [build] = await at.world.column(
+        "SELECT assignment_id FROM assignments WHERE kind = 'build' AND state = 'wanted'"
+    )
+    await at.world.claims.claim(BUILDER, build)  # type: ignore[arg-type]
+
+
+async def test_work_refused_for_a_reason_that_still_holds_does_not_wake_the_control_plane(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-3.7: a pass would announce it again, to be refused again, while the gate
+    waits for a person."""
+    at = delivering_world
+    await released(at)
+    await at.work()  # the story is at its gate; everything is done
+    await at.world.column(
+        "UPDATE assignments SET state = 'wanted', grant_id = NULL, granted_to = NULL "
+        "WHERE kind = 'assess' RETURNING 1"
+    )
+    await at.world.column("UPDATE stories SET seal_id = NULL RETURNING 1")  # so it is refused
+    assess = (await at.world.claims.of(await _the(at, "assess"))) or {}
+    passes: list[str] = []
+
+    async def counting(project_id: str) -> None:
+        passes.append(project_id)
+
+    analyst = at.workers["analyst"]
+    analyst._then = counting
+
+    for _ in range(3):
+        assert (await analyst.carry_out(assess)).startswith("refused: S1 has no seal")
+
+    assert passes == []
+
+
+async def test_a_planned_story_a_decision_changed_is_reworded_by_the_analyst(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-3.4: from an answer about that story, through the Analyst's verdict and a
+    worker's revision, to the approval of the reworded story."""
+    at, world = delivering_world, delivering_world.world
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    reworded = {
+        "change": "reworded",
+        "story_id": "S2",
+        "title": "Greeting in French",
+        "outcome": "the shopper is greeted in French",
+        "criteria": [{"id": "AC1", "text": "bonjour is printed"}],
+    }
+    roles = staffed(
+        analyst__You_propose_the_roadmap=[
+            proposing({"change": "kept", "story_id": "S1"}, reworded)
+        ],
+        analyst__You_are_asked_whether=[
+            delivering(verdict="to_be_replaced", because="the greeting is to be in French")
+        ],
+    )
+    await at.staff(analyst=roles["analyst"])
+
+    await world.answer(await world.ask(story="S2"), "greet in French")
+    await at.work()
+
+    [asked] = briefings(roles["analyst"], "You propose the roadmap")
+    assert "story S2 no longer stands under the decisions now in force" in asked
+    [proposal] = [each for each in await world.stories.inbox(PROJECT) if each.kind == "roadmap"]
+    await world.decide(proposal.gate_id)
+    assert await world.column("SELECT title FROM stories WHERE story_id = 'S2'") == [
+        "Greeting in French"
+    ]
+
+
+async def test_a_withdrawal_sent_again_wakes_the_control_plane_again_and_withdraws_nothing_more(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-3.11: cut short between the commit and the wake-up, and sent again."""
+    at = delivering_world
+    b2 = delivering(
+        demonstrated=False,
+        behaviour_id="B2",
+        summary="another",
+        demonstrates=["AC1"],
+        contract={
+            **STANDARD_RATE_CONTRACT,
+            "contract_id": "B2-quarter",
+            "expect_stdout": "125\n",
+            "baseline_stdout": "120\n",
+        },
+        replaces="B1",
+        replaces_because="the rate is 25%",
+    )
+    await released(at, verifier__You_decide_how_a_user_story_is_shown=[B1, b2])
+    await at.work()
+    gate = await at.world.gate()
+    await Supersessions(at.world.database).withdraw(VERIFIER, PROJECT, gate)  # and no wake-up
+    assert await at.world.state("B2") is BehaviourState.VALIDATING_RED
+
+    again = Supersessions(at.world.database, then=at.world.features.reconcile)
+    await again.withdraw(VERIFIER, PROJECT, gate)
+
+    assert await at.world.state("B2") is BehaviourState.IMPLEMENTING
+    assert await at.world.column("SELECT state FROM supersessions") == ["withdrawn"]

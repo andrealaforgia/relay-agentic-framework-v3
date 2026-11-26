@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
-from relay.application.behaviours import Behaviours
+from relay.application.behaviours import Behaviours, rewrite_contract_in
 from relay.domain.behaviour import BehaviourState, TransitionRefused
 from relay.domain.evidence import (
     Execution,
@@ -290,6 +290,12 @@ async def test_the_ledger_is_gap_free_and_in_order(
     )
     await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
     commit(tmp_path / "subject", {"vat.py": VAT_RETURNS_NET})
+    # One red per contract as it was written: after one that showed nothing, the
+    # Verifier writes the contract again, as it was if it was right, and that owes a red.
+    with pytest.raises(ActionRefused, match="has been observed"):
+        await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
+    async with database.connection() as connection, connection.transaction():
+        await rewrite_contract_in(connection, VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
     await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
 
     events = await read_events(database, PROJECT)
@@ -302,6 +308,7 @@ async def test_the_ledger_is_gap_free_and_in_order(
         "behaviour.test_design_started",
         "behaviour.acceptance_test_registered",
         "behaviour.red_rejected",
+        "behaviour.acceptance_test_rewritten",
         "behaviour.test_red_verified",
     ]
 

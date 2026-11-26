@@ -153,6 +153,8 @@ class Integration:
         # A feature's final checks put off behind a push are taken up by whichever
         # control plane settles that push, with the oracle it observes its own checks by.
         self.completion = Completion(pool, oracle, push_timeout)
+        # Batches being given up for callers that were cancelled as they were made.
+        self.giving_up: set[asyncio.Future[None]] = set()
 
     def _mirror(self, project_id: str) -> Mirror:
         return Mirror(self._mirrors / f"{require_identifier('project', project_id)}.git")
@@ -327,14 +329,24 @@ class Integration:
         try:
             started = await asyncio.shield(making)
         except asyncio.CancelledError:
-            try:
-                made = await asyncio.shield(making)
-            except BaseException:  # noqa: BLE001 - nothing was made; the cancel stands
-                raise asyncio.CancelledError from None
-            if not isinstance(made, IntegrationReceipt):
-                await asyncio.shield(self._abandon(made["batch_id"]))
+            # A task of its own, kept: however often this caller is cancelled while it
+            # waits, the making is let finish and what it made is given up.
+            giving_up = asyncio.ensure_future(self._give_up_what_was_made(making))
+            self.giving_up.add(giving_up)
+            giving_up.add_done_callback(self.giving_up.discard)
+            await asyncio.shield(giving_up)
             raise
         return await self._finish(started)
+
+    async def _give_up_what_was_made(
+        self, making: asyncio.Future[dict[str, Any] | IntegrationReceipt]
+    ) -> None:
+        try:
+            made = await making
+        except BaseException:  # noqa: BLE001 - nothing was made
+            return
+        if not isinstance(made, IntegrationReceipt):
+            await self._abandon(made["batch_id"])
 
     async def _finish(self, started: dict[str, Any] | IntegrationReceipt) -> IntegrationReceipt:
         if isinstance(started, IntegrationReceipt):
@@ -391,13 +403,29 @@ class Integration:
             await self.completion.take_up_what_is_owed(row["project_id"])
         return settled
 
-    async def retry_integration(self, project_id: str, behaviour_id: str, reason: str) -> None:
+    async def retry_integration(
+        self, project_id: str, behaviour_id: str, reason: str, request_id: str | None = None
+    ) -> None:
         """Put a behaviour whose integration the repository refused back where it can be
-        integrated again. A person decides this, once the cause has been dealt with."""
+        integrated again. A person decides this, once the cause has been dealt with.
+
+        `request_id` names the person's request. Sent again after a lost reply, it is
+        the same request and allows nothing more: the retry it allowed has been owed,
+        and whatever the repository said to that is not another refusal to answer."""
         if not reason.strip():
             raise ValueError("retrying an integration needs a stated reason")
         async with self._pool.connection() as connection, connection.transaction():
             behaviour, _ = await _locked_behaviour(connection, project_id, behaviour_id)
+            if request_id is not None:
+                seen = await (
+                    await connection.execute(
+                        "SELECT 1 FROM assignments WHERE project_id = %s AND behaviour_id = %s "
+                        "AND kind = 'integrate' AND issued_on->>'retry_request' = %s",
+                        (project_id, behaviour_id, request_id),
+                    )
+                ).fetchone()
+                if seen is not None:
+                    return
             require_open(await closure_of_behaviour(connection, project_id, behaviour_id))
             last = await (
                 await connection.execute(
@@ -435,7 +463,8 @@ class Integration:
                     correlation_id=uuid.uuid7(),
                     payload={"cycle_id": str(last["cycle_id"]), "retry": reason},
                 ),
-                issued_on={"cycle_id": str(last["cycle_id"])},
+                issued_on={"cycle_id": str(last["cycle_id"])}
+                | ({"retry_request": request_id} if request_id is not None else {}),
             )
 
     async def _start_batch(

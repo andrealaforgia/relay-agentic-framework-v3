@@ -71,10 +71,14 @@ class Features:
         await self.reconcile(gate["project_id"])
         return receipt
 
-    async def retry_integration(self, project_id: str, behaviour_id: str, reason: str) -> None:
+    async def retry_integration(
+        self, project_id: str, behaviour_id: str, reason: str, request_id: str | None = None
+    ) -> None:
         """A person allows an integration the repository refused to be tried again, and
-        Relay tries it: the retry owes the integration, and the pass takes it up."""
-        await self._integration.retry_integration(project_id, behaviour_id, reason)
+        Relay tries it: the retry owes the integration, and the pass takes it up. The
+        same request sent again allows no further push; the pass is run again, which
+        changes nothing if there is nothing owed."""
+        await self._integration.retry_integration(project_id, behaviour_id, reason, request_id)
         await self.reconcile(project_id)
 
     async def summary_of(self, project_id: str, feature_id: str) -> dict[str, Any] | None:

@@ -578,3 +578,32 @@ async def test_a_red_being_observed_across_a_pause_and_a_resume_is_observed_once
     assert await world.column("SELECT count(*) FROM executions WHERE purpose = 'red'") == [1]
     assert await world.column("SELECT state FROM assignments WHERE kind = 'red'") == ["done"]
     assert await assignments(world) == ["build:wanted"]
+
+
+async def test_a_red_whose_grant_was_taken_back_decides_nothing_when_it_reports(
+    world: StoryWorld,
+) -> None:
+    """3B-S3-3.2: the old owner reports first after the red was owed again. What it saw
+    is kept; the behaviour still awaits its red, and that red is still owed."""
+    await world.behaviours.propose(
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
+    await world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    await world.behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
+    barrier, behaviours = held(world)
+    late = asyncio.create_task(behaviours.run_red(RELAY_ITSELF, PROJECT, "B1"))
+    await held_at_the_barrier(late, barrier)
+    await world.column(
+        "UPDATE assignments SET state = 'wanted', grant_id = NULL, granted_to = NULL, "
+        "first_effect_at = NULL WHERE kind = 'red' RETURNING 1"
+    )
+
+    barrier.release.set()
+    verdict = await late
+
+    assert not verdict.is_valid and verdict.rejection is RedRejection.SUPERSEDED
+    assert await world.state("B1") is BehaviourState.VALIDATING_RED
+    assert await world.column(
+        "SELECT kind || ':' || state FROM assignments WHERE kind IN ('red', 'build')"
+    ) == ["red:wanted"]
+    assert (await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid

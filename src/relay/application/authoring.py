@@ -56,6 +56,7 @@ from relay.domain.story import ActionRefused, SealRefused
 from relay.git.checkout import resolve_ref
 from relay.git.mirror import Mirror
 from relay.persistence.database import Connection, Pool
+from relay.persistence.ledger import append_event
 from relay.providers.confinement import confinement_for, effective_agent_sha256
 from relay.providers.definitions import DEFAULT_DEFINITIONS, find_definition
 
@@ -361,7 +362,7 @@ class RoadmapTask(Authoring):
                 # What the feature's final check observed that did not hold, for a
                 # roadmap that is to change because of it.
                 "SELECT o.name, o.contract->'expect' AS expected, x.exit_code, "
-                "convert_from(x.stdout, 'UTF8') AS stdout FROM completion_receipts r "
+                "x.stdout FROM completion_receipts r "
                 "JOIN obligations o USING (obligation_id) JOIN executions x USING (execution_id) "
                 "WHERE r.batch_id::text = %s AND NOT r.satisfied ORDER BY o.name",
                 (assignment["issued_on"].get("batch_id"),),
@@ -449,7 +450,15 @@ class RoadmapTask(Authoring):
                     "leaving it answered by what is already there."
                 ),
             ]
-        if about["kind"] == "revise":
+        if about["kind"] == "revise" and not about["failed"] and not about["asked"]:
+            lines += [
+                "",
+                (
+                    "The roadmap in force is to be revised. Propose the roadmap as it should "
+                    "now be; why it is owed is said below."
+                ),
+            ]
+        elif about["kind"] == "revise":
             lines += [
                 "",
                 (
@@ -461,7 +470,9 @@ class RoadmapTask(Authoring):
                 "What the final check observed that did not hold:",
                 *(
                     f"  {each['name']}: expected {json.dumps(each['expected'], sort_keys=True)}, "
-                    f"observed exit code {each['exit_code']} and output {each['stdout']!r}"
+                    f"observed exit code {each['exit_code']} and output "
+                    # Whatever bytes they were: a check may print anything.
+                    f"{bytes(each['stdout']).decode('utf-8', 'backslashreplace')!r}"
                     for each in about["failed"]
                 ),
             ]
@@ -695,6 +706,7 @@ class SpecifyTask(Authoring):
             "contract": _CONTRACT,
             "replaces": {"type": "string"},
             "replaces_because": {"type": "string"},
+            "no_longer_replaces": {"type": "boolean"},
         },
         "required": ["demonstrated"],
         "additionalProperties": False,
@@ -765,8 +777,11 @@ class SpecifyTask(Authoring):
                     "What to deliver: demonstrated false. If the behaviour still replaces it, "
                     "name the behaviour it replaces under replaces and say why under "
                     "replaces_because: the Product Owner is shown both contracts again. If its "
-                    "contract has to change first, give the contract as well. Give no "
-                    "behaviour_id, summary or demonstrates."
+                    "contract has to change first, give the contract as well. If it should "
+                    "instead satisfy what is on the trunk like any other behaviour, say "
+                    "no_longer_replaces true and name nothing: it is then built and checked "
+                    "against every contract on the trunk. Give no behaviour_id, summary or "
+                    "demonstrates."
                 ),
             ]
         elif about["behaviour_id"] is not None:
@@ -842,7 +857,8 @@ class SpecifyTask(Authoring):
         if "contract" not in delivered:
             # Only what a behaviour there already is may say: that it still replaces
             # what it was approved to replace, its contract being as it was.
-            if delivered.get("replaces") and "behaviour_id" not in delivered:
+            says = bool(delivered.get("replaces")) or bool(delivered.get("no_longer_replaces"))
+            if says and "behaviour_id" not in delivered:
                 return None
             return "a behaviour is specified by its contract"
         try:
@@ -863,6 +879,29 @@ class SpecifyTask(Authoring):
         if work["behaviour_id"] is not None:
             if delivered.get("demonstrated"):
                 raise ActionRefused("what was asked for is about one behaviour, not the story")
+            voided = work["issued_on"].get("voided")
+            if voided is None and "contract" not in delivered:
+                # Owed because a red showed the contract cannot serve. Naming what it
+                # replaces changes nothing about that: the contract is written again.
+                raise ActionRefused(
+                    "the red showed this contract cannot serve: what is asked for is the "
+                    "contract, written again"
+                )
+            if delivered.get("no_longer_replaces"):
+                if voided is None or delivered.get("replaces"):
+                    raise ActionRefused(
+                        "no_longer_replaces answers a replacement that a decision ended, "
+                        "and names nothing to replace"
+                    )
+                # The behaviour goes on in the ordinary way: what it was to replace
+                # stays required of its candidate, and this request has its answer.
+                await append_event(
+                    connection,
+                    project_id,
+                    "behaviour.replacement_not_proposed_again",
+                    subject_id=work["behaviour_id"],
+                    payload={"supersession_id": voided, "by": caller.identity},
+                )
             if "contract" in delivered:
                 await rewrite_contract_in(
                     connection,
@@ -1173,8 +1212,10 @@ class ReconfirmTask(Authoring):
                     'What to deliver: verdict "stands", if it does. If this revision is a '
                     "proposal still waiting to be approved and it no longer stands, verdict "
                     '"to_be_replaced", saying why under because: it is withdrawn, and you '
-                    "will be asked to propose again. If the roadmap in force no longer "
-                    "stands, ask the Product Owner what should change."
+                    "will be asked to propose again. If this revision is the roadmap in "
+                    'force and it no longer stands, also verdict "to_be_replaced" with why: '
+                    "its stories stay stopped, and you will be asked for a revision of it. "
+                    "Ask the Product Owner only what the decisions do not settle."
                 ),
             ]
         if about["subject"] == "story":
@@ -1188,8 +1229,11 @@ class ReconfirmTask(Authoring):
                 *_story_lines(about["story"]),
                 "",
                 (
-                    'What to deliver: verdict "stands", if it does. If it does not, ask the '
-                    "Product Owner what should change."
+                    'What to deliver: verdict "stands", if it does. If the story has not '
+                    "been started yet (it is planned) and its text or criteria have to "
+                    'change, verdict "to_be_replaced" with why: it stays stopped, and you '
+                    "will be asked for a revision of the roadmap that rewords it. Ask the "
+                    "Product Owner only what the decisions do not settle."
                 ),
             ]
         return [
@@ -1238,10 +1282,34 @@ class ReconfirmTask(Authoring):
         there are. A reply written before a later decision withdraws nothing of what
         that decision owes."""
         work = await _work(connection, run)
-        if work["subject"] != "roadmap":
-            return
         delivered = run.invocation["reply"]["delivered"]
         project_id, feature_id = work["project_id"], work["feature_id"]
+        if work["subject"] == "story" and delivered["verdict"] == "to_be_replaced":
+            story = await (
+                await connection.execute(
+                    "SELECT state FROM stories WHERE project_id = %s AND story_id = %s",
+                    (project_id, work["story_id"]),
+                )
+            ).fetchone()
+            assert story is not None
+            if story["state"] != "planned":
+                raise ActionRefused(
+                    f"{work['story_id']} is {story['state'].replace('_', ' ')}: only a "
+                    "planned story is reworded. Ask the Product Owner what should happen"
+                )
+            # Nothing says the story stands: it stays stopped until a revision that
+            # rewords or drops it is approved, and the Analyst is owed that revision.
+            await owe_a_revision(
+                connection,
+                project_id,
+                feature_id,
+                f"story {work['story_id']} no longer stands under the decisions now in "
+                "force: " + (str(delivered.get("because", "")).strip() or "its author says so"),
+            )
+            await complete(connection, work["assignment_id"])
+            return
+        if work["subject"] != "roadmap":
+            return
         revision = work["issued_on"]["revision"]
         effective, proposed = await _revisions_of(connection, project_id, feature_id)
         because = str(delivered.get("because", "")).strip() or "its author says so"
@@ -1278,8 +1346,10 @@ class ReconfirmTask(Authoring):
         caller, basis = caller_of(run.invocation), run.invocation["expects"]["basis"]
         project_id = work["project_id"]
         verdict = delivered["verdict"]
-        if work["subject"] == "story" and verdict != "stands":
-            raise ActionRefused("a story stands, or the Product Owner is asked")
+        if work["subject"] == "story" and verdict == "amended":
+            raise ActionRefused("a story stands or is to be replaced")
+        if work["subject"] == "story" and verdict == "to_be_replaced":
+            return  # owed as a revision of the roadmap, where the effect is marked
         if work["subject"] == "roadmap" and verdict == "amended":
             raise ActionRefused("a roadmap stands or is to be replaced")
         if work["subject"] == "roadmap":

@@ -23,6 +23,7 @@ from relay.application.invocations import Effect, EffectRun, Invocations, Overta
 from relay.application.reviews import NewFinding, Review, Reviews
 from relay.application.worker import Call
 from relay.domain.review import Carried, Severity, SubmissionRefused
+from relay.domain.schema import problem_with as schema_problem
 from relay.domain.story import ActionRefused, Principal, PrincipalKind
 from relay.git.checkout import CandidateMoved, RemoteRejected, attempt_ref, resolve_ref
 from relay.git.mirror import Mirror
@@ -66,10 +67,25 @@ def plain(reply: Any) -> Any:
     return {**rest, **delivered} if isinstance(delivered, dict) else rest
 
 
-def _shape_problem(reply: Any) -> str | None:
-    """What is wrong with how a reply says which of the two it is, or None."""
+def _shape_problem(reply: Any, flat: Mapping[str, Any]) -> str | None:
+    """What is wrong with how a reply says which of the two it is, or with what it then
+    says, or None. A reply is in one form or the other and never a mixture, and what it
+    delivers is held to the whole of the schema in either: `flat` is that schema."""
     if not isinstance(reply, dict):
         return "the reply is an object"
+    if "delivered" in reply:
+        inside = reply["delivered"]
+        if not isinstance(inside, dict):
+            return "what a reply delivers is an object"
+        beside = sorted(set(reply) - {"outcome", "delivered", "assumptions", "question"})
+        if beside:
+            return f"a reply that says what it delivers under delivered has no {beside} beside it"
+        within = sorted(set(inside) & {"outcome", "delivered", "assumptions", "question"})
+        if within:
+            return f"what a reply delivers has no {within} within it"
+    said = schema_problem(plain(reply), dict(flat))
+    if said:
+        return said
     outcome = reply.get("outcome")
     if outcome == "question" and (reply.get("question") is None or "delivered" in reply):
         return "a reply that asks has a question and delivers nothing"
@@ -128,7 +144,7 @@ async def put_question(connection: Connection, run: EffectRun) -> None:
     together: answering it owes the work again."""
     await record_assumptions(connection, run)
     work = await work_of(connection, run)
-    asked = run.invocation["reply"]["question"]
+    asked = plain(run.invocation["reply"])["question"]
     await ask_in(
         connection,
         caller_of(run.invocation),
@@ -191,6 +207,16 @@ REVIEW_REPLY = {
     "required": [],
     "additionalProperties": False,
 }
+
+
+def _flat(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """A reply schema as its own flat form alone: what a reply is held to once read."""
+    properties = {
+        name: inner
+        for name, inner in schema["properties"].items()
+        if name not in ("outcome", "delivered")
+    }
+    return {**schema, "properties": properties}
 
 
 @dataclass(frozen=True)
@@ -290,7 +316,7 @@ class ReviewTask:
         )
 
     def problem_with(self, reply: Any) -> str | None:
-        shape = _shape_problem(reply)
+        shape = _shape_problem(reply, _flat(REVIEW_REPLY))
         if shape:
             return shape
         reply = plain(reply)
@@ -315,7 +341,7 @@ class ReviewTask:
         shutil.rmtree(call.workdir.parent, ignore_errors=True)
 
     def effects(self, invocation: Mapping[str, Any]) -> list[Effect]:
-        if asks(invocation["reply"]):
+        if asks(plain(invocation["reply"])):
             return [ASK]
         return [Effect("submit", self._submit)]
 
@@ -561,7 +587,7 @@ class BuildTask:
         )
 
     def problem_with(self, reply: Any) -> str | None:
-        shape = _shape_problem(reply)
+        shape = _shape_problem(reply, _flat(BUILD_REPLY))
         if shape:
             return shape
         reply = plain(reply)
@@ -588,7 +614,7 @@ class BuildTask:
         shutil.rmtree(call.workdir.parent, ignore_errors=True)
 
     def effects(self, invocation: Mapping[str, Any]) -> list[Effect]:
-        if asks(invocation["reply"]):
+        if asks(plain(invocation["reply"])):
             # Nothing was kept of what a call that asks left, and nothing is published.
             return [ASK]
         return [Effect("publish", self._publish), Effect("green", self._green)]

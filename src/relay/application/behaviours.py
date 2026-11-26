@@ -278,9 +278,7 @@ class Behaviours:
                     f"{behaviour_id} is proposed as a replacement the Product Owner has "
                     "yet to decide: its red waits for that"
                 )
-            grant = await _take_red(connection, project_id, behaviour_id, cycle)
-            if grant is not None:
-                taken.append(grant)
+            taken.append(await _take_red(connection, project_id, behaviour_id, cycle))
             story_id = await _story_of(connection, project_id, behaviour_id)
             launched_on = await story_basis(connection, project_id, story_id)
             isolation = self._oracle.isolation
@@ -305,8 +303,12 @@ class Behaviours:
             closed_by = await closure_of_behaviour(connection, project_id, behaviour_id)
             # A run that outlives a cancel, or a decision of the Product Owner's, is
             # kept as what was seen and changes nothing.
-            overtaken = closed_by == CANCELLED or launched_on != await story_basis(
-                connection, project_id, story_id
+            overtaken = (
+                closed_by == CANCELLED
+                or launched_on != await story_basis(connection, project_id, story_id)
+                # Or the red is no longer this caller's to decide: it was taken back and
+                # is another's now. What this run saw is kept, and decides nothing.
+                or not await _still_holds(connection, taken[0])
             )
             verdict = behaviour.record_red_run(
                 execution, started_in_cycle=cycle, withdrawn=overtaken
@@ -326,7 +328,7 @@ class Behaviours:
                 await connection.execute(
                     "UPDATE assignments SET state = 'done' WHERE grant_id = %s "
                     "AND state = 'granted'",
-                    (taken[0] if taken else None,),
+                    (taken[0],),
                 )
             if not verdict.is_valid:
                 await self._red_rejected(
@@ -922,14 +924,25 @@ async def rewrite_contract_in(
     await owe_red(connection, project_id, behaviour_id)
 
 
+async def _still_holds(connection: Connection, grant: uuid.UUID) -> bool:
+    row = await (
+        await connection.execute(
+            "SELECT 1 FROM assignments WHERE grant_id = %s AND state = 'granted' FOR UPDATE",
+            (grant,),
+        )
+    ).fetchone()
+    return row is not None
+
+
 async def _take_red(
     connection: Connection, project_id: str, behaviour_id: str, cycle: int
-) -> uuid.UUID | None:
+) -> uuid.UUID:
     """Take the red that is owed for this cycle, before anything is launched, and return
     the grant it is observed under: its launch, its verdict and its giving back are all
     that grant's. A grant that has launched is a first effect, so a pause leaves it to
-    be judged. Refused if another caller is observing it at this moment. None if no red
-    is on record as owed for the cycle: a caller's own, then, and nobody else's."""
+    be judged. Refused if another caller is observing it at this moment, and refused if
+    none is owed: the red of this cycle has been observed already, and a behaviour that
+    still awaits one after that awaits its contract, written again."""
     owed = await (
         await connection.execute(
             "SELECT assignment_id, state FROM assignments WHERE project_id = %s "
@@ -939,7 +952,9 @@ async def _take_red(
         )
     ).fetchone()
     if owed is None:
-        return None
+        raise ActionRefused(
+            f"no red of {behaviour_id} is owed: the one for this contract has been observed"
+        )
     if owed["state"] == "granted":
         raise ActionRefused(f"the red of {behaviour_id} is being observed already")
     grant = uuid.uuid7()

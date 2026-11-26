@@ -223,8 +223,14 @@ async def test_the_change_owed_after_a_failed_check_is_the_analysts_to_claim(
     planning = Planning(world, world.builder.parent / "planning")
     [assignment] = [await world.claims.of(owed)]
     assert assignment is not None
+    # 3B-S3-3.8: a check may print anything, and the briefing shows what it was.
+    await world.column(
+        "UPDATE executions SET stdout = '\\x6f6b00ff'::bytea WHERE execution_id IN "
+        "(SELECT execution_id FROM completion_receipts WHERE NOT satisfied) RETURNING 1"
+    )
     call = await planning.task.prepare(assignment, uuid.uuid7(), None)
     planning.task.discard(call)
+    assert "output 'ok\\x00\\\\xff'" in call.prepared.briefing
     assert "asked for the roadmap to change: greet the shopper" in call.prepared.briefing
     assert "What the final check observed that did not hold:" in call.prepared.briefing
     assert f"  {GREETING.contract_id}: expected" in call.prepared.briefing

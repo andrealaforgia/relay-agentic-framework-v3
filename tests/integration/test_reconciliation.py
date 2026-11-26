@@ -931,3 +931,49 @@ async def test_a_pass_cut_short_as_its_first_batch_is_made_leaves_the_integratio
     assert [str(each).split(":", 1)[1] for each in await batches(world)] == ["1:interrupted"]
     await world.features.reconcile(PROJECT)
     assert world.trunk() == candidate
+
+
+async def test_a_retry_sent_again_after_a_lost_reply_allows_no_further_push(
+    world: StoryWorld,
+) -> None:
+    """3B-S3-3.6: the person's request is one request, and it answered one refusal."""
+    await reviewed_and_owed_to_relay(world)
+    world.hook_flag("refuse").touch()
+    await world.features.reconcile(PROJECT)
+
+    await world.features.retry_integration(PROJECT, "B1", "try again", "retry-1")
+    assert await world.column("SELECT state FROM integration_intents") == ["rejected"] * 2
+    await world.features.retry_integration(PROJECT, "B1", "try again", "retry-1")
+
+    assert await world.column("SELECT state FROM integration_intents") == ["rejected"] * 2
+    assert await world.column(
+        "SELECT count(*) FROM assignments WHERE kind = 'integrate' AND issued_on ? 'retry_request'"
+    ) == [1]
+
+
+async def test_a_pass_cancelled_twice_as_its_first_batch_is_made_still_gives_the_batch_up(
+    world: StoryWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S3-3.10: the giving up is a task of its own, and is not the caller's to lose."""
+    candidate = await reviewed_and_owed_to_relay(world)
+    real = integration_module.Integration._start_batch
+    committed = asyncio.Event()
+
+    async def slow_to_say_so(self: Any, *arguments: Any, **named: Any) -> Any:
+        made = await real(self, *arguments, **named)
+        committed.set()
+        await asyncio.sleep(0.3)
+        return made
+
+    with monkeypatch.context() as patched:
+        patched.setattr(integration_module.Integration, "_start_batch", slow_to_say_so)
+        passing = asyncio.create_task(world.features.reconcile(PROJECT))
+        await committed.wait()
+        passing.cancel()
+        await asyncio.sleep(0.05)
+        await killed(passing)  # cancelled again, while it waits for the giving up
+        await asyncio.gather(*world.integration.giving_up)
+
+    assert [str(each).split(":", 1)[1] for each in await batches(world)] == ["1:interrupted"]
+    await world.features.reconcile(PROJECT)
+    assert world.trunk() == candidate
