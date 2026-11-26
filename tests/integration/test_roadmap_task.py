@@ -72,7 +72,7 @@ class Planning:
             Profile("claude-sonnet-5-5"),
         )
         self.tasks = {"plan": self.task, "revise": self.task, "correct": self.task}
-        self.invocations._effects_for = Tasks(self.tasks).effects_for
+        Tasks(self.tasks).attach(self.invocations)
         self.sessions: list[WorkerSession] = []
 
     async def worker(self, provider: Any) -> Worker:
@@ -250,13 +250,27 @@ async def test_a_proposal_the_service_refuses_is_a_reply_that_gave_nothing(
     planning: Planning,
 ) -> None:
     """A story that is kept and was never there: refused under the lock, with the mark."""
-    analyst = Reviewer(proposing({"change": "kept", "story_id": "S9"}), proposing(S1))
+    refused = proposing({"change": "kept", "story_id": "S9"}, assuming=("S9 exists",))
+    analyst = Reviewer(refused, proposing(S1))
     worker = await planning.worker(analyst)
 
     assert await worker.carry_out(await planning.owed()) == "applied"
 
     assert "S9 is not a story of the roadmap being revised" in analyst.asked[1].briefing
     assert await planning.world.column("SELECT revision FROM roadmaps") == [1]
+    # 3B-S3-1.12: what a refused reply assumed is nobody's assumption.
+    assert await planning.world.column("SELECT text FROM decisions") == []
+
+
+async def test_what_a_reply_that_asks_assumed_is_on_record_with_its_question(
+    planning: Planning,
+) -> None:
+    worker = await planning.worker(Reviewer({**ASKING, "assumptions": ["books are goods"]}))
+
+    assert await worker.carry_out(await planning.owed()) == "applied"
+
+    assert await planning.world.column("SELECT text FROM decisions") == ["books are goods"]
+    assert len(await planning.world.decisions.open_questions(PROJECT)) == 1
 
 
 async def test_a_proposal_written_while_the_roadmap_moved_is_overtaken_and_blamed_for_nothing(
@@ -307,6 +321,8 @@ async def test_a_rejected_story_is_corrected_by_a_worker_and_the_correction_is_d
     assert await worker.carry_out(await planning.owed("correct")) == "applied"
 
     assert "Story S1 was rejected" in analyst.asked[0].briefing
+    # 3B-S3-1.13: rejected while it was being worked on, and told why all the same.
+    assert "Rejected by the Product Owner: VAT is out of scope" in analyst.asked[0].briefing
     assert await planning.states("correct") == ["granted"]
     await world.decide(await planning.gate())
     assert await planning.states("correct") == ["done"]

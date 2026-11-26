@@ -60,6 +60,7 @@ from relay.domain.story import (
     Principal,
     PrincipalKind,
     Receipt,
+    SealRefused,
     StoryState,
     answer_again,
     next_story_to_release,
@@ -1927,6 +1928,19 @@ async def say_demonstrated(
     _require_at_work(story)
     _require_revisions(story, story_revision, list_revision, story["list_revision"])
     require_basis(basis, await story_basis(connection, project_id, story_id))
+    listed = await _behaviours_of(connection, project_id, story_id)
+    try:
+        # The rule a seal is held to, held to here: a story is not demonstrated by
+        # behaviours that leave a criterion with nothing to show it, and saying so
+        # would owe a seal that no reply could make.
+        require_sealable(
+            story["criteria"].keys(),
+            {row["behaviour_id"]: row["demonstrates"] for row in _in_force(listed)},
+        )
+    except SealRefused as refused:
+        raise ActionRefused(
+            f"{story_id} is not demonstrated yet: {refused}. Specify the behaviour that shows it"
+        ) from None
     await connection.execute(
         "UPDATE stories SET demonstrated = %s WHERE project_id = %s AND story_id = %s",
         (

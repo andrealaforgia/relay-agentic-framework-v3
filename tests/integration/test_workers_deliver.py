@@ -129,13 +129,11 @@ class Delivering:
             "qa": {"review": review},
             "sentinel": {"review": review},
         }
-        every: dict[str, Any] = {}
-        for tasks in self.by_role.values():
-            every.update(tasks)
-        self._reconfirms = {
-            role: tasks["reconfirm"] for role, tasks in self.by_role.items() if "reconfirm" in tasks
-        }
-        self.invocations._effects_for = self._effects_for(Tasks(every))
+        every: dict[Any, Any] = {}
+        for role, tasks in self.by_role.items():
+            for kind, task in tasks.items():
+                every[(kind, role) if kind == "reconfirm" else kind] = task
+        Tasks(every).attach(self.invocations)
         world.features = Features(
             world.database,
             world.reviews,
@@ -147,14 +145,6 @@ class Delivering:
         self.workers: dict[str, Worker] = {}
         self.sessions: list[WorkerSession] = []
         self.left: list[str] = []
-
-    def _effects_for(self, tasks: Tasks) -> Any:
-        def effects_for(invocation: dict[str, Any]) -> Any:
-            if invocation["kind"] == "reconfirm":
-                return self._reconfirms[invocation["role"]].effects(invocation)
-            return tasks.effects_for(invocation)
-
-        return effects_for
 
     async def staff(self, **providers: Any) -> None:
         for role, provider in providers.items():

@@ -25,7 +25,14 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from relay.application.assignments import BUILD, CORRECT, RECONFIRM, REMEDIATE, REVIEW
+from relay.application.assignments import (
+    BUILD,
+    CORRECT,
+    RECONFIRM,
+    REMEDIATE,
+    REVIEW,
+    require_nothing_to_reconfirm,
+)
 from relay.application.closure import (
     closure_of_feature,
     feature_basis,
@@ -151,6 +158,9 @@ class Invocations:
         # How a known result is applied, by whoever has to apply it: the worker that
         # obtained it, or the pass, if that worker is gone.
         self._effects_for = effects_for
+        # Why a reply that satisfies its schema is still not what its kind of work asks
+        # for, by the kind of work and the role: asked wherever a result is recorded.
+        self.meaning_problem: Callable[[str, str, Any], str | None] | None = None
         self._prices = prices
         self._session: WorkerSession | None = None
         self._starting = asyncio.Lock()
@@ -292,10 +302,20 @@ class Invocations:
             # Whoever hands a result over, it is checked here against the schema that was
             # stored with the call: a late result delivered by other hands than the
             # worker's is read as nothing either until it has been.
-            state, reason = _ending(
-                result,
-                problem or result.unusable or reply_problem(result, invocation["schema"]),
-            )
+            problem = problem or result.unusable or reply_problem(result, invocation["schema"])
+            if (
+                problem is None
+                and self.meaning_problem is not None
+                and result.outcome is Outcome.RETURNED
+                and result.terminal is not None
+            ):
+                # What the schema cannot say (a question has its text, a reply that
+                # delivers has what was asked for) is checked here too, by whoever
+                # brings the result: recovery never meets a reply nothing has read.
+                problem = self.meaning_problem(
+                    assignment["kind"], assignment["role"], result.terminal.structured_output
+                )
+            state, reason = _ending(result, problem)
             if late and result.terminal is None and result.outcome is not Outcome.NOT_STARTED:
                 return "uncertain"  # nothing more is known than was
             if state == "returned" and assignment["kind"] in (BUILD, REMEDIATE) and not retained:
@@ -1016,6 +1036,7 @@ async def _has_a_successor(connection: Connection, invocation: dict[str, Any]) -
 
 
 async def _require_may_start(connection: Connection, assignment: dict[str, Any]) -> None:
+    await require_nothing_to_reconfirm(connection, assignment)
     if assignment["kind"] not in (RECONFIRM, CORRECT) and assignment["story_id"] is not None:
         await require_startable(
             connection, assignment["project_id"], assignment["story_id"], assignment["behaviour_id"]

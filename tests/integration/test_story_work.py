@@ -508,3 +508,127 @@ async def test_two_passes_at_once_observe_a_red_once(delivering_world: Deliverin
 
     assert await at.world.column("SELECT count(*) FROM executions WHERE purpose = 'red'") == [1]
     assert await at.world.state("B1") is BehaviourState.IMPLEMENTING
+
+
+async def test_a_story_is_not_said_to_be_demonstrated_while_a_criterion_has_nothing_to_show_it(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-1.5: the rule a seal is held to is held to where the saying is accepted."""
+    at = delivering_world
+    roles = await released(
+        at, verifier__You_decide_how_a_user_story_is_shown=[DEMONSTRATED, B1, DEMONSTRATED]
+    )
+
+    await at.work()
+
+    assert (
+        "S1 is not demonstrated yet: a story with no behaviours demonstrates nothing"
+        in (briefings(roles["verifier"], "You decide how")[1])
+    )
+    assert await at.world.column("SELECT count(*) FROM assignments WHERE kind = 'seal'") == [1]
+    assert (await at.world.stories.inbox(PROJECT))[0].kind == "story"
+
+
+async def test_a_behaviour_named_as_one_there_already_is_specifies_nothing(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-1.6: a refusal of the reply, on record, and the next reply is used."""
+    at = delivering_world
+    roles = await released(
+        at, verifier__You_decide_how_a_user_story_is_shown=[B1, B1, DEMONSTRATED]
+    )
+
+    await at.work()
+
+    assert (
+        "B1 is already a behaviour of this project"
+        in (briefings(roles["verifier"], "You decide how")[2])
+    )
+    assert await at.world.column("SELECT behaviour_id FROM behaviours") == ["B1"]
+    assert (await at.world.stories.inbox(PROJECT))[0].kind == "story"
+
+
+async def test_a_reply_that_asks_nothing_is_no_result_whoever_hands_it_to_the_record(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-1.6: the schema allows it, and what the schema cannot say is checked where
+    a result is recorded, not only by the worker that would have refused it first."""
+    at = delivering_world
+    asks_nothing = {"outcome": "question", "assumptions": []}
+    await released(at, verifier__You_decide_how_a_user_story_is_shown=[asks_nothing, B1])
+    verifier = at.workers["verifier"]
+    at.workers.pop("builder")  # the story goes no further than its first behaviour
+
+    class TakesAnything:
+        """The Verifier's task, as a worker that checked nothing itself would use it."""
+
+        def __init__(self, task: Any) -> None:
+            self._task = task
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._task, name)
+
+        def problem_with(self, reply: Any) -> None:
+            return None
+
+    verifier._tasks = {kind: TakesAnything(task) for kind, task in verifier._tasks.items()}  # type: ignore[assignment]
+
+    await at.work()
+    await at.world.features.reconcile(PROJECT)
+
+    assert await at.world.column(
+        "SELECT state || ': ' || reason FROM invocations WHERE role = 'verifier' ORDER BY attempt"
+    ) == ["rejected: a reply that asks has a question and delivers nothing", None]
+    assert await at.world.column(
+        "SELECT envelope IS NOT NULL FROM invocations WHERE role = 'verifier' ORDER BY attempt"
+    ) == [True, True]
+    assert await at.world.column("SELECT behaviour_id FROM behaviours") == ["B1"]
+
+
+@pytest.mark.parametrize("first", ["analyst", "verifier"])
+async def test_nothing_is_asked_about_a_story_until_every_owner_has_reconfirmed_what_is_theirs(
+    delivering_world: Delivering, first: str
+) -> None:
+    """3B-S3-1.7: in whichever order the two owners answer."""
+    at = delivering_world
+    roles = await released(
+        at,
+        verifier__You_decide_how_a_user_story_is_shown=[B1, DEMONSTRATED, DEMONSTRATED],
+        verifier__You_are_asked_to_vouch=[VOUCHED, VOUCHED],
+        analyst__You_are_asked_to_assess=[VOUCHED, VOUCHED],
+    )
+    await at.work()
+    await at.world.answer(await at.world.ask(), "zero-rated")
+    second = "verifier" if first == "analyst" else "analyst"
+    later = at.workers.pop(second)
+    authoring = len(briefings(roles["verifier"], "You decide how"))
+
+    await at.work()
+    await at.world.features.reconcile(PROJECT)
+
+    assert await kinds(at, "wanted") == ["reconfirm"]
+    assert len(briefings(roles["verifier"], "You decide how")) == authoring
+    at.workers[second] = later
+    await at.work()
+    assert (await at.world.stories.inbox(PROJECT))[0].kind == "story"
+
+
+async def test_a_waiting_proposal_is_reconfirmed_on_what_it_proposes_new_stories_and_all(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-1.8: a story a proposal adds is no story yet, and is what is vouched for."""
+    at = delivering_world
+    roles = staffed()
+    await at.staff(analyst=roles["analyst"])
+    await at.world.stories.open_feature(PRODUCT_OWNER, PROJECT, "F1", "prices need VAT")
+    await at.work()
+    first = await at.world.gate()
+
+    await at.world.answer(await at.world.ask(story=None), "prices are in euros")
+    await at.work()
+
+    [asked] = briefings(roles["analyst"], "You are asked whether")
+    assert "S1 [new] Standard rate: a gross price is shown" in asked
+    assert "AC1: 100 net is shown as 120" in asked
+    assert "prices are in euros" in asked
+    assert await at.world.gate() != first  # the same proposal, put to the person again

@@ -85,7 +85,7 @@ class Reviewing:
             [agents],
             Profile("claude-sonnet-5-5"),
         )
-        self.invocations._effects_for = Tasks({"review": self.task}).effects_for
+        Tasks({"review": self.task}).attach(self.invocations)
         self.sessions: list[WorkerSession] = []
         self.candidate = ""
 

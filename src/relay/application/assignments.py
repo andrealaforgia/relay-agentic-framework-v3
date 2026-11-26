@@ -485,6 +485,7 @@ class Assignments:
                     connection, project_id, assignment["feature_id"], assignment["story_id"]
                 )
             )
+            await require_nothing_to_reconfirm(connection, assignment)
             if (
                 assignment["kind"] == RECONFIRM
                 and assignment["behaviour_id"] is not None
@@ -595,6 +596,26 @@ async def _first_effect(
         )
     ).fetchone()
     return row["assignment_id"] if row else None
+
+
+async def require_nothing_to_reconfirm(connection: Connection, assignment: dict[str, Any]) -> None:
+    """Work on a story as a whole (what it needs next, its seal, its assessment) relies
+    on every contract of it standing. Until each owner has answered for what a decision
+    put in question, none of it starts: a call made now could not be applied."""
+    if assignment["kind"] not in (SPECIFY, SEAL, ASSESS) or assignment["behaviour_id"] is not None:
+        return
+    owed = await (
+        await connection.execute(
+            "SELECT coalesce(behaviour_id, story_id) AS subject FROM assignments "
+            "WHERE project_id = %s AND story_id = %s AND kind = 'reconfirm' "
+            "AND state IN ('wanted', 'granted') ORDER BY created_at LIMIT 1",
+            (assignment["project_id"], assignment["story_id"]),
+        )
+    ).fetchone()
+    if owed is not None:
+        raise ActionRefused(
+            f"{owed['subject']} has yet to be reconfirmed by its owner: nothing new starts here"
+        )
 
 
 async def _has_a_proposal_waiting(connection: Connection, project_id: str, feature_id: str) -> bool:

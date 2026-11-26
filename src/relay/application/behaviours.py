@@ -784,6 +784,17 @@ async def specify_in(
     demonstrates = tuple(demonstrates)
     correlation_id = uuid.uuid7()
     await lock_gate(connection, project_id)
+    taken = await (
+        await connection.execute(
+            "SELECT 1 FROM behaviours WHERE project_id = %s AND behaviour_id = %s",
+            (project_id, behaviour_id),
+        )
+    ).fetchone()
+    if taken is not None:
+        raise ActionRefused(
+            f"{behaviour_id} is already a behaviour of this project: a new one has an "
+            "identifier of its own"
+        )
     position = await add_behaviour_to_story(
         connection, project_id, story_id, demonstrates, basis, story_revision
     )

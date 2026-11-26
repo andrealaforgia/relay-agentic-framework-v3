@@ -32,7 +32,12 @@ async def owe_what_is_needed(connection: Connection, project_id: str) -> None:
             "not_current(s.project_id, s.story_id, NULL) AS not_current, "
             "EXISTS (SELECT 1 FROM questions q WHERE q.project_id = s.project_id "
             "AND q.feature_id = s.feature_id AND q.state = 'open' "
-            "AND q.scope_story IN ('', s.story_id)) AS asked "
+            "AND q.scope_story IN ('', s.story_id)) AS asked, "
+            # Of the story or of any behaviour of it: `not_current` asked of the story
+            # alone does not see a contract its Verifier has yet to answer for.
+            "EXISTS (SELECT 1 FROM assignments a WHERE a.project_id = s.project_id "
+            "AND a.kind = 'reconfirm' AND a.state IN ('wanted', 'granted') "
+            "AND a.story_id = s.story_id) AS reconfirming "
             "FROM stories s WHERE s.project_id = %s "
             "AND s.state IN ('released', 'changes_requested') ORDER BY s.story_id",
             (project_id,),
@@ -41,7 +46,7 @@ async def owe_what_is_needed(connection: Connection, project_id: str) -> None:
     for story in stories:
         # A question's answer owes what asked it, and a reconfirmation's completion asks
         # this again: until then the story's next step is not known.
-        if story["asked"] or story["not_current"] is not None:
+        if story["asked"] or story["not_current"] is not None or story["reconfirming"]:
             continue
         await _owe_for(connection, story)
 

@@ -293,14 +293,30 @@ def _review_briefing(role: str, about: Mapping[str, Any], last_problem: str | No
 
 
 class Tasks:
-    """Which task carries out which kind of work, and how its known result is applied."""
+    """Which task carries out which kind of work, and how its known result is applied.
+    A kind of work that differs by role (a reconfirmation is the Analyst's or the
+    Verifier's) is registered under the kind and the role."""
 
-    def __init__(self, by_kind: Mapping[str, Any]) -> None:
+    def __init__(self, by_kind: Mapping[Any, Any]) -> None:
         self.by_kind = dict(by_kind)
 
+    def _for(self, kind: str, role: str) -> Any:
+        return self.by_kind.get((kind, role)) or self.by_kind[kind]
+
     def effects_for(self, invocation: dict[str, Any]) -> Sequence[Effect]:
-        effects: Sequence[Effect] = self.by_kind[invocation["kind"]].effects(invocation)
+        effects: Sequence[Effect] = self._for(invocation["kind"], invocation["role"]).effects(
+            invocation
+        )
         return effects
+
+    def problem_with(self, kind: str, role: str, reply: Any) -> str | None:
+        problem: str | None = self._for(kind, role).problem_with(reply)
+        return problem
+
+    def attach(self, invocations: Invocations) -> None:
+        """Have this record apply results, and read replies, by these tasks."""
+        invocations._effects_for = self.effects_for
+        invocations.meaning_problem = self.problem_with
 
 
 BUILD_REPLY = {

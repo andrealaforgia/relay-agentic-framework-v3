@@ -215,6 +215,19 @@ async def test_the_change_owed_after_a_failed_check_is_the_analysts_to_claim(
     with pytest.raises(ActionRefused, match="for a analyst to claim"):
         await world.claims.claim(VERIFIER, owed)
 
+    # 3B-S3-1.13: and briefed with what the final check observed, and what was asked.
+    from tests.integration.test_roadmap_task import Planning
+
+    (world.builder.parent / "planning").mkdir()
+    planning = Planning(world, world.builder.parent / "planning")
+    [assignment] = [await world.claims.of(owed)]
+    assert assignment is not None
+    call = await planning.task.prepare(assignment, uuid.uuid7(), None)
+    planning.task.discard(call)
+    assert "asked for the roadmap to change: greet the shopper" in call.prepared.briefing
+    assert "What the final check observed that did not hold:" in call.prepared.briefing
+    assert f"  {GREETING.contract_id}: expected" in call.prepared.briefing
+
     assert await world.column("SELECT state FROM assignments WHERE kind = 'revise'") == ["granted"]
 
 

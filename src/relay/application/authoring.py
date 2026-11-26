@@ -36,8 +36,10 @@ from relay.application.stories import (
 )
 from relay.application.tasks import Profile, Workspaces
 from relay.application.worker import Call
+from relay.domain.behaviour import TransitionRefused
 from relay.domain.evidence import Baseline, Expected, Launch, ProcessContract
-from relay.domain.story import ActionRefused, Principal, PrincipalKind
+from relay.domain.review import SubmissionRefused
+from relay.domain.story import ActionRefused, Principal, PrincipalKind, SealRefused
 from relay.git.checkout import resolve_ref
 from relay.git.mirror import Mirror
 from relay.persistence.database import Connection, Pool
@@ -250,14 +252,25 @@ class Authoring:
         shutil.rmtree(call.workdir.parent, ignore_errors=True)
 
     def effects(self, invocation: Mapping[str, Any]) -> list[Effect]:
-        """Assumptions first: what they are recorded beside is made after them. A
-        question last, and alone: it stops its scope, and nothing is applied in a scope
-        that is stopped."""
-        reply = invocation["reply"]
-        first = [Effect("assume", _nothing, self._assume)] if reply["assumptions"] else []
-        if reply["outcome"] == "question":
-            return [*first, Effect("ask", _nothing, self._ask)]
-        return [*first, *self._deliver(invocation)]
+        return [_refusing(effect) for effect in self._effects(invocation)]
+
+    def _effects(self, invocation: Mapping[str, Any]) -> list[Effect]:
+        """What was assumed is recorded in the transaction that accepts what it was
+        assumed for, the artefact or the question: a reply that is refused leaves no
+        assumption behind to be read as a decision. A question is the only effect of a
+        reply that asks: it stops its scope, and nothing is applied in a stopped scope."""
+        if invocation["reply"]["outcome"] == "question":
+            return [Effect("ask", _nothing, self._ask)]
+        first, *rest = self._deliver(invocation)
+        accepted = first.settle
+
+        async def with_what_was_assumed(
+            connection: Connection, run: EffectRun
+        ) -> Mapping[str, Any] | None:
+            await self._assume(connection, run)
+            return await accepted(connection, run) if accepted is not None else None
+
+        return [Effect(first.name, first.perform, with_what_was_assumed), *rest]
 
     async def _assume(self, connection: Connection, run: EffectRun) -> None:
         work = await _work(connection, run)
@@ -274,6 +287,7 @@ class Authoring:
     async def _ask(self, connection: Connection, run: EffectRun) -> None:
         """The question, and the end of this occasion, together: answering it owes the
         work again."""
+        await self._assume(connection, run)
         work = await _work(connection, run)
         asked = run.invocation["reply"]["question"]
         await ask_in(
@@ -289,6 +303,30 @@ class Authoring:
             asked_for=work["assignment_id"],
         )
         await ask_instead(connection, work["assignment_id"])
+
+
+# What a service or the domain raises to say "not this": each is why the reply gave
+# nothing, kept with the call, and never an error that leaves a paid reply unread.
+_REFUSALS = (SealRefused, TransitionRefused, SubmissionRefused, ValueError, KeyError, TypeError)
+
+
+def _refusing(effect: Effect) -> Effect:
+    """The same effect, with every refusal of the reply said as one."""
+
+    async def perform(run: EffectRun) -> Mapping[str, Any] | None:
+        try:
+            return await effect.perform(run)
+        except _REFUSALS as refused:
+            raise ActionRefused(f"{refused}") from None
+
+    async def settle(connection: Connection, run: EffectRun) -> Mapping[str, Any] | None:
+        assert effect.settle is not None
+        try:
+            return await effect.settle(connection, run)
+        except _REFUSALS as refused:
+            raise ActionRefused(f"{refused}") from None
+
+    return Effect(effect.name, perform, settle if effect.settle is not None else None)
 
 
 async def _work(connection: Connection, run: EffectRun) -> dict[str, Any]:
@@ -353,7 +391,9 @@ class RoadmapTask(Authoring):
                 "SELECT s.story_id, s.title, s.outcome, s.criteria, s.state, s.revision, "
                 "s.corrects, story_basis(s.project_id, s.story_id) AS basis, "
                 "(SELECT v.payload->'said'->>'reason' FROM events v WHERE v.project_id = "
-                "s.project_id AND v.subject_id = s.story_id AND v.event_type = 'gate.rejected' "
+                # At its gate, or while it was being worked on: both are rejections.
+                "s.project_id AND v.subject_id = s.story_id "
+                "AND v.event_type IN ('gate.rejected', 'story.rejected') "
                 "ORDER BY v.sequence DESC LIMIT 1) AS rejected_because "
                 "FROM roadmap_entries e JOIN stories s ON s.project_id = e.project_id "
                 "AND s.story_id = e.story_id WHERE e.project_id = %s AND e.feature_id = %s "
@@ -361,7 +401,28 @@ class RoadmapTask(Authoring):
                 (project_id, feature_id, effective),
             )
         ).fetchall()
+        failed = await (
+            await connection.execute(
+                # What the feature's final check observed that did not hold, for a
+                # roadmap that is to change because of it.
+                "SELECT o.name, o.contract->'expect' AS expected, x.exit_code, "
+                "convert_from(x.stdout, 'UTF8') AS stdout FROM completion_receipts r "
+                "JOIN obligations o USING (obligation_id) JOIN executions x USING (execution_id) "
+                "WHERE r.batch_id::text = %s AND NOT r.satisfied ORDER BY o.name",
+                (assignment["issued_on"].get("batch_id"),),
+            )
+        ).fetchall()
+        asked = await (
+            await connection.execute(
+                "SELECT payload->'said'->>'reason' AS reason FROM events WHERE project_id = %s "
+                "AND subject_id = %s AND event_type = 'gate.changes_requested' "
+                "AND payload->>'kind' = 'completion' ORDER BY sequence DESC LIMIT 1",
+                (project_id, feature_id),
+            )
+        ).fetchone()
         return {
+            "failed": failed,
+            "asked": asked["reason"] if asked else None,
             "kind": assignment["kind"],
             "feature_id": feature_id,
             "problem": feature["problem"],
@@ -438,7 +499,15 @@ class RoadmapTask(Authoring):
                 "",
                 (
                     "The feature's final check failed and the Product Owner asked for the "
-                    "roadmap to change. Propose the change that would let the feature be completed."
+                    "roadmap to change"
+                    + (f": {about['asked']}" if about["asked"] else ".")
+                    + " Propose the change that would let the feature be completed."
+                ),
+                "What the final check observed that did not hold:",
+                *(
+                    f"  {each['name']}: expected {json.dumps(each['expected'], sort_keys=True)}, "
+                    f"observed exit code {each['exit_code']} and output {each['stdout']!r}"
+                    for each in about["failed"]
                 ),
             ]
         lines += [
@@ -911,6 +980,20 @@ class AssessTask(Authoring):
         )
 
 
+def _revision_lines(stories: Sequence[Mapping[str, Any]]) -> list[str]:
+    lines = []
+    for each in stories:
+        corrects = f", correcting {each['corrects']}" if each["corrects"] else ""
+        lines.append(
+            f"  {each['story_id']} [{each['kind']}{corrects}] {each['title']}: {each['outcome']}"
+        )
+        if each["kind"] != "dropped":
+            lines += [
+                f"      {name}: {text}" for name, text in sorted((each["criteria"] or {}).items())
+            ]
+    return lines
+
+
 class ReconfirmTask(Authoring):
     """After a decision of the Product Owner's, each owner says whether what is theirs
     still stands: the Analyst for a roadmap or a story, the Verifier for a contract,
@@ -940,13 +1023,16 @@ class ReconfirmTask(Authoring):
             ),
         }
         if assignment["subject"] == "roadmap":
+            # From the revision as it is stored, whether or not it is in force: a story
+            # a proposal adds is no story yet, and is exactly what is being vouched for.
             about["stories"] = await (
                 await connection.execute(
-                    "SELECT e.story_id, coalesce(e.title, s.title) AS title, "
-                    "coalesce(e.outcome, s.outcome) AS outcome FROM roadmap_entries e "
-                    "JOIN stories s ON s.project_id = e.project_id AND s.story_id = e.story_id "
-                    "WHERE e.project_id = %s AND e.feature_id = %s AND e.revision = %s "
-                    "AND e.kind <> 'dropped' ORDER BY e.position",
+                    "SELECT e.story_id, e.kind, coalesce(e.title, s.title) AS title, "
+                    "coalesce(e.outcome, s.outcome) AS outcome, "
+                    "coalesce(e.criteria, s.criteria) AS criteria, e.corrects "
+                    "FROM roadmap_entries e LEFT JOIN stories s ON s.project_id = e.project_id "
+                    "AND s.story_id = e.story_id WHERE e.project_id = %s AND e.feature_id = %s "
+                    "AND e.revision = %s ORDER BY e.kind = 'dropped', e.position",
                     (project_id, assignment["feature_id"], about["revision"]),
                 )
             ).fetchall()
@@ -989,11 +1075,11 @@ class ReconfirmTask(Authoring):
                 ),
                 "",
                 *decided,
-                "The roadmap:",
-                *(
-                    f"  {each['story_id']} {each['title']}: {each['outcome']}"
-                    for each in about["stories"]
+                (
+                    "The roadmap, as this revision has it (each story with what the revision "
+                    "does to it: kept, new, reworded or dropped):"
                 ),
+                *_revision_lines(about["stories"]),
                 "",
                 (
                     'What to deliver: verdict "stands", if it does. If it does not, ask the '

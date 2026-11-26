@@ -90,9 +90,7 @@ class Building:
             [agents],
             Profile("claude-sonnet-5-5"),
         )
-        self.invocations._effects_for = Tasks(
-            {"build": self.task, "remediate": self.task}
-        ).effects_for
+        Tasks({"build": self.task, "remediate": self.task}).attach(self.invocations)
         self.sessions: list[WorkerSession] = []
 
     async def worker(self, provider: Any) -> Worker:
