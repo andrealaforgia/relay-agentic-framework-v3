@@ -381,7 +381,15 @@ class Stories:
             if moved_on:
                 # What this proposal is about has changed since it was written. It is
                 # not approved as it stands; the Analyst proposes again.
-                await _close_gate(connection, gate, "superseded", "superseded")
+                # And it is over: left waiting, it would stand in the way of the very
+                # work that is owed to replace it.
+                await _end_proposal(
+                    connection,
+                    project_id,
+                    located["feature_id"],
+                    gate["basis"]["roadmap_revision"],
+                    "sent_back",
+                )
                 await _owe_roadmap_work_again(
                     connection,
                     project_id,
@@ -1197,8 +1205,10 @@ async def _owe_roadmap_work_again(
     Work that waited while the proposal did is announced again."""
     owed = await (
         await connection.execute(
-            "SELECT a.assignment_id, EXISTS (SELECT 1 FROM invocations v WHERE "
-            "v.assignment_id = a.assignment_id AND v.state = 'applied') AS answered "
+            # Read from what the proposal's own transaction wrote. Whether the call that
+            # made it has been marked applied yet is another transaction's business.
+            "SELECT a.assignment_id, EXISTS (SELECT 1 FROM roadmaps r WHERE "
+            "r.submitted_for = a.assignment_id) AS answered "
             "FROM assignments a WHERE a.project_id = %s AND a.feature_id = %s "
             "AND a.kind = ANY(%s) AND a.state IN ('wanted', 'granted') "
             "ORDER BY a.assignment_id FOR UPDATE",
@@ -1689,8 +1699,10 @@ async def publish_roadmap_in(
     basis: int,
     revises: int | None = None,
     replaces: int | None = None,
+    submitted_for: uuid.UUID | None = None,
 ) -> uuid.UUID:
-    """`Stories.publish_roadmap`, in the caller's transaction."""
+    """`Stories.publish_roadmap`, in the caller's transaction. `submitted_for` is the
+    work this proposal is the reply to."""
     _require_role(principal, "analyst")
     # Read once, before anything is awaited. What is stored and what is shown are
     # both made from this, so they cannot differ.
@@ -1748,9 +1760,9 @@ async def publish_roadmap_in(
     assert row is not None
     revision: int = row["next"]
     await connection.execute(
-        "INSERT INTO roadmaps (project_id, feature_id, revision, current_on) "
-        "VALUES (%s, %s, %s, %s)",
-        (project_id, feature_id, revision, basis),
+        "INSERT INTO roadmaps (project_id, feature_id, revision, current_on, submitted_for) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (project_id, feature_id, revision, basis, submitted_for),
     )
     position = 0
     for entry in entries:
@@ -1937,3 +1949,16 @@ async def say_demonstrated(
         payload={"list_revision": list_revision, "by": principal.identity},
     )
     await owe_what_is_needed(connection, project_id)
+
+
+async def give_up_proposal(
+    connection: Connection, project_id: str, feature_id: str, revision: int, reason: str
+) -> None:
+    """A proposal that is waiting will not be put to the Product Owner again: its author
+    says it no longer stands, or it cannot. It ends, with whatever was owed for it, and
+    the work it was the reply to is owed again with why."""
+    _, proposed = await _revisions_of(connection, project_id, feature_id)
+    if revision != proposed:
+        raise ActionRefused(f"revision {revision} is not a proposal that is waiting")
+    await _end_proposal(connection, project_id, feature_id, revision, "sent_back")
+    await _owe_roadmap_work_again(connection, project_id, feature_id, reason)

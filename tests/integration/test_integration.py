@@ -351,7 +351,11 @@ async def test_authorisation_looks_again_at_everything_the_checks_took_for_grant
     assert world.trunk() == base
     assert await world.column("SELECT count(*) FROM integration_intents") == [0]
     assert await world.column("SELECT count(*) FROM remediation_requests") == [0]
-    assert (await world.events())[-1] == "integration.batch_discarded"
+    # Nobody is relied on to ask again: the integration is owed in its place.
+    assert (await world.events())[-1] == "integration.batch_interrupted"
+    assert await world.column(
+        "SELECT state FROM assignments WHERE kind = 'integrate' ORDER BY created_at"
+    ) == ["done", "wanted"]
 
 
 async def test_a_failing_batch_gives_way_to_a_later_request_still_running(
@@ -799,8 +803,8 @@ async def test_checks_that_could_not_be_completed_leave_the_request_answered_and
         with pytest.raises(CheckoutFailed):
             await world.integrate(request="first")
 
-    assert (await world.integrate(request="first")).outcome is Outcome.SUPERSEDED
-    assert await world.column("SELECT state FROM check_batches") == ["abandoned"]
+    assert (await world.integrate(request="first")).outcome is Outcome.HELD
+    assert await world.column("SELECT state FROM check_batches") == ["interrupted"]
     assert (await world.integrate()).outcome is Outcome.INTEGRATED
     assert world.trunk() == candidate
 
@@ -853,7 +857,7 @@ async def test_runs_that_are_not_every_check_on_the_candidate_authorise_nothing(
     assert receipt.outcome is Outcome.SUPERSEDED
     assert world.trunk() == base
     assert await world.column("SELECT count(*) FROM integration_intents") == [0]
-    assert await world.column("SELECT state FROM check_batches") == ["discarded"]
+    assert await world.column("SELECT state FROM check_batches") == ["interrupted"]
     assert await world.state() is BehaviourState.REVIEW
 
 
@@ -1141,7 +1145,7 @@ async def test_which_batch_is_settled_is_not_for_the_check_runner_to_say(
     else:
         with pytest.raises(CheckoutFailed):
             await world.integrate()
-        assert await world.column("SELECT state FROM check_batches") == ["abandoned"]
+        assert await world.column("SELECT state FROM check_batches") == ["interrupted"]
 
 
 async def a_second_project_also_owed_a_push(

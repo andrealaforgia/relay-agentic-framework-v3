@@ -48,7 +48,10 @@ async def owe_what_is_needed(connection: Connection, project_id: str) -> None:
 
 async def owe_red(connection: Connection, project_id: str, behaviour_id: str) -> None:
     """One red per behaviour and red cycle, the control plane's to observe: owed in the
-    transaction that registers, rewrites or amends a contract, or reopens a red."""
+    transaction that registers, rewrites or amends a contract, or reopens a red. A red
+    that showed the contract cannot serve stays on record as that cycle's, so the
+    behaviour, which still awaits a red, is not owed the same one again: the Verifier is
+    owed the contract, and the contract written again is a new cycle."""
     behaviour = await (
         await connection.execute(
             "SELECT state, red_cycle, correlation_id, story_id FROM behaviours "
@@ -58,7 +61,15 @@ async def owe_red(connection: Connection, project_id: str, behaviour_id: str) ->
     ).fetchone()
     if behaviour is None or behaviour["state"] != "validating_red":
         return
-    if await _is_owed(connection, project_id, RED, behaviour_id=behaviour_id):
+    asked_for = await (
+        await connection.execute(
+            "SELECT 1 FROM assignments WHERE project_id = %s AND behaviour_id = %s "
+            "AND kind = 'red' AND state <> 'retired' AND issued_on->>'red_cycle' = %s",
+            (project_id, behaviour_id, str(behaviour["red_cycle"])),
+        )
+    ).fetchone()
+    if asked_for is not None:
+        # Owed, being observed, or observed and found wanting: once for this cycle.
         return
     await _owe(
         connection,

@@ -220,19 +220,30 @@ class Behaviours:
     async def observe_owed_reds(self, project_id: str) -> None:
         """Carry out every red that is owed: the pass's to call. One that cannot be
         observed now (the repository does not answer, its scope is stopped) stays owed."""
-        async with self._pool.connection() as connection:
-            owed = await (
+        async with self._pool.connection() as connection, connection.transaction():
+            # Taken before anything is launched: of two passes that look at the same
+            # moment, one observes each red and the other finds it taken.
+            taken = await (
                 await connection.execute(
-                    "SELECT behaviour_id FROM assignments WHERE project_id = %s "
-                    "AND kind = 'red' AND state = 'wanted' ORDER BY created_at",
-                    (project_id,),
+                    "UPDATE assignments SET state = 'granted', grant_id = gen_random_uuid(), "
+                    "granted_to = %s WHERE project_id = %s AND kind = 'red' AND state = 'wanted' "
+                    "RETURNING assignment_id, behaviour_id",
+                    (CONTROL_PLANE, project_id),
                 )
             ).fetchall()
-        for each in owed:
+        for each in taken:
             try:
                 await self.run_red(_RELAY, project_id, each["behaviour_id"])
             except CheckoutFailed, ActionRefused, TransitionRefused:
-                continue
+                pass
+            finally:
+                # Whatever was not settled by a verdict is owed still.
+                async with self._pool.connection() as connection, connection.transaction():
+                    await connection.execute(
+                        "UPDATE assignments SET state = 'wanted', grant_id = NULL, "
+                        "granted_to = NULL WHERE assignment_id = %s AND state = 'granted'",
+                        (each["assignment_id"],),
+                    )
 
     async def run_red(self, principal: Principal, project_id: str, behaviour_id: str) -> RedVerdict:
         """Observe the registered contract on the project's own trunk and judge the result.
@@ -296,8 +307,9 @@ class Behaviours:
                 await connection.execute(
                     "UPDATE assignments SET state = 'done', grant_id = %s, granted_to = %s, "
                     "first_effect_at = now() WHERE project_id = %s AND behaviour_id = %s "
-                    "AND kind = 'red' AND state = 'wanted'",
-                    (uuid.uuid7(), CONTROL_PLANE, project_id, behaviour_id),
+                    "AND kind = 'red' AND state IN ('wanted', 'granted') "
+                    "AND issued_on->>'red_cycle' = %s",
+                    (uuid.uuid7(), CONTROL_PLANE, project_id, behaviour_id, str(cycle)),
                 )
             if not verdict.is_valid:
                 await self._red_rejected(
@@ -861,7 +873,8 @@ async def rewrite_contract_in(
     await save_behaviour(connection, project_id, behaviour)
     await connection.execute(
         "UPDATE assignments SET state = 'retired', grant_id = NULL, granted_to = NULL "
-        "WHERE project_id = %s AND behaviour_id = %s AND kind = 'red' AND state = 'wanted'",
+        "WHERE project_id = %s AND behaviour_id = %s AND kind = 'red' "
+        "AND state IN ('wanted', 'granted')",
         (project_id, behaviour_id),
     )
     await append_event(

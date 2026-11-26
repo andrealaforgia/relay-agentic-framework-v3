@@ -25,14 +25,23 @@ ALTER TABLE questions ADD COLUMN asked_for uuid REFERENCES assignments;
 -- three is not a statement about the story as it now stands.
 ALTER TABLE stories ADD COLUMN demonstrated jsonb;
 
+-- The work a proposal was the reply to, written with the proposal: what becomes of that
+-- work when the proposal is decided is read from this, and from nothing that is
+-- recorded afterwards.
+ALTER TABLE roadmaps ADD COLUMN submitted_for uuid REFERENCES assignments;
+
 -- Each step of a story is owed once at a time, and each red of a behaviour.
 CREATE UNIQUE INDEX one_step_owed_per_story ON assignments (project_id, story_id, kind)
     WHERE kind IN ('specify', 'seal', 'assess') AND behaviour_id IS NULL
       AND state IN ('wanted', 'granted');
-CREATE UNIQUE INDEX one_red_or_contract_owed_per_behaviour
-    ON assignments (project_id, behaviour_id, kind)
-    WHERE kind IN ('red', 'specify') AND behaviour_id IS NOT NULL
-      AND state IN ('wanted', 'granted');
+CREATE UNIQUE INDEX one_contract_owed_per_behaviour
+    ON assignments (project_id, behaviour_id)
+    WHERE kind = 'specify' AND behaviour_id IS NOT NULL AND state IN ('wanted', 'granted');
+-- One red per behaviour and red cycle, whatever became of it: a red that showed its
+-- contract cannot serve is not owed again for the same cycle.
+CREATE UNIQUE INDEX one_red_per_cycle
+    ON assignments (project_id, behaviour_id, (issued_on->>'red_cycle'))
+    WHERE kind = 'red' AND state <> 'retired';
 
 -- One row per call to a provider, written before the call is made.
 CREATE TABLE invocations (

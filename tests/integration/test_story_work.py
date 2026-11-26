@@ -4,6 +4,7 @@ control plane observes for itself. Each history is driven by workers and a perso
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -468,3 +469,42 @@ async def test_a_reconfirmation_that_asks_is_not_owed_again_by_the_answer(
         "GROUP BY state ORDER BY state"
     ) == ["asked", "done"]
     assert await kinds(at, "wanted") == ["build"]
+
+
+async def test_a_red_found_wanting_is_not_observed_again_while_its_contract_waits_to_be_rewritten(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-1.2: however many passes run before the Verifier replies."""
+    at = delivering_world
+    passes_already = delivering(**{**B1["delivered"], "contract": ALREADY_PASSES})
+    await released(at, verifier__You_decide_how_a_user_story_is_shown=[passes_already])
+    await at.workers["verifier"].carry_out(
+        (await at.world.claims.of(await _the(at, "specify"))) or {}
+    )
+    assert await at.world.column("SELECT count(*) FROM executions WHERE purpose = 'red'") == [1]
+
+    await at.world.features.reconcile(PROJECT)
+    await asyncio.gather(at.world.features.reconcile(PROJECT), at.world.features.reconcile(PROJECT))
+
+    assert await at.world.column("SELECT count(*) FROM executions WHERE purpose = 'red'") == [1]
+    assert await at.world.column(
+        "SELECT kind || ':' || state FROM assignments WHERE behaviour_id = 'B1' ORDER BY created_at"
+    ) == ["red:done", "specify:wanted"]
+
+
+async def test_two_passes_at_once_observe_a_red_once(delivering_world: Delivering) -> None:
+    """3B-S3-1.2: the red is taken before it is launched."""
+    at = delivering_world
+    await released(at)
+    at.world.features._behaviours = None  # so that the red is still owed
+    await at.workers["verifier"].carry_out(
+        (await at.world.claims.of(await _the(at, "specify"))) or {}
+    )
+
+    await asyncio.gather(
+        at.world.behaviours.observe_owed_reds(PROJECT),
+        at.world.behaviours.observe_owed_reds(PROJECT),
+    )
+
+    assert await at.world.column("SELECT count(*) FROM executions WHERE purpose = 'red'") == [1]
+    assert await at.world.state("B1") is BehaviourState.IMPLEMENTING

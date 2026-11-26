@@ -495,6 +495,7 @@ class RoadmapTask(Authoring):
             basis=run.invocation["expects"]["basis"],
             revises=read["revises"],
             replaces=read["replaces"],
+            submitted_for=work["assignment_id"],
         )
 
 

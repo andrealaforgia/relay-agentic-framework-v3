@@ -600,8 +600,12 @@ async def _first_effect(
 async def _has_a_proposal_waiting(connection: Connection, project_id: str, feature_id: str) -> bool:
     row = await (
         await connection.execute(
-            "SELECT 1 FROM roadmaps WHERE project_id = %s AND feature_id = %s "
-            "AND state = 'proposed'",
+            # Waiting before the Product Owner, that is: a proposal whose gate a decision
+            # closed is waiting for its author, and may be replaced.
+            "SELECT 1 FROM roadmaps r WHERE r.project_id = %s AND r.feature_id = %s "
+            "AND r.state = 'proposed' AND EXISTS (SELECT 1 FROM gates g "
+            "WHERE g.project_id = r.project_id AND g.feature_id = r.feature_id "
+            "AND g.kind = 'roadmap' AND g.state = 'open')",
             (project_id, feature_id),
         )
     ).fetchone()

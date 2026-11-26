@@ -809,3 +809,79 @@ async def test_one_projects_silent_repository_does_not_keep_the_pass_from_anothe
         str(kind)
         for kind in await world.column("SELECT event_type FROM events WHERE project_id = 'alpha'")
     ]
+
+
+async def reviewed_and_owed_to_relay(world: StoryWorld) -> str:
+    """A reviewed candidate whose first integration nobody has asked for."""
+    await world.integration.require_check(PROJECT, ZERO_STAYS_ZERO)
+    base = await world.awaiting_builder("B1")
+    return await world.reviewed("B1", on=base)
+
+
+async def test_a_first_integration_overtaken_by_a_new_required_check_reaches_trunk_unasked(
+    world: StoryWorld,
+) -> None:
+    """S3-19.8 and 3B-S3-1.1: generation one is the control plane's to see through."""
+    candidate = await reviewed_and_owed_to_relay(world)
+    barrier = HeldAtABarrier(ContainerIsolation(world.image))
+    features = Features(world.database, world.reviews, world.integration_with(barrier))
+    passing = asyncio.create_task(features.reconcile(PROJECT))
+    await held_at_the_barrier(passing, barrier)
+
+    await world.integration.require_check(
+        PROJECT, replace(ZERO_STAYS_ZERO, contract_id="zero-still-stays-zero")
+    )
+    barrier.release.set()
+    await passing
+
+    assert [str(each).split(":", 1)[1] for each in await batches(world)] == [
+        "1:interrupted",
+        "2:authorised",
+    ]
+    assert world.trunk() == candidate
+
+
+async def test_a_first_integration_cut_short_is_still_owed_and_reaches_trunk_unasked(
+    world: StoryWorld,
+) -> None:
+    """3B-S3-1.1: interrupted after its checks started, with no caller to ask again."""
+    candidate = await reviewed_and_owed_to_relay(world)
+    barrier = HeldAtABarrier(ContainerIsolation(world.image))
+    features = Features(world.database, world.reviews, world.integration_with(barrier))
+    passing = asyncio.create_task(features.reconcile(PROJECT))
+    await held_at_the_barrier(passing, barrier)
+
+    await killed(passing)
+    await restarted(world).start()
+
+    assert [str(each).split(":", 1)[1] for each in await batches(world)] == [
+        "1:interrupted",
+        "2:authorised",
+    ]
+    assert world.trunk() == candidate
+
+
+async def test_a_first_integration_taken_up_late_starts_nothing_for_a_cycle_it_was_not_owed_for(
+    world: StoryWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S3-1.11: the cycle is looked at where the batch is made, not only before the
+    repository is asked."""
+    await reviewed_and_owed_to_relay(world)
+    [owed] = await world.column(
+        "SELECT assignment_id FROM assignments WHERE kind = 'integrate' AND state = 'wanted'"
+    )
+    real = integration_module.trunk_head
+
+    async def while_the_cycle_is_replaced(*arguments: Any, **named: Any) -> str:
+        await world.column("UPDATE review_cycles SET state = 'superseded' RETURNING 1")
+        return await real(*arguments, **named)
+
+    monkeypatch.setattr(integration_module, "trunk_head", while_the_cycle_is_replaced)
+
+    receipt = await world.integration.take_up(owed)  # type: ignore[arg-type]
+
+    assert receipt is not None and receipt.outcome is Outcome.SUPERSEDED
+    assert await batches(world) == []
+    assert await world.column("SELECT state FROM assignments WHERE kind = 'integrate'") == [
+        "retired"
+    ]

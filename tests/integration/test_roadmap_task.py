@@ -20,7 +20,7 @@ from relay.application.workers import WorkerSession
 from relay.domain.story import HumanAction
 from tests.integration.decision_world import DecisionWorld
 from tests.integration.fixtures import PRODUCT_OWNER
-from tests.integration.story_world import STANDARD_RATE
+from tests.integration.story_world import GREETS, STANDARD_RATE
 from tests.integration.test_review_task import Reviewer
 from tests.integration.test_worker import RUNTIME, SeenToHold
 from tests.integration.trunk_world import PROJECT
@@ -330,3 +330,67 @@ async def test_work_that_waited_for_a_proposal_to_be_decided_is_announced_again(
         f"AND message_id = '{plan['command_message_id']}'"
     ) == [1]
     assert await planning.states() == ["wanted"]
+
+
+async def test_a_proposal_sent_back_before_its_call_was_marked_applied_is_still_owed_again(
+    planning: Planning,
+) -> None:
+    """3B-S3-1.3: what a proposal was the reply to is written with the proposal."""
+    analyst = Reviewer(proposing(S1, S2))
+    worker = await planning.worker(analyst)
+    first = await planning.owed()
+    assert await worker.carry_out(first) == "applied"
+    # As if the process had stopped between the effect's mark and the invocation's.
+    await planning.world.column("UPDATE invocations SET state = 'returned' RETURNING 1")
+
+    await planning.world.decide(await planning.gate(), "request_changes", reason="too big")
+    await planning.invocations.recover(PROJECT)
+
+    assert await planning.states() == ["done", "wanted"]
+    assert await planning.world.column(
+        "SELECT envelope->'payload'->>'reason' FROM outbox o JOIN assignments a "
+        "ON a.command_message_id = o.message_id WHERE a.succeeds IS NOT NULL"
+    ) == ["your proposal was sent back: too big"]
+
+
+async def test_a_proposal_that_could_not_be_approved_as_it_stood_ends_and_can_be_replaced(
+    planning: Planning,
+) -> None:
+    """3B-S3-1.4: left waiting, it would refuse the very work owed to replace it."""
+    world = planning.world
+    await world.decide(await world.revise(STANDARD_RATE, GREETS))
+    world.requests += 1
+    await world.stories.reject(
+        PROJECT,
+        HumanAction(
+            PRODUCT_OWNER,
+            f"reject-{world.requests}",
+            "S1",
+            "reject",
+            {"reason": "VAT is out of scope", "revision": "1", "basis": "0"},
+        ),
+    )
+    reworded = {**S2, "change": "reworded", "title": "A warmer greeting"}
+    kept, corrected = {"change": "kept", "story_id": "S1"}, {**S1, "story_id": "S3"}
+    analyst = Reviewer(
+        proposing(kept, reworded, {**corrected, "corrects": "S1"}),
+        proposing(kept, {"change": "kept", "story_id": "S2"}, {**corrected, "corrects": "S1"}),
+    )
+    worker = await planning.worker(analyst)
+    assert await worker.carry_out(await planning.owed("correct")) == "applied"
+    # The story the proposal rewords moves on before the proposal is approved.
+    await world.column(
+        "UPDATE stories SET revision = revision + 1 WHERE story_id = 'S2' RETURNING 1"
+    )
+
+    assert (await world.decide(await planning.gate())).disposition == "stale"
+
+    assert await world.column("SELECT state FROM roadmaps ORDER BY revision") == [
+        "approved",
+        "sent_back",
+    ]
+    assert await planning.states("correct") == ["done", "wanted"]
+    assert await worker.carry_out(await planning.owed("correct")) == "applied"
+    assert "could not be approved as it stood" in analyst.asked[1].briefing
+    await world.decide(await planning.gate())
+    assert (await world.stories.roadmap_of(PROJECT, "F1")).stories == ("S1", "S2", "S3")

@@ -240,8 +240,27 @@ class Integration:
                     return None
         if "batch_id" in owed["issued_on"]:
             return await self.continue_integration(assignment_id)
-        return await self.integrate(
-            owed["project_id"], owed["behaviour_id"], f"cycle-{owed['issued_on']['cycle_id']}"
+        cycle_id = str(owed["issued_on"]["cycle_id"])
+        self._require_gate_bearing_checks()
+        async with self._pool.connection() as connection:
+            source = await (
+                await connection.execute(
+                    "SELECT repository, trunk FROM projects WHERE project_id = %s",
+                    (owed["project_id"],),
+                )
+            ).fetchone()
+        assert source is not None
+        head = await trunk_head(source["repository"], source["trunk"], timeout=self._push_timeout)
+        # The cycle is looked at again where the batch is made: what was satisfied a
+        # moment ago may have been replaced while the repository was being asked.
+        return await self._finish(
+            await self._start_batch(
+                owed["project_id"],
+                owed["behaviour_id"],
+                f"cycle-{cycle_id}",
+                head,
+                first=(assignment_id, cycle_id),
+            )
         )
 
     async def continue_integration(self, assignment_id: uuid.UUID) -> IntegrationReceipt:
@@ -387,6 +406,7 @@ class Integration:
         request_id: str,
         head: str,
         successor: uuid.UUID | None = None,
+        first: tuple[uuid.UUID, str] | None = None,
     ) -> dict[str, Any] | IntegrationReceipt:
         answer_again: dict[str, Any] | None = None
         reconcile: uuid.UUID | None = None
@@ -412,6 +432,21 @@ class Integration:
                     connection, project_id, row, entering_design=False, on_its_contract=True
                 )
                 cycle = await _live_cycle(connection, project_id, behaviour_id)
+                if first is not None and (
+                    cycle is None
+                    or str(cycle["cycle_id"]) != first[1]
+                    or cycle["state"] != "satisfied"
+                ):
+                    # Taken up for one cycle, and that is no longer the behaviour's
+                    # satisfied one: it has been replaced since this was looked at.
+                    # Nothing is started for whatever is there now under this request;
+                    # that cycle is owed its own.
+                    await retire(connection, first[0])
+                    return IntegrationReceipt(
+                        Outcome.SUPERSEDED,
+                        reason="the candidate this integration was owed for is no longer "
+                        "the one whose review gate is satisfied",
+                    )
                 if (
                     behaviour.state is not BehaviourState.REVIEW
                     or cycle is None
@@ -540,9 +575,8 @@ class Integration:
         return executions
 
     async def _abandon(self, batch_id: uuid.UUID) -> None:
-        """The checks could not be completed. A first generation was asked for by a
-        caller, who is told and may ask again. A later generation was taken up by the
-        control plane on nobody's request, so the integration stays owed."""
+        """The checks could not be completed. An integration is the control plane's to
+        see through, the first generation as much as any later one: it stays owed."""
         async with self._pool.connection() as connection, connection.transaction():
             batch = await (
                 await connection.execute(
@@ -552,16 +586,8 @@ class Integration:
                 )
             ).fetchone()
             assert batch is not None
-            if batch["generation"] > 1:
-                await _close_unfinished(
-                    connection, batch["project_id"], batch["behaviour_id"], batch_id, "running"
-                )
-                return
-            await connection.execute(
-                "UPDATE check_batches SET state = 'abandoned', "
-                "reason = 'the checks could not be completed' "
-                "WHERE batch_id = %s AND state = 'running'",
-                (batch_id,),
+            await _close_unfinished(
+                connection, batch["project_id"], batch["behaviour_id"], batch_id, "running"
             )
 
     async def _settle_batch(
@@ -1168,13 +1194,9 @@ async def _close_unfinished(
 
 
 async def _discard(connection: Connection, batch: dict[str, Any], reason: str) -> None:
-    """What these checks saw can no longer decide anything. A first generation was asked
-    for by a caller, who is told why and may ask again. A later one was taken up by the
-    control plane on nobody's request: the integration stays owed, and whether it is
-    still worth doing is judged when it is next taken up."""
-    if batch["generation"] == 1:
-        await _close_batch(connection, batch, "discarded", reason)
-        return
+    """What these checks saw can no longer decide anything. The integration stays owed,
+    whichever generation this was and whoever asked for it: no caller is relied on to
+    ask again. Whether it is still worth doing is judged when it is next taken up."""
     await _close_unfinished(
         connection,
         batch["project_id"],
