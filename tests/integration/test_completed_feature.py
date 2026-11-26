@@ -15,6 +15,7 @@ from psycopg_pool import AsyncConnectionPool
 from relay.application.integration import Outcome
 from relay.application.reviews import NewFinding, Review
 from relay.application.stories import Dropped, Kept, StoryDraft
+from relay.domain.behaviour import BehaviourState
 from relay.domain.evidence import Expected, Launch
 from relay.domain.review import Carried, Severity
 from relay.domain.story import ActionRefused, Receipt
@@ -245,8 +246,9 @@ async def test_what_a_replaced_behaviour_left_open_is_not_a_limitation_of_what_w
     await world.decide(await world.gate())
     base = await world.awaiting_builder("Z", REDUCED_RATE, "S2")
     await world.reviewed("Z", {"vat.py": VAT_APPLIES_REDUCED_RATE}, on=base)
+    # Approved, and integrated by the pass that follows the decision: nobody asks.
     await world.decide(await world.propose())
-    assert (await world.integrate("Z")).outcome is Outcome.INTEGRATED
+    assert await world.state("Z") is BehaviourState.INTEGRATED
     await world.seal("S2")
     await world.assess("Z shows 105 for 100", "S2")
 

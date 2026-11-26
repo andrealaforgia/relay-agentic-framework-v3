@@ -19,7 +19,10 @@ def test_a_reply_in_the_form_asked_for_has_no_problem() -> None:
     ("reply", "says"),
     [
         ([], "not a object"),
-        ({"findings": []}, "has no carried"),
+        (
+            {"findings": [{"severity": "high", "claim": "c", "evidence": "e"}], "carried": []},
+            "has no remediation",
+        ),
         ({"findings": [], "carried": [], "extra": 1}, "extra, which was not asked for"),
         ({"findings": [{**FINDING, "claim": 17}], "carried": []}, "claim of item 1"),
         ({"findings": [{**FINDING, "evidence": None}], "carried": []}, "evidence of item 1"),
