@@ -108,7 +108,7 @@ async def test_work_still_wanted_is_announced_again_as_the_same_message(world: S
 
     [first, second] = delivered.of("build.requested")
     assert first == second
-    [build] = await world.column("SELECT assignment_id FROM assignments")
+    [build] = await world.column("SELECT assignment_id FROM assignments WHERE kind = 'build'")
     assert isinstance(build, uuid.UUID)
     await Assignments(world.database).claim(BUILDER, build)
     assert await again(world) == 0
@@ -392,7 +392,7 @@ async def test_a_green_run_cut_short_by_a_process_that_died_leaves_the_build_to_
 ) -> None:
     base = await world.awaiting_builder("B1")
     world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE}, on=base)
-    [build] = await world.column("SELECT assignment_id FROM assignments")
+    [build] = await world.column("SELECT assignment_id FROM assignments WHERE kind = 'build'")
     assert isinstance(build, uuid.UUID)
     claims = Assignments(world.database)
     before = await claims.claim(BUILDER, build)
@@ -405,12 +405,12 @@ async def test_a_green_run_cut_short_by_a_process_that_died_leaves_the_build_to_
     await restarted(world).start()
 
     assert await world.column("SELECT state FROM green_runs") == ["interrupted"]
-    assert await world.column("SELECT state FROM assignments") == ["wanted"]
+    assert await world.column("SELECT state FROM assignments WHERE kind = 'build'") == ["wanted"]
     with pytest.raises(ActionRefused, match="not the current one"):
         await world.behaviours.run_green(PROJECT, "B1", 1, before)
     fresh = await claims.claim(BUILDER, build)
     await world.close("pause", reason="one moment")  # the fresh grant has done nothing yet
-    assert await world.column("SELECT state FROM assignments") == ["wanted"]
+    assert await world.column("SELECT state FROM assignments WHERE kind = 'build'") == ["wanted"]
     await world.close("resume")
     after = await claims.claim(BUILDER, build)
     assert after != fresh
@@ -449,7 +449,7 @@ async def test_a_command_already_on_its_way_when_a_pause_lands_cannot_be_claimed
     await world.close("pause", reason="budget review")
     delivered.go_on.set()
     await publishing
-    [build] = await world.column("SELECT assignment_id FROM assignments")
+    [build] = await world.column("SELECT assignment_id FROM assignments WHERE kind = 'build'")
     assert isinstance(build, uuid.UUID)
 
     with pytest.raises(ActionRefused, match="paused"):
@@ -507,7 +507,9 @@ async def test_starting_leaves_a_paused_features_integration_waiting_and_sees_to
     await later.open()
     await later.decide(await later.roadmap(STANDARD_RATE))
     await later.awaiting_builder("B1")
-    [build] = await world.column("SELECT assignment_id FROM assignments WHERE project_id = 'zeta'")
+    [build] = await world.column(
+        "SELECT assignment_id FROM assignments WHERE project_id = 'zeta' AND kind = 'build'"
+    )
     assert isinstance(build, uuid.UUID)
     await Assignments(database).claim(BUILDER, build)
     candidate, _ = await held_then_resumed_without_the_pass(world)
@@ -516,9 +518,9 @@ async def test_starting_leaves_a_paused_features_integration_waiting_and_sees_to
     await restarted(world).start()
 
     assert await integrations_owed(world) == ["wanted"]
-    assert await world.column("SELECT state FROM assignments WHERE project_id = 'zeta'") == [
-        "wanted"
-    ]
+    assert await world.column(
+        "SELECT state FROM assignments WHERE project_id = 'zeta' AND kind = 'build'"
+    ) == ["wanted"]
     await world.close("resume")
     assert world.trunk() == candidate
 

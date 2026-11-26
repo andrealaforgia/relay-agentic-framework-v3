@@ -221,7 +221,7 @@ async def roadmap_changed(connection: Connection, project_id: str, feature_id: s
     """A roadmap revision was approved: a change that was owed has been made."""
     await connection.execute(
         "UPDATE assignments SET state = 'done' WHERE project_id = %s AND feature_id = %s "
-        "AND kind = 'revise' AND state = 'wanted'",
+        "AND kind = 'revise' AND state IN ('wanted', 'granted')",
         (project_id, feature_id),
     )
 

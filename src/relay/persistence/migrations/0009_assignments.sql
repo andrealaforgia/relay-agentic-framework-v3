@@ -12,11 +12,14 @@ CREATE TABLE assignments (
     behaviour_id    text,
     kind            text NOT NULL
                     CHECK (kind IN ('build', 'remediate', 'review', 'integrate', 'reconfirm',
-                                    'correct', 'complete', 'revise')),
+                                    'correct', 'complete', 'revise', 'plan', 'specify',
+                                    'seal', 'assess', 'red')),
     role            text NOT NULL,
     issued_on       jsonb NOT NULL,
     state           text NOT NULL DEFAULT 'wanted'
-                    CHECK (state IN ('wanted', 'granted', 'done', 'retired')),
+                    -- `asked`: its reply was a question for the Product Owner. The work is
+                    -- owed again, as a successor, when the question is answered.
+                    CHECK (state IN ('wanted', 'granted', 'done', 'retired', 'asked')),
     grant_id        uuid UNIQUE,
     granted_to      text,
     first_effect_at timestamptz,

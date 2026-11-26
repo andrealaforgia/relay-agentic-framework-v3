@@ -19,7 +19,10 @@ from psycopg.types.json import Jsonb
 
 from relay.application.assignments import (
     CORRECT,
+    PLAN,
+    ROADMAP_WORK,
     owe,
+    owe_again,
     retire_all_of_feature,
     retire_all_of_story,
     retire_what_a_roadmap_answers,
@@ -180,6 +183,22 @@ class Stories:
                 subject_id=feature_id,
                 payload={"problem": problem, "by": principal.identity},
             )
+            await owe(
+                connection,
+                PLAN,
+                Envelope(
+                    message_kind=MessageKind.COMMAND,
+                    event_type="roadmap.requested",
+                    project_id=project_id,
+                    sender=CONTROL_PLANE,
+                    recipient="analyst",
+                    idempotency_key=f"plan:{project_id}:{feature_id}",
+                    correlation_id=uuid.uuid7(),
+                    payload={"feature_id": feature_id},
+                ),
+                issued_on={"feature_id": feature_id},
+                feature_id=feature_id,
+            )
 
     async def publish_roadmap(
         self,
@@ -197,92 +216,17 @@ class Stories:
         it revises and the waiting proposal it replaces, each `None` if there is none;
         all three are compared under the lock. It is stored whole and changes nothing
         until a person approves it at the gate this opens."""
-        _require_role(principal, "analyst")
-        # Read once, before anything is awaited. What is stored and what is shown are
-        # both made from this, so they cannot differ.
-        entries = tuple(entries)
-        if not entries:
-            raise ValueError("a roadmap needs at least one story")
         async with self._pool.connection() as connection, connection.transaction():
-            # Exclusively: a proposal inspects, and its approval changes, stories that
-            # other transactions lock in their own order under the shared gate lock.
-            await lock_gate(connection, project_id, exclusive=True)
-            await _locked_project(connection, project_id)
-            feature = await _locked_feature(connection, project_id, feature_id)
-            require_open(await closure_of_feature(connection, project_id, feature_id))
-            if feature["state"] == "completed":
-                raise ActionRefused("the feature is completed: a new feature is opened instead")
-            if feature["state"] in ("checking", "needs_decision"):
-                # A revision and a completion could otherwise be decided against each
-                # other. The Product Owner sends the feature back from its gate first.
-                raise ActionRefused(
-                    "the feature is at its final check: its roadmap is not proposed again "
-                    "until that is decided"
-                )
-            require_basis(basis, await feature_basis(connection, project_id, feature_id))
-            effective, proposed = await _revisions_of(connection, project_id, feature_id)
-            if revises != effective:
-                raise ActionRefused(
-                    f"this was written against roadmap revision {revises or 'none'}; "
-                    f"the one in force is {effective or 'none'}: read it again"
-                )
-            if replaces != proposed:
-                raise ActionRefused(
-                    f"proposal {proposed} is waiting: a new one has to say it replaces it"
-                    if proposed is not None
-                    else f"there is no proposal {replaces} waiting to be replaced"
-                )
-            why = why_not_a_revision(
-                await _members(connection, project_id, feature_id, effective),
-                [_as_entry(entry) for entry in entries],
-            ) or await _why_an_edit_is_out_of_date(
-                connection, project_id, [_as_row(entry, 0) for entry in entries]
+            return await publish_roadmap_in(
+                connection,
+                principal,
+                project_id,
+                feature_id,
+                entries,
+                basis=basis,
+                revises=revises,
+                replaces=replaces,
             )
-            if why:
-                raise ActionRefused(why)
-            await _require_unused(
-                connection, project_id, [e.story_id for e in entries if isinstance(e, StoryDraft)]
-            )
-            if proposed is not None:
-                await _end_proposal(connection, project_id, feature_id, proposed, "replaced")
-            row = await (
-                await connection.execute(
-                    "SELECT coalesce(max(revision), 0) + 1 AS next FROM roadmaps "
-                    "WHERE project_id = %s AND feature_id = %s",
-                    (project_id, feature_id),
-                )
-            ).fetchone()
-            assert row is not None
-            revision: int = row["next"]
-            await connection.execute(
-                "INSERT INTO roadmaps (project_id, feature_id, revision, current_on) "
-                "VALUES (%s, %s, %s, %s)",
-                (project_id, feature_id, revision, basis),
-            )
-            position = 0
-            for entry in entries:
-                position += 0 if isinstance(entry, Dropped) else 1
-                stored = _as_row(entry, position)
-                await connection.execute(
-                    "INSERT INTO roadmap_entries (project_id, feature_id, revision, story_id, "
-                    "position, kind, title, outcome, criteria, corrects, story_revision, "
-                    "story_basis) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                    (
-                        project_id,
-                        feature_id,
-                        revision,
-                        stored["story_id"],
-                        stored["position"],
-                        stored["kind"],
-                        stored["title"],
-                        stored["outcome"],
-                        Jsonb(stored["criteria"]) if stored["criteria"] is not None else None,
-                        stored["corrects"],
-                        stored["story_revision"],
-                        stored["story_basis"],
-                    ),
-                )
-            return await _open_roadmap_gate(connection, project_id, feature, revision, basis)
 
     async def seal(
         self,
@@ -482,7 +426,9 @@ class Stories:
                 action.action, "changes_requested"
             )
             moved_on = (
-                await _settle_roadmap(connection, gate, outcome)
+                await _settle_roadmap(
+                    connection, gate, outcome, str(action.payload.get("reason", ""))
+                )
                 if gate["kind"] == "roadmap"
                 else ""
             )
@@ -490,6 +436,12 @@ class Stories:
                 # What this proposal is about has changed since it was written. It is
                 # not approved as it stands; the Analyst proposes again.
                 await _close_gate(connection, gate, "superseded", "superseded")
+                await _owe_roadmap_work_again(
+                    connection,
+                    project_id,
+                    located["feature_id"],
+                    f"your proposal could not be approved as it stood: {moved_on}",
+                )
                 receipt = Receipt("stale", f"nothing changed: {moved_on}")
                 await _record(connection, action, receipt)
                 return receipt
@@ -1274,7 +1226,37 @@ async def _basis_now(
     )
 
 
-async def _settle_roadmap(connection: Connection, gate: Mapping[str, Any], outcome: str) -> str:
+async def _owe_roadmap_work_again(
+    connection: Connection, project_id: str, feature_id: str, reason: str | None
+) -> None:
+    """A proposal has been decided, or has ended some other way. Work of the Analyst's
+    that it answered and that is still owed is owed again, as a successor that says
+    why: its call was made and applied, and nothing more would come of that occasion.
+    Work that waited while the proposal did is announced again."""
+    owed = await (
+        await connection.execute(
+            "SELECT a.assignment_id, EXISTS (SELECT 1 FROM invocations v WHERE "
+            "v.assignment_id = a.assignment_id AND v.state = 'applied') AS answered "
+            "FROM assignments a WHERE a.project_id = %s AND a.feature_id = %s "
+            "AND a.kind = ANY(%s) AND a.state IN ('wanted', 'granted') "
+            "ORDER BY a.assignment_id FOR UPDATE",
+            (project_id, feature_id, list(ROADMAP_WORK)),
+        )
+    ).fetchall()
+    for each in owed:
+        if each["answered"] and reason is not None:
+            await owe_again(connection, each["assignment_id"], state="done", reason=reason)
+    await connection.execute(
+        "UPDATE outbox SET published_at = NULL WHERE message_id IN "
+        "(SELECT command_message_id FROM assignments WHERE project_id = %s AND feature_id = %s "
+        "AND kind = ANY(%s) AND state = 'wanted' AND parked IS NULL)",
+        (project_id, feature_id, list(ROADMAP_WORK)),
+    )
+
+
+async def _settle_roadmap(
+    connection: Connection, gate: Mapping[str, Any], outcome: str, reason: str = ""
+) -> str:
     """Apply the person's decision on a proposal. Sent back, it ends. Approved, it
     replaces the roadmap in force, all at once: but only if it is still a valid change
     to what is there now, and each of its edits is still of the story it was written
@@ -1288,8 +1270,11 @@ async def _settle_roadmap(connection: Connection, gate: Mapping[str, Any], outco
             "AND revision = %s",
             (project_id, feature_id, revision),
         )
-        # Nothing is owed for it: a proposal waiting to be reconfirmed has no open gate
-        # to be sent back at.
+        # Nothing is owed for it to be reconfirmed: a proposal waiting for that has no
+        # open gate to be sent back at. What it was the answer to is owed again.
+        await _owe_roadmap_work_again(
+            connection, project_id, feature_id, f"your proposal was sent back: {reason}"
+        )
         return ""
     effective, _ = await _revisions_of(connection, project_id, feature_id)
     entries = await _entries(connection, project_id, feature_id, revision)
@@ -1371,6 +1356,14 @@ async def _settle_roadmap(connection: Connection, gate: Mapping[str, Any], outco
         "AND state IN ('wanted', 'granted') AND issued_on->>'story_id' = ANY(%s)",
         (project_id, feature_id, [e["corrects"] for e in entries if e["corrects"] is not None]),
     )
+    # The feature has a roadmap in force: the plan that was owed for it has been made.
+    await connection.execute(
+        "UPDATE assignments SET state = 'done' WHERE project_id = %s AND feature_id = %s "
+        "AND kind = 'plan' AND state IN ('wanted', 'granted')",
+        (project_id, feature_id),
+    )
+    # A correction this revision did not make is still owed, and waited for this.
+    await _owe_roadmap_work_again(connection, project_id, feature_id, None)
     return ""
 
 
@@ -1722,3 +1715,102 @@ async def _assessment(connection: Connection, story: Mapping[str, Any]) -> dict[
             (story["seal_id"],),
         )
     ).fetchone()
+
+
+async def publish_roadmap_in(
+    connection: Connection,
+    principal: Principal,
+    project_id: str,
+    feature_id: str,
+    entries: Sequence[Proposed],
+    *,
+    basis: int,
+    revises: int | None = None,
+    replaces: int | None = None,
+) -> uuid.UUID:
+    """`Stories.publish_roadmap`, in the caller's transaction."""
+    _require_role(principal, "analyst")
+    # Read once, before anything is awaited. What is stored and what is shown are
+    # both made from this, so they cannot differ.
+    entries = tuple(entries)
+    if not entries:
+        raise ValueError("a roadmap needs at least one story")
+    # Exclusively: a proposal inspects, and its approval changes, stories that
+    # other transactions lock in their own order under the shared gate lock.
+    await lock_gate(connection, project_id, exclusive=True)
+    await _locked_project(connection, project_id)
+    feature = await _locked_feature(connection, project_id, feature_id)
+    require_open(await closure_of_feature(connection, project_id, feature_id))
+    if feature["state"] == "completed":
+        raise ActionRefused("the feature is completed: a new feature is opened instead")
+    if feature["state"] in ("checking", "needs_decision"):
+        # A revision and a completion could otherwise be decided against each
+        # other. The Product Owner sends the feature back from its gate first.
+        raise ActionRefused(
+            "the feature is at its final check: its roadmap is not proposed again "
+            "until that is decided"
+        )
+    require_basis(basis, await feature_basis(connection, project_id, feature_id))
+    effective, proposed = await _revisions_of(connection, project_id, feature_id)
+    if revises != effective:
+        raise ActionRefused(
+            f"this was written against roadmap revision {revises or 'none'}; "
+            f"the one in force is {effective or 'none'}: read it again"
+        )
+    if replaces != proposed:
+        raise ActionRefused(
+            f"proposal {proposed} is waiting: a new one has to say it replaces it"
+            if proposed is not None
+            else f"there is no proposal {replaces} waiting to be replaced"
+        )
+    why = why_not_a_revision(
+        await _members(connection, project_id, feature_id, effective),
+        [_as_entry(entry) for entry in entries],
+    ) or await _why_an_edit_is_out_of_date(
+        connection, project_id, [_as_row(entry, 0) for entry in entries]
+    )
+    if why:
+        raise ActionRefused(why)
+    await _require_unused(
+        connection, project_id, [e.story_id for e in entries if isinstance(e, StoryDraft)]
+    )
+    if proposed is not None:
+        await _end_proposal(connection, project_id, feature_id, proposed, "replaced")
+    row = await (
+        await connection.execute(
+            "SELECT coalesce(max(revision), 0) + 1 AS next FROM roadmaps "
+            "WHERE project_id = %s AND feature_id = %s",
+            (project_id, feature_id),
+        )
+    ).fetchone()
+    assert row is not None
+    revision: int = row["next"]
+    await connection.execute(
+        "INSERT INTO roadmaps (project_id, feature_id, revision, current_on) "
+        "VALUES (%s, %s, %s, %s)",
+        (project_id, feature_id, revision, basis),
+    )
+    position = 0
+    for entry in entries:
+        position += 0 if isinstance(entry, Dropped) else 1
+        stored = _as_row(entry, position)
+        await connection.execute(
+            "INSERT INTO roadmap_entries (project_id, feature_id, revision, story_id, "
+            "position, kind, title, outcome, criteria, corrects, story_revision, "
+            "story_basis) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                project_id,
+                feature_id,
+                revision,
+                stored["story_id"],
+                stored["position"],
+                stored["kind"],
+                stored["title"],
+                stored["outcome"],
+                Jsonb(stored["criteria"]) if stored["criteria"] is not None else None,
+                stored["corrects"],
+                stored["story_revision"],
+                stored["story_basis"],
+            ),
+        )
+    return await _open_roadmap_gate(connection, project_id, feature, revision, basis)

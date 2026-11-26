@@ -24,7 +24,6 @@ from relay.domain.evidence import (
 from relay.domain.story import ActionRefused
 from relay.git.checkout import CheckoutFailed
 from relay.persistence.ledger import read_events
-from relay.persistence.outbox import pending_messages
 from relay.testing.oracle import (
     ContainerIsolation,
     Isolation,
@@ -43,6 +42,7 @@ from tests.integration.fixtures import (
     CountingLaunches,
     commit,
     in_a_story,
+    work_announced,
 )
 
 PROJECT = "vat-calculator"
@@ -84,7 +84,7 @@ async def awaiting_red(
 
 async def builder_is_blocked(behaviours: Behaviours, database: AsyncConnectionPool) -> bool:
     state = await behaviours.state_of(PROJECT, "B1")
-    return state is BehaviourState.VALIDATING_RED and await pending_messages(database) == []
+    return state is BehaviourState.VALIDATING_RED and await work_announced(database) == []
 
 
 async def test_the_wrong_business_value_releases_exactly_one_build_request(
@@ -101,7 +101,7 @@ async def test_the_wrong_business_value_releases_exactly_one_build_request(
     assert await behaviours.state_of(PROJECT, "B1") is BehaviourState.IMPLEMENTING
     verified = (await read_events(database, PROJECT))[-1]
     assert verified.event_type == "behaviour.test_red_verified"
-    [request] = await pending_messages(database)
+    [request] = await work_announced(database)
     assert request.stream == f"relay:{PROJECT}:cmd:builder"
     assert request.envelope["event_type"] == "build.requested"
     assert request.envelope["behaviour_id"] == "B1"
@@ -247,7 +247,7 @@ async def test_a_released_behaviour_is_not_run_again(
 
     assert container.launches == 1
     assert await read_events(database, PROJECT) == before
-    assert len(await pending_messages(database)) == 1
+    assert len(await work_announced(database)) == 1
 
 
 async def test_a_failed_checkout_is_on_the_ledger_and_the_builder_stays_blocked(

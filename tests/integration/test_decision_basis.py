@@ -221,7 +221,7 @@ async def test_reopening_a_red_does_not_remove_the_reconfirmation_it_would_need(
     )
     assert await world.state("B1") is BehaviourState.VALIDATING_RED
     assert await world.column(
-        "SELECT kind || ':' || state FROM assignments ORDER BY created_at"
+        "SELECT kind || ':' || state FROM assignments WHERE kind <> 'plan' ORDER BY created_at"
     ) == ["build:retired", "reconfirm:done", "reconfirm:done"]
     assert "behaviour.contract_amended" in await world.events()
 

@@ -152,7 +152,7 @@ async def test_a_decision_made_without_a_question_takes_back_grants_that_have_do
     world: DecisionWorld,
 ) -> None:
     await world.awaiting_builder("B1")
-    [build] = await world.column("SELECT assignment_id FROM assignments")
+    [build] = await world.column("SELECT assignment_id FROM assignments WHERE kind = 'build'")
     await world.claims.claim(BUILDER, build)  # type: ignore[arg-type]
     assumed = await world.decisions.assume(ANALYST, PROJECT, "F1", story_id="S1", text="pounds")
 

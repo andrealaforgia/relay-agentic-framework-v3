@@ -253,3 +253,15 @@ async def submit_review(
     grant = held["grant_id"] if held else uuid.uuid7()
     receipt = (held["receipt"] if held else None) or uuid.uuid7()
     return await reviews.submit_review(task_id, review, grant, receipt)
+
+
+async def work_announced(database: Any) -> list[Any]:
+    """The commands waiting to be sent, without the plan every opened feature owes its
+    Analyst: these tests are about what comes after a roadmap."""
+    from relay.persistence.outbox import pending_messages
+
+    return [
+        each
+        for each in await pending_messages(database)
+        if each.envelope["event_type"] != "roadmap.requested"
+    ]

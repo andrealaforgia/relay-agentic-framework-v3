@@ -25,7 +25,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from relay.application.assignments import BUILD, CORRECT, RECONFIRM, REMEDIATE
+from relay.application.assignments import BUILD, CORRECT, RECONFIRM, REMEDIATE, REVIEW
 from relay.application.closure import (
     closure_of_feature,
     feature_basis,
@@ -172,7 +172,7 @@ class Invocations:
         for its locks, and an answer got before that wait is about another moment."""
         async with self._pool.connection() as connection, connection.transaction():
             assignment = await _locked_assignment(connection, assignment_id)
-            if assignment["state"] in ("done", "retired"):
+            if assignment["state"] in ("done", "retired", "asked"):
                 return Admission("finished")
             if assignment["state"] != "granted" or assignment["grant_id"] != grant_id:
                 return Admission("refused", reason="this grant is not the current one")
@@ -943,17 +943,31 @@ async def _locked_invocation(connection: Connection, invocation_id: uuid.UUID) -
 
 
 async def _locked_assignment(connection: Connection, assignment_id: uuid.UUID) -> dict[str, Any]:
-    """Gate, then the behaviour if the work has one, then the assignment: the order
-    `reopen_red` takes them in, which retires a build under its behaviour's lock."""
+    """Gate, then the story if the work is a story's own, then the behaviour if it has
+    one, then the assignment: the order `reopen_red` takes them in, which retires a
+    build under its behaviour's lock, and the order every transition of a story takes.
+
+    Work that is applied by proposing a roadmap, by changing a story's list, or by
+    putting a question, does that in the transaction that marks its effect, and each of
+    those needs the gate exclusively. It is taken so from the start: a transaction that
+    held it shared and then asked for more would wait on another doing the same."""
     known = await (
         await connection.execute(
-            "SELECT project_id, behaviour_id FROM assignments WHERE assignment_id = %s",
+            "SELECT project_id, kind, story_id, behaviour_id FROM assignments "
+            "WHERE assignment_id = %s",
             (assignment_id,),
         )
     ).fetchone()
     if known is None:
         raise LookupError(f"there is no assignment {assignment_id}")
-    await lock_gate(connection, known["project_id"])
+    await lock_gate(
+        connection, known["project_id"], exclusive=known["kind"] not in (BUILD, REMEDIATE, REVIEW)
+    )
+    if known["story_id"] is not None and known["behaviour_id"] is None:
+        await connection.execute(
+            "SELECT 1 FROM stories WHERE project_id = %s AND story_id = %s FOR UPDATE",
+            (known["project_id"], known["story_id"]),
+        )
     if known["behaviour_id"] is not None:
         await connection.execute(
             "SELECT 1 FROM behaviours WHERE project_id = %s AND behaviour_id = %s FOR UPDATE",
@@ -1044,7 +1058,7 @@ async def _ended_for_good(
     if assignment["state"] == "retired":
         return "the work it was for was ended"
     under = invocation["applied_under"] or invocation["grant_id"]
-    if assignment["state"] == "done" and assignment["grant_id"] != under:
+    if assignment["state"] in ("done", "asked") and assignment["grant_id"] != under:
         # Finished, and not under the grant this result acts under: by a roadmap approved
         # meanwhile, say. Work finished under that grant was finished by this apply, or by
         # the same hands, and the rest of it goes on.

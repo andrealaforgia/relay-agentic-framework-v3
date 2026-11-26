@@ -28,7 +28,7 @@ from relay.domain.story import ActionRefused, Principal, PrincipalKind
 from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
 from relay.persistence.outbox import enqueue
-from relay.transport.envelope import Envelope
+from relay.transport.envelope import Envelope, MessageKind
 
 BUILD = "build"
 REMEDIATE = "remediate"
@@ -38,6 +38,13 @@ COMPLETE = "complete"
 REVISE = "revise"
 RECONFIRM = "reconfirm"
 CORRECT = "correct"
+PLAN = "plan"
+SPECIFY = "specify"
+SEAL = "seal"
+ASSESS = "assess"
+RED = "red"
+# Work that changes nothing but the roadmap's proposals.
+ROADMAP_WORK = (PLAN, REVISE, CORRECT)
 _LIVE = ("wanted", "granted")
 
 
@@ -48,6 +55,7 @@ async def owe(
     *,
     issued_on: dict[str, Any],
     feature_id: str | None = None,
+    succeeds: uuid.UUID | None = None,
 ) -> uuid.UUID:
     """Record that this work is owed and announce it, in the caller's transaction. The
     command is addressed to the role that may claim it and carries the assignment's id.
@@ -73,8 +81,8 @@ async def owe(
     assert feature_id is not None
     await connection.execute(
         "INSERT INTO assignments (assignment_id, project_id, subject, feature_id, story_id, "
-        "behaviour_id, kind, role, issued_on, command_message_id) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        "behaviour_id, kind, role, issued_on, command_message_id, succeeds) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (
             assignment_id,
             command.project_id,
@@ -86,10 +94,65 @@ async def owe(
             command.recipient,
             Jsonb(issued_on),
             command.message_id,
+            succeeds,
         ),
     )
     await enqueue(connection, f"relay:{command.project_id}:cmd:{command.recipient}", command)
     return assignment_id
+
+
+async def owe_again(
+    connection: Connection, predecessor: uuid.UUID, *, state: str, reason: str
+) -> uuid.UUID:
+    """One occasion on which work was owed is over, in `state`, and the same work is owed
+    again: a new assignment that names the one it succeeds, announced by a command of
+    its own that says why. A redelivery of the old command finds its assignment
+    finished and calls nothing; the new one admits a call of its own."""
+    earlier = await (
+        await connection.execute(
+            "SELECT a.*, o.envelope FROM assignments a JOIN outbox o "
+            "ON o.message_id = a.command_message_id WHERE a.assignment_id = %s FOR UPDATE OF a",
+            (predecessor,),
+        )
+    ).fetchone()
+    assert earlier is not None
+    await connection.execute(
+        "UPDATE assignments SET state = %s, parked = NULL WHERE assignment_id = %s",
+        (state, predecessor),
+    )
+    was = earlier["envelope"]
+    payload = {
+        name: value
+        for name, value in was["payload"].items()
+        if name not in ("assignment_id", "succeeds", "reason")
+    }
+    return await owe(
+        connection,
+        earlier["kind"],
+        Envelope(
+            message_kind=MessageKind.COMMAND,
+            event_type=was["event_type"],
+            project_id=earlier["project_id"],
+            sender=was["sender"],
+            recipient=earlier["role"],
+            idempotency_key=f"again:{predecessor}",
+            correlation_id=uuid.UUID(was["correlation_id"]),
+            story_id=was["story_id"],
+            behaviour_id=was["behaviour_id"],
+            payload={**payload, "succeeds": str(predecessor), "reason": reason},
+        ),
+        issued_on=earlier["issued_on"],
+        feature_id=earlier["feature_id"],
+        succeeds=predecessor,
+    )
+
+
+async def ask_instead(connection: Connection, assignment_id: uuid.UUID) -> None:
+    """The reply to this work was a question for the Product Owner: this occasion is
+    over. Answering the question owes the work again."""
+    await connection.execute(
+        "UPDATE assignments SET state = 'asked' WHERE assignment_id = %s", (assignment_id,)
+    )
 
 
 async def retire_all_of_behaviour(
@@ -397,15 +460,11 @@ class Assignments:
                 )
             ).fetchone()
             assert assignment is not None
-            if assignment["kind"] == REVISE:
-                # Answered by publishing a roadmap revision, which needs no grant: a
-                # grant that could be taken back would only hide that the change is owed.
-                raise ActionRefused("a roadmap change is made by proposing the roadmap again")
-            if assignment["kind"] in (INTEGRATE, COMPLETE):
+            if assignment["kind"] in (INTEGRATE, COMPLETE, RED):
                 # Its grant and its first effect are made together, by the control plane.
                 # A grant on its own would leave the checks never started.
                 raise ActionRefused(
-                    "the control plane takes up integrations and completions itself"
+                    "the control plane takes up integrations, completions and reds itself"
                 )
             if principal.kind is not PrincipalKind.WORKER or principal.role != assignment["role"]:
                 raise ActionRefused(f"this work is for a {assignment['role']} to claim")
@@ -414,7 +473,7 @@ class Assignments:
                 assignment["behaviour_id"] or assignment["story_id"] or assignment["feature_id"]
             )
             ordinary = assignment["kind"] not in (RECONFIRM, CORRECT)
-            if ordinary:
+            if ordinary and assignment["story_id"] is not None:
                 # Ordinary work relies on the story, the contract and the evidence so
                 # far being current. Reconfirming is how they become so, and a
                 # correction is owed for a story that is finished with.
@@ -426,15 +485,26 @@ class Assignments:
                     connection, project_id, assignment["feature_id"], assignment["story_id"]
                 )
             )
-            if ordinary or assignment["kind"] == CORRECT:
-                pass
-            elif assignment["behaviour_id"] is not None and await _has_an_unsettled_integration(
-                connection, project_id, assignment["behaviour_id"]
+            if (
+                assignment["kind"] == RECONFIRM
+                and assignment["behaviour_id"] is not None
+                and await _has_an_unsettled_integration(
+                    connection, project_id, assignment["behaviour_id"]
+                )
             ):
                 # The Verifier is asked to vouch for what is on record, and what will be
                 # on record is not known until the push has its answer.
                 raise ActionRefused(
                     f"the integration of {assignment['behaviour_id']} has not settled yet"
+                )
+            if assignment["kind"] in ROADMAP_WORK and await _has_a_proposal_waiting(
+                connection, project_id, assignment["feature_id"]
+            ):
+                # One proposal at a time is before the Product Owner. What is decided
+                # there says what is still owed, and announces it again.
+                raise ActionRefused(
+                    "a proposal for this roadmap is waiting to be decided: nothing more "
+                    "is proposed until it is"
                 )
             if assignment["parked"] is not None:
                 raise ActionRefused(f"this work is parked: {assignment['parked']}")
@@ -525,6 +595,17 @@ async def _first_effect(
         )
     ).fetchone()
     return row["assignment_id"] if row else None
+
+
+async def _has_a_proposal_waiting(connection: Connection, project_id: str, feature_id: str) -> bool:
+    row = await (
+        await connection.execute(
+            "SELECT 1 FROM roadmaps WHERE project_id = %s AND feature_id = %s "
+            "AND state = 'proposed'",
+            (project_id, feature_id),
+        )
+    ).fetchone()
+    return row is not None
 
 
 async def _has_an_unsettled_integration(

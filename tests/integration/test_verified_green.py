@@ -18,7 +18,6 @@ from relay.domain.evidence import GreenRejection, Launch, ProcessContract, RedRe
 from relay.git.checkout import CheckoutFailed
 from relay.git.mirror import Mirror
 from relay.persistence.ledger import read_events
-from relay.persistence.outbox import pending_messages
 from relay.testing.oracle import ContainerIsolation, NativeIsolation, ProcessOracle
 from tests.integration.fixtures import (
     CONTRACT,
@@ -35,6 +34,7 @@ from tests.integration.fixtures import (
     publish_attempt,
     publish_tag_as_attempt,
     run_green,
+    work_announced,
 )
 
 PROJECT = "vat-calculator"
@@ -498,7 +498,7 @@ async def test_a_fresh_red_issues_a_build_request_with_a_new_idempotency_key(
     await behaviours.reopen_red(VERIFIER, PROJECT, "B1", reason="runner image upgraded")
     assert (await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
 
-    first, second = await pending_messages(database)
+    first, second = await work_announced(database)
 
     assert first.envelope["event_type"] == second.envelope["event_type"] == "build.requested"
     assert first.envelope["idempotency_key"] != second.envelope["idempotency_key"]
@@ -596,7 +596,7 @@ async def test_a_red_released_after_the_replacement_red_was_accepted_is_still_re
             )
         ).fetchone()
     assert paired == {"revision": new_trunk}
-    assert len(await pending_messages(database)) == 2
+    assert len(await work_announced(database)) == 2
 
 
 async def test_a_candidate_judged_green_stays_pinned_after_the_builder_moves_the_attempt(

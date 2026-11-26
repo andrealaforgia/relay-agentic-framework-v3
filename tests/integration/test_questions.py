@@ -268,14 +268,14 @@ async def test_cancelling_a_feature_withdraws_its_questions(world: DecisionWorld
 async def test_asking_takes_back_a_grant_that_has_done_nothing_yet(world: DecisionWorld) -> None:
     await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
     await world.awaiting_builder("B1")
-    [build] = await world.column("SELECT assignment_id FROM assignments")
+    [build] = await world.column("SELECT assignment_id FROM assignments WHERE kind = 'build'")
     assert isinstance(build, uuid.UUID)
     claims = Assignments(world.database)
     before = await claims.claim(BUILDER, build)
 
     question = await world.ask("S1")
 
-    assert await world.column("SELECT state FROM assignments") == ["wanted"]
+    assert await world.column("SELECT state FROM assignments WHERE kind = 'build'") == ["wanted"]
     with pytest.raises(ActionRefused, match="question"):
         await claims.claim(BUILDER, build)
     await world.answer(question)

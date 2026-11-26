@@ -197,9 +197,12 @@ async def test_the_summary_names_the_roadmap_revisions_there_were(world: Complet
     ]
 
 
-async def test_the_change_owed_after_a_failed_check_is_not_something_a_worker_claims(
+async def test_the_change_owed_after_a_failed_check_is_the_analysts_to_claim(
     world: CompletionWorld,
 ) -> None:
+    """A paid call is admitted under a grant, so the change is claimed like any other
+    work (the 3b design, section 3). Proposing does not end it: it is owed until a later
+    revision is approved."""
     gate = await last_story_at_its_gate(world)
     await world.integration.require_check(PROJECT, GREETING.as_check())
     await world.decide(gate)
@@ -208,8 +211,11 @@ async def test_the_change_owed_after_a_failed_check_is_not_something_a_worker_cl
     [owed] = await world.column("SELECT assignment_id FROM assignments WHERE kind = 'revise'")
     assert isinstance(owed, uuid.UUID)
 
-    with pytest.raises(ActionRefused, match="proposing the roadmap again"):
-        await world.claims.claim(ANALYST, owed)
+    await world.claims.claim(ANALYST, owed)
+    with pytest.raises(ActionRefused, match="for a analyst to claim"):
+        await world.claims.claim(VERIFIER, owed)
+
+    assert await world.column("SELECT state FROM assignments WHERE kind = 'revise'") == ["granted"]
 
 
 async def test_what_a_replaced_behaviour_left_open_is_not_a_limitation_of_what_was_delivered(

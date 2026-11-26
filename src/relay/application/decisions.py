@@ -25,6 +25,7 @@ from relay.application.assignments import (
     RECONFIRM,
     complete_reconfirmation,
     owe,
+    owe_again,
     retire_all_of_behaviour,
     retire_reconfirmations,
     revoke_unstarted_grants,
@@ -125,78 +126,18 @@ class Decisions:
         """Put a question to the Product Owner and stop its scope until it is answered.
         The principal and request id identify the request: asked again after a lost
         reply, it is the same question."""
-        _require_worker(principal, "asks a question")
-        options = tuple(options)
-        if not text.strip() or not why.strip() or not all(option.strip() for option in options):
-            raise ActionRefused("a question needs its text, why it matters and its options")
-        scope = story_id or ""
-        digest = _digest(
-            {
-                "project": project_id,
-                "feature": feature_id,
-                "story": scope,
-                "text": text,
-                "why": why,
-                "options": list(options),
-            }
-        )
         async with self._pool.connection() as connection, connection.transaction():
-            await lock_gate(connection, project_id, exclusive=True)
-            earlier = await (
-                await connection.execute(
-                    "SELECT question_id, digest FROM questions "
-                    "WHERE asked_by = %s AND request_id = %s",
-                    (principal.identity, request_id),
-                )
-            ).fetchone()
-            if earlier is not None:
-                if earlier["digest"] != digest:
-                    raise ActionRefused(
-                        f"request id {request_id!r} was already used for a different question"
-                    )
-                asked: uuid.UUID = earlier["question_id"]
-                return asked
-            await _require_scope(connection, project_id, feature_id, story_id)
-            if await closure_of_feature(connection, project_id, feature_id) == CANCELLED:
-                raise ActionRefused("the feature is cancelled: there is nothing to ask about")
-            question_id = uuid.uuid7()
-            await connection.execute(
-                "INSERT INTO questions (question_id, project_id, feature_id, scope_story, "
-                "asked_by, request_id, digest, text, why, options) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (
-                    question_id,
-                    project_id,
-                    feature_id,
-                    scope,
-                    principal.identity,
-                    request_id,
-                    digest,
-                    text,
-                    why,
-                    Jsonb(list(options)),
-                ),
-            )
-            await connection.execute(
-                "INSERT INTO inbox_items (item_id, project_id, kind, question_id) "
-                "VALUES (%s, %s, 'question', %s)",
-                (uuid.uuid7(), project_id, question_id),
-            )
-            await revoke_unstarted_grants(connection, project_id, feature_id, story_id)
-            await append_event(
+            return await ask_in(
                 connection,
+                principal,
+                request_id,
                 project_id,
-                "question.asked",
-                subject_id=story_id or feature_id,
-                payload={
-                    "question_id": str(question_id),
-                    "asked_by": principal.identity,
-                    "text": text,
-                    "why": why,
-                    "options": list(options),
-                },
+                feature_id,
+                story_id=story_id,
+                text=text,
+                why=why,
+                options=options,
             )
-            return question_id
 
     async def answer(self, action: HumanAction) -> Receipt:
         """The Product Owner's answer: one decision, made once, and the question closed.
@@ -253,6 +194,7 @@ class Decisions:
                 },
             )
             await _after_a_decision(connection, question)
+            await _owe_what_asked(connection, question, action.payload["text"])
             receipt = Receipt("effective", "answered")
             await _record(connection, action, receipt)
         await self._features.reconcile(project_id)
@@ -331,30 +273,10 @@ class Decisions:
     ) -> uuid.UUID:
         """Record what a model assumed, so a person can see it and overrule it. It stops
         nothing and moves no basis."""
-        _require_worker(principal, "records an assumption")
-        if not text.strip():
-            raise ActionRefused("an assumption needs its text")
         async with self._pool.connection() as connection, connection.transaction():
-            await lock_gate(connection, project_id)
-            # The project before the feature: the order every other transaction keeps.
-            # And before the story is looked at: an approval holds this lock, and what
-            # was true of the story before it commits is not what is true after.
-            await _locked_project(connection, project_id)
-            await _require_scope(connection, project_id, feature_id, story_id)
-            scope = {
-                "project_id": project_id,
-                "feature_id": feature_id,
-                "scope_story": story_id or "",
-            }
-            decision_id = await _decide(connection, scope, source=MODEL, text=text)
-            await append_event(
-                connection,
-                project_id,
-                "decision.assumed",
-                subject_id=story_id or feature_id,
-                payload={"decision_id": str(decision_id), "by": principal.identity, "text": text},
+            return await assume_in(
+                connection, principal, project_id, feature_id, story_id=story_id, text=text
             )
-            return decision_id
 
     async def evidence_of(self, project_id: str, behaviour_id: str) -> Evidence:
         """What a behaviour currently has on record, as the Verifier must name it when
@@ -738,6 +660,38 @@ async def _evidence_of(connection: Connection, project_id: str, behaviour_id: st
     return Evidence(**row)
 
 
+async def _owe_what_asked(connection: Connection, question: dict[str, Any], answer: str) -> None:
+    """The work whose reply was this question is owed again, if it still is: one
+    successor, briefed with the question and its answer. It can be claimed once the
+    reconfirmations the answer calls for are complete, by the rule there is for that.
+
+    A reconfirmation that asked is not owed again here: the answer is a decision, and
+    owes the reconfirmations of its own basis."""
+    asked = await (
+        await connection.execute(
+            "SELECT a.assignment_id, a.kind, s.state AS story FROM assignments a "
+            "LEFT JOIN stories s ON s.project_id = a.project_id AND s.story_id = a.story_id "
+            "WHERE a.assignment_id = %s AND a.state = 'asked'",
+            (question["asked_for"],),
+        )
+    ).fetchone()
+    if asked is None or asked["kind"] == RECONFIRM:
+        return
+    if asked["story"] in ("approved", "rejected", "cancelled", "withdrawn"):
+        return  # the story is finished with
+    if (
+        await closure_of_feature(connection, question["project_id"], question["feature_id"])
+        == CANCELLED
+    ):
+        return
+    await owe_again(
+        connection,
+        asked["assignment_id"],
+        state="asked",
+        reason=f"you asked: {question['text']} The Product Owner answered: {answer}",
+    )
+
+
 async def _after_a_decision(connection: Connection, scope: dict[str, Any]) -> None:
     """What a decision of the Product Owner's does to its scope, in its own transaction,
     under the exclusive gate lock: everything in scope was made under other decisions,
@@ -1067,3 +1021,126 @@ def _as_id(target: str, what: str) -> uuid.UUID:
 def _digest(document: dict[str, Any]) -> str:
     canonical = json.dumps(document, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+
+
+async def ask_in(
+    connection: Connection,
+    principal: Principal,
+    request_id: str,
+    project_id: str,
+    feature_id: str,
+    *,
+    story_id: str | None,
+    text: str,
+    why: str,
+    options: Sequence[str],
+    asked_for: uuid.UUID | None = None,
+) -> uuid.UUID:
+    """`Decisions.ask`, in the caller's transaction. `asked_for` is the work whose reply
+    the question was: answering it owes that work again."""
+    _require_worker(principal, "asks a question")
+    options = tuple(options)
+    if not text.strip() or not why.strip() or not all(option.strip() for option in options):
+        raise ActionRefused("a question needs its text, why it matters and its options")
+    scope = story_id or ""
+    digest = _digest(
+        {
+            "project": project_id,
+            "feature": feature_id,
+            "story": scope,
+            "text": text,
+            "why": why,
+            "options": list(options),
+        }
+    )
+    await lock_gate(connection, project_id, exclusive=True)
+    earlier = await (
+        await connection.execute(
+            "SELECT question_id, digest FROM questions WHERE asked_by = %s AND request_id = %s",
+            (principal.identity, request_id),
+        )
+    ).fetchone()
+    if earlier is not None:
+        if earlier["digest"] != digest:
+            raise ActionRefused(
+                f"request id {request_id!r} was already used for a different question"
+            )
+        asked: uuid.UUID = earlier["question_id"]
+        return asked
+    await _require_scope(connection, project_id, feature_id, story_id)
+    if await closure_of_feature(connection, project_id, feature_id) == CANCELLED:
+        raise ActionRefused("the feature is cancelled: there is nothing to ask about")
+    question_id = uuid.uuid7()
+    await connection.execute(
+        "INSERT INTO questions (question_id, project_id, feature_id, scope_story, "
+        "asked_by, request_id, digest, text, why, options, asked_for) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            question_id,
+            project_id,
+            feature_id,
+            scope,
+            principal.identity,
+            request_id,
+            digest,
+            text,
+            why,
+            Jsonb(list(options)),
+            asked_for,
+        ),
+    )
+    await connection.execute(
+        "INSERT INTO inbox_items (item_id, project_id, kind, question_id) "
+        "VALUES (%s, %s, 'question', %s)",
+        (uuid.uuid7(), project_id, question_id),
+    )
+    await revoke_unstarted_grants(connection, project_id, feature_id, story_id)
+    await append_event(
+        connection,
+        project_id,
+        "question.asked",
+        subject_id=story_id or feature_id,
+        payload={
+            "question_id": str(question_id),
+            "asked_by": principal.identity,
+            "text": text,
+            "why": why,
+            "options": list(options),
+        },
+    )
+    return question_id
+
+
+async def assume_in(
+    connection: Connection,
+    principal: Principal,
+    project_id: str,
+    feature_id: str,
+    *,
+    story_id: str | None,
+    text: str,
+) -> uuid.UUID:
+    """`Decisions.assume`, in the caller's transaction."""
+    _require_worker(principal, "records an assumption")
+    if not text.strip():
+        raise ActionRefused("an assumption needs its text")
+    await lock_gate(connection, project_id)
+    # The project before the feature: the order every other transaction keeps.
+    # And before the story is looked at: an approval holds this lock, and what
+    # was true of the story before it commits is not what is true after.
+    await _locked_project(connection, project_id)
+    await _require_scope(connection, project_id, feature_id, story_id)
+    scope = {
+        "project_id": project_id,
+        "feature_id": feature_id,
+        "scope_story": story_id or "",
+    }
+    decision_id = await _decide(connection, scope, source=MODEL, text=text)
+    await append_event(
+        connection,
+        project_id,
+        "decision.assumed",
+        subject_id=story_id or feature_id,
+        payload={"decision_id": str(decision_id), "by": principal.identity, "text": text},
+    )
+    return decision_id

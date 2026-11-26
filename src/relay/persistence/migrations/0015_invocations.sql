@@ -17,6 +17,8 @@ ALTER TABLE assignments ADD COLUMN granted_worker uuid REFERENCES workers;
 ALTER TABLE assignments ADD COLUMN parked text;
 -- An assignment is one occasion on which work is owed. Work owed again is a new one.
 ALTER TABLE assignments ADD COLUMN succeeds uuid REFERENCES assignments;
+-- The work whose reply was this question: answering it owes that work again.
+ALTER TABLE questions ADD COLUMN asked_for uuid REFERENCES assignments;
 
 -- One row per call to a provider, written before the call is made.
 CREATE TABLE invocations (
