@@ -632,3 +632,90 @@ async def test_a_waiting_proposal_is_reconfirmed_on_what_it_proposes_new_stories
     assert "AC1: 100 net is shown as 120" in asked
     assert "prices are in euros" in asked
     assert await at.world.gate() != first  # the same proposal, put to the person again
+
+
+async def test_a_contract_on_trunk_that_no_longer_stands_is_replaced_by_workers_and_a_person(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-1.9: the Verifier declares it, specifies the behaviour that replaces it, the
+    Product Owner approves the replacement, and the candidate that contradicts the old
+    contract reaches trunk."""
+    at = delivering_world
+    quarter = {
+        **STANDARD_RATE_CONTRACT,
+        "contract_id": "B2-quarter",
+        "expect_stdout": "125\n",
+        "baseline_stdout": "120\n",
+    }
+    b2 = delivering(
+        demonstrated=False,
+        behaviour_id="B2",
+        summary="the rate is a quarter",
+        demonstrates=["AC1"],
+        contract=quarter,
+        replaces="B1",
+        replaces_because="the Product Owner decided the rate is 25%",
+    )
+    applies_a_quarter = "import sys\nprint(int(sys.argv[1]) * 125 // 100)\n"
+    roles = await released(
+        at,
+        verifier__You_decide_how_a_user_story_is_shown=[B1, DEMONSTRATED, b2, DEMONSTRATED],
+        verifier__You_are_asked_to_vouch=[VOUCHED, VOUCHED],
+        verifier__You_are_asked_whether=[delivering(verdict="to_be_replaced")],
+        analyst__You_are_asked_to_assess=[VOUCHED, VOUCHED],
+        builder__You_are_the_Builder=[
+            builds({"vat.py": VAT_APPLIES_STANDARD_RATE}),
+            builds({"vat.py": applies_a_quarter}),
+        ],
+        qa__You_are_reviewing=[NOTHING_FOUND, NOTHING_FOUND],
+        sentinel__You_are_reviewing=[NOTHING_FOUND, NOTHING_FOUND],
+    )
+    await at.work()
+
+    await at.world.answer(await at.world.ask(), "the rate is 25%")
+    await at.work()
+
+    assert await at.world.column("SELECT to_be_replaced FROM behaviours ORDER BY position") == [
+        True,
+        False,
+    ]
+    [supersession] = await at.world.stories.inbox(PROJECT)
+    assert supersession.kind == "supersession"
+    assert supersession.manifest["reason"] == "the Product Owner decided the rate is 25%"
+    assert "B1 (declared to be replaced)" in briefings(roles["verifier"], "You decide how")[2]
+    assert await at.world.state("B2") is BehaviourState.VALIDATING_RED  # nothing built yet
+
+    assert (await at.world.decide(supersession.gate_id)).disposition == "effective"
+    assert await at.world.column("SELECT state FROM supersessions") == ["standing"]
+    await at.work()
+
+    on_trunk = at.world.git("show", f"{at.world.trunk()}:vat.py", at=at.world.remote)
+    assert on_trunk == applies_a_quarter.strip()
+    assert (await at.world.stories.inbox(PROJECT))[0].kind == "story"
+
+
+async def test_a_waiting_proposal_its_author_says_no_longer_stands_is_withdrawn_and_owed_again(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-1.4: and the work owed to replace it can be claimed."""
+    at = delivering_world
+    roles = staffed(
+        analyst__You_propose_the_roadmap=[proposing(S1), proposing(S1)],
+        analyst__You_are_asked_whether=[
+            delivering(verdict="to_be_replaced", because="prices are not in pounds")
+        ],
+    )
+    await at.staff(analyst=roles["analyst"])
+    await at.world.stories.open_feature(PRODUCT_OWNER, PROJECT, "F1", "prices need VAT")
+    await at.work()
+
+    await at.world.answer(await at.world.ask(story=None), "prices are in euros")
+    await at.work()
+
+    assert await at.world.column("SELECT state FROM roadmaps ORDER BY revision") == [
+        "sent_back",
+        "proposed",
+    ]
+    again = briefings(roles["analyst"], "You propose the roadmap")[1]
+    assert "the proposal has to be replaced: prices are not in pounds" in again
+    assert await kinds(at, "wanted") == []

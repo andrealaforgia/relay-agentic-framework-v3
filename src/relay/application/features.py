@@ -66,7 +66,9 @@ class Features:
                 )
             ).fetchone()
         assert gate is not None
-        await self.complete_what_is_owed(gate["project_id"])
+        # The whole pass, which ends with the completions: a decision can leave a red to
+        # observe or an integration to take up, with no worker about to apply anything.
+        await self.reconcile(gate["project_id"])
         return receipt
 
     async def summary_of(self, project_id: str, feature_id: str) -> dict[str, Any] | None:

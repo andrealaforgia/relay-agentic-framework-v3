@@ -227,6 +227,12 @@ class Behaviours:
                 await connection.execute(
                     "UPDATE assignments SET state = 'granted', grant_id = gen_random_uuid(), "
                     "granted_to = %s WHERE project_id = %s AND kind = 'red' AND state = 'wanted' "
+                    # A behaviour proposed as the replacement of something on trunk waits
+                    # for the Product Owner: built before that is decided, its candidate
+                    # would only fail the very check it is meant to replace.
+                    "AND NOT EXISTS (SELECT 1 FROM supersessions s WHERE s.project_id = "
+                    "assignments.project_id AND s.behaviour_id = assignments.behaviour_id "
+                    "AND s.state = 'proposed') "
                     "RETURNING assignment_id, behaviour_id",
                     (CONTROL_PLANE, project_id),
                 )

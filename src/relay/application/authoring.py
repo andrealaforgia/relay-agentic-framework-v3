@@ -19,7 +19,7 @@ from typing import Any
 
 from relay.application.assignments import complete
 from relay.application.behaviours import rewrite_contract_in, specify_in
-from relay.application.closure import decisions_in_force
+from relay.application.closure import decisions_in_force, lock_gate
 from relay.application.decisions import Decisions, Evidence, _evidence_of
 from relay.application.invocations import Effect, EffectRun, Invocations, Overtaken, Prepared
 from relay.application.stories import (
@@ -30,10 +30,12 @@ from relay.application.stories import (
     StoryDraft,
     _revisions_of,
     assess_in,
+    give_up_proposal,
     publish_roadmap_in,
     say_demonstrated,
     seal_in,
 )
+from relay.application.supersessions import propose_in
 from relay.application.tasks import (
     QUESTION,
     Profile,
@@ -689,6 +691,8 @@ class SpecifyTask(Authoring):
             "summary": {"type": "string"},
             "demonstrates": {"type": "array", "items": {"type": "string"}},
             "contract": _CONTRACT,
+            "replaces": {"type": "string"},
+            "replaces_because": {"type": "string"},
         },
         "required": ["demonstrated"],
         "additionalProperties": False,
@@ -698,6 +702,17 @@ class SpecifyTask(Authoring):
         about = await _story(connection, assignment["project_id"], assignment["story_id"])
         about["behaviour_id"] = assignment["behaviour_id"]
         about["invalid_red"] = None
+        # What every candidate of the project must still satisfy, by the behaviour that
+        # put it there: a new behaviour that contradicts one of these has to say so.
+        about["obligations"] = await (
+            await connection.execute(
+                "SELECT o.obligation_id, o.behaviour_id, o.digest, o.contract, b.to_be_replaced "
+                "FROM obligations o JOIN behaviours b ON b.project_id = o.project_id "
+                "AND b.behaviour_id = o.behaviour_id WHERE o.project_id = %s "
+                "AND o.state = 'active' ORDER BY o.behaviour_id",
+                (assignment["project_id"],),
+            )
+        ).fetchall()
         if assignment["behaviour_id"] is not None:
             command = await (
                 await connection.execute(
@@ -751,10 +766,41 @@ class SpecifyTask(Authoring):
                     "else. A behaviour's identifier is one no behaviour of the project has had."
                 ),
             ]
+            if about["obligations"]:
+                lines += [
+                    "",
+                    (
+                        "Behaviours already on the trunk, whose contracts every later candidate "
+                        "must still satisfy:"
+                    ),
+                    *(
+                        f"  {each['behaviour_id']}"
+                        + (" (declared to be replaced)" if each["to_be_replaced"] else "")
+                        + f": {json.dumps(each['contract'], sort_keys=True)}"
+                        for each in about["obligations"]
+                    ),
+                    (
+                        "If the behaviour you specify contradicts one of them (the same command "
+                        "must now print something else), name that behaviour under replaces and "
+                        "say why under replaces_because. The Product Owner is shown both "
+                        "contracts and decides; until then nothing is built."
+                    ),
+                ]
         return lines
 
     def _evidence(self, about: Mapping[str, Any]) -> dict[str, Any]:
-        return {"rewrites": about["behaviour_id"]}
+        return {
+            "rewrites": about["behaviour_id"],
+            # Each obligation as it was read: a replacement is proposed of that, by
+            # identity and digest, and of nothing it has become since.
+            "obligations": {
+                each["behaviour_id"]: {
+                    "obligation": str(each["obligation_id"]),
+                    "digest": each["digest"],
+                }
+                for each in about["obligations"]
+            },
+        }
 
     def _problem_with_delivered(self, delivered: Any) -> str | None:
         if delivered.get("demonstrated"):
@@ -816,6 +862,24 @@ class SpecifyTask(Authoring):
             )
         except ValueError as refused:
             raise ActionRefused(str(refused)) from None
+        if delivered.get("replaces"):
+            replaced = run.invocation["evidence"]["obligations"].get(str(delivered["replaces"]))
+            if replaced is None:
+                raise ActionRefused(
+                    f"{delivered['replaces']} has no contract on the trunk for this to replace"
+                )
+            await propose_in(
+                connection,
+                caller,
+                project_id,
+                obligation=uuid.UUID(replaced["obligation"]),
+                digest=replaced["digest"],
+                behaviour=str(delivered["behaviour_id"]),
+                contract_digest=contract_from(delivered["contract"]).digest,
+                story_revision=expects["story_revision"],
+                basis=expects["basis"],
+                reason=str(delivered.get("replaces_because", "")),
+            )
         # The list has one more behaviour, by this effect's own doing.
         return {"list_revision": expects["list_revision"] + 1}
 
@@ -953,7 +1017,11 @@ class ReconfirmTask(Authoring):
 
     delivered: Mapping[str, Any] = {
         "type": "object",
-        "properties": {"verdict": {"enum": ["stands", "amended"]}, "contract": _CONTRACT},
+        "properties": {
+            "verdict": {"enum": ["stands", "amended", "to_be_replaced"]},
+            "contract": _CONTRACT,
+            "because": {"type": "string"},
+        },
         "required": ["verdict"],
         "additionalProperties": False,
     }
@@ -999,13 +1067,25 @@ class ReconfirmTask(Authoring):
             about["evidence"] = await _evidence_of(
                 connection, project_id, assignment["behaviour_id"]
             )
+            carried = await (
+                await connection.execute(
+                    "SELECT obligation_id FROM obligations WHERE project_id = %s "
+                    "AND behaviour_id = %s AND state = 'active'",
+                    (project_id, assignment["behaviour_id"]),
+                )
+            ).fetchone()
+            about["obligation"] = str(carried["obligation_id"]) if carried else None
         return about
 
     def _evidence(self, about: Mapping[str, Any]) -> dict[str, Any]:
         if about["subject"] != "behaviour":
             return {}
         contract = ProcessContract.from_dict(about["behaviour"]["contract"])
-        return {"contract_digest": contract.digest, "retains": asdict(about["evidence"])}
+        return {
+            "contract_digest": contract.digest,
+            "retains": asdict(about["evidence"]),
+            "obligation": about["obligation"],
+        }
 
     def _briefing(self, about: Mapping[str, Any]) -> list[str]:
         decided = [
@@ -1033,8 +1113,11 @@ class ReconfirmTask(Authoring):
                 *_revision_lines(about["stories"]),
                 "",
                 (
-                    'What to deliver: verdict "stands", if it does. If it does not, ask the '
-                    "Product Owner what should change."
+                    'What to deliver: verdict "stands", if it does. If this revision is a '
+                    "proposal still waiting to be approved and it no longer stands, verdict "
+                    '"to_be_replaced", saying why under because: it is withdrawn, and you '
+                    "will be asked to propose again. If the roadmap in force no longer "
+                    "stands, ask the Product Owner what should change."
                 ),
             ]
         if about["subject"] == "story":
@@ -1070,11 +1153,16 @@ class ReconfirmTask(Authoring):
             (
                 'What to deliver: verdict "stands", if all of it does; or verdict "amended" '
                 "with the contract as it should now be, which sets aside everything gathered "
-                "for the old one."
+                "for the old one. A behaviour that is already on the trunk cannot be amended: "
+                'if its contract no longer stands, verdict "to_be_replaced". What it put on '
+                "the trunk stays required of every candidate until a behaviour that replaces "
+                "it has been approved by the Product Owner and integrated."
             ),
         ]
 
     def _problem_with_delivered(self, delivered: Any) -> str | None:
+        if delivered.get("verdict") not in ("stands", "amended", "to_be_replaced"):
+            return "a verdict is stands, amended or to_be_replaced"
         if delivered.get("verdict") != "amended":
             return None if "contract" not in delivered else "a contract that stands is not given"
         try:
@@ -1092,8 +1180,56 @@ class ReconfirmTask(Authoring):
         delivered, read = run.invocation["reply"]["delivered"], run.invocation["evidence"]
         caller, basis = caller_of(run.invocation), run.invocation["expects"]["basis"]
         project_id = work["project_id"]
-        if work["subject"] != "behaviour" and delivered["verdict"] != "stands":
-            raise ActionRefused("a roadmap or a story stands, or the Product Owner is asked")
+        verdict = delivered["verdict"]
+        if work["subject"] == "story" and verdict != "stands":
+            raise ActionRefused("a story stands, or the Product Owner is asked")
+        if work["subject"] == "roadmap" and verdict == "amended":
+            raise ActionRefused("a roadmap stands or is to be replaced")
+        if work["subject"] == "roadmap":
+            revision = work["issued_on"]["revision"]
+            why = str(delivered.get("because", "")).strip() or "its author says it no longer stands"
+            if verdict == "stands":
+                try:
+                    await self._decisions.reconfirm_roadmap(
+                        caller,
+                        project_id,
+                        work["feature_id"],
+                        grant=run.grant_id,
+                        basis=basis,
+                        revision=revision,
+                    )
+                    return
+                except ActionRefused as refused:
+                    if "has to be replaced" not in str(refused):
+                        raise
+                    # It cannot be made approvable by saying it stands. That is not the
+                    # reply's fault, and it is not left waiting for nobody.
+                    why = str(refused)
+            async with self._pool.connection() as connection, connection.transaction():
+                await lock_gate(connection, project_id, exclusive=True)
+                await give_up_proposal(
+                    connection,
+                    project_id,
+                    work["feature_id"],
+                    revision,
+                    f"the proposal has to be replaced: {why}",
+                )
+            await self._decisions._features.reconcile(project_id)
+            return
+        if verdict == "to_be_replaced":
+            if read.get("obligation") is None:
+                raise ActionRefused(
+                    f"{work['behaviour_id']} is not on the trunk: its contract can be amended"
+                )
+            await self._decisions.declare_replaced(
+                caller,
+                project_id,
+                work["behaviour_id"],
+                grant=run.grant_id,
+                basis=basis,
+                obligation=uuid.UUID(read["obligation"]),
+            )
+            return
         if work["subject"] == "roadmap":
             await self._decisions.reconfirm_roadmap(
                 caller,

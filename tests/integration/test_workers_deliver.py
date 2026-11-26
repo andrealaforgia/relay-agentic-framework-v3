@@ -72,6 +72,7 @@ class Role:
         self.asked.append(request)
         for marker, waiting in self.replies.items():
             if marker.replace("_", " ") in request.briefing:
+                assert waiting, f"nothing more scripted for {marker!r}: {request.briefing[-600:]}"
                 reply = waiting.pop(0)
                 if callable(reply):
                     reply = reply(request)

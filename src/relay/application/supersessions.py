@@ -83,82 +83,18 @@ class Supersessions:
         if not reason.strip():
             raise ActionRefused("a supersession needs a stated reason")
         async with self._pool.connection() as connection, connection.transaction():
-            await lock_gate(connection, project_id, exclusive=True)
-            await void_what_no_longer_stands(connection, project_id)
-            replaced = await (
-                await connection.execute(
-                    "SELECT * FROM obligations WHERE obligation_id = %s AND project_id = %s "
-                    "FOR UPDATE",
-                    (obligation, project_id),
-                )
-            ).fetchone()
-            if replaced is None:
-                raise ActionRefused("there is no such obligation in this project")
-            if replaced["digest"] != digest or replaced["state"] != "active":
-                raise ActionRefused("that is not the obligation as it stands now")
-            if replaced["source"] != "behaviour":
-                raise ActionRefused("a required project check is not replaced by a story's work")
-            replacing = await _replacing(connection, project_id, behaviour)
-            await require_startable(connection, project_id, replacing["story_id"], behaviour)
-            live = await (
-                await connection.execute(
-                    "SELECT 1 FROM supersessions WHERE project_id = %s AND state = ANY(%s) "
-                    "AND (obligation_id = %s OR behaviour_id = %s) LIMIT 1",
-                    (project_id, list(_LIVE), obligation, behaviour),
-                )
-            ).fetchone()
-            if live is not None:
-                raise ActionRefused(
-                    "there is already a replacement proposed or standing for that obligation, "
-                    "or one that this behaviour makes"
-                )
-            if await _being_pushed(connection, project_id, behaviour):
-                raise ActionRefused(
-                    f"{behaviour} has an integration authorised already, without a replacement"
-                )
-            on = await _basis(connection, project_id, replaced, replacing)
-            assert on is not None
-            if (contract_digest, story_revision) != (on["contract_digest"], on["story_revision"]):
-                raise ActionRefused(f"that is not {behaviour} as it stands now")
-            require_basis(basis, on["decisions"])
-            gate_id = await _open_gate(
+            return await propose_in(
                 connection,
+                principal,
                 project_id,
-                replacing["feature_id"],
-                kind="supersession",
-                story_id=replacing["story_id"],
-                basis=on,
-                manifest={
-                    "reason": reason,
-                    "replaces": {
-                        "obligation_id": str(obligation),
-                        "behaviour_id": replaced["behaviour_id"],
-                        "contract": replaced["contract"],
-                    },
-                    "with": {
-                        "behaviour_id": behaviour,
-                        "story_id": replacing["story_id"],
-                        "story_revision": replacing["story_revision"],
-                        "contract": replacing["contract"],
-                    },
-                },
+                obligation=obligation,
+                digest=digest,
+                behaviour=behaviour,
+                contract_digest=contract_digest,
+                story_revision=story_revision,
+                basis=basis,
+                reason=reason,
             )
-            await connection.execute(
-                "INSERT INTO supersessions (supersession_id, project_id, obligation_id, "
-                "behaviour_id, reason, proposed_by, basis, gate_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (
-                    uuid.uuid7(),
-                    project_id,
-                    obligation,
-                    behaviour,
-                    reason,
-                    principal.identity,
-                    Jsonb(on),
-                    gate_id,
-                ),
-            )
-            return gate_id
 
     async def withdraw(self, principal: Principal, project_id: str, gate_id: uuid.UUID) -> None:
         """The Verifier takes back a proposal nobody has decided."""
@@ -507,3 +443,98 @@ async def _end(connection: Connection, supersession: dict[str, Any], state: str,
             "reason": why,
         },
     )
+
+
+async def propose_in(
+    connection: Connection,
+    principal: Principal,
+    project_id: str,
+    *,
+    obligation: uuid.UUID,
+    digest: str,
+    behaviour: str,
+    contract_digest: str,
+    story_revision: int,
+    basis: int,
+    reason: str,
+) -> uuid.UUID:
+    """`Supersessions.propose`, in the caller's transaction."""
+    if principal.kind is not PrincipalKind.WORKER or principal.role != "verifier":
+        raise ActionRefused("a supersession is for the verifier to propose")
+    if not reason.strip():
+        raise ActionRefused("a supersession needs a stated reason")
+    await lock_gate(connection, project_id, exclusive=True)
+    await void_what_no_longer_stands(connection, project_id)
+    replaced = await (
+        await connection.execute(
+            "SELECT * FROM obligations WHERE obligation_id = %s AND project_id = %s FOR UPDATE",
+            (obligation, project_id),
+        )
+    ).fetchone()
+    if replaced is None:
+        raise ActionRefused("there is no such obligation in this project")
+    if replaced["digest"] != digest or replaced["state"] != "active":
+        raise ActionRefused("that is not the obligation as it stands now")
+    if replaced["source"] != "behaviour":
+        raise ActionRefused("a required project check is not replaced by a story's work")
+    replacing = await _replacing(connection, project_id, behaviour)
+    await require_startable(connection, project_id, replacing["story_id"], behaviour)
+    live = await (
+        await connection.execute(
+            "SELECT 1 FROM supersessions WHERE project_id = %s AND state = ANY(%s) "
+            "AND (obligation_id = %s OR behaviour_id = %s) LIMIT 1",
+            (project_id, list(_LIVE), obligation, behaviour),
+        )
+    ).fetchone()
+    if live is not None:
+        raise ActionRefused(
+            "there is already a replacement proposed or standing for that obligation, "
+            "or one that this behaviour makes"
+        )
+    if await _being_pushed(connection, project_id, behaviour):
+        raise ActionRefused(
+            f"{behaviour} has an integration authorised already, without a replacement"
+        )
+    on = await _basis(connection, project_id, replaced, replacing)
+    assert on is not None
+    if (contract_digest, story_revision) != (on["contract_digest"], on["story_revision"]):
+        raise ActionRefused(f"that is not {behaviour} as it stands now")
+    require_basis(basis, on["decisions"])
+    gate_id = await _open_gate(
+        connection,
+        project_id,
+        replacing["feature_id"],
+        kind="supersession",
+        story_id=replacing["story_id"],
+        basis=on,
+        manifest={
+            "reason": reason,
+            "replaces": {
+                "obligation_id": str(obligation),
+                "behaviour_id": replaced["behaviour_id"],
+                "contract": replaced["contract"],
+            },
+            "with": {
+                "behaviour_id": behaviour,
+                "story_id": replacing["story_id"],
+                "story_revision": replacing["story_revision"],
+                "contract": replacing["contract"],
+            },
+        },
+    )
+    await connection.execute(
+        "INSERT INTO supersessions (supersession_id, project_id, obligation_id, "
+        "behaviour_id, reason, proposed_by, basis, gate_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            uuid.uuid7(),
+            project_id,
+            obligation,
+            behaviour,
+            reason,
+            principal.identity,
+            Jsonb(on),
+            gate_id,
+        ),
+    )
+    return gate_id
