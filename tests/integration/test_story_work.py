@@ -9,15 +9,20 @@ from typing import Any
 
 import pytest
 
-from relay.application.authoring import contract_from
+from relay.application import authoring as authoring_module
+from relay.application import behaviours as behaviours_module
+from relay.application.authoring import _refusing, contract_from
 from relay.application.behaviours import rewrite_contract_in
-from relay.domain.behaviour import BehaviourState
-from relay.domain.story import ActionRefused
+from relay.application.invocations import Effect
+from relay.domain.behaviour import BehaviourState, TransitionRefused
+from relay.domain.story import ActionRefused, HumanAction, SealRefused
+from relay.git.checkout import CheckoutFailed
 from tests.integration.fixtures import (
     PRODUCT_OWNER,
     VAT_APPLIES_STANDARD_RATE,
     VERIFIER,
 )
+from tests.integration.story_world import GREETS, STANDARD_RATE
 from tests.integration.test_review_task import NOTHING_FOUND
 from tests.integration.test_roadmap_task import ASKING, S1, proposing
 from tests.integration.test_workers_deliver import (
@@ -719,3 +724,140 @@ async def test_a_waiting_proposal_its_author_says_no_longer_stands_is_withdrawn_
     again = briefings(roles["analyst"], "You propose the roadmap")[1]
     assert "the proposal has to be replaced: prices are not in pounds" in again
     assert await kinds(at, "wanted") == []
+
+
+async def test_a_red_that_could_not_be_observed_is_owed_still_and_observed_by_a_later_pass(
+    delivering_world: Delivering, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Taken before it is launched, and given back when no verdict settled it."""
+    at = delivering_world
+    await released(at)
+    at.workers.pop("builder")
+
+    async def does_not_answer(*_: Any, **__: Any) -> str:
+        raise CheckoutFailed("no route to host")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(behaviours_module, "trunk_head", does_not_answer)
+        await at.work()
+        assert await at.world.column("SELECT state FROM assignments WHERE kind = 'red'") == [
+            "wanted"
+        ]
+        assert await at.world.state("B1") is BehaviourState.VALIDATING_RED
+
+    await at.world.features.reconcile(PROJECT)
+
+    assert await at.world.state("B1") is BehaviourState.IMPLEMENTING
+
+
+async def test_what_a_service_raises_to_refuse_a_reply_is_a_refusal_of_the_reply() -> None:
+    """3B-S3-1.5: on record with the call, not an error that leaves a paid reply unread."""
+
+    async def nothing(run: Any) -> None:
+        return None
+
+    async def refuses(connection: Any, run: Any) -> None:
+        raise SealRefused("no behaviour demonstrates ['AC2']")
+
+    async def raises_in_perform(run: Any) -> None:
+        raise TransitionRefused("seal", BehaviourState.PROPOSED, (BehaviourState.REVIEW,))
+
+    with pytest.raises(ActionRefused, match="no behaviour demonstrates"):
+        settle = _refusing(Effect("seal", nothing, refuses)).settle
+        assert settle is not None
+        await settle(None, None)  # type: ignore[arg-type]
+    with pytest.raises(ActionRefused):
+        await _refusing(Effect("seal", raises_in_perform)).perform(None)  # type: ignore[arg-type]
+
+
+async def test_a_storys_step_already_owed_is_not_claimed_while_a_contract_waits_to_be_reconfirmed(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-1.7: work owed before the decision, and claimed after the story's own
+    reconfirmation, is refused at the claim."""
+    at = delivering_world
+    await released(
+        at, verifier__You_decide_how_a_user_story_is_shown=[B1, DEMONSTRATED, DEMONSTRATED]
+    )
+    await at.work()
+    await at.world.column(
+        "UPDATE stories SET seal_id = NULL, sealed_revision = NULL, state = 'released' RETURNING 1"
+    )
+    await at.world.column("UPDATE gates SET state = 'superseded' RETURNING 1")
+    await at.world.features.reconcile(PROJECT)
+    seal = await _the(at, "seal")
+    at.workers.pop("verifier")
+
+    await at.world.answer(await at.world.ask(), "zero-rated")
+    await at.work()  # the Analyst reconfirms the story; the contract still waits
+
+    assert seal == await _the(at, "seal")
+    with pytest.raises(ActionRefused, match="B1 has yet to be reconfirmed by its owner"):
+        await at.world.claims.claim(VERIFIER, seal)
+
+
+async def test_a_proposal_that_cannot_stand_is_withdrawn_when_its_author_says_it_stands(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-1.4: the service says it has to be replaced, and it is not left waiting."""
+    at, world = delivering_world, delivering_world.world
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    world.requests += 1
+    await world.stories.reject(
+        PROJECT,
+        HumanAction(
+            PRODUCT_OWNER,
+            f"reject-{world.requests}",
+            "S1",
+            "reject",
+            {"reason": "VAT is out of scope", "revision": "1", "basis": "0"},
+        ),
+    )
+    kept = {"change": "kept", "story_id": "S1"}
+    corrected = {**S1, "story_id": "S3", "corrects": "S1"}
+    reworded = {**S1, "story_id": "S2", "change": "reworded", "title": "A warmer greeting"}
+    roles = staffed(
+        analyst__You_propose_the_roadmap=[
+            proposing(kept, reworded, corrected),
+            proposing(kept, {"change": "kept", "story_id": "S2"}, corrected),
+        ],
+        analyst__You_are_asked_whether=[STANDS, STANDS, STANDS, STANDS],
+    )
+    await at.staff(analyst=roles["analyst"])
+    await at.work()
+    assert await world.column("SELECT state FROM roadmaps ORDER BY revision") == [
+        "approved",
+        "proposed",
+    ]
+
+    await world.answer(await world.ask(story=None), "prices are in euros")
+    await at.work()
+
+    assert await world.column("SELECT state FROM roadmaps ORDER BY revision") == [
+        "approved",
+        "sent_back",
+        "proposed",
+    ]
+    assert "the proposal has to be replaced" in briefings(roles["analyst"], "You propose")[1]
+
+
+async def test_a_seal_the_domain_refuses_is_a_reply_that_gave_nothing_and_not_an_error(
+    delivering_world: Delivering, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S3-1.5, through a task's own effects: the reply is disposed of, on record."""
+    at = delivering_world
+    await released(at, verifier__You_are_asked_to_vouch=[VOUCHED, VOUCHED, VOUCHED])
+
+    async def refuses(*_: Any, **__: Any) -> None:
+        raise SealRefused("no behaviour demonstrates ['AC1']")
+
+    monkeypatch.setattr(authoring_module, "seal_in", refuses)
+
+    await at.work()
+
+    assert set(
+        await at.world.column(
+            "SELECT v.state || ': ' || v.reason FROM invocations v JOIN assignments a "
+            "USING (assignment_id) WHERE a.kind = 'seal'"
+        )
+    ) == {"rejected: no behaviour demonstrates ['AC1']"}
