@@ -30,7 +30,7 @@ from relay.application.assignments import (
     CORRECT,
     RECONFIRM,
     REMEDIATE,
-    require_nothing_to_reconfirm,
+    require_still_due,
 )
 from relay.application.closure import (
     closure_of_feature,
@@ -1046,7 +1046,7 @@ async def _has_a_successor(connection: Connection, invocation: dict[str, Any]) -
 
 
 async def _require_may_start(connection: Connection, assignment: dict[str, Any]) -> None:
-    await require_nothing_to_reconfirm(connection, assignment)
+    await require_still_due(connection, assignment)
     if assignment["kind"] not in (RECONFIRM, CORRECT) and assignment["story_id"] is not None:
         await require_startable(
             connection, assignment["project_id"], assignment["story_id"], assignment["behaviour_id"]

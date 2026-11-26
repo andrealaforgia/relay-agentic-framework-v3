@@ -22,7 +22,9 @@ from typing import Any
 from psycopg.types.json import Jsonb
 
 from relay.application.assignments import (
+    ASSESS,
     RECONFIRM,
+    SEAL,
     complete_reconfirmation,
     owe,
     owe_again,
@@ -675,7 +677,10 @@ async def _owe_what_asked(connection: Connection, question: dict[str, Any], answ
             (question["asked_for"],),
         )
     ).fetchone()
-    if asked is None or asked["kind"] == RECONFIRM:
+    if asked is None or asked["kind"] in (RECONFIRM, SEAL, ASSESS):
+        # A seal or an assessment that asked: the answer undoes what it was of (what
+        # was said to be demonstrated, the seal). What the story needs next is derived
+        # once its owners have reconfirmed it, and may not be that step at all.
         return
     if asked["story"] in ("approved", "rejected", "cancelled", "withdrawn"):
         return  # the story is finished with

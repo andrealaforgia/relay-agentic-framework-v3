@@ -126,6 +126,65 @@ async def owe_contract_again(
     )
 
 
+async def replacement_undecided(
+    connection: Connection, project_id: str, behaviour_id: str
+) -> dict[str, Any] | None:
+    """The replacement this behaviour makes of something on trunk, if whether it stands
+    is not settled: proposed and before the Product Owner, or approved once and ended by
+    a decision since, with the Verifier yet to say whether it is proposed again. Until
+    it is settled the behaviour's red waits and nothing is built: a candidate would only
+    fail the very check it is meant to replace."""
+    latest = await (
+        await connection.execute(
+            "SELECT s.supersession_id, s.state, o.behaviour_id AS replaced FROM supersessions s "
+            "JOIN obligations o USING (obligation_id) WHERE s.project_id = %s "
+            "AND s.behaviour_id = %s ORDER BY s.proposed_at DESC LIMIT 1",
+            (project_id, behaviour_id),
+        )
+    ).fetchone()
+    if latest is None or latest["state"] not in ("proposed", "void"):
+        return None
+    if latest["state"] == "void":
+        answered = await (
+            await connection.execute(
+                "SELECT 1 FROM assignments WHERE project_id = %s AND behaviour_id = %s "
+                "AND kind = 'specify' AND state = 'done' AND issued_on->>'voided' = %s",
+                (project_id, behaviour_id, str(latest["supersession_id"])),
+            )
+        ).fetchone()
+        if answered is not None:
+            return None
+    return latest
+
+
+async def _owe_the_replacement_again(
+    connection: Connection, project_id: str, behaviour: dict[str, Any]
+) -> None:
+    """An approval that a decision ended leaves two contracts that still contradict
+    each other, and only the Verifier can put them before the Product Owner again."""
+    undecided = await replacement_undecided(connection, project_id, behaviour["behaviour_id"])
+    if undecided is None or undecided["state"] != "void":
+        return
+    if await _is_owed(connection, project_id, SPECIFY, behaviour_id=behaviour["behaviour_id"]):
+        return
+    await _owe(
+        connection,
+        SPECIFY,
+        Envelope(
+            message_kind=MessageKind.COMMAND,
+            event_type="behaviour.contract_requested",
+            project_id=project_id,
+            behaviour_id=behaviour["behaviour_id"],
+            sender=CONTROL_PLANE,
+            recipient="verifier",
+            idempotency_key=f"replace-again:{undecided['supersession_id']}",
+            correlation_id=behaviour["correlation_id"],
+            payload={"voided": str(undecided["supersession_id"])},
+        ),
+        {"voided": str(undecided["supersession_id"]), "replaced": undecided["replaced"]},
+    )
+
+
 async def _owe_for(connection: Connection, story: dict[str, Any]) -> None:
     project_id, story_id = story["project_id"], story["story_id"]
     behaviours = await (
@@ -138,6 +197,8 @@ async def _owe_for(connection: Connection, story: dict[str, Any]) -> None:
         )
     ).fetchall()
     for behaviour in behaviours:
+        if behaviour["state"] not in _ON_TRUNK:
+            await _owe_the_replacement_again(connection, project_id, behaviour)
         if behaviour["state"] == "validating_red":
             await owe_red(connection, project_id, behaviour["behaviour_id"])
         elif behaviour["state"] == "implementing" and behaviour["red_revision"] is not None:

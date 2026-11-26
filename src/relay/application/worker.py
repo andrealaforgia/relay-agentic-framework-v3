@@ -166,7 +166,10 @@ class Worker:
         What was applied may leave something for the control plane to do by itself, and
         that is done before this returns."""
         left = await self._carry_out(assignment)
-        if left == "applied" and self._then is not None:
+        if self._then is not None:
+            # Whatever came of it. A worker cut short after its result was applied and
+            # before this never ran the pass that follows: the delivery that comes
+            # again finds the work done, and this is what runs that pass.
             await self._then(str(assignment["project_id"]))
         return left
 

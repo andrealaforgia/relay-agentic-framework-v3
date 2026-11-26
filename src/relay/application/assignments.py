@@ -494,7 +494,7 @@ class Assignments:
                     connection, project_id, assignment["feature_id"], assignment["story_id"]
                 )
             )
-            await require_nothing_to_reconfirm(connection, assignment)
+            await require_still_due(connection, assignment)
             if (
                 assignment["kind"] == RECONFIRM
                 and assignment["behaviour_id"] is not None
@@ -607,24 +607,62 @@ async def _first_effect(
     return row["assignment_id"] if row else None
 
 
-async def require_nothing_to_reconfirm(connection: Connection, assignment: dict[str, Any]) -> None:
-    """Work on a story as a whole (what it needs next, its seal, its assessment) relies
-    on every contract of it standing. Until each owner has answered for what a decision
-    put in question, none of it starts: a call made now could not be applied."""
-    if assignment["kind"] not in (SPECIFY, SEAL, ASSESS) or assignment["behaviour_id"] is not None:
+async def require_still_due(connection: Connection, assignment: dict[str, Any]) -> None:
+    """Refuse to start a step that is not the step there is to take now. Asked at the
+    claim and where a call is admitted, so no call is paid for that could not be applied.
+
+    Work on a story as a whole (what it needs next, its seal, its assessment) relies on
+    every contract of it standing: until each owner has answered for what a decision put
+    in question, none of it starts. A seal is of a story its Verifier has said is
+    demonstrated as it now stands, and an assessment is of a seal: owed before a decision
+    that undid either, they wait for it to be so again. And nothing is built for a
+    behaviour whose replacement of something on trunk is not settled."""
+    project_id, kind = assignment["project_id"], assignment["kind"]
+    if kind in (BUILD, REMEDIATE):
+        from relay.application.owed import replacement_undecided  # it imports this module
+
+        if await replacement_undecided(connection, project_id, assignment["behaviour_id"]):
+            raise ActionRefused(
+                f"{assignment['behaviour_id']} is to replace something on the trunk, and "
+                "that is not settled yet: nothing is built until it is"
+            )
+        return
+    if kind not in (SPECIFY, SEAL, ASSESS) or assignment["behaviour_id"] is not None:
         return
     owed = await (
         await connection.execute(
             "SELECT coalesce(behaviour_id, story_id) AS subject FROM assignments "
             "WHERE project_id = %s AND story_id = %s AND kind = 'reconfirm' "
             "AND state IN ('wanted', 'granted') ORDER BY created_at LIMIT 1",
-            (assignment["project_id"], assignment["story_id"]),
+            (project_id, assignment["story_id"]),
         )
     ).fetchone()
     if owed is not None:
         raise ActionRefused(
             f"{owed['subject']} has yet to be reconfirmed by its owner: nothing new starts here"
         )
+    story = await (
+        await connection.execute(
+            "SELECT revision, list_revision, sealed_revision, seal_id, demonstrated, "
+            "story_basis(project_id, story_id) AS basis FROM stories "
+            "WHERE project_id = %s AND story_id = %s",
+            (project_id, assignment["story_id"]),
+        )
+    ).fetchone()
+    assert story is not None
+    sealed = story["seal_id"] is not None and story["sealed_revision"] == story["list_revision"]
+    stands = {
+        "story_revision": story["revision"],
+        "list_revision": story["list_revision"],
+        "basis": story["basis"],
+    }
+    if kind == SEAL and story["demonstrated"] != stands:
+        raise ActionRefused(
+            f"{assignment['story_id']} has not been said to be demonstrated as it now "
+            "stands: there is nothing to seal yet"
+        )
+    if kind == ASSESS and not sealed:
+        raise ActionRefused(f"{assignment['story_id']} has no seal to assess yet")
 
 
 async def _has_a_proposal_waiting(connection: Connection, project_id: str, feature_id: str) -> bool:

@@ -11,6 +11,7 @@ the old obligation is retired when, and only when, that integration reaches trun
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,8 +46,10 @@ class Obligation:
 
 
 class Supersessions:
-    def __init__(self, pool: Pool) -> None:
+    def __init__(self, pool: Pool, then: Callable[[str], Awaitable[None]] | None = None) -> None:
         self._pool = pool
+        # What the control plane does by itself once a proposal has ended: its pass.
+        self.then = then
 
     async def obligations(self, project_id: str) -> list[Obligation]:
         """Everything a candidate of this project has had to satisfy, in force or retired."""
@@ -112,6 +115,10 @@ class Supersessions:
             if proposal is None:
                 raise ActionRefused("there is no such proposal waiting")
             await _end(connection, proposal, "withdrawn", "withdrawn by the verifier")
+        if self.then is not None:
+            # The red that waited for this proposal to be decided waits no longer, and
+            # nobody is about to apply anything: the control plane looks now.
+            await self.then(project_id)
 
 
 async def add_obligation(

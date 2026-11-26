@@ -20,6 +20,7 @@ from psycopg.types.json import Jsonb
 from relay.application.assignments import (
     CORRECT,
     PLAN,
+    REVISE,
     ROADMAP_WORK,
     owe,
     owe_again,
@@ -1976,3 +1977,35 @@ async def give_up_proposal(
         raise ActionRefused(f"revision {revision} is not a proposal that is waiting")
     await _end_proposal(connection, project_id, feature_id, revision, "sent_back")
     await _owe_roadmap_work_again(connection, project_id, feature_id, reason)
+
+
+async def owe_a_revision(
+    connection: Connection, project_id: str, feature_id: str, reason: str
+) -> None:
+    """The Analyst is owed a revision of the roadmap in force, because its author has
+    said it no longer stands. One at a time: a revision already owed is this one."""
+    owed = await (
+        await connection.execute(
+            "SELECT 1 FROM assignments WHERE project_id = %s AND feature_id = %s "
+            "AND kind = 'revise' AND state IN ('wanted', 'granted')",
+            (project_id, feature_id),
+        )
+    ).fetchone()
+    if owed is not None:
+        return
+    await owe(
+        connection,
+        REVISE,
+        Envelope(
+            message_kind=MessageKind.COMMAND,
+            event_type="roadmap.revision_requested",
+            project_id=project_id,
+            sender=CONTROL_PLANE,
+            recipient="analyst",
+            idempotency_key=f"revise:{uuid.uuid7()}",
+            correlation_id=uuid.uuid7(),
+            payload={"feature_id": feature_id, "reason": reason},
+        ),
+        issued_on={"reason": reason},
+        feature_id=feature_id,
+    )

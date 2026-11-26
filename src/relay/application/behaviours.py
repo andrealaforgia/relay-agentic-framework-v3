@@ -28,7 +28,7 @@ from relay.application.closure import (
     require_basis,
     story_basis,
 )
-from relay.application.owed import owe_contract_again, owe_red
+from relay.application.owed import owe_contract_again, owe_red, replacement_undecided
 from relay.application.reviews import open_cycle
 from relay.application.stories import add_behaviour_to_story, require_story_at_work
 from relay.domain.behaviour import Behaviour, BehaviourState, TransitionRefused
@@ -271,7 +271,7 @@ class Behaviours:
         ):
             contract = behaviour.require_awaiting_red()
             cycle = behaviour.red_cycle
-            if await _replaces_undecided(connection, project_id, behaviour_id):
+            if await replacement_undecided(connection, project_id, behaviour_id):
                 # Built before that is decided, its candidate would only fail the very
                 # check it is meant to replace. Whoever asks, the pass or a caller.
                 raise ActionRefused(
@@ -920,17 +920,6 @@ async def rewrite_contract_in(
         correlation_id=row["correlation_id"],
     )
     await owe_red(connection, project_id, behaviour_id)
-
-
-async def _replaces_undecided(connection: Connection, project_id: str, behaviour_id: str) -> bool:
-    row = await (
-        await connection.execute(
-            "SELECT 1 FROM supersessions WHERE project_id = %s AND behaviour_id = %s "
-            "AND state = 'proposed'",
-            (project_id, behaviour_id),
-        )
-    ).fetchone()
-    return row is not None
 
 
 async def _take_red(

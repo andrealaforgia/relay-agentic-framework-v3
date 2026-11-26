@@ -19,7 +19,7 @@ from typing import Any
 
 from relay.application.assignments import complete
 from relay.application.behaviours import rewrite_contract_in, specify_in
-from relay.application.closure import decisions_in_force, lock_gate
+from relay.application.closure import decisions_in_force
 from relay.application.decisions import Decisions, Evidence, _evidence_of
 from relay.application.invocations import Effect, EffectRun, Invocations, Overtaken, Prepared
 from relay.application.stories import (
@@ -31,9 +31,11 @@ from relay.application.stories import (
     _revisions_of,
     assess_in,
     give_up_proposal,
+    owe_a_revision,
     publish_roadmap_in,
     say_demonstrated,
     seal_in,
+    why_a_proposal_cannot_stand,
 )
 from relay.application.supersessions import propose_in
 from relay.application.tasks import (
@@ -722,6 +724,7 @@ class SpecifyTask(Authoring):
                 )
             ).fetchone()
             about["invalid_red"] = command["why"] if command else None
+            about["voided"] = assignment["issued_on"].get("replaced")
         return about
 
     def _briefing(self, about: Mapping[str, Any]) -> list[str]:
@@ -737,7 +740,36 @@ class SpecifyTask(Authoring):
             *_ABOUT_A_CONTRACT,
             "",
         ]
-        if about["behaviour_id"] is not None:
+        if about["behaviour_id"] is not None and about.get("voided"):
+            [behaviour] = [
+                each
+                for each in about["behaviours"]
+                if each["behaviour_id"] == about["behaviour_id"]
+            ]
+            lines += [
+                (
+                    f"Behaviour {about['behaviour_id']} was approved by the Product Owner to "
+                    f"replace what {about['voided']} requires on the trunk. A decision made "
+                    "since ended that approval, and the two contracts still contradict each "
+                    "other. The contract as it is:"
+                ),
+                json.dumps(behaviour["contract"], indent=2, sort_keys=True),
+                "",
+                "Contracts on the trunk every candidate must still satisfy:",
+                *(
+                    f"  {each['behaviour_id']}: {json.dumps(each['contract'], sort_keys=True)}"
+                    for each in about["obligations"]
+                ),
+                "",
+                (
+                    "What to deliver: demonstrated false. If the behaviour still replaces it, "
+                    "name the behaviour it replaces under replaces and say why under "
+                    "replaces_because: the Product Owner is shown both contracts again. If its "
+                    "contract has to change first, give the contract as well. Give no "
+                    "behaviour_id, summary or demonstrates."
+                ),
+            ]
+        elif about["behaviour_id"] is not None:
             [behaviour] = [
                 each
                 for each in about["behaviours"]
@@ -807,6 +839,12 @@ class SpecifyTask(Authoring):
             if set(delivered) != {"demonstrated"}:
                 return "a story that is demonstrated needs nothing else said"
             return None
+        if "contract" not in delivered:
+            # Only what a behaviour there already is may say: that it still replaces
+            # what it was approved to replace, its contract being as it was.
+            if delivered.get("replaces") and "behaviour_id" not in delivered:
+                return None
+            return "a behaviour is specified by its contract"
         try:
             contract_from(delivered["contract"])
         except (KeyError, TypeError, ValueError) as malformed:
@@ -824,15 +862,18 @@ class SpecifyTask(Authoring):
         await complete(connection, work["assignment_id"])
         if work["behaviour_id"] is not None:
             if delivered.get("demonstrated"):
-                raise ActionRefused("what was asked for is the contract, written again")
-            await rewrite_contract_in(
-                connection,
-                caller,
-                project_id,
-                work["behaviour_id"],
-                contract_from(delivered["contract"]),
-                basis=expects["basis"],
-            )
+                raise ActionRefused("what was asked for is about one behaviour, not the story")
+            if "contract" in delivered:
+                await rewrite_contract_in(
+                    connection,
+                    caller,
+                    project_id,
+                    work["behaviour_id"],
+                    contract_from(delivered["contract"]),
+                    basis=expects["basis"],
+                )
+            if delivered.get("replaces"):
+                await self._propose_replacement(connection, run, work["behaviour_id"])
             return None
         if delivered.get("demonstrated"):
             await say_demonstrated(
@@ -863,25 +904,41 @@ class SpecifyTask(Authoring):
         except ValueError as refused:
             raise ActionRefused(str(refused)) from None
         if delivered.get("replaces"):
-            replaced = run.invocation["evidence"]["obligations"].get(str(delivered["replaces"]))
-            if replaced is None:
-                raise ActionRefused(
-                    f"{delivered['replaces']} has no contract on the trunk for this to replace"
-                )
-            await propose_in(
-                connection,
-                caller,
-                project_id,
-                obligation=uuid.UUID(replaced["obligation"]),
-                digest=replaced["digest"],
-                behaviour=str(delivered["behaviour_id"]),
-                contract_digest=contract_from(delivered["contract"]).digest,
-                story_revision=expects["story_revision"],
-                basis=expects["basis"],
-                reason=str(delivered.get("replaces_because", "")),
-            )
+            await self._propose_replacement(connection, run, str(delivered["behaviour_id"]))
         # The list has one more behaviour, by this effect's own doing.
         return {"list_revision": expects["list_revision"] + 1}
+
+    async def _propose_replacement(
+        self, connection: Connection, run: EffectRun, behaviour_id: str
+    ) -> None:
+        """Put to the Product Owner that this behaviour replace what one on trunk
+        requires: of the obligation as it was read, by the behaviour's contract as it
+        is on record at this moment."""
+        delivered, expects = run.invocation["reply"]["delivered"], run.invocation["expects"]
+        replaced = run.invocation["evidence"]["obligations"].get(str(delivered["replaces"]))
+        if replaced is None:
+            raise ActionRefused(
+                f"{delivered['replaces']} has no contract on the trunk for this to replace"
+            )
+        row = await (
+            await connection.execute(
+                "SELECT contract FROM behaviours WHERE project_id = %s AND behaviour_id = %s",
+                (run.invocation["project_id"], behaviour_id),
+            )
+        ).fetchone()
+        assert row is not None
+        await propose_in(
+            connection,
+            caller_of(run.invocation),
+            run.invocation["project_id"],
+            obligation=uuid.UUID(replaced["obligation"]),
+            digest=replaced["digest"],
+            behaviour=behaviour_id,
+            contract_digest=ProcessContract.from_dict(row["contract"]).digest,
+            story_revision=expects["story_revision"],
+            basis=expects["basis"],
+            reason=str(delivered.get("replaces_because", "")),
+        )
 
 
 _NOTE = {
@@ -1172,7 +1229,47 @@ class ReconfirmTask(Authoring):
         return None
 
     def _deliver(self, invocation: Mapping[str, Any]) -> list[Effect]:
-        return [Effect("reconfirm", self._reconfirm)]
+        return [Effect("reconfirm", self._reconfirm, self._replace_the_roadmap)]
+
+    async def _replace_the_roadmap(self, connection: Connection, run: EffectRun) -> None:
+        """A roadmap its author says no longer stands, or a proposal that cannot: done
+        in the transaction that marks the effect, which has established by then that the
+        grant, the decisions and the try this reply was made under are still the ones
+        there are. A reply written before a later decision withdraws nothing of what
+        that decision owes."""
+        work = await _work(connection, run)
+        if work["subject"] != "roadmap":
+            return
+        delivered = run.invocation["reply"]["delivered"]
+        project_id, feature_id = work["project_id"], work["feature_id"]
+        revision = work["issued_on"]["revision"]
+        effective, proposed = await _revisions_of(connection, project_id, feature_id)
+        because = str(delivered.get("because", "")).strip() or "its author says so"
+        if revision == proposed:
+            cannot = await why_a_proposal_cannot_stand(connection, project_id, feature_id, revision)
+            if delivered["verdict"] != "to_be_replaced" and not cannot:
+                return
+            await give_up_proposal(
+                connection,
+                project_id,
+                feature_id,
+                revision,
+                f"the proposal has to be replaced: {cannot or because}",
+            )
+        elif revision == effective and delivered["verdict"] == "to_be_replaced":
+            # The roadmap in force: nothing is withdrawn, and its stories stay stopped
+            # until a revision is approved. The Analyst is owed that revision.
+            await owe_a_revision(
+                connection,
+                project_id,
+                feature_id,
+                "the roadmap in force no longer stands under the decisions now in force: "
+                + because,
+            )
+        else:
+            return
+        # This reconfirmation has its answer, and the answer was not "it stands".
+        await complete(connection, work["assignment_id"])
 
     async def _reconfirm(self, run: EffectRun) -> None:
         async with self._pool.connection() as connection:
@@ -1186,35 +1283,22 @@ class ReconfirmTask(Authoring):
         if work["subject"] == "roadmap" and verdict == "amended":
             raise ActionRefused("a roadmap stands or is to be replaced")
         if work["subject"] == "roadmap":
-            revision = work["issued_on"]["revision"]
-            why = str(delivered.get("because", "")).strip() or "its author says it no longer stands"
-            if verdict == "stands":
-                try:
-                    await self._decisions.reconfirm_roadmap(
-                        caller,
-                        project_id,
-                        work["feature_id"],
-                        grant=run.grant_id,
-                        basis=basis,
-                        revision=revision,
-                    )
-                    return
-                except ActionRefused as refused:
-                    if "has to be replaced" not in str(refused):
-                        raise
-                    # It cannot be made approvable by saying it stands. That is not the
-                    # reply's fault, and it is not left waiting for nobody.
-                    why = str(refused)
-            async with self._pool.connection() as connection, connection.transaction():
-                await lock_gate(connection, project_id, exclusive=True)
-                await give_up_proposal(
-                    connection,
+            if verdict != "stands":
+                return  # what that means is done where the effect is marked, below
+            try:
+                await self._decisions.reconfirm_roadmap(
+                    caller,
                     project_id,
                     work["feature_id"],
-                    revision,
-                    f"the proposal has to be replaced: {why}",
+                    grant=run.grant_id,
+                    basis=basis,
+                    revision=work["issued_on"]["revision"],
                 )
-            await self._decisions._features.reconcile(project_id)
+            except ActionRefused as refused:
+                if "has to be replaced" not in str(refused):
+                    raise
+                # A proposal that cannot be made approvable by saying it stands. That is
+                # not the reply's fault; it is withdrawn where the effect is marked.
             return
         if verdict == "to_be_replaced":
             if read.get("obligation") is None:
@@ -1230,16 +1314,7 @@ class ReconfirmTask(Authoring):
                 obligation=uuid.UUID(read["obligation"]),
             )
             return
-        if work["subject"] == "roadmap":
-            await self._decisions.reconfirm_roadmap(
-                caller,
-                project_id,
-                work["feature_id"],
-                grant=run.grant_id,
-                basis=basis,
-                revision=work["issued_on"]["revision"],
-            )
-        elif work["subject"] == "story":
+        if work["subject"] == "story":
             await self._decisions.reconfirm_story(
                 caller,
                 project_id,
