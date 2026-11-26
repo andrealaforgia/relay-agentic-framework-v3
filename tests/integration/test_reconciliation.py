@@ -205,7 +205,10 @@ async def test_checks_held_by_a_pause_run_again_after_the_resume_and_integrate_o
     assert world.trunk() == candidate
     assert await batches(world) == ["once:1:interrupted", "once:2:authorised"]
     assert await world.column("SELECT state FROM integration_intents") == ["integrated"]
-    assert await world.column("SELECT state FROM assignments WHERE kind = 'integrate'") == ["done"]
+    assert await world.column("SELECT state FROM assignments WHERE kind = 'integrate'") == [
+        "done",  # the first, which the caller's own request started
+        "done",  # the one owed for the checks the pause held
+    ]
     assert (await world.integration.integrate(PROJECT, "B1", "once")).outcome is Outcome.INTEGRATED
     await world.features.reconcile(PROJECT)
     await world.features.start()
@@ -224,7 +227,9 @@ async def held_then_resumed_without_the_pass(world: StoryWorld) -> tuple[str, uu
     await close_feature(world.database, PROJECT, resume)
     async with world.database.connection() as connection, connection.transaction():
         await hand_on_unfinished_batches(connection, PROJECT, starting=False)
-    [owed] = await world.column("SELECT assignment_id FROM assignments WHERE kind = 'integrate'")
+    [owed] = await world.column(
+        "SELECT assignment_id FROM assignments WHERE kind = 'integrate' AND state = 'wanted'"
+    )
     assert isinstance(owed, uuid.UUID)
     return candidate, owed
 
@@ -241,9 +246,7 @@ async def test_an_integration_owed_for_checks_that_were_since_replaced_starts_no
 
     assert late.outcome is Outcome.SUPERSEDED
     assert await batches(world) == ["first:1:interrupted", "second:1:running"]
-    assert await world.column("SELECT state FROM assignments WHERE kind = 'integrate'") == [
-        "retired"
-    ]
+    assert await integrations_owed(world) == ["retired"]
     assert (await world.events())[-1] == "integration.successor_stale"
     barrier.release.set()
     assert (await newer).outcome is Outcome.INTEGRATED
@@ -460,9 +463,11 @@ async def test_a_command_already_on_its_way_when_a_pause_lands_cannot_be_claimed
 
 
 async def integrations_owed(world: StoryWorld) -> list[object]:
+    """The integrations owed for checks that were held or cut short: not the first of a
+    candidate, which the request that started those checks was."""
     return await world.column(
-        "SELECT state FROM assignments WHERE kind = 'integrate' AND project_id = "
-        f"'{world.project}' ORDER BY created_at"
+        "SELECT state FROM assignments WHERE kind = 'integrate' AND issued_on ? 'batch_id' "
+        f"AND project_id = '{world.project}' ORDER BY created_at"
     )
 
 

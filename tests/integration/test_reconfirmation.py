@@ -121,8 +121,8 @@ async def test_a_candidate_is_not_integrated_on_a_contract_nobody_has_reconfirme
         await world.integrate("B1")
 
     assert world.trunk() == base
+    # The pass that follows the reconfirmation integrates it: nobody has to ask again.
     await world.reconfirm(await owed_for(world, "behaviour"))
-    await world.integrate("B1")
     assert world.trunk() == candidate
 
 

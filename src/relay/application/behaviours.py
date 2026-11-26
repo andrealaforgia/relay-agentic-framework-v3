@@ -28,14 +28,16 @@ from relay.application.closure import (
     require_basis,
     story_basis,
 )
+from relay.application.owed import owe_contract_again, owe_red
 from relay.application.reviews import open_cycle
 from relay.application.stories import add_behaviour_to_story, require_story_at_work
-from relay.domain.behaviour import Behaviour, BehaviourState
+from relay.domain.behaviour import Behaviour, BehaviourState, TransitionRefused
 from relay.domain.evidence import (
     Execution,
     GreenVerdict,
     PairedRed,
     ProcessContract,
+    RedRejection,
     RedVerdict,
     is_gate_bearing,
     refuse_green_before_launch,
@@ -59,6 +61,9 @@ from relay.testing.oracle import ProcessOracle
 from relay.transport.envelope import Envelope, MessageKind
 
 CONTROL_PLANE = "relay/control-plane"
+
+
+_RELAY = Principal(PrincipalKind.CONTROL_PLANE, "relay/control-plane")
 
 
 def _require_verifier(principal: Principal, to: str) -> None:
@@ -208,6 +213,26 @@ class Behaviours:
                 payload={"contract": contract.to_dict(), "contract_digest": contract.digest},
                 correlation_id=correlation,
             )
+            # Saved before the red is owed: what is owed is read from the record.
+            await save_behaviour(connection, project_id, behaviour)
+            await owe_red(connection, project_id, behaviour_id)
+
+    async def observe_owed_reds(self, project_id: str) -> None:
+        """Carry out every red that is owed: the pass's to call. One that cannot be
+        observed now (the repository does not answer, its scope is stopped) stays owed."""
+        async with self._pool.connection() as connection:
+            owed = await (
+                await connection.execute(
+                    "SELECT behaviour_id FROM assignments WHERE project_id = %s "
+                    "AND kind = 'red' AND state = 'wanted' ORDER BY created_at",
+                    (project_id,),
+                )
+            ).fetchall()
+        for each in owed:
+            try:
+                await self.run_red(_RELAY, project_id, each["behaviour_id"])
+            except CheckoutFailed, ActionRefused, TransitionRefused:
+                continue
 
     async def run_red(self, principal: Principal, project_id: str, behaviour_id: str) -> RedVerdict:
         """Observe the registered contract on the project's own trunk and judge the result.
@@ -265,10 +290,25 @@ class Behaviours:
                 "isolation": execution.isolation,
                 "runtime_identity": execution.runtime_identity,
             }
+            if verdict.rejection is not RedRejection.SUPERSEDED:
+                # The red that was owed has been observed, whichever way it went. One
+                # that was overtaken in flight observed nothing of what is owed now.
+                await connection.execute(
+                    "UPDATE assignments SET state = 'done', grant_id = %s, granted_to = %s, "
+                    "first_effect_at = now() WHERE project_id = %s AND behaviour_id = %s "
+                    "AND kind = 'red' AND state = 'wanted'",
+                    (uuid.uuid7(), CONTROL_PLANE, project_id, behaviour_id),
+                )
             if not verdict.is_valid:
                 await self._red_rejected(
                     connection, project_id, behaviour_id, correlation, verdict, contract, evidence
                 )
+                if verdict.rejection is not RedRejection.SUPERSEDED and (
+                    behaviour.state is BehaviourState.VALIDATING_RED
+                ):
+                    # Running it again would show the same. The contract is the
+                    # Verifier's to put right, briefed with what was observed.
+                    await owe_contract_again(connection, project_id, behaviour_id, verdict.reason)
                 return verdict
             await connection.execute(
                 "UPDATE behaviours SET red_execution_id = %s "
@@ -416,6 +456,8 @@ class Behaviours:
                 payload={"reason": reason},
                 correlation_id=correlation,
             )
+            await save_behaviour(connection, project_id, behaviour)
+            await owe_red(connection, project_id, behaviour_id)
 
     async def _green_refused(
         self,
@@ -707,3 +749,127 @@ async def record_execution(
         ),
     )
     return execution_id
+
+
+async def specify_in(
+    connection: Connection,
+    principal: Principal,
+    project_id: str,
+    story_id: str,
+    behaviour_id: str,
+    summary: str,
+    demonstrates: Sequence[str],
+    contract: ProcessContract,
+    *,
+    basis: int,
+    story_revision: int,
+) -> None:
+    """A behaviour proposed, taken into test design and given its contract, in the
+    caller's transaction: there is no state in which a behaviour that was specified
+    exists without its contract. Its red is owed with it."""
+    _require_verifier(principal, "specifying a behaviour")
+    behaviour = Behaviour.propose(behaviour_id, summary)
+    demonstrates = tuple(demonstrates)
+    correlation_id = uuid.uuid7()
+    await lock_gate(connection, project_id)
+    position = await add_behaviour_to_story(
+        connection, project_id, story_id, demonstrates, basis, story_revision
+    )
+    await connection.execute(
+        "INSERT INTO behaviours (project_id, behaviour_id, summary, state, "
+        "correlation_id, story_id, position, demonstrates) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            project_id,
+            behaviour_id,
+            summary,
+            behaviour.state.value,
+            correlation_id,
+            story_id,
+            position,
+            list(demonstrates),
+        ),
+    )
+    row = await (
+        await connection.execute(
+            "SELECT * FROM behaviours WHERE project_id = %s AND behaviour_id = %s FOR UPDATE",
+            (project_id, behaviour_id),
+        )
+    ).fetchone()
+    assert row is not None
+    await require_story_at_work(connection, project_id, row, entering_design=True)
+    behaviour.begin_test_design()
+    behaviour.register_acceptance_test(contract)
+    await connection.execute(
+        "UPDATE behaviours SET current_on = %s WHERE project_id = %s AND behaviour_id = %s",
+        (basis, project_id, behaviour_id),
+    )
+    await save_behaviour(connection, project_id, behaviour)
+    for event_type, payload in (
+        (
+            "behaviour.proposed",
+            {"summary": summary, "story_id": story_id, "demonstrates": list(demonstrates)},
+        ),
+        ("behaviour.test_design_started", {}),
+        (
+            "behaviour.acceptance_test_registered",
+            {"contract": contract.to_dict(), "contract_digest": contract.digest},
+        ),
+    ):
+        await append_event(
+            connection,
+            project_id,
+            event_type,
+            subject_id=behaviour_id,
+            payload=payload,
+            correlation_id=correlation_id,
+        )
+    await owe_red(connection, project_id, behaviour_id)
+
+
+async def rewrite_contract_in(
+    connection: Connection,
+    principal: Principal,
+    project_id: str,
+    behaviour_id: str,
+    contract: ProcessContract,
+    *,
+    basis: int,
+) -> None:
+    """The Verifier replaces a contract whose red showed it cannot serve, in the
+    caller's transaction. The old red cycle is over, and a red of the new one is owed."""
+    _require_verifier(principal, "rewriting an acceptance contract")
+    await lock_gate(connection, project_id)
+    row = await (
+        await connection.execute(
+            "SELECT * FROM behaviours WHERE project_id = %s AND behaviour_id = %s FOR UPDATE",
+            (project_id, behaviour_id),
+        )
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"unknown behaviour {behaviour_id!r} in project {project_id!r}")
+    await require_story_at_work(connection, project_id, row, entering_design=False)
+    require_basis(basis, await story_basis(connection, project_id, row["story_id"]))
+    behaviour = load_behaviour(row)
+    if behaviour.state is not BehaviourState.VALIDATING_RED:
+        raise ActionRefused(f"{behaviour_id} is not waiting for a red: its contract stands")
+    behaviour.amend_contract(contract)
+    await connection.execute(
+        "UPDATE behaviours SET current_on = %s WHERE project_id = %s AND behaviour_id = %s",
+        (basis, project_id, behaviour_id),
+    )
+    await save_behaviour(connection, project_id, behaviour)
+    await connection.execute(
+        "UPDATE assignments SET state = 'retired', grant_id = NULL, granted_to = NULL "
+        "WHERE project_id = %s AND behaviour_id = %s AND kind = 'red' AND state = 'wanted'",
+        (project_id, behaviour_id),
+    )
+    await append_event(
+        connection,
+        project_id,
+        "behaviour.acceptance_test_rewritten",
+        subject_id=behaviour_id,
+        payload={"contract": contract.to_dict(), "contract_digest": contract.digest},
+        correlation_id=row["correlation_id"],
+    )
+    await owe_red(connection, project_id, behaviour_id)

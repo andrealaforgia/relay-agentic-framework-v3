@@ -9,15 +9,18 @@ the mark, or not at all.
 
 from __future__ import annotations
 
+import json
 import shutil
 import uuid
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from relay.application.assignments import ask_instead
+from relay.application.assignments import ask_instead, complete
+from relay.application.behaviours import rewrite_contract_in, specify_in
 from relay.application.closure import decisions_in_force
-from relay.application.decisions import ask_in, assume_in
+from relay.application.decisions import Decisions, Evidence, _evidence_of, ask_in, assume_in
 from relay.application.invocations import Effect, EffectRun, Invocations, Overtaken, Prepared
 from relay.application.stories import (
     Dropped,
@@ -26,10 +29,14 @@ from relay.application.stories import (
     Reworded,
     StoryDraft,
     _revisions_of,
+    assess_in,
     publish_roadmap_in,
+    say_demonstrated,
+    seal_in,
 )
 from relay.application.tasks import Profile, Workspaces
 from relay.application.worker import Call
+from relay.domain.evidence import Baseline, Expected, Launch, ProcessContract
 from relay.domain.story import ActionRefused, Principal, PrincipalKind
 from relay.git.checkout import resolve_ref
 from relay.git.mirror import Mirror
@@ -518,3 +525,574 @@ def _entries(delivered: Any, read: Mapping[str, Any]) -> list[Proposed]:
                     StoryDraft(story_id, title, outcome, criteria, each.get("corrects") or None)
                 )
     return entries
+
+
+_CONTRACT = {
+    "type": "object",
+    "properties": {
+        "contract_id": {"type": "string"},
+        "observes": {"type": "string"},
+        "argv": {"type": "array", "items": {"type": "string"}},
+        "timeout_seconds": {"type": "integer"},
+        "expect_exit_code": {"type": "integer"},
+        "expect_stdout": {"type": "string"},
+        "baseline_exit_code": {"type": "integer"},
+        "baseline_stdout": {"type": "string"},
+        "baseline_stderr": {"type": "string"},
+    },
+    "required": [
+        "contract_id",
+        "observes",
+        "argv",
+        "timeout_seconds",
+        "expect_exit_code",
+        "expect_stdout",
+        "baseline_exit_code",
+    ],
+    "additionalProperties": False,
+}
+
+_ABOUT_A_CONTRACT = [
+    (
+        "An acceptance contract is one command and what it must print. Relay launches it "
+        "itself, in a container with no network, on a clean checkout: first on the trunk as "
+        "it is, where it must fail in exactly the way you say (the baseline), and later on "
+        "the Builder's candidate, where it must give exactly what you expect."
+    ),
+    "  contract_id: a name for it. observes: the public behaviour it observes, in words.",
+    "  argv: the command, one argument per item. timeout_seconds: how long it may take.",
+    "  expect_exit_code and expect_stdout: what the finished behaviour gives, exactly.",
+    (
+        "  baseline_exit_code, and one of baseline_stdout or baseline_stderr: what the trunk "
+        "gives now, exactly. It must differ from what you expect: a test that already passes "
+        "shows nothing."
+    ),
+    (
+        "The command observes behaviour from outside, through what the program prints. It "
+        "does not look at how the code is written."
+    ),
+]
+
+
+def contract_from(reply: Mapping[str, Any]) -> ProcessContract:
+    """The contract a reply amounts to. Raises ValueError if it is not one."""
+    out, err = reply.get("baseline_stdout"), reply.get("baseline_stderr")
+    if (out is None) == (err is None):
+        raise ValueError("a baseline says what is printed to one of stdout or stderr")
+    return ProcessContract(
+        contract_id=str(reply["contract_id"]),
+        observes=str(reply["observes"]),
+        launch=Launch(
+            argv=tuple(str(each) for each in reply["argv"]),
+            timeout_seconds=int(reply["timeout_seconds"]),
+        ),
+        expect=Expected(
+            exit_code=int(reply["expect_exit_code"]), stdout=str(reply["expect_stdout"])
+        ),
+        baseline=Baseline(exit_code=int(reply["baseline_exit_code"]), stdout=out, stderr=err),
+    )
+
+
+async def _story(connection: Connection, project_id: str, story_id: str) -> dict[str, Any]:
+    story = await (
+        await connection.execute(
+            "SELECT s.story_id, s.feature_id, s.title, s.outcome, s.criteria, s.revision, "
+            "s.list_revision, s.seal_id, s.state FROM stories s "
+            "WHERE s.project_id = %s AND s.story_id = %s",
+            (project_id, story_id),
+        )
+    ).fetchone()
+    assert story is not None
+    story["decisions"] = await decisions_in_force(
+        connection, project_id, story["feature_id"], story_id
+    )
+    story["behaviours"] = await (
+        await connection.execute(
+            "SELECT behaviour_id, summary, state, demonstrates, contract FROM behaviours "
+            "WHERE project_id = %s AND story_id = %s ORDER BY position",
+            (project_id, story_id),
+        )
+    ).fetchall()
+    story["sent_back"] = await (
+        await connection.execute(
+            "SELECT payload->'said'->>'reason' AS reason FROM events WHERE project_id = %s "
+            "AND subject_id = %s AND event_type = 'gate.changes_requested' "
+            "ORDER BY sequence DESC LIMIT 1",
+            (project_id, story_id),
+        )
+    ).fetchone()
+    return story
+
+
+def _story_lines(story: Mapping[str, Any]) -> list[str]:
+    lines = [
+        f"Story {story['story_id']}, {story['title']}: {story['outcome']}",
+        "Its acceptance criteria:",
+        *(f"  {name}: {text}" for name, text in sorted(story["criteria"].items())),
+    ]
+    if story["decisions"]:
+        lines += [
+            "",
+            (
+                "Decisions in force (the Product Owner's bind you; a model's are "
+                "assumptions a person may overrule):"
+            ),
+        ]
+        lines += [
+            f"  {each['number']} ({each['source'].replace('_', ' ')}): {each['text']}"
+            for each in story["decisions"]
+        ]
+    if story["behaviours"]:
+        lines += ["", "Its behaviours so far, in order:"]
+        lines += [
+            f"  {each['behaviour_id']} [{each['state'].replace('_', ' ')}] {each['summary']} "
+            f"(demonstrates {', '.join(each['demonstrates'])})"
+            for each in story["behaviours"]
+        ]
+    else:
+        lines += ["", "It has no behaviours yet."]
+    if story["state"] == "changes_requested" and story["sent_back"]:
+        lines += ["", f"The Product Owner sent the story back: {story['sent_back']['reason']}"]
+    return lines
+
+
+class SpecifyTask(Authoring):
+    """The Verifier says what a story needs next: one more behaviour, with the contract
+    that will show it, or nothing more. For a behaviour whose red showed its contract
+    cannot serve, it writes the contract again."""
+
+    role = "verifier"
+    delivered: Mapping[str, Any] = {
+        "type": "object",
+        "properties": {
+            "demonstrated": {"type": "boolean"},
+            "behaviour_id": {"type": "string"},
+            "summary": {"type": "string"},
+            "demonstrates": {"type": "array", "items": {"type": "string"}},
+            "contract": _CONTRACT,
+        },
+        "required": ["demonstrated"],
+        "additionalProperties": False,
+    }
+
+    async def _about(self, connection: Connection, assignment: Mapping[str, Any]) -> dict[str, Any]:
+        about = await _story(connection, assignment["project_id"], assignment["story_id"])
+        about["behaviour_id"] = assignment["behaviour_id"]
+        about["invalid_red"] = None
+        if assignment["behaviour_id"] is not None:
+            command = await (
+                await connection.execute(
+                    "SELECT envelope->'payload'->>'invalid_red' AS why FROM outbox "
+                    "WHERE message_id = %s",
+                    (assignment["command_message_id"],),
+                )
+            ).fetchone()
+            about["invalid_red"] = command["why"] if command else None
+        return about
+
+    def _briefing(self, about: Mapping[str, Any]) -> list[str]:
+        lines = [
+            (
+                "You are the Verifier. You decide how a user story is shown to be delivered: "
+                "one behaviour at a time, each with an acceptance contract that Relay itself "
+                "observes. You write no production code."
+            ),
+            "",
+            *_story_lines(about),
+            "",
+            *_ABOUT_A_CONTRACT,
+            "",
+        ]
+        if about["behaviour_id"] is not None:
+            [behaviour] = [
+                each
+                for each in about["behaviours"]
+                if each["behaviour_id"] == about["behaviour_id"]
+            ]
+            lines += [
+                (
+                    f"The contract of behaviour {about['behaviour_id']} was run on the trunk and "
+                    f"cannot serve: {about['invalid_red']}"
+                ),
+                "The contract as it is:",
+                json.dumps(behaviour["contract"], indent=2, sort_keys=True),
+                "",
+                (
+                    "What to deliver: demonstrated false, and the contract written again for "
+                    "that behaviour. Give no behaviour_id, summary or demonstrates."
+                ),
+            ]
+        else:
+            lines += [
+                (
+                    "What to deliver: the next behaviour this story needs, the smallest that "
+                    "moves it forward (demonstrated false, with behaviour_id, summary, the "
+                    "criteria it demonstrates, and its contract); or, if every criterion is "
+                    "already shown by the behaviours on trunk, demonstrated true and nothing "
+                    "else. A behaviour's identifier is one no behaviour of the project has had."
+                ),
+            ]
+        return lines
+
+    def _evidence(self, about: Mapping[str, Any]) -> dict[str, Any]:
+        return {"rewrites": about["behaviour_id"]}
+
+    def _problem_with_delivered(self, delivered: Any) -> str | None:
+        if delivered.get("demonstrated"):
+            if set(delivered) != {"demonstrated"}:
+                return "a story that is demonstrated needs nothing else said"
+            return None
+        try:
+            contract_from(delivered["contract"])
+        except (KeyError, TypeError, ValueError) as malformed:
+            return f"the contract is not in the form asked for: {malformed}"
+        return None
+
+    def _deliver(self, invocation: Mapping[str, Any]) -> list[Effect]:
+        return [Effect("specify", _nothing, self._specify)]
+
+    async def _specify(self, connection: Connection, run: EffectRun) -> Mapping[str, Any] | None:
+        work = await _work(connection, run)
+        delivered = run.invocation["reply"]["delivered"]
+        expects, caller = run.invocation["expects"], caller_of(run.invocation)
+        project_id = work["project_id"]
+        await complete(connection, work["assignment_id"])
+        if work["behaviour_id"] is not None:
+            if delivered.get("demonstrated"):
+                raise ActionRefused("what was asked for is the contract, written again")
+            await rewrite_contract_in(
+                connection,
+                caller,
+                project_id,
+                work["behaviour_id"],
+                contract_from(delivered["contract"]),
+                basis=expects["basis"],
+            )
+            return None
+        if delivered.get("demonstrated"):
+            await say_demonstrated(
+                connection,
+                caller,
+                project_id,
+                work["story_id"],
+                story_revision=expects["story_revision"],
+                list_revision=expects["list_revision"],
+                basis=expects["basis"],
+            )
+            return None
+        if not delivered.get("behaviour_id") or not delivered.get("demonstrates"):
+            raise ActionRefused("a behaviour needs its identifier and what it demonstrates")
+        try:
+            await specify_in(
+                connection,
+                caller,
+                project_id,
+                work["story_id"],
+                str(delivered["behaviour_id"]),
+                str(delivered.get("summary", "")),
+                [str(each) for each in delivered["demonstrates"]],
+                contract_from(delivered["contract"]),
+                basis=expects["basis"],
+                story_revision=expects["story_revision"],
+            )
+        except ValueError as refused:
+            raise ActionRefused(str(refused)) from None
+        # The list has one more behaviour, by this effect's own doing.
+        return {"list_revision": expects["list_revision"] + 1}
+
+
+_NOTE = {
+    "type": "object",
+    "properties": {"statement": {"type": "string"}},
+    "required": ["statement"],
+    "additionalProperties": False,
+}
+
+
+class SealTask(Authoring):
+    """The Verifier vouches that the behaviours on trunk, and no others, show the
+    story's criteria."""
+
+    role = "verifier"
+    delivered: Mapping[str, Any] = _NOTE
+
+    async def _about(self, connection: Connection, assignment: Mapping[str, Any]) -> dict[str, Any]:
+        return await _story(connection, assignment["project_id"], assignment["story_id"])
+
+    def _briefing(self, about: Mapping[str, Any]) -> list[str]:
+        return [
+            (
+                "You are the Verifier. Every behaviour of this story is on the trunk. You are "
+                "asked to vouch that these behaviours, and no others, show the story's "
+                "acceptance criteria."
+            ),
+            "",
+            *_story_lines(about),
+            "",
+            (
+                "What to deliver: a statement, in a sentence or two, of how the behaviours show "
+                "the criteria. Delivering it is vouching for it. If they do not show them, do "
+                "not vouch: ask the Product Owner what should happen."
+            ),
+        ]
+
+    def _problem_with_delivered(self, delivered: Any) -> str | None:
+        return None if str(delivered.get("statement", "")).strip() else "a statement says something"
+
+    def _deliver(self, invocation: Mapping[str, Any]) -> list[Effect]:
+        return [Effect("seal", _nothing, self._seal)]
+
+    async def _seal(self, connection: Connection, run: EffectRun) -> None:
+        work, expects = await _work(connection, run), run.invocation["expects"]
+        try:
+            await seal_in(
+                connection,
+                caller_of(run.invocation),
+                work["project_id"],
+                work["story_id"],
+                story_revision=expects["story_revision"],
+                list_revision=expects["list_revision"],
+                basis=expects["basis"],
+            )
+        except ValueError as refused:
+            raise ActionRefused(str(refused)) from None
+
+
+class AssessTask(Authoring):
+    """The Analyst says, for the Product Owner to read, whether the sealed behaviours
+    demonstrate the story's outcome."""
+
+    role = "analyst"
+    delivered: Mapping[str, Any] = _NOTE
+
+    async def _about(self, connection: Connection, assignment: Mapping[str, Any]) -> dict[str, Any]:
+        return await _story(connection, assignment["project_id"], assignment["story_id"])
+
+    def _evidence(self, about: Mapping[str, Any]) -> dict[str, Any]:
+        return {"seal": str(about["seal_id"]) if about["seal_id"] else None}
+
+    def _briefing(self, about: Mapping[str, Any]) -> list[str]:
+        return [
+            (
+                "You are the Analyst. The Verifier has sealed this story's behaviours: all of "
+                "them are on the trunk. You are asked to assess whether, together, they "
+                "demonstrate the outcome the story is for. The Product Owner reads what you "
+                "write, as you write it, before deciding whether to accept the story."
+            ),
+            "",
+            *_story_lines(about),
+            "",
+            (
+                "What to deliver: your assessment as a statement, plain and specific: what is "
+                "demonstrated, and anything that is not."
+            ),
+        ]
+
+    def _problem_with_delivered(self, delivered: Any) -> str | None:
+        return None if str(delivered.get("statement", "")).strip() else "a statement says something"
+
+    def _deliver(self, invocation: Mapping[str, Any]) -> list[Effect]:
+        return [Effect("assess", _nothing, self._assess)]
+
+    async def _assess(self, connection: Connection, run: EffectRun) -> None:
+        work, expects = await _work(connection, run), run.invocation["expects"]
+        seal = run.invocation["evidence"]["seal"]
+        if seal is None:
+            raise Overtaken("the story had no seal when this assessment was asked for")
+        await assess_in(
+            connection,
+            caller_of(run.invocation),
+            work["project_id"],
+            work["story_id"],
+            str(run.invocation["reply"]["delivered"]["statement"]),
+            story_revision=expects["story_revision"],
+            list_revision=expects["list_revision"],
+            basis=expects["basis"],
+            seal=uuid.UUID(seal),
+        )
+
+
+class ReconfirmTask(Authoring):
+    """After a decision of the Product Owner's, each owner says whether what is theirs
+    still stands: the Analyst for a roadmap or a story, the Verifier for a contract,
+    which it may amend instead. The services that record this answer the same statement
+    under the same grant once, however often it is made."""
+
+    delivered: Mapping[str, Any] = {
+        "type": "object",
+        "properties": {"verdict": {"enum": ["stands", "amended"]}, "contract": _CONTRACT},
+        "required": ["verdict"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self, role: str, decisions: Decisions, *arguments: Any, **named: Any) -> None:
+        super().__init__(*arguments, **named)
+        self.role = role
+        self._decisions = decisions
+
+    async def _about(self, connection: Connection, assignment: Mapping[str, Any]) -> dict[str, Any]:
+        project_id = assignment["project_id"]
+        about: dict[str, Any] = {
+            "subject": assignment["subject"],
+            "feature_id": assignment["feature_id"],
+            "revision": assignment["issued_on"].get("revision"),
+            "decisions": await decisions_in_force(
+                connection, project_id, assignment["feature_id"], assignment["story_id"]
+            ),
+        }
+        if assignment["subject"] == "roadmap":
+            about["stories"] = await (
+                await connection.execute(
+                    "SELECT e.story_id, coalesce(e.title, s.title) AS title, "
+                    "coalesce(e.outcome, s.outcome) AS outcome FROM roadmap_entries e "
+                    "JOIN stories s ON s.project_id = e.project_id AND s.story_id = e.story_id "
+                    "WHERE e.project_id = %s AND e.feature_id = %s AND e.revision = %s "
+                    "AND e.kind <> 'dropped' ORDER BY e.position",
+                    (project_id, assignment["feature_id"], about["revision"]),
+                )
+            ).fetchall()
+            return about
+        about["story"] = await _story(connection, project_id, assignment["story_id"])
+        if assignment["subject"] == "behaviour":
+            [behaviour] = [
+                each
+                for each in about["story"]["behaviours"]
+                if each["behaviour_id"] == assignment["behaviour_id"]
+            ]
+            about["behaviour"] = behaviour
+            about["evidence"] = await _evidence_of(
+                connection, project_id, assignment["behaviour_id"]
+            )
+        return about
+
+    def _evidence(self, about: Mapping[str, Any]) -> dict[str, Any]:
+        if about["subject"] != "behaviour":
+            return {}
+        contract = ProcessContract.from_dict(about["behaviour"]["contract"])
+        return {"contract_digest": contract.digest, "retains": asdict(about["evidence"])}
+
+    def _briefing(self, about: Mapping[str, Any]) -> list[str]:
+        decided = [
+            "The decisions now in force:",
+            *(
+                f"  {each['number']} ({each['source'].replace('_', ' ')}): {each['text']}"
+                for each in about["decisions"]
+            ),
+            "",
+        ]
+        if about["subject"] == "roadmap":
+            return [
+                (
+                    "You are the Analyst. The Product Owner has made a decision since this "
+                    f"roadmap (revision {about['revision']} of feature {about['feature_id']}) "
+                    "was written. You are asked whether it still stands under the decisions "
+                    "now in force."
+                ),
+                "",
+                *decided,
+                "The roadmap:",
+                *(
+                    f"  {each['story_id']} {each['title']}: {each['outcome']}"
+                    for each in about["stories"]
+                ),
+                "",
+                (
+                    'What to deliver: verdict "stands", if it does. If it does not, ask the '
+                    "Product Owner what should change."
+                ),
+            ]
+        if about["subject"] == "story":
+            return [
+                (
+                    "You are the Analyst. The Product Owner has made a decision since this "
+                    "story was written. You are asked whether its text and criteria still "
+                    "stand under the decisions now in force."
+                ),
+                "",
+                *_story_lines(about["story"]),
+                "",
+                (
+                    'What to deliver: verdict "stands", if it does. If it does not, ask the '
+                    "Product Owner what should change."
+                ),
+            ]
+        return [
+            (
+                "You are the Verifier. The Product Owner has made a decision since the "
+                f"contract of behaviour {about['behaviour']['behaviour_id']} was written. You "
+                "are asked whether the contract, and everything observed under it, still "
+                "stands under the decisions now in force."
+            ),
+            "",
+            *_story_lines(about["story"]),
+            "",
+            "The contract:",
+            json.dumps(about["behaviour"]["contract"], indent=2, sort_keys=True),
+            "",
+            *_ABOUT_A_CONTRACT,
+            "",
+            (
+                'What to deliver: verdict "stands", if all of it does; or verdict "amended" '
+                "with the contract as it should now be, which sets aside everything gathered "
+                "for the old one."
+            ),
+        ]
+
+    def _problem_with_delivered(self, delivered: Any) -> str | None:
+        if delivered.get("verdict") != "amended":
+            return None if "contract" not in delivered else "a contract that stands is not given"
+        try:
+            contract_from(delivered["contract"])
+        except (KeyError, TypeError, ValueError) as malformed:
+            return f"the contract is not in the form asked for: {malformed}"
+        return None
+
+    def _deliver(self, invocation: Mapping[str, Any]) -> list[Effect]:
+        return [Effect("reconfirm", self._reconfirm)]
+
+    async def _reconfirm(self, run: EffectRun) -> None:
+        async with self._pool.connection() as connection:
+            work = await _work(connection, run)
+        delivered, read = run.invocation["reply"]["delivered"], run.invocation["evidence"]
+        caller, basis = caller_of(run.invocation), run.invocation["expects"]["basis"]
+        project_id = work["project_id"]
+        if work["subject"] != "behaviour" and delivered["verdict"] != "stands":
+            raise ActionRefused("a roadmap or a story stands, or the Product Owner is asked")
+        if work["subject"] == "roadmap":
+            await self._decisions.reconfirm_roadmap(
+                caller,
+                project_id,
+                work["feature_id"],
+                grant=run.grant_id,
+                basis=basis,
+                revision=work["issued_on"]["revision"],
+            )
+        elif work["subject"] == "story":
+            await self._decisions.reconfirm_story(
+                caller,
+                project_id,
+                work["story_id"],
+                grant=run.grant_id,
+                basis=basis,
+                revision=run.invocation["expects"]["story_revision"],
+            )
+        elif delivered["verdict"] == "stands":
+            await self._decisions.reconfirm_contract(
+                caller,
+                project_id,
+                work["behaviour_id"],
+                grant=run.grant_id,
+                basis=basis,
+                contract_digest=read["contract_digest"],
+                evidence=Evidence(**read["retains"]),
+            )
+        else:
+            await self._decisions.amend_contract(
+                caller,
+                project_id,
+                work["behaviour_id"],
+                contract_from(delivered["contract"]),
+                grant=run.grant_id,
+                basis=basis,
+                replaces=read["contract_digest"],
+            )

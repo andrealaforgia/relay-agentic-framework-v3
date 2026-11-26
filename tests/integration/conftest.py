@@ -6,6 +6,8 @@ import os
 import subprocess
 import uuid
 from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
 
 import pytest
 import redis.asyncio as redis
@@ -75,3 +77,20 @@ def runner_image() -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+@pytest.fixture
+async def delivering_world(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> AsyncIterator[Any]:
+    """A project whose every role is a worker's: see `test_workers_deliver`."""
+    from tests.integration.completion_world import CompletionWorld
+    from tests.integration.test_workers_deliver import Delivering
+
+    world = CompletionWorld(database, tmp_path, runner_image)
+    world.base = await world.open()
+    delivering = Delivering(world, tmp_path)
+    yield delivering
+    await delivering.invocations.close()
+    for session in delivering.sessions:
+        await session.stop()

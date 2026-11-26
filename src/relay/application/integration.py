@@ -213,6 +213,37 @@ class Integration:
             await self._start_batch(project_id, behaviour_id, request_id, head)
         )
 
+    async def take_up(self, assignment_id: uuid.UUID) -> IntegrationReceipt | None:
+        """Take up an integration that is owed: the first of a candidate whose review
+        gate was satisfied, or the next generation of one that was held or cut short. A
+        first integration whose cycle is no longer the behaviour's satisfied one is
+        retired, and nothing starts."""
+        async with self._pool.connection() as connection, connection.transaction():
+            owed = await (
+                await connection.execute(
+                    "SELECT project_id, behaviour_id, issued_on FROM assignments "
+                    "WHERE assignment_id = %s AND kind = 'integrate' AND state = 'wanted'",
+                    (assignment_id,),
+                )
+            ).fetchone()
+            if owed is None:
+                return None
+            if "batch_id" not in owed["issued_on"]:
+                await lock_gate(connection, owed["project_id"])
+                cycle = await _live_cycle(connection, owed["project_id"], owed["behaviour_id"])
+                if (
+                    cycle is None
+                    or str(cycle["cycle_id"]) != owed["issued_on"]["cycle_id"]
+                    or cycle["state"] != "satisfied"
+                ):
+                    await retire(connection, assignment_id)
+                    return None
+        if "batch_id" in owed["issued_on"]:
+            return await self.continue_integration(assignment_id)
+        return await self.integrate(
+            owed["project_id"], owed["behaviour_id"], f"cycle-{owed['issued_on']['cycle_id']}"
+        )
+
     async def continue_integration(self, assignment_id: uuid.UUID) -> IntegrationReceipt:
         """Take up an integration whose checks were held by a pause or cut short by a
         restart: start the next generation of the same request, if what it would
@@ -421,6 +452,15 @@ class Integration:
                     }
                     if successor is not None:
                         await take_up(connection, successor, CONTROL_PLANE)
+                    # The first integration owed for this cycle is this one, whoever
+                    # asked for it: its grant and its first effect are made together.
+                    await connection.execute(
+                        "UPDATE assignments SET state = 'done', grant_id = gen_random_uuid(), "
+                        "granted_to = %s, first_effect_at = now() WHERE project_id = %s "
+                        "AND behaviour_id = %s AND kind = 'integrate' AND state = 'wanted' "
+                        "AND issued_on->>'cycle_id' = %s AND NOT issued_on ? 'batch_id'",
+                        (CONTROL_PLANE, project_id, behaviour_id, str(cycle["cycle_id"])),
+                    )
                     if head != cycle["red_revision"]:
                         await _insert_batch(connection, batch, state="base_moved")
                         await self._reopen(

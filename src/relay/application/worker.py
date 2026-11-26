@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -108,7 +108,11 @@ class Worker:
         tasks: Mapping[str, Task],
         boundaries: Shown,
         runtime: Callable[[], Mapping[str, str]],
+        then: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
+        # What the control plane does by itself once something has been applied: the
+        # pass, which publishes a candidate, observes a red, takes up an integration.
+        self._then = then
         self._session = session
         self._claims = claims
         self._invocations = invocations
@@ -158,7 +162,15 @@ class Worker:
 
     async def carry_out(self, assignment: Mapping[str, Any]) -> str:
         """Do what can be done for this work now, and say where that left it: `applied`,
-        or the state its last call ended in, or `refused: ...` if nothing could start."""
+        or the state its last call ended in, or `refused: ...` if nothing could start.
+        What was applied may leave something for the control plane to do by itself, and
+        that is done before this returns."""
+        left = await self._carry_out(assignment)
+        if left == "applied" and self._then is not None:
+            await self._then(str(assignment["project_id"]))
+        return left
+
+    async def _carry_out(self, assignment: Mapping[str, Any]) -> str:
         assignment_id: uuid.UUID = assignment["assignment_id"]
         task = self._tasks[assignment["kind"]]
         try:

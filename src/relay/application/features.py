@@ -11,6 +11,7 @@ import uuid
 from typing import Any
 
 from relay.application.assignments import announce_again, revoke_every_grant
+from relay.application.behaviours import Behaviours
 from relay.application.closure import lock_gate, lock_project
 from relay.application.completion import evaluate_completion
 from relay.application.final_checks import Completion, end_batches_left_running
@@ -20,6 +21,7 @@ from relay.application.integration import (
     hand_on_unfinished_batches,
 )
 from relay.application.invocations import Invocations
+from relay.application.owed import owe_what_is_needed
 from relay.application.reviews import Reviews
 from relay.application.stories import Stories, close_feature
 from relay.domain.story import ActionRefused, HumanAction, Receipt
@@ -37,7 +39,9 @@ class Features:
         integration: Integration,
         completion: Completion | None = None,
         invocations: Invocations | None = None,
+        behaviours: Behaviours | None = None,
     ) -> None:
+        self._behaviours = behaviours
         self._pool = pool
         self._reviews = reviews
         self._integration = integration
@@ -113,9 +117,16 @@ class Features:
                 await lock_gate(connection, project_id)
                 await lock_project(connection, project_id)
                 await evaluate_completion(connection, project_id, feature["feature_id"])
+        async with self._pool.connection() as connection, connection.transaction():
+            # The net under every trigger: whatever a story needs and is not owed.
+            await lock_gate(connection, project_id)
+            await owe_what_is_needed(connection, project_id)
         if self._invocations is not None:
             # What a worker that is gone left behind: a grant, a call, a known result.
             await self._invocations.recover(project_id)
+        if self._behaviours is not None:
+            # A red is the control plane's to observe, and nobody else asks for one.
+            await self._behaviours.observe_owed_reds(project_id)
         # The completions are taken up once, at the end of this pass.
         await self._integration.reconcile(then_completions=False)
         await self._reviews.publish_candidates()
@@ -136,7 +147,7 @@ class Features:
             for assignment_id in owed:
                 attempted.add(assignment_id)
                 try:
-                    await self._integration.continue_integration(assignment_id)
+                    await self._integration.take_up(assignment_id)
                 except CheckoutFailed, ActionRefused, IntegrationRefused:
                     # The repository could not be read, or the feature is closed (it may
                     # have been closed a moment ago), or this process cannot observe

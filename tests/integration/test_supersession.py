@@ -190,9 +190,13 @@ async def test_an_authority_given_under_other_decisions_is_void(world: Supersedi
     await world.decide(await world.propose())
     assumed = await world.decisions.assume(ANALYST, PROJECT, "F1", story_id="S2", text="5%")
     await world.replace(assumed, "5%, for books only")
-    await world.reconfirm_everything()
+    before = world.trunk()
+    await world.reconfirm_everything()  # and the pass that follows takes up Z's integration
 
-    assert (await world.integrate("Z")).outcome is Outcome.CHECKS_FAILED
+    assert await world.column(
+        "SELECT count(*) FROM events WHERE event_type = 'integration.checks_failed'"
+    ) == [1]
+    assert world.trunk() == before
     assert (await world.obligation_of("B1")).state == "active"
 
 
@@ -420,10 +424,10 @@ async def test_an_authority_survives_a_restart_and_is_used_once(world: Supersedi
     candidate = await z_reviewed(world)
     await world.decide(await world.propose())
 
-    await world.features.start()
-
     assert await world.column("SELECT state FROM supersessions") == ["standing"]
-    assert (await world.integrate("Z")).outcome is Outcome.INTEGRATED
+
+    await world.features.start()  # which takes up the integration that is owed
+
     assert world.trunk() == candidate
     await world.features.start()
     assert await world.column("SELECT state FROM supersessions") == ["used"]

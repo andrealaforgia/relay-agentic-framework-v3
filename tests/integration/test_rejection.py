@@ -208,7 +208,7 @@ async def test_a_story_being_worked_on_is_set_aside_as_the_person_saw_it(
     assert await world.story("S1") is StoryState.REJECTED
     assert await world.state("B1") is BehaviourState.INTEGRATED
     assert await world.column(
-        "SELECT kind || ':' || state FROM assignments WHERE behaviour_id = 'B2'"
+        "SELECT kind || ':' || state FROM assignments WHERE behaviour_id = 'B2' AND kind <> 'red'"
     ) == ["build:retired"]
     with pytest.raises(ActionRefused, match="not being worked on"):
         await run_green(world.behaviours, PROJECT, "B2", 1)

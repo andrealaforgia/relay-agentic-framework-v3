@@ -45,6 +45,7 @@ from relay.application.closure import (
 from relay.application.completion import end_request as end_completion_request
 from relay.application.completion import evaluate_completion, roadmap_changed
 from relay.application.completion import settle_gate as settle_completion_gate
+from relay.application.owed import owe_what_is_needed
 from relay.domain.evidence import ProcessContract
 from relay.domain.identifiers import require_identifier
 from relay.domain.story import (
@@ -243,39 +244,16 @@ class Stories:
         that arrives after the list or the decisions have moved on vouches for something
         that is no longer there, and is refused. Returns the seal's identity, which an
         assessment has to name."""
-        _require_role(principal, "verifier")
         async with self._pool.connection() as connection, connection.transaction():
-            await lock_gate(connection, project_id)
-            story = await _locked_story(connection, project_id, story_id)
-            _require_at_work(story)
-            listed = await _behaviours_of(connection, project_id, story_id)
-            await _require_all_startable(connection, project_id, story_id, listed)
-            _require_revisions(story, story_revision, list_revision, story["list_revision"])
-            require_basis(basis, await story_basis(connection, project_id, story_id))
-            require_sealable(
-                story["criteria"].keys(),
-                # A behaviour that was replaced on trunk demonstrates nothing now.
-                {row["behaviour_id"]: row["demonstrates"] for row in _in_force(listed)},
-            )
-            seal_id = uuid.uuid7()
-            await connection.execute(
-                "UPDATE stories SET sealed_revision = list_revision, seal_id = %s "
-                "WHERE project_id = %s AND story_id = %s",
-                (seal_id, project_id, story_id),
-            )
-            await append_event(
+            return await seal_in(
                 connection,
+                principal,
                 project_id,
-                "story.behaviours_sealed",
-                subject_id=story_id,
-                payload={
-                    "seal_id": str(seal_id),
-                    "list_revision": story["list_revision"],
-                    "behaviours": [row["behaviour_id"] for row in listed],
-                },
+                story_id,
+                story_revision=story_revision,
+                list_revision=list_revision,
+                basis=basis,
             )
-            await evaluate_story_gate(connection, project_id, story_id)
-            return seal_id
 
     async def assess(
         self,
@@ -292,50 +270,18 @@ class Stories:
         """The Analyst says whether one named sealed list demonstrates the outcome. The
         statement is shown to the Product Owner as written, so it must be about the seal
         and the decisions the Analyst read, and is refused if either has moved on."""
-        _require_role(principal, "analyst")
-        if not statement.strip():
-            raise ValueError("an assessment says something")
         async with self._pool.connection() as connection, connection.transaction():
-            await lock_gate(connection, project_id)
-            story = await _locked_story(connection, project_id, story_id)
-            _require_at_work(story)
-            await _require_all_startable(
+            return await assess_in(
                 connection,
+                principal,
                 project_id,
                 story_id,
-                await _behaviours_of(connection, project_id, story_id),
+                statement,
+                story_revision=story_revision,
+                list_revision=list_revision,
+                basis=basis,
+                seal=seal,
             )
-            if _is_unsealed(story):
-                raise ActionRefused("only a sealed list of behaviours can be assessed")
-            _require_revisions(story, story_revision, list_revision, story["sealed_revision"])
-            require_basis(basis, await story_basis(connection, project_id, story_id))
-            if seal != story["seal_id"]:
-                raise ActionRefused("this assessment is of a seal that is no longer the story's")
-            if await _assessment(connection, story) is not None:
-                raise ActionRefused("this sealed list has already been assessed")
-            await connection.execute(
-                "INSERT INTO story_assessments (assessment_id, project_id, story_id, "
-                "story_revision, list_revision, statement, seal_id, basis) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (
-                    uuid.uuid7(),
-                    project_id,
-                    story_id,
-                    story["revision"],
-                    story["sealed_revision"],
-                    statement,
-                    seal,
-                    basis,
-                ),
-            )
-            await append_event(
-                connection,
-                project_id,
-                "story.assessed",
-                subject_id=story_id,
-                payload={"list_revision": story["sealed_revision"]},
-            )
-            await evaluate_story_gate(connection, project_id, story_id)
 
     async def decide(self, action: HumanAction) -> Receipt:
         """Apply one thing a person asked for on one gate. However often the request
@@ -617,6 +563,8 @@ async def add_behaviour_to_story(
     if unknown:
         raise ActionRefused(f"{story_id} has no acceptance criteria {unknown}")
     listed = await _behaviours_of(connection, project_id, story_id)
+    # The story's next behaviour is being said: whoever was owed the saying of it.
+    await _step_made(connection, project_id, story_id, ["specify"])
     await connection.execute(
         "UPDATE stories SET list_revision = list_revision + 1 "
         "WHERE project_id = %s AND story_id = %s",
@@ -668,6 +616,13 @@ async def require_story_at_work(
 
 
 async def evaluate_story_gate(connection: Connection, project_id: str, story_id: str) -> None:
+    """Open the story's gate if it has everything it needs; if it has not, owe what it
+    needs next."""
+    await _evaluate_story_gate(connection, project_id, story_id)
+    await owe_what_is_needed(connection, project_id)
+
+
+async def _evaluate_story_gate(connection: Connection, project_id: str, story_id: str) -> None:
     """Open the story's gate if, and only if, everything it needs is on record: the
     latest list of behaviours is sealed, every one of them is integrated, and the Analyst
     has assessed that list. Run after each event that could complete the set, in that
@@ -1042,6 +997,13 @@ async def revisions_of_roadmap(
 
 
 async def release_next(connection: Connection, project_id: str) -> None:
+    """Start the story that may start now, if there is one, and owe whatever the
+    stories being worked on need next and are not owed already."""
+    await _release_next(connection, project_id)
+    await owe_what_is_needed(connection, project_id)
+
+
+async def _release_next(connection: Connection, project_id: str) -> None:
     """Start the one story of this project that may start now, if there is one. Run in
     the transaction of every event that can free the project's place or add a story to
     choose from, so a feature that had to wait is looked at again without a restart."""
@@ -1814,3 +1776,164 @@ async def publish_roadmap_in(
             ),
         )
     return await _open_roadmap_gate(connection, project_id, feature, revision, basis)
+
+
+async def seal_in(
+    connection: Connection,
+    principal: Principal,
+    project_id: str,
+    story_id: str,
+    *,
+    story_revision: int,
+    list_revision: int,
+    basis: int,
+) -> uuid.UUID:
+    """`Stories.seal`, in the caller's transaction."""
+    _require_role(principal, "verifier")
+    await lock_gate(connection, project_id)
+    story = await _locked_story(connection, project_id, story_id)
+    _require_at_work(story)
+    listed = await _behaviours_of(connection, project_id, story_id)
+    await _require_all_startable(connection, project_id, story_id, listed)
+    _require_revisions(story, story_revision, list_revision, story["list_revision"])
+    require_basis(basis, await story_basis(connection, project_id, story_id))
+    require_sealable(
+        story["criteria"].keys(),
+        # A behaviour that was replaced on trunk demonstrates nothing now.
+        {row["behaviour_id"]: row["demonstrates"] for row in _in_force(listed)},
+    )
+    seal_id = uuid.uuid7()
+    await connection.execute(
+        "UPDATE stories SET sealed_revision = list_revision, seal_id = %s "
+        "WHERE project_id = %s AND story_id = %s",
+        (seal_id, project_id, story_id),
+    )
+    await append_event(
+        connection,
+        project_id,
+        "story.behaviours_sealed",
+        subject_id=story_id,
+        payload={
+            "seal_id": str(seal_id),
+            "list_revision": story["list_revision"],
+            "behaviours": [row["behaviour_id"] for row in listed],
+        },
+    )
+    await _step_made(connection, project_id, story_id, ["specify", "seal"])
+    await evaluate_story_gate(connection, project_id, story_id)
+    return seal_id
+
+
+async def assess_in(
+    connection: Connection,
+    principal: Principal,
+    project_id: str,
+    story_id: str,
+    statement: str,
+    *,
+    story_revision: int,
+    list_revision: int,
+    basis: int,
+    seal: uuid.UUID,
+) -> None:
+    """`Stories.assess`, in the caller's transaction."""
+    _require_role(principal, "analyst")
+    if not statement.strip():
+        raise ValueError("an assessment says something")
+    await lock_gate(connection, project_id)
+    story = await _locked_story(connection, project_id, story_id)
+    _require_at_work(story)
+    await _require_all_startable(
+        connection,
+        project_id,
+        story_id,
+        await _behaviours_of(connection, project_id, story_id),
+    )
+    if _is_unsealed(story):
+        raise ActionRefused("only a sealed list of behaviours can be assessed")
+    _require_revisions(story, story_revision, list_revision, story["sealed_revision"])
+    require_basis(basis, await story_basis(connection, project_id, story_id))
+    if seal != story["seal_id"]:
+        raise ActionRefused("this assessment is of a seal that is no longer the story's")
+    if await _assessment(connection, story) is not None:
+        raise ActionRefused("this sealed list has already been assessed")
+    await connection.execute(
+        "INSERT INTO story_assessments (assessment_id, project_id, story_id, "
+        "story_revision, list_revision, statement, seal_id, basis) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            uuid.uuid7(),
+            project_id,
+            story_id,
+            story["revision"],
+            story["sealed_revision"],
+            statement,
+            seal,
+            basis,
+        ),
+    )
+    await append_event(
+        connection,
+        project_id,
+        "story.assessed",
+        subject_id=story_id,
+        payload={"list_revision": story["sealed_revision"]},
+    )
+    await _step_made(connection, project_id, story_id, ["assess"])
+    await evaluate_story_gate(connection, project_id, story_id)
+
+
+async def _step_made(
+    connection: Connection, project_id: str, story_id: str, kinds: Sequence[str]
+) -> None:
+    """A step of the story is on record: the work that was owed for it is finished,
+    whoever made it. A result still to come for that work finds it finished by other
+    means, and is overtaken."""
+    await connection.execute(
+        "UPDATE assignments SET state = 'done' WHERE project_id = %s AND story_id = %s "
+        "AND behaviour_id IS NULL AND kind = ANY(%s) AND state IN ('wanted', 'granted')",
+        (project_id, story_id, list(kinds)),
+    )
+
+
+async def say_demonstrated(
+    connection: Connection,
+    principal: Principal,
+    project_id: str,
+    story_id: str,
+    *,
+    story_revision: int,
+    list_revision: int,
+    basis: int,
+) -> None:
+    """The Verifier says the story needs no further behaviour: what is on trunk shows
+    its criteria, as the story now stands. That is a statement about this revision,
+    this list and these decisions, and about no later ones. The seal is then owed."""
+    _require_role(principal, "verifier")
+    await lock_gate(connection, project_id)
+    story = await _locked_story(connection, project_id, story_id)
+    _require_at_work(story)
+    _require_revisions(story, story_revision, list_revision, story["list_revision"])
+    require_basis(basis, await story_basis(connection, project_id, story_id))
+    await connection.execute(
+        "UPDATE stories SET demonstrated = %s WHERE project_id = %s AND story_id = %s",
+        (
+            Jsonb(
+                {
+                    "story_revision": story_revision,
+                    "list_revision": list_revision,
+                    "basis": basis,
+                }
+            ),
+            project_id,
+            story_id,
+        ),
+    )
+    await append_event(
+        connection,
+        project_id,
+        "story.said_demonstrated",
+        subject_id=story_id,
+        payload={"list_revision": list_revision, "by": principal.identity},
+    )
+    await owe_what_is_needed(connection, project_id)

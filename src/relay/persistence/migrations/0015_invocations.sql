@@ -20,6 +20,20 @@ ALTER TABLE assignments ADD COLUMN succeeds uuid REFERENCES assignments;
 -- The work whose reply was this question: answering it owes that work again.
 ALTER TABLE questions ADD COLUMN asked_for uuid REFERENCES assignments;
 
+-- What the Verifier last said was demonstrated: the story's revision, its list revision
+-- and the decision basis it said so on. A statement about an earlier one of any of the
+-- three is not a statement about the story as it now stands.
+ALTER TABLE stories ADD COLUMN demonstrated jsonb;
+
+-- Each step of a story is owed once at a time, and each red of a behaviour.
+CREATE UNIQUE INDEX one_step_owed_per_story ON assignments (project_id, story_id, kind)
+    WHERE kind IN ('specify', 'seal', 'assess') AND behaviour_id IS NULL
+      AND state IN ('wanted', 'granted');
+CREATE UNIQUE INDEX one_red_or_contract_owed_per_behaviour
+    ON assignments (project_id, behaviour_id, kind)
+    WHERE kind IN ('red', 'specify') AND behaviour_id IS NOT NULL
+      AND state IN ('wanted', 'granted');
+
 -- One row per call to a provider, written before the call is made.
 CREATE TABLE invocations (
     invocation_id   uuid PRIMARY KEY,

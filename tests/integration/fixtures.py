@@ -256,12 +256,20 @@ async def submit_review(
 
 
 async def work_announced(database: Any) -> list[Any]:
-    """The commands waiting to be sent, without the plan every opened feature owes its
-    Analyst: these tests are about what comes after a roadmap."""
+    """The commands waiting to be sent, without what is owed before a behaviour has a red: the
+    plan an opened feature owes its Analyst, the specification a released story owes its
+    Verifier, and the red a registered contract owes the control plane. These tests are
+    about what comes after."""
     from relay.persistence.outbox import pending_messages
 
     return [
         each
         for each in await pending_messages(database)
-        if each.envelope["event_type"] != "roadmap.requested"
+        if each.envelope["event_type"]
+        not in (
+            "roadmap.requested",
+            "behaviour.specification_requested",
+            "behaviour.contract_requested",
+            "red.requested",
+        )
     ]

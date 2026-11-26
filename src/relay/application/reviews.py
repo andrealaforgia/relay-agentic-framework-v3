@@ -22,6 +22,7 @@ from typing import Any
 from psycopg.types.json import Jsonb
 
 from relay.application.assignments import (
+    INTEGRATE,
     REMEDIATE,
     REVIEW,
     complete,
@@ -730,6 +731,35 @@ class Reviews:
             payload=payload,
             causation_id=cause,
         )
+        if gate.state is GateState.SATISFIED:
+            # The first integration of this candidate is the control plane's, owed here
+            # and taken up by the pass: no caller is waiting to ask for it.
+            already = await (
+                await connection.execute(
+                    "SELECT 1 FROM assignments WHERE project_id = %s AND behaviour_id = %s "
+                    "AND kind = 'integrate' AND issued_on->>'cycle_id' = %s "
+                    "AND NOT issued_on ? 'batch_id'",
+                    (project_id, behaviour_id, str(cycle_id)),
+                )
+            ).fetchone()
+            if already is None:
+                await owe(
+                    connection,
+                    INTEGRATE,
+                    Envelope(
+                        message_kind=MessageKind.COMMAND,
+                        event_type="integration.requested",
+                        project_id=project_id,
+                        behaviour_id=behaviour_id,
+                        sender=CONTROL_PLANE,
+                        recipient="integrator",
+                        idempotency_key=f"integrate:first:{cycle_id}",
+                        correlation_id=behaviour_row["correlation_id"],
+                        causation_id=decided.event_id,
+                        payload={"cycle_id": str(cycle_id)},
+                    ),
+                    issued_on={"cycle_id": str(cycle_id)},
+                )
         if gate.state is GateState.CHANGES_REQUESTED:
             await owe(
                 connection,

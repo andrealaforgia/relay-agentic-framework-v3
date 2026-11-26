@@ -60,7 +60,7 @@ async def the_build(world: StoryWorld) -> uuid.UUID:
 
 async def assignments(world: StoryWorld) -> list[object]:
     return await world.column(
-        "SELECT kind || ':' || state FROM assignments WHERE kind <> 'plan' ORDER BY created_at"
+        "SELECT kind || ':' || state FROM assignments WHERE kind NOT IN ('plan', 'specify', 'red') ORDER BY created_at"
     )
 
 
@@ -71,7 +71,7 @@ async def test_a_verified_red_owes_one_build_and_the_command_says_which(
 
     assert await assignments(world) == ["build:wanted"]
     assert [str(await the_build(world))] == await world.column(
-        "SELECT assignment_id::text FROM assignments WHERE kind <> 'plan'"
+        "SELECT assignment_id::text FROM assignments WHERE kind NOT IN ('plan', 'specify', 'red')"
     )
 
 
