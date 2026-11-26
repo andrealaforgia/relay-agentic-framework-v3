@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 
+from relay.application.authoring import contract_from
+from relay.application.behaviours import rewrite_contract_in
 from relay.domain.behaviour import BehaviourState
 from relay.domain.story import ActionRefused
 from tests.integration.fixtures import (
@@ -140,7 +142,7 @@ async def _the(at: Delivering, kind: str) -> Any:
     ("contract", "why"),
     [
         ({**STANDARD_RATE_CONTRACT, "baseline_stdout": "120\n"}, "already satisfies"),
-        ({**STANDARD_RATE_CONTRACT, "baseline_stderr": "boom"}, "one of stdout or stderr"),
+        ({**STANDARD_RATE_CONTRACT, "baseline_stderr": "boom"}, "exactly one of stdout or stderr"),
         ({**STANDARD_RATE_CONTRACT, "observes": " "}, "public behaviour"),
     ],
 )
@@ -252,6 +254,9 @@ async def test_a_decision_that_clears_a_seal_is_reconfirmed_and_the_story_reache
     first = await at.world.gate()
 
     await at.world.answer(await at.world.ask(), "zero-rated")
+    # Until its owners have reconfirmed it, the story's next step is not known: the
+    # pass that follows the answer owes the reconfirmations and nothing else.
+    assert set(await kinds(at, "wanted")) == {"reconfirm"}
     await at.work()
 
     assert await at.world.gate() != first
@@ -311,3 +316,155 @@ async def test_what_a_story_needs_is_owed_while_its_feature_is_paused_and_claime
         await at.world.claims.claim(VERIFIER, specify)  # type: ignore[arg-type]
     await at.world.close("resume")
     await at.world.claims.claim(VERIFIER, specify)  # type: ignore[arg-type]
+
+
+async def snapshots(at: Delivering) -> list[list[object]]:
+    """What is wanted each time something has been applied, before the pass that
+    follows it: what the apply's own transaction owed, and not the pass after it."""
+    seen: list[list[object]] = []
+    real = at.world.features.reconcile
+
+    async def looking_first(project_id: str, **named: Any) -> None:
+        seen.append(
+            await at.world.column(
+                "SELECT kind FROM assignments WHERE state = 'wanted' ORDER BY created_at"
+            )
+        )
+        await real(project_id, **named)
+
+    for worker in at.workers.values():
+        worker._then = looking_first
+    return seen
+
+
+async def test_each_step_owes_the_next_in_its_own_transaction_and_not_only_by_the_pass(
+    delivering_world: Delivering,
+) -> None:
+    at = delivering_world
+    await released(at)
+    seen = await snapshots(at)
+
+    await at.work()
+
+    assert ["red"] in seen  # the behaviour specified
+    assert ["seal"] in seen  # the story said to be demonstrated
+    assert ["assess"] in seen  # the list sealed
+
+
+async def test_a_contract_written_again_owes_its_red_and_one_that_fails_again_is_written_again(
+    delivering_world: Delivering,
+) -> None:
+    """Each writing is an occasion of its own: the second invalid red finds nothing
+    still owed from the first, and owes the contract again."""
+    at = delivering_world
+    passes_already = delivering(**{**B1["delivered"], "contract": ALREADY_PASSES})
+    still_wrong = delivering(
+        demonstrated=False, contract={**ALREADY_PASSES, "contract_id": "B1-second"}
+    )
+    rewritten = delivering(demonstrated=False, contract=STANDARD_RATE_CONTRACT)
+    roles = await released(
+        at,
+        verifier__You_decide_how_a_user_story_is_shown=[
+            passes_already,
+            still_wrong,
+            rewritten,
+            DEMONSTRATED,
+        ],
+    )
+    seen = await snapshots(at)
+
+    await at.work()
+
+    assert len(briefings(roles["verifier"], "cannot serve")) == 2
+    assert seen[:3] == [["red"], ["red"], ["red"]]  # each contract owed its own red
+    assert await at.world.column(
+        "SELECT state FROM assignments WHERE kind = 'specify' AND behaviour_id = 'B1'"
+    ) == ["done", "done"]
+    assert (await at.world.stories.inbox(PROJECT))[0].kind == "story"
+
+
+async def test_a_contract_is_written_again_only_while_its_behaviour_waits_for_a_red(
+    delivering_world: Delivering,
+) -> None:
+    at = delivering_world
+    await released(at)
+    at.workers.pop("builder")
+    await at.work()
+    assert await at.world.state("B1") is BehaviourState.IMPLEMENTING
+
+    with pytest.raises(ActionRefused, match="not waiting for a red"):
+        async with at.world.database.connection() as connection, connection.transaction():
+            await rewrite_contract_in(
+                connection, VERIFIER, PROJECT, "B1", contract_from(ALREADY_PASSES), basis=0
+            )
+
+
+async def test_a_contract_registered_by_hand_owes_its_red_too(
+    delivering_world: Delivering,
+) -> None:
+    at = delivering_world
+    await released(at)
+    behaviours = at.world.behaviours
+
+    await behaviours.propose(
+        VERIFIER, PROJECT, "S1", "B9", "by hand", ["AC1"], basis=0, story_revision=1
+    )
+    await behaviours.begin_test_design(VERIFIER, PROJECT, "B9")
+    await behaviours.register_acceptance_test(
+        VERIFIER, PROJECT, "B9", contract_from(STANDARD_RATE_CONTRACT), basis=0
+    )
+
+    assert await at.world.column(
+        "SELECT state FROM assignments WHERE kind = 'red' AND behaviour_id = 'B9'"
+    ) == ["wanted"]
+    # And the specification the story was owed is finished: its behaviour has been said.
+    assert await kinds(at, "wanted") == ["red"]
+
+
+async def test_an_assessment_asked_for_of_a_seal_that_is_gone_is_overtaken(
+    delivering_world: Delivering,
+) -> None:
+    at = delivering_world
+    roles = await released(at)
+
+    class WithTheSealGone(Role):
+        async def invoke(self, request: Any, **named: Any) -> Any:
+            return await Role.invoke(roles["analyst"], request, **named)
+
+    analyst = at.workers.pop("analyst")
+    await at.work()
+    [assess] = await at.world.column(
+        "SELECT assignment_id FROM assignments WHERE kind = 'assess' AND state = 'wanted'"
+    )
+    await at.world.column("UPDATE stories SET seal_id = NULL, sealed_revision = NULL RETURNING 1")
+    at.workers["analyst"] = analyst
+
+    left = await analyst.carry_out((await at.world.claims.of(assess)) or {})  # type: ignore[arg-type]
+
+    assert left == "overtaken"
+    assert await at.world.column("SELECT count(*) FROM story_assessments") == [0]
+
+
+async def test_a_reconfirmation_that_asks_is_not_owed_again_by_the_answer(
+    delivering_world: Delivering,
+) -> None:
+    """The answer is a decision, and owes the reconfirmations of its own basis."""
+    at = delivering_world
+    await released(at, analyst__You_are_asked_whether=[ASKING, STANDS, STANDS])
+    at.workers.pop("builder")
+    await at.work()
+
+    await at.world.answer(await at.world.ask(), "zero-rated")
+    await at.work()
+    [question] = await at.world.decisions.open_questions(PROJECT)
+    await at.world.answer(question.question_id, "zero")
+    await at.work()
+
+    assert await at.world.column(
+        "SELECT count(*) FROM assignments WHERE kind = 'reconfirm' AND succeeds IS NOT NULL"
+    ) == [0]
+    assert await at.world.column(
+        "SELECT state, count(*) FROM assignments WHERE kind = 'reconfirm' AND role = 'analyst' "
+        "GROUP BY state ORDER BY state"
+    ) == ["asked", "done"]
+    assert await kinds(at, "wanted") == ["build"]

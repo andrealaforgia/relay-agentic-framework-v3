@@ -577,8 +577,6 @@ _ABOUT_A_CONTRACT = [
 def contract_from(reply: Mapping[str, Any]) -> ProcessContract:
     """The contract a reply amounts to. Raises ValueError if it is not one."""
     out, err = reply.get("baseline_stdout"), reply.get("baseline_stderr")
-    if (out is None) == (err is None):
-        raise ValueError("a baseline says what is printed to one of stdout or stderr")
     return ProcessContract(
         contract_id=str(reply["contract_id"]),
         observes=str(reply["observes"]),
