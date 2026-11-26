@@ -230,6 +230,43 @@ Reservations:
 - **The stand-in CLI** shows how Relay calls the CLI and reads it, and nothing about what the real CLI enforces. That is step 2's suite, and D-5's condition.
 - **No time-based lease** until slice 5: a worker that hangs with its connection open keeps its grant.
 
+### Step 2 as built: the boundary around a run, and the two existing tasks
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 48 | CHALLENGE, 11 of 11 reachable | A launch under policy nobody had established; a disproved pass still counted; a rejected candidate taken for green on replay; a superseded green try opening a review, and the wrong commit observed; another project's findings in a briefing; the only usable delivery acknowledged; a review submitted from a checkout the model was not handed; a tracked file deleted by `retain`; probes credited without a refusal, and one workspace layout; two operations with no principal; a malformed reply become a finding |
+| 49 | CHALLENGE, 9 of 9 reachable | D-5 to be done now, and the suite's runtime read at the wrong moment; a superseded observation replayed as a verdict; overtaken work left with nobody; hand-back decided by history, not by what is in flight; four more operations with no caller; validation only on the worker's path; cleanup freeing another call's try; probes credited on resemblance; an attempt ref that is gone |
+| 50 | CHALLENGE, 8 reachable and 1 reservation | A decided review answering, and recording evidence for, a caller it was never handed to; a green accepted after its story gained a behaviour; a review that could not be prepared left with a live worker; a refusal cut short leaving its effect taken; an earlier pass recorded again undoing a later failure, and a late write renewing old observations; the boundary asked before admission waited; a pre-launch green refusal judged again on recovery; trees and bases never let go of; a schema for extra properties accepted and not checked |
+
+Twenty-eight findings and a reservation, every one reachable through a real entry point. **Step 2 was not accepted.** Round 50 was the third and last round (D-8). Seven of its eight findings and the reservation are fixed, each with a test that fails without the fix, at commit `45d1c8b`; **Astra has not seen those fixes.** The eighth, 3B-S2-3.7, is not fixed and is the first reservation below.
+
+Deliberate breakage, since every test of this step was written with its code: 49 breakages of the step as first built, then 34, 37 and 20 against the three rounds of fixes. Of the 20 against the last round, 17 were caught and 3 survived; each survivor got a test that now catches it (the latest assessment chosen by when it was observed; a base kept for a build prepared and never called; a tree discarded while a cancelled caller's record was still being made from it). One breakage was at first reported caught by a test that had nothing to do with it, which failed because the host's clock and the database's did not agree to the millisecond; that test no longer depends on it, and the breakage was run again. The last full run is 1093 tests, green; three tests were added after it and pass with their files.
+
+Decided during the build:
+
+- **No review capabilities (D-11, superseding D-5).** What lets a caller act on a review is the grant on the review's assignment. A grant is not a secret. A future API must authenticate the caller as the grant's holder.
+- **The operator's statement of remote policy is a launch condition, not proof (D-10).** Software cannot establish what a provider's servers apply; a person says so on record, and with nothing said no run with tools is launched.
+- **The boundary is asked inside admission**, after the locks, and the assessment that allowed a launch is recorded with the call.
+- **A run of the suite is one assessment**, with an identity and a time of observation given when it runs. The latest observed is what is true of a boundary.
+- **Every way a result becomes `overtaken` goes through one function**, which gives the work back and announces it again, or parks it when as many calls have been made as a person is asked after.
+- **Hand-back is decided by the work's latest call**: a call in flight or a result waiting keeps the grant.
+- **A green run's event says whether it judged the candidate.** Replay reads only judgements.
+- **`record` checks every result against the schema stored with its call**, and a schema Relay cannot check in full is refused before anything is paid for.
+- **A surviving breakage gets a test or a stated reason.** Three times in this slice I removed code because a breakage of it survived, and each time a history turned up that needed it.
+
+Reservations:
+
+- **Astra has not reviewed the round 50 fixes.**
+- **3B-S2-3.7 is open.** A green refused before launch (native isolation not approved) is recorded with no judgement. If the worker stops between that refusal and the invocation hearing of it, recovery asks again and a second, identical refusal goes on record. Nothing is executed twice and nothing is decided differently; the ledger has a duplicate.
+- **A worker refused by the boundary while it holds an adopted result does not apply that result itself.** It keeps the grant and the pass applies it.
+- **The suite judges on what Claude Code 2.1.330 says on macOS when it refuses.** Another version or platform may word a refusal differently; the suite then fails, which is the safe direction, and the markers have to be read again.
+- **Remote policy is stated, not observed** (D-10). A change of it inside a pass's 24 hours is not detected.
+- **A pass's time of observation is the host's clock; its freshness is judged by the database's.** A host whose clock runs ahead gets a longer lease by that much.
+- **The sandbox's temporary directory is shared between runs on a host.** The suite does not probe it.
+- **The grant is authority only while callers are in-process.** `claim` still gives a grant to a caller inside the control plane with no worker and no liveness check; that grant admits no paid call.
+- **The overlapping-oracle histories are tested with two real oracle runs in one process**, not two worker processes.
+- **Whether a discarded tree is really gone** is checked by looking at the workspace root after the call, not under a failing filesystem; `rmtree` errors are ignored.
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.
