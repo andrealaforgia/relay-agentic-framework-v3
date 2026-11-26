@@ -375,8 +375,10 @@ class Behaviours:
         *,
         expecting: str | None = None,
         still_heard: Callable[[Connection], Awaitable[bool]] | None = None,
+        with_it: Callable[[Connection], Awaitable[None]] | None = None,
     ) -> GreenVerdict:
         """Observe the contract on the candidate a Builder published for this attempt.
+        `with_it` is called in the transaction that accepts a green, and only then.
 
         The caller names an attempt and the grant it was given for the build, nothing
         more. Relay reads the candidate from the project's own repository, checks it was
@@ -443,6 +445,7 @@ class Behaviours:
             contract,
             descends=descends,
             still_heard=still_heard,
+            with_it=with_it,
         )
 
     async def reopen_red(
@@ -516,6 +519,7 @@ class Behaviours:
         *,
         descends: bool,
         still_heard: Callable[[Connection], Awaitable[bool]] | None = None,
+        with_it: Callable[[Connection], Awaitable[None]] | None = None,
     ) -> GreenVerdict:
         """`observed` is the contract the run was launched to observe. The record says
         that one, whatever the behaviour's contract has become meanwhile."""
@@ -555,6 +559,8 @@ class Behaviours:
                 evidence["rejection"] = verdict.rejection.value
             else:
                 await complete(connection, run.assignment_id)
+                if with_it is not None:
+                    await with_it(connection)
                 await connection.execute(
                     "UPDATE behaviours SET candidate_revision = %s "
                     "WHERE project_id = %s AND behaviour_id = %s",

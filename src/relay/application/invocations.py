@@ -30,7 +30,6 @@ from relay.application.assignments import (
     CORRECT,
     RECONFIRM,
     REMEDIATE,
-    REVIEW,
     require_nothing_to_reconfirm,
 )
 from relay.application.closure import (
@@ -977,10 +976,9 @@ async def _locked_assignment(connection: Connection, assignment_id: uuid.UUID) -
     one, then the assignment: the order `reopen_red` takes them in, which retires a
     build under its behaviour's lock, and the order every transition of a story takes.
 
-    Work that is applied by proposing a roadmap, by changing a story's list, or by
-    putting a question, does that in the transaction that marks its effect, and each of
-    those needs the gate exclusively. It is taken so from the start: a transaction that
-    held it shared and then asked for more would wait on another doing the same."""
+    Work is applied by proposing a roadmap, by changing a story's list, or by putting
+    a question, in the transaction that marks its effect, and each of those needs the
+    gate exclusively."""
     known = await (
         await connection.execute(
             "SELECT project_id, kind, story_id, behaviour_id FROM assignments "
@@ -990,9 +988,11 @@ async def _locked_assignment(connection: Connection, assignment_id: uuid.UUID) -
     ).fetchone()
     if known is None:
         raise LookupError(f"there is no assignment {assignment_id}")
-    await lock_gate(
-        connection, known["project_id"], exclusive=known["kind"] not in (BUILD, REMEDIATE, REVIEW)
-    )
+    # Every kind of work may be answered with a question, and a question takes the gate
+    # exclusively. Taken shared here and exclusively later, behind a row another
+    # transaction was waiting for under its own shared hold, is two transactions each
+    # waiting on the other. So it is exclusive from the start, for every kind.
+    await lock_gate(connection, known["project_id"], exclusive=True)
     if known["story_id"] is not None and known["behaviour_id"] is None:
         await connection.execute(
             "SELECT 1 FROM stories WHERE project_id = %s AND story_id = %s FOR UPDATE",

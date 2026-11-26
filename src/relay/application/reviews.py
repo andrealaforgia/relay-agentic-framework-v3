@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -533,7 +533,13 @@ class Reviews:
         return Checkout(tree, receipt)
 
     async def submit_review(
-        self, task_id: uuid.UUID, review: Review, grant: uuid.UUID, checkout: uuid.UUID
+        self,
+        task_id: uuid.UUID,
+        review: Review,
+        grant: uuid.UUID,
+        checkout: uuid.UUID,
+        *,
+        with_it: Callable[[Connection], Awaitable[None]] | None = None,
     ) -> Receipt:
         """Record one reviewer's review. Every request gets exactly one answer however often
         it is retried, and only the first accepted submission of a task has any effect.
@@ -574,7 +580,12 @@ class Reviews:
                 return await _store(connection, task, review, "stale", is_current)
             if not await _has_checkout(connection, task_id, grant, checkout):
                 raise SubmissionRefused("no tree was prepared for this review under this grant")
-            return await self._accept(connection, task, review)
+            receipt = await self._accept(connection, task, review)
+            if with_it is not None:
+                # What goes on record with a review that is accepted as the effective
+                # one, in the transaction that accepts it: what its author assumed.
+                await with_it(connection)
+            return receipt
 
     async def dispute(
         self, principal: Principal, project_id: str, finding_id: str, evidence: str

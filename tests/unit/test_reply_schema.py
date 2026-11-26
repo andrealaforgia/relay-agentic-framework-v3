@@ -2,10 +2,14 @@
 read as anything. Asking the provider to enforce the schema is not the same as its
 having done so."""
 
+import asyncio
+from typing import Any
+
 import pytest
 
-from relay.application.tasks import BUILD_REPLY, REVIEW_REPLY
+from relay.application.tasks import BUILD_REPLY, REVIEW_REPLY, BuildTask, ReviewTask, Tasks
 from relay.domain.schema import problem_with, require_checkable
+from relay.domain.story import ActionRefused
 
 FINDING = {"severity": "high", "claim": "c", "evidence": "e", "remediation": "r"}
 
@@ -77,3 +81,63 @@ def test_a_schema_for_the_extra_properties_is_one_relay_does_not_check() -> None
     with pytest.raises(ValueError, match="additionalProperties"):
         require_checkable({"type": "object", "additionalProperties": {"type": "integer"}})
     require_checkable({"type": "object", "additionalProperties": True})
+
+
+QUESTION = {"text": "Refuse negatives?", "why": "no criterion says", "options": ["yes", "no"]}
+
+
+@pytest.mark.parametrize(
+    ("task", "schema", "delivered"),
+    [
+        (ReviewTask, REVIEW_REPLY, {"findings": [FINDING], "carried": []}),
+        (BuildTask, BUILD_REPLY, {"note": "done"}),
+    ],
+)
+def test_a_build_or_a_review_may_reply_in_the_form_every_other_kind_of_work_does(
+    task: Any, schema: dict[str, Any], delivered: dict[str, Any]
+) -> None:
+    """3B-S3-2.12: the common shape is not a paid attempt lost."""
+    asks = {"outcome": "question", "question": QUESTION, "assumptions": []}
+    delivers = {"outcome": "delivered", "assumptions": ["x"], "delivered": delivered}
+
+    for reply in (asks, delivers, delivered, {"question": QUESTION}):
+        assert problem_with(reply, schema) is None
+        assert task.problem_with(None, reply) is None
+
+
+@pytest.mark.parametrize(
+    ("reply", "says"),
+    [
+        ({"note": "done", "assumptions": [" "]}, "an assumption says nothing"),
+        ({"note": "done", "question": QUESTION}, "no note of work done"),
+        ({"outcome": "question", "delivered": {"note": "x"}, "question": QUESTION}, "delivers"),
+        ({"outcome": "delivered", "question": QUESTION}, "has no question"),
+        ({"outcome": "question"}, "has a question"),
+    ],
+)
+def test_what_a_schema_cannot_say_of_a_build_reply_its_task_says(
+    reply: dict[str, Any], says: str
+) -> None:
+    """3B-S3-2.7 and 3B-S3-2.11."""
+    assert problem_with(reply, BUILD_REPLY) is None  # the schema takes it
+    found = BuildTask.problem_with(None, reply)  # type: ignore[arg-type]
+
+    assert found is not None and says in found
+
+
+def test_a_reply_its_task_would_not_take_is_applied_as_a_refusal_whoever_recorded_it() -> None:
+    """3B-S3-2.11: read where it is applied, not only where a recorder chose to."""
+
+    class Build:
+        problem_with = BuildTask.problem_with
+
+        def effects(self, invocation: Any) -> list[Any]:
+            raise AssertionError("a reply that was refused has no effects of its own")
+
+    reply = {"note": "done", "question": QUESTION}
+    [effect] = Tasks({"build": Build()}).effects_for(
+        {"kind": "build", "role": "builder", "reply": reply}
+    )
+
+    with pytest.raises(ActionRefused, match="no note of work done"):
+        asyncio.run(effect.perform(None))  # type: ignore[arg-type]

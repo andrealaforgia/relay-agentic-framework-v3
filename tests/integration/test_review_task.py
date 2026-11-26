@@ -4,6 +4,7 @@ The provider is scripted; what is real is everything around it."""
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -466,3 +467,50 @@ async def test_no_tree_is_left_behind_by_a_review_or_by_a_delivery_that_came_to_
     worker._boundaries.holding = True  # type: ignore[attr-defined]
     assert await worker.carry_out(await reviewing.owed("qa")) == "applied"
     assert list(root.iterdir()) == []
+
+
+async def test_one_reviewer_asking_while_the_other_reviews_does_not_stop_either(
+    reviewing: Reviewing,
+) -> None:
+    """3B-S3-2.2: the gate is taken exclusively before the behaviour's row, by both, so
+    neither waits on the other while holding what the other needs."""
+    asks = {
+        "question": {
+            "text": "Should a negative amount be refused?",
+            "why": "no criterion says",
+            "options": ["yes", "no"],
+        }
+    }
+    qa = await reviewing.worker("qa", Reviewer(asks))
+    sentinel = await reviewing.worker("sentinel", Reviewer(NOTHING_FOUND))
+
+    for _ in range(5):  # whichever order their transactions fall in
+        left = await asyncio.gather(
+            qa.carry_out(await reviewing.owed("qa")),
+            sentinel.carry_out(await reviewing.owed("sentinel")),
+        )
+        if left[0] == "applied":
+            break
+
+    assert left[0] == "applied" and left[1] in ("applied", "held")
+    assert len(await reviewing.world.decisions.open_questions(PROJECT)) == 1
+
+
+async def test_what_a_reviewer_assumed_is_on_record_with_the_review_it_delivered(
+    reviewing: Reviewing,
+) -> None:
+    """3B-S3-2.7 and 3B-S3-2.12: in the transaction that accepts the review, and in the
+    form every other kind of work replies in."""
+    reply = {
+        "outcome": "delivered",
+        "assumptions": ["amounts are whole numbers"],
+        "delivered": NOTHING_FOUND,
+    }
+    worker = await reviewing.worker("qa", Reviewer(reply))
+
+    assert await worker.carry_out(await reviewing.owed("qa")) == "applied"
+
+    assert await reviewing.world.column("SELECT text FROM decisions") == [
+        "amounts are whole numbers"
+    ]
+    assert await reviewing.world.column("SELECT count(*) FROM review_submissions") == [1]

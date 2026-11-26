@@ -55,6 +55,31 @@ def asks(reply: Any) -> bool:
     return isinstance(reply, dict) and reply.get("question") is not None
 
 
+def plain(reply: Any) -> Any:
+    """A build's or a review's reply in its own flat form, whichever of the two forms it
+    came in: its own (`note`, or `findings` and `carried`), or the form every other
+    kind of work replies in (`outcome`, and what was asked for under `delivered`)."""
+    if not isinstance(reply, dict) or not ({"outcome", "delivered"} & set(reply)):
+        return reply
+    delivered = reply.get("delivered")
+    rest = {name: value for name, value in reply.items() if name not in ("outcome", "delivered")}
+    return {**rest, **delivered} if isinstance(delivered, dict) else rest
+
+
+def _shape_problem(reply: Any) -> str | None:
+    """What is wrong with how a reply says which of the two it is, or None."""
+    if not isinstance(reply, dict):
+        return "the reply is an object"
+    outcome = reply.get("outcome")
+    if outcome == "question" and (reply.get("question") is None or "delivered" in reply):
+        return "a reply that asks has a question and delivers nothing"
+    if outcome == "delivered" and reply.get("question") is not None:
+        return "a reply that delivers has no question"
+    if not all(str(text).strip() for text in reply.get("assumptions") or ()):
+        return "an assumption says nothing"
+    return None
+
+
 def question_problem(reply: Mapping[str, Any]) -> str | None:
     asked = reply.get("question")
     if not isinstance(asked, dict):
@@ -87,7 +112,7 @@ async def work_of(connection: Connection, run: EffectRun) -> dict[str, Any]:
 
 async def record_assumptions(connection: Connection, run: EffectRun) -> None:
     work = await work_of(connection, run)
-    for text in run.invocation["reply"].get("assumptions") or ():
+    for text in plain(run.invocation["reply"]).get("assumptions") or ():
         await assume_in(
             connection,
             caller_of(run.invocation),
@@ -126,11 +151,6 @@ async def _nothing(run: EffectRun) -> None:
 ASK = Effect("ask", _nothing, put_question)
 
 
-async def _assumed(connection: Connection, run: EffectRun) -> None:
-    """What was assumed in doing the work, recorded where the work is accepted."""
-    await record_assumptions(connection, run)
-
-
 REVIEW_REPLY = {
     "type": "object",
     "properties": {
@@ -164,6 +184,8 @@ REVIEW_REPLY = {
         },
         "question": QUESTION,
         "assumptions": _ASSUMPTIONS,
+        "outcome": {"enum": ["delivered", "question"]},
+        "delivered": {"type": "object"},
     },
     # A review, with its findings and how the earlier ones stand; or a question.
     "required": [],
@@ -268,10 +290,16 @@ class ReviewTask:
         )
 
     def problem_with(self, reply: Any) -> str | None:
+        shape = _shape_problem(reply)
+        if shape:
+            return shape
+        reply = plain(reply)
         if asks(reply):
             if "findings" in reply or "carried" in reply:
                 return "a reply that asks has a question and no review"
             return question_problem(reply)
+        if set(reply) - {"findings", "carried", "assumptions"}:
+            return "a review has its findings, how the earlier ones stand, and nothing else"
         try:
             review_from(reply)
         except SubmissionRefused as refused:
@@ -289,7 +317,7 @@ class ReviewTask:
     def effects(self, invocation: Mapping[str, Any]) -> list[Effect]:
         if asks(invocation["reply"]):
             return [ASK]
-        return [Effect("submit", self._submit, _assumed)]
+        return [Effect("submit", self._submit)]
 
     async def _submit(self, run: EffectRun) -> Mapping[str, Any]:
         """Submit the review from the checkout the model was handed, under the grant that
@@ -311,9 +339,10 @@ class ReviewTask:
         try:
             accepted = await self._reviews.submit_review(
                 about["task_id"],
-                review_from(run.invocation["reply"]),
+                review_from(plain(run.invocation["reply"])),
                 run.grant_id,
                 uuid.UUID(run.invocation["evidence"]["checkout"]),
+                with_it=lambda connection: record_assumptions(connection, run),
             )
         except SubmissionRefused as refused:
             raise ActionRefused(str(refused)) from None
@@ -422,9 +451,18 @@ class Tasks:
         return self.by_kind.get((kind, role)) or self.by_kind[kind]
 
     def effects_for(self, invocation: dict[str, Any]) -> Sequence[Effect]:
-        effects: Sequence[Effect] = self._for(invocation["kind"], invocation["role"]).effects(
-            invocation
-        )
+        """How this result is applied. A reply is read here too, whoever recorded it and
+        with whatever they had to read it by: one its task would not have taken is
+        applied as nothing, and that is its one effect."""
+        task = self._for(invocation["kind"], invocation["role"])
+        problem = task.problem_with(invocation["reply"])
+        if problem is not None:
+
+            async def refuse(run: EffectRun) -> None:
+                raise ActionRefused(problem)
+
+            return [Effect("read", refuse)]
+        effects: Sequence[Effect] = task.effects(invocation)
         return effects
 
     def problem_with(self, kind: str, role: str, reply: Any) -> str | None:
@@ -443,6 +481,8 @@ BUILD_REPLY = {
         "note": {"type": "string"},
         "question": QUESTION,
         "assumptions": _ASSUMPTIONS,
+        "outcome": {"enum": ["delivered", "question"]},
+        "delivered": {"type": "object"},
     },
     # A note of what was built; or a question, and then nothing that was left is kept.
     "required": [],
@@ -521,11 +561,15 @@ class BuildTask:
         )
 
     def problem_with(self, reply: Any) -> str | None:
+        shape = _shape_problem(reply)
+        if shape:
+            return shape
+        reply = plain(reply)
         if asks(reply):
             if "note" in reply:
                 return "a reply that asks has a question and no note of work done"
             return question_problem(reply)
-        if not isinstance(reply, dict) or not isinstance(reply.get("note"), str):
+        if not isinstance(reply.get("note"), str) or set(reply) - {"note", "assumptions"}:
             return "the reply is a note saying what was done"
         return None
 
@@ -547,7 +591,7 @@ class BuildTask:
         if asks(invocation["reply"]):
             # Nothing was kept of what a call that asks left, and nothing is published.
             return [ASK]
-        return [Effect("publish", self._publish), Effect("green", self._green, _assumed)]
+        return [Effect("publish", self._publish), Effect("green", self._green)]
 
     async def _attempt(self, invocation: Mapping[str, Any]) -> int:
         """The attempt number of this call's candidate: one more than the behaviour has
@@ -647,6 +691,7 @@ class BuildTask:
                     # The commit that was kept and published, and no other the ref may name.
                     expecting=str(run.invocation["retained"]),
                     still_heard=still_heard,
+                    with_it=lambda connection: record_assumptions(connection, run),
                 )
             except CandidateMoved as moved:
                 # Somebody moved the attempt ref after it was published, or removed it.
