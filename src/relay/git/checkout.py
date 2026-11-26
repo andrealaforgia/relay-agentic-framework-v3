@@ -36,6 +36,11 @@ class CheckoutFailed(Exception):
     pass
 
 
+class CandidateMoved(CheckoutFailed):
+    """The ref an attempt was published under names another commit than the one that
+    was to be observed. Nothing was observed."""
+
+
 class RemoteUnavailable(CheckoutFailed):
     """The repository could not be asked. Nothing is known; the same request may succeed
     later. Never grounds for a permanent decision."""

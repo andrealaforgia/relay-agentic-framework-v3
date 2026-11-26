@@ -19,11 +19,16 @@ from relay.application.tasks import Profile, ReviewTask, Tasks, Workspaces
 from relay.application.worker import Worker
 from relay.application.workers import WorkerSession
 from relay.domain.review import Severity
-from relay.domain.story import ActionRefused
+from relay.domain.story import ActionRefused, HumanAction
 from relay.providers.claude import Outcome, ProviderResult, Request
 from relay.providers.stream import Terminal
 from tests.integration.decision_world import DecisionWorld
-from tests.integration.fixtures import VAT_APPLIES_STANDARD_RATE, VERIFIER, run_green
+from tests.integration.fixtures import (
+    PRODUCT_OWNER,
+    VAT_APPLIES_STANDARD_RATE,
+    VERIFIER,
+    run_green,
+)
 from tests.integration.story_world import STANDARD_RATE
 from tests.integration.test_worker import RUNTIME, SeenToHold
 from tests.integration.trunk_world import PROJECT
@@ -417,3 +422,40 @@ async def test_only_the_builder_disputes_a_finding(reviewing: Reviewing) -> None
         await reviewing.world.reviews.dispute(VERIFIER, PROJECT, str(raised), "it is fine")
 
     assert await reviewing.world.column("SELECT status FROM findings") == ["open"]
+
+
+async def test_a_review_adopted_under_another_grant_is_overtaken_and_done_again(
+    reviewing: Reviewing,
+) -> None:
+    """3B-S2-1.7: the first reviewer's call was given up on, a retry was allowed and
+    claimed, and then its reply arrived. The reply was written from a checkout made
+    under a grant that no longer holds the work, and the review service takes a review
+    only from one made under the grant that does. Nothing is submitted from it, nobody
+    is blamed, and the work is done again."""
+    first = await reviewing.worker("qa", Reviewer())
+    owed = await reviewing.owed("qa")
+    one = reviewing.sessions[-1]
+    grant = await reviewing.world.claims.claim(one.principal, owed["assignment_id"], one.worker_id)
+    call = await reviewing.task.prepare(owed, grant, None)
+    admission = await reviewing.invocations.admit(one, owed["assignment_id"], grant, call.prepared)
+    assert admission.invocation_id is not None
+    await one.stop()
+    await reviewing.invocations.recover(PROJECT)
+    reviewing_requests = HumanAction(
+        PRODUCT_OWNER, "retry-the-review", str(admission.invocation_id), "retry", {}
+    )
+    await reviewing.invocations.decide(reviewing_requests)
+    provider = Reviewer(NOTHING_FOUND)
+    second = await reviewing.worker("qa", provider)
+    two = reviewing.sessions[-1]
+    await reviewing.world.claims.claim(two.principal, owed["assignment_id"], two.worker_id)
+    assert first is not second
+
+    late = replying({"findings": [NO_USAGE_MESSAGE], "carried": []})
+    assert await reviewing.invocations.record(admission.invocation_id, late) == "returned"
+    assert await second.carry_out(await reviewing.owed("qa")) == "overtaken"
+
+    assert await reviewing.world.column("SELECT count(*) FROM findings") == [0]
+    assert await reviewing.invocations.parked(PROJECT) == []
+    assert await second.carry_out(await reviewing.owed("qa")) == "applied"
+    assert len(provider.asked) == 1

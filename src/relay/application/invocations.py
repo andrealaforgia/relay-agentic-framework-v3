@@ -183,11 +183,13 @@ class Invocations:
                     return Admission("apply", latest["invocation_id"], latest["attempt"])
                 if state == "intended":
                     return Admission("refused", reason="a call for this work is in flight")
-                if state in ("applied", "overtaken"):
+                if state == "applied":
                     return Admission("finished")
-                # Otherwise the last call gave nothing: it was uncertain, errored,
-                # rejected or never started. Work that is waiting on a person for that
-                # reason is parked, and parked work has no grant to be here under.
+                # Otherwise the last call gave nothing that was used: it was uncertain,
+                # errored, rejected, never started, or overtaken. Work that is waiting on
+                # a person is parked, and parked work has no grant to be here under. Work
+                # whose last result was overtaken and which is still granted here is
+                # still owed: what ended for good was retired, and never gets this far.
             try:
                 # Every stop that would refuse a claim refuses a paid call, the first
                 # and every one after it.

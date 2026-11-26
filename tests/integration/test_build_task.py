@@ -454,3 +454,66 @@ async def test_only_the_verifier_reopens_a_red(building: Building) -> None:
         await building.world.behaviours.reopen_red(BUILDER, PROJECT, "B1", "I would like another")
 
     assert (await building.owed())["state"] == "wanted"
+
+
+async def test_an_attempt_that_was_moved_after_it_was_published_is_not_observed(
+    building: Building,
+) -> None:
+    """3B-S2-1.4: the build task has Relay observe the commit it kept, and no other the
+    ref may come to name. That is nobody's defective reply."""
+    provider = Builder(RIGHT)
+    worker = await building.worker(provider)
+    real = building.task._publish
+
+    def move(ref: str) -> None:
+        # Somebody with access to the repository points the attempt at another commit.
+        subprocess.run(
+            ["git", "-C", str(building.world.builder), "push", "-q", "-f", "origin",
+             f"{building.world.base}:{ref}"],
+            check=True,
+        )  # fmt: skip
+
+    async def published_and_then_moved(run: Any) -> Any:
+        done = await real(run)
+        move(done["ref"])
+        return done
+
+    building.task._publish = published_and_then_moved  # type: ignore[method-assign]
+
+    assert await worker.carry_out(await building.owed()) == "overtaken"
+
+    assert await building.states() == ["overtaken"]
+    assert await building.world.column("SELECT count(*) FROM review_cycles") == [0]
+    assert await building.invocations.parked(PROJECT) == []
+
+
+async def test_the_build_task_asks_for_its_own_commit_and_stays_answerable_for_its_try(
+    building: Building,
+) -> None:
+    """3B-S2-1.4: what the task hands the green run. The commit is the one it kept, and
+    the question of whether it may still be heard is answered from the record: yes while
+    this try is the effect's current one, no once it has been taken over."""
+    provider = Builder(RIGHT)
+    worker = await building.worker(provider)
+    real = building.world.behaviours.run_green
+    heard: list[Any] = []
+
+    async def looked_at(*arguments: Any, **named: Any) -> Any:
+        async with building.world.database.connection() as connection:
+            heard.append(named["expecting"])
+            heard.append(await named["still_heard"](connection))
+            await connection.execute(
+                "UPDATE invocation_effects SET try = try + 1 WHERE name = 'green'"
+            )
+            heard.append(await named["still_heard"](connection))
+            await connection.execute(
+                "UPDATE invocation_effects SET try = try - 1 WHERE name = 'green'"
+            )
+        return await real(*arguments, **named)
+
+    building.world.behaviours.run_green = looked_at  # type: ignore[method-assign]
+
+    assert await worker.carry_out(await building.owed()) == "applied"
+
+    [kept] = await building.world.column("SELECT retained FROM invocations")
+    assert heard == [kept, True, False]

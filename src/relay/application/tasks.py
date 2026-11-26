@@ -21,7 +21,7 @@ from relay.application.reviews import NewFinding, Review, Reviews
 from relay.application.worker import Call
 from relay.domain.review import Carried, Severity, SubmissionRefused
 from relay.domain.story import ActionRefused
-from relay.git.checkout import RemoteRejected, attempt_ref, resolve_ref
+from relay.git.checkout import CandidateMoved, RemoteRejected, attempt_ref, resolve_ref
 from relay.git.mirror import Mirror
 from relay.persistence.database import Connection, Pool
 from relay.providers.confinement import confinement_for, effective_agent_sha256
@@ -481,15 +481,20 @@ class BuildTask:
                 # the oracle ran has its run kept, and opens no review.
                 return await Invocations.is_current_try(connection, invocation_id, "green", try_)
 
-            verdict = await self._behaviours.run_green(
-                about["project_id"],
-                about["behaviour_id"],
-                attempt,
-                run.grant_id,
-                # The commit that was kept and published, and no other the ref may name.
-                expecting=str(run.invocation["retained"]),
-                still_heard=still_heard,
-            )
+            try:
+                verdict = await self._behaviours.run_green(
+                    about["project_id"],
+                    about["behaviour_id"],
+                    attempt,
+                    run.grant_id,
+                    # The commit that was kept and published, and no other the ref may name.
+                    expecting=str(run.invocation["retained"]),
+                    still_heard=still_heard,
+                )
+            except CandidateMoved as moved:
+                # Somebody moved the attempt ref after it was published. The reply is
+                # not at fault, and there is nothing of it left to observe.
+                raise Overtaken(str(moved)) from None
             accepted, reason = verdict.is_valid, verdict.reason
         else:
             accepted, reason = judged["event_type"] == "behaviour.green_verified", judged["reason"]

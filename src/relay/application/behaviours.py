@@ -44,6 +44,7 @@ from relay.domain.evidence import (
 from relay.domain.identifiers import require_identifier
 from relay.domain.story import ActionRefused, Principal, PrincipalKind
 from relay.git.checkout import (
+    CandidateMoved,
     CheckoutFailed,
     attempt_head,
     attempt_ref,
@@ -335,7 +336,7 @@ class Behaviours:
         try:
             candidate = await attempt_head(repository, project_id, behaviour_id, attempt)
             if expecting is not None and candidate != expecting:
-                raise CheckoutFailed("the attempt no longer names the candidate that was kept")
+                raise CandidateMoved("the attempt no longer names the candidate that was kept")
             # Pin the candidate before anything depends on it: the Builder may move the
             # attempt ref at any time, and this commit is about to become evidence.
             mirror = self._mirror(project_id)

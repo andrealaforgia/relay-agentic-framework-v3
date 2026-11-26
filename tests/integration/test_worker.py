@@ -629,7 +629,9 @@ async def test_a_runtime_that_changed_since_the_worker_started_is_asked_about_as
     worker = await bench.worker(Scripted(said(), said()))
     owed = await bench.owed()
     await worker.carry_out(owed)
-    bench.stated["local_policy"] = "a digest that was not there before"
+    # As a policy file changing on the host would show: what is read now is other than
+    # what was read when the worker started.
+    bench.stated = {**RUNTIME, "local_policy": "a digest that was not there before"}
 
     await worker.carry_out(owed)
 
@@ -646,6 +648,8 @@ async def test_work_refused_before_any_call_is_handed_back_to_be_taken_up_later(
     worker = await bench.worker(provider)
     bench.boundaries.holding = False
     owed = await bench.owed()
+    async with bench.world.database.connection() as connection:
+        await connection.execute("UPDATE outbox SET published_at = now()")  # it was delivered
 
     await worker.carry_out(owed)
 
