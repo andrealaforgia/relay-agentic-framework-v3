@@ -14,11 +14,13 @@ from relay.application import behaviours as behaviours_module
 from relay.application.authoring import _refusing, contract_from
 from relay.application.behaviours import rewrite_contract_in
 from relay.application.invocations import Effect
+from relay.application.stories import owe_a_revision
 from relay.application.supersessions import Supersessions
 from relay.domain.behaviour import BehaviourState, TransitionRefused
 from relay.domain.story import ActionRefused, HumanAction, SealRefused
 from relay.git.checkout import CheckoutFailed
 from tests.integration.fixtures import (
+    BUILDER,
     PRODUCT_OWNER,
     VAT_APPLIES_STANDARD_RATE,
     VERIFIER,
@@ -1069,6 +1071,11 @@ async def test_a_replacement_a_decision_voided_is_proposed_again_by_the_verifier
         in (briefings(roles["verifier"], "You decide how")[3])
     )
     assert len(briefings(roles["builder"], "You are the Builder")) == 1  # nothing built for B2
+    [build] = await at.world.column(
+        "SELECT assignment_id FROM assignments WHERE kind = 'build' AND state = 'wanted'"
+    )
+    with pytest.raises(ActionRefused, match="B2 is to replace something on the trunk"):
+        await at.world.claims.claim(BUILDER, build)  # type: ignore[arg-type]
     [again] = await at.world.stories.inbox(PROJECT)
     assert again.manifest["reason"] == "it is still 25%"
 
@@ -1107,3 +1114,83 @@ async def test_a_replacement_its_verifier_withdraws_lets_its_red_be_observed_wit
     await supersessions.withdraw(VERIFIER, PROJECT, await at.world.gate())
 
     assert await at.world.state("B2") is BehaviourState.IMPLEMENTING
+
+
+async def test_a_voided_replacement_its_verifier_does_not_propose_again_is_asked_about_once(
+    delivering_world: Delivering,
+) -> None:
+    """Answered by the contract written again and no replacement named: the behaviour
+    goes on, and the Verifier is not asked the same thing by every pass."""
+    at = delivering_world
+    quarter = {
+        **STANDARD_RATE_CONTRACT,
+        "contract_id": "B2-quarter",
+        "expect_stdout": "125\n",
+        "baseline_stdout": "120\n",
+    }
+    b2 = delivering(
+        demonstrated=False,
+        behaviour_id="B2",
+        summary="another",
+        demonstrates=["AC1"],
+        contract=quarter,
+        replaces="B1",
+        replaces_because="the rate is 25%",
+    )
+    no_longer = delivering(demonstrated=False, contract={**quarter, "contract_id": "B2-again"})
+    roles = await released(
+        at,
+        verifier__You_decide_how_a_user_story_is_shown=[B1, b2, no_longer],
+        verifier__You_are_asked_whether=[STANDS, STANDS],
+    )
+    await at.work()
+    assert await at.world.state("B2") is BehaviourState.VALIDATING_RED
+    at.workers.pop("builder")  # B1 is on the trunk; nothing more is to be built here
+
+    await at.world.answer(await at.world.ask(), "the rate stays as it is")
+    await at.work()
+    await at.world.features.reconcile(PROJECT)
+
+    assert await at.world.column("SELECT state FROM supersessions") == ["void"]
+    assert len(briefings(roles["verifier"], "was approved by the Product Owner")) == 1
+    assert await at.world.column(
+        "SELECT contract->>'contract_id' FROM behaviours WHERE behaviour_id = 'B2'"
+    ) == ["B2-again"]
+    assert await at.world.state("B2") is BehaviourState.IMPLEMENTING
+
+
+async def test_a_seal_owed_before_a_decision_undid_what_it_was_of_is_not_claimed(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S3-2.4: every owner has reconfirmed, and the story has not been said to be
+    demonstrated as it now stands."""
+    at = delivering_world
+    await released(at)
+    verifier = at.workers.pop("verifier")
+    for kind in ("specify", "specify"):  # B1, then "demonstrated": the seal is owed
+        at.workers["verifier"] = verifier
+        await verifier.carry_out((await at.world.claims.of(await _the(at, kind))) or {})
+        at.workers.pop("verifier")
+        await at.work()
+    seal = await _the(at, "seal")
+
+    await at.world.answer(await at.world.ask(), "zero-rated")
+    await at.world.reconfirm_everything()
+
+    with pytest.raises(ActionRefused, match="has not been said to be demonstrated as it now"):
+        await at.world.claims.claim(VERIFIER, seal)
+
+
+async def test_a_revision_of_the_roadmap_in_force_is_owed_once(
+    delivering_world: Delivering,
+) -> None:
+    world = delivering_world.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+
+    async with world.database.connection() as connection, connection.transaction():
+        await owe_a_revision(connection, PROJECT, "F1", "it no longer stands")
+        await owe_a_revision(connection, PROJECT, "F1", "it still does not")
+
+    assert await world.column(
+        "SELECT issued_on->>'reason' FROM assignments WHERE kind = 'revise'"
+    ) == ["it no longer stands"]
