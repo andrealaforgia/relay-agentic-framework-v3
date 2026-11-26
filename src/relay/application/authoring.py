@@ -17,10 +17,10 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from relay.application.assignments import ask_instead, complete
+from relay.application.assignments import complete
 from relay.application.behaviours import rewrite_contract_in, specify_in
 from relay.application.closure import decisions_in_force
-from relay.application.decisions import Decisions, Evidence, _evidence_of, ask_in, assume_in
+from relay.application.decisions import Decisions, Evidence, _evidence_of
 from relay.application.invocations import Effect, EffectRun, Invocations, Overtaken, Prepared
 from relay.application.stories import (
     Dropped,
@@ -34,28 +34,26 @@ from relay.application.stories import (
     say_demonstrated,
     seal_in,
 )
-from relay.application.tasks import Profile, Workspaces
+from relay.application.tasks import (
+    QUESTION,
+    Profile,
+    Workspaces,
+    caller_of,
+    put_question,
+    question_problem,
+    record_assumptions,
+)
+from relay.application.tasks import work_of as _work
 from relay.application.worker import Call
 from relay.domain.behaviour import TransitionRefused
 from relay.domain.evidence import Baseline, Expected, Launch, ProcessContract
 from relay.domain.review import SubmissionRefused
-from relay.domain.story import ActionRefused, Principal, PrincipalKind, SealRefused
+from relay.domain.story import ActionRefused, SealRefused
 from relay.git.checkout import resolve_ref
 from relay.git.mirror import Mirror
 from relay.persistence.database import Connection, Pool
 from relay.providers.confinement import confinement_for, effective_agent_sha256
 from relay.providers.definitions import DEFAULT_DEFINITIONS, find_definition
-
-_QUESTION = {
-    "type": "object",
-    "properties": {
-        "text": {"type": "string"},
-        "why": {"type": "string"},
-        "options": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["text", "why", "options"],
-    "additionalProperties": False,
-}
 
 
 def reply_schema(delivered: Mapping[str, Any]) -> dict[str, Any]:
@@ -67,7 +65,7 @@ def reply_schema(delivered: Mapping[str, Any]) -> dict[str, Any]:
             "outcome": {"enum": ["delivered", "question"]},
             "assumptions": {"type": "array", "items": {"type": "string"}},
             "delivered": dict(delivered),
-            "question": _QUESTION,
+            "question": QUESTION,
         },
         "required": ["outcome", "assumptions"],
         "additionalProperties": False,
@@ -91,12 +89,6 @@ _HOW_TO_REPLY = [
 
 async def _nothing(run: EffectRun) -> None:
     """What these effects do, they do where they are marked done."""
-
-
-def caller_of(invocation: Mapping[str, Any]) -> Principal:
-    """The worker whose call this was: what it replied is done in its name."""
-    role = str(invocation["role"])
-    return Principal(PrincipalKind.WORKER, f"{role}@{invocation['worker_id']}", role)
 
 
 class Authoring:
@@ -232,11 +224,7 @@ class Authoring:
         if reply.get("outcome") == "question":
             if not isinstance(asked, dict) or delivered is not None:
                 return "a reply that asks has a question and delivers nothing"
-            if not str(asked.get("text", "")).strip() or not str(asked.get("why", "")).strip():
-                return "a question needs its text and why it matters"
-            if not all(str(option).strip() for option in asked.get("options", ())):
-                return "an option of a question says nothing"
-            return None
+            return question_problem(reply)
         if delivered is None or asked is not None:
             return "a reply that delivers has what was asked for and no question"
         if not all(str(text).strip() for text in reply.get("assumptions", ())):
@@ -273,36 +261,10 @@ class Authoring:
         return [Effect(first.name, first.perform, with_what_was_assumed), *rest]
 
     async def _assume(self, connection: Connection, run: EffectRun) -> None:
-        work = await _work(connection, run)
-        for text in run.invocation["reply"]["assumptions"]:
-            await assume_in(
-                connection,
-                caller_of(run.invocation),
-                work["project_id"],
-                work["feature_id"],
-                story_id=work["story_id"],
-                text=str(text),
-            )
+        await record_assumptions(connection, run)
 
     async def _ask(self, connection: Connection, run: EffectRun) -> None:
-        """The question, and the end of this occasion, together: answering it owes the
-        work again."""
-        await self._assume(connection, run)
-        work = await _work(connection, run)
-        asked = run.invocation["reply"]["question"]
-        await ask_in(
-            connection,
-            caller_of(run.invocation),
-            f"invocation:{run.invocation['invocation_id']}",
-            work["project_id"],
-            work["feature_id"],
-            story_id=work["story_id"],
-            text=str(asked["text"]),
-            why=str(asked["why"]),
-            options=[str(option) for option in asked["options"]],
-            asked_for=work["assignment_id"],
-        )
-        await ask_instead(connection, work["assignment_id"])
+        await put_question(connection, run)
 
 
 # What a service or the domain raises to say "not this": each is why the reply gave
@@ -327,17 +289,6 @@ def _refusing(effect: Effect) -> Effect:
             raise ActionRefused(f"{refused}") from None
 
     return Effect(effect.name, perform, settle if effect.settle is not None else None)
-
-
-async def _work(connection: Connection, run: EffectRun) -> dict[str, Any]:
-    row = await (
-        await connection.execute(
-            "SELECT * FROM assignments WHERE assignment_id = %s",
-            (run.invocation["assignment_id"],),
-        )
-    ).fetchone()
-    assert row is not None
-    return row
 
 
 _STORY = {

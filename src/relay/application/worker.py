@@ -347,7 +347,14 @@ class Worker:
             # reply failing the check. Either way the call and what it used are recorded.
             problem = f"the reply could not be checked: {fault!r}"
         retained = None
-        if result.outcome is Outcome.RETURNED and problem is None and not result.unusable:
+        asked = result.terminal is not None and _asks(result.terminal.structured_output)
+        if (
+            result.outcome is Outcome.RETURNED
+            and problem is None
+            and not result.unusable
+            # A reply that asks did not do the work: nothing it left is kept.
+            and not asked
+        ):
             try:
                 retained = await task.retain(assignment, call, invocation_id)
             except Exception as failure:  # noqa: BLE001 - whatever stopped it is recorded
@@ -368,3 +375,7 @@ def _problem(task: Task, result: ProviderResult, schema: Mapping[str, Any]) -> s
     if found is not None or result.terminal is None:
         return found
     return task.problem_with(result.terminal.structured_output)
+
+
+def _asks(reply: Any) -> bool:
+    return isinstance(reply, dict) and reply.get("question") is not None

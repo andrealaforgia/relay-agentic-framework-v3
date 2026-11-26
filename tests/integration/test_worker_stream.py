@@ -222,3 +222,47 @@ async def test_a_review_that_could_not_be_prepared_is_taken_up_when_the_reposito
     await served.publisher.publish_pending()
     assert await second.serve_once(served.streams, PROJECT) == ["applied"]
     assert (len(first_provider.asked), len(second_provider.asked)) == (0, 1)
+
+
+WHICH_RATE = {
+    "question": {
+        "text": "Should a negative amount be refused?",
+        "why": "the candidate prints a negative gross amount, and no criterion says",
+        "options": ["refuse it", "print it"],
+    },
+    "assumptions": ["amounts are whole numbers"],
+}
+
+
+async def test_a_reviewer_that_asks_is_answered_and_reviews_afresh_under_a_successor(
+    served: Served,
+) -> None:
+    """3B-S3-1.10: a product question from a reviewer reaches the Product Owner, and
+    the review is owed again on the same task, from a checkout of its own."""
+    provider = Reviewer(WHICH_RATE, NOTHING_FOUND)
+    worker = await served.worker("qa", provider)
+    world = served.world
+
+    assert await worker.serve_once(served.streams, PROJECT) == ["applied"]
+
+    first = await served.owed("qa")
+    assert first["state"] == "asked"
+    [question] = await world.decisions.open_questions(PROJECT)
+    assert question.text == "Should a negative amount be refused?"
+    assert await world.column("SELECT text FROM decisions") == ["amounts are whole numbers"]
+    assert await world.column("SELECT count(*) FROM review_submissions") == [0]
+
+    await world.answer(question.question_id, "print it")
+    await world.reconfirm_everything()
+    await served.publisher.publish_pending()
+    assert await worker.serve_once(served.streams, PROJECT) == ["applied"]
+
+    successor = await served.owed("qa")
+    assert (successor["succeeds"], successor["state"]) == (first["assignment_id"], "done")
+    assert "The Product Owner answered: print it" in provider.asked[1].briefing
+    assert await world.column(
+        "SELECT count(DISTINCT c.grant_id) FROM review_checkouts c JOIN review_tasks t "
+        "USING (task_id) WHERE t.role = 'qa'"
+    ) == [2]
+    assert provider.asked[0].workdir != provider.asked[1].workdir
+    assert await world.column("SELECT count(*) FROM review_submissions") == [1]

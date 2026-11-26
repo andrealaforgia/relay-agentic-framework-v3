@@ -311,7 +311,7 @@ async def test_a_reply_that_says_nothing_of_what_was_done_is_asked_for_again(
     assert await worker.carry_out(await building.owed()) == "applied"
 
     assert await building.states() == ["rejected", "applied"]
-    assert "the reply has no note" in provider.asked[1].briefing
+    assert "the reply has wrote, which was not asked for" in provider.asked[1].briefing
     assert await building.world.column(
         "SELECT retained IS NULL FROM invocations ORDER BY started_at"
     ) == [True, False]  # nothing was kept of the reply that was not one
@@ -685,3 +685,44 @@ async def test_no_base_is_kept_for_a_build_that_was_prepared_and_never_called(
 
     assert list(building.task._workspaces._root.iterdir()) == []
     assert building.task._bases == {}
+
+
+async def test_a_builder_that_asks_keeps_and_publishes_nothing_and_builds_after_the_answer(
+    building: Building, broker: Any, namespace: str
+) -> None:
+    """3B-S3-1.10, through the stream: a question in place of the work."""
+    from relay.persistence.outbox import OutboxPublisher
+    from relay.transport.streams import Streams
+
+    streams = Streams(broker, prefix=namespace)
+    publisher = OutboxPublisher(building.world.database, streams)
+    asks = {
+        "question": {
+            "text": "Is the rate 20% for every amount?",
+            "why": "the contract shows one amount only",
+            "options": ["yes", "no"],
+        }
+    }
+    builder = Builder(WRONG, RIGHT, replies=[asks, {"note": "applied the standard rate"}])
+    worker = await building.worker(builder)
+    world = building.world
+    await publisher.publish_pending()
+
+    assert await worker.serve_once(streams, PROJECT) == ["applied"]
+
+    assert await world.column("SELECT state FROM assignments WHERE kind = 'build'") == ["asked"]
+    assert await world.column("SELECT retained FROM invocations") == [None]
+    assert building.at("refs/relay/attempts/vat-calculator/B1/1") == ""
+    assert await world.column("SELECT count(*) FROM build_attempts") == [0]
+    [question] = await world.decisions.open_questions(PROJECT)
+
+    await world.answer(question.question_id, "yes")
+    await world.reconfirm_everything()
+    await publisher.publish_pending()
+    assert await worker.serve_once(streams, PROJECT) == ["applied"]
+
+    assert await world.column(
+        "SELECT state FROM assignments WHERE kind = 'build' ORDER BY created_at"
+    ) == ["asked", "done"]
+    assert "The Product Owner answered: yes" in builder.asked[1].briefing
+    assert await world.state("B1") is BehaviourState.REVIEW

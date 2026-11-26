@@ -16,17 +16,120 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from relay.application.assignments import ask_instead
 from relay.application.behaviours import Behaviours
+from relay.application.decisions import ask_in, assume_in
 from relay.application.invocations import Effect, EffectRun, Invocations, Overtaken, Prepared
 from relay.application.reviews import NewFinding, Review, Reviews
 from relay.application.worker import Call
 from relay.domain.review import Carried, Severity, SubmissionRefused
-from relay.domain.story import ActionRefused
+from relay.domain.story import ActionRefused, Principal, PrincipalKind
 from relay.git.checkout import CandidateMoved, RemoteRejected, attempt_ref, resolve_ref
 from relay.git.mirror import Mirror
 from relay.persistence.database import Connection, Pool
 from relay.providers.confinement import confinement_for, effective_agent_sha256
 from relay.providers.definitions import DEFAULT_DEFINITIONS, find_definition
+
+QUESTION = {
+    "type": "object",
+    "properties": {
+        "text": {"type": "string"},
+        "why": {"type": "string"},
+        "options": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["text", "why", "options"],
+    "additionalProperties": False,
+}
+_ASSUMPTIONS = {"type": "array", "items": {"type": "string"}}
+
+ASKING_INSTEAD = (
+    "If you cannot do this without a decision that is the Product Owner's to make (what "
+    "the product should do, not how), reply with a question instead and nothing else: its "
+    "text, why it matters, and the options you see. Do not ask what you can settle by "
+    "reading. Under assumptions, list anything you took to be so without being told."
+)
+
+
+def asks(reply: Any) -> bool:
+    """Whether a reply is a question for the Product Owner in place of the work."""
+    return isinstance(reply, dict) and reply.get("question") is not None
+
+
+def question_problem(reply: Mapping[str, Any]) -> str | None:
+    asked = reply.get("question")
+    if not isinstance(asked, dict):
+        return "a question is an object with its text, why it matters and its options"
+    if not str(asked.get("text", "")).strip() or not str(asked.get("why", "")).strip():
+        return "a question needs its text and why it matters"
+    if not all(str(option).strip() for option in asked.get("options", ())):
+        return "an option of a question says nothing"
+    if not all(str(text).strip() for text in reply.get("assumptions") or ()):
+        return "an assumption says nothing"
+    return None
+
+
+def caller_of(invocation: Mapping[str, Any]) -> Principal:
+    """The worker whose call this was: what it replied is done in its name."""
+    role = str(invocation["role"])
+    return Principal(PrincipalKind.WORKER, f"{role}@{invocation['worker_id']}", role)
+
+
+async def work_of(connection: Connection, run: EffectRun) -> dict[str, Any]:
+    row = await (
+        await connection.execute(
+            "SELECT * FROM assignments WHERE assignment_id = %s",
+            (run.invocation["assignment_id"],),
+        )
+    ).fetchone()
+    assert row is not None
+    return row
+
+
+async def record_assumptions(connection: Connection, run: EffectRun) -> None:
+    work = await work_of(connection, run)
+    for text in run.invocation["reply"].get("assumptions") or ():
+        await assume_in(
+            connection,
+            caller_of(run.invocation),
+            work["project_id"],
+            work["feature_id"],
+            story_id=work["story_id"],
+            text=str(text),
+        )
+
+
+async def put_question(connection: Connection, run: EffectRun) -> None:
+    """The question, what was assumed in asking it, and the end of this occasion,
+    together: answering it owes the work again."""
+    await record_assumptions(connection, run)
+    work = await work_of(connection, run)
+    asked = run.invocation["reply"]["question"]
+    await ask_in(
+        connection,
+        caller_of(run.invocation),
+        f"invocation:{run.invocation['invocation_id']}",
+        work["project_id"],
+        work["feature_id"],
+        story_id=work["story_id"],
+        text=str(asked["text"]),
+        why=str(asked["why"]),
+        options=[str(option) for option in asked["options"]],
+        asked_for=work["assignment_id"],
+    )
+    await ask_instead(connection, work["assignment_id"])
+
+
+async def _nothing(run: EffectRun) -> None:
+    """What this effect does, it does where it is marked done."""
+
+
+ASK = Effect("ask", _nothing, put_question)
+
+
+async def _assumed(connection: Connection, run: EffectRun) -> None:
+    """What was assumed in doing the work, recorded where the work is accepted."""
+    await record_assumptions(connection, run)
+
 
 REVIEW_REPLY = {
     "type": "object",
@@ -59,8 +162,11 @@ REVIEW_REPLY = {
                 "additionalProperties": False,
             },
         },
+        "question": QUESTION,
+        "assumptions": _ASSUMPTIONS,
     },
-    "required": ["findings", "carried"],
+    # A review, with its findings and how the earlier ones stand; or a question.
+    "required": [],
     "additionalProperties": False,
 }
 
@@ -162,6 +268,10 @@ class ReviewTask:
         )
 
     def problem_with(self, reply: Any) -> str | None:
+        if asks(reply):
+            if "findings" in reply or "carried" in reply:
+                return "a reply that asks has a question and no review"
+            return question_problem(reply)
         try:
             review_from(reply)
         except SubmissionRefused as refused:
@@ -177,7 +287,9 @@ class ReviewTask:
         shutil.rmtree(call.workdir.parent, ignore_errors=True)
 
     def effects(self, invocation: Mapping[str, Any]) -> list[Effect]:
-        return [Effect("submit", self._submit)]
+        if asks(invocation["reply"]):
+            return [ASK]
+        return [Effect("submit", self._submit, _assumed)]
 
     async def _submit(self, run: EffectRun) -> Mapping[str, Any]:
         """Submit the review from the checkout the model was handed, under the grant that
@@ -214,6 +326,9 @@ class ReviewTask:
             row = await (
                 await connection.execute(
                     "SELECT t.task_id, t.role, c.project_id, c.candidate_revision, "
+                    "(SELECT o.envelope->'payload'->>'reason' FROM assignments a JOIN outbox o "
+                    "ON o.message_id = a.command_message_id "
+                    "WHERE a.assignment_id = t.assignment_id) AS reason, "
                     "b.behaviour_id, "
                     "b.summary, b.contract, s.story_id, s.title, s.outcome, s.criteria "
                     "FROM review_tasks t JOIN review_cycles c USING (cycle_id) "
@@ -287,6 +402,9 @@ def _review_briefing(role: str, about: Mapping[str, Any], last_problem: str | No
         ]
     else:
         lines += ["", "You have no earlier findings on this behaviour: reply with no carried ones."]
+    lines += ["", ASKING_INSTEAD]
+    if about.get("reason"):
+        lines += ["", f"This review was owed before, and is owed again because {about['reason']}"]
     if last_problem:
         lines += ["", f"Your last reply could not be used: {last_problem}. Reply again in full."]
     return "\n".join(lines) + "\n"
@@ -321,8 +439,13 @@ class Tasks:
 
 BUILD_REPLY = {
     "type": "object",
-    "properties": {"note": {"type": "string"}},
-    "required": ["note"],
+    "properties": {
+        "note": {"type": "string"},
+        "question": QUESTION,
+        "assumptions": _ASSUMPTIONS,
+    },
+    # A note of what was built; or a question, and then nothing that was left is kept.
+    "required": [],
     "additionalProperties": False,
 }
 
@@ -398,6 +521,10 @@ class BuildTask:
         )
 
     def problem_with(self, reply: Any) -> str | None:
+        if asks(reply):
+            if "note" in reply:
+                return "a reply that asks has a question and no note of work done"
+            return question_problem(reply)
         if not isinstance(reply, dict) or not isinstance(reply.get("note"), str):
             return "the reply is a note saying what was done"
         return None
@@ -417,7 +544,10 @@ class BuildTask:
         shutil.rmtree(call.workdir.parent, ignore_errors=True)
 
     def effects(self, invocation: Mapping[str, Any]) -> list[Effect]:
-        return [Effect("publish", self._publish), Effect("green", self._green)]
+        if asks(invocation["reply"]):
+            # Nothing was kept of what a call that asks left, and nothing is published.
+            return [ASK]
+        return [Effect("publish", self._publish), Effect("green", self._green, _assumed)]
 
     async def _attempt(self, invocation: Mapping[str, Any]) -> int:
         """The attempt number of this call's candidate: one more than the behaviour has
@@ -599,6 +729,8 @@ def _build_briefing(about: Mapping[str, Any], last_problem: str | None) -> str:
         ),
         "",
         "When you are done, reply with a short note of what you changed and why.",
+        "",
+        ASKING_INSTEAD + " A reply that asks keeps nothing of what you left here.",
     ]
     if about["kind"] == "remediate":
         lines += ["", "This is a repair of a candidate that was sent back."]
@@ -617,6 +749,11 @@ def _build_briefing(about: Mapping[str, Any], last_problem: str | None) -> str:
                 "Checks every candidate must pass, which this one did not: "
                 + ", ".join(about["command"]["failed_checks"])
             ]
+    if about["command"].get("reason"):
+        lines += [
+            "",
+            f"This work was owed before, and is owed again because {about['command']['reason']}",
+        ]
     if last_problem:
         lines += ["", f"Your last attempt could not be used: {last_problem}"]
     return "\n".join(lines) + "\n"

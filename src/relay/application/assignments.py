@@ -126,7 +126,7 @@ async def owe_again(
         for name, value in was["payload"].items()
         if name not in ("assignment_id", "succeeds", "reason")
     }
-    return await owe(
+    successor = await owe(
         connection,
         earlier["kind"],
         Envelope(
@@ -145,6 +145,15 @@ async def owe_again(
         feature_id=earlier["feature_id"],
         succeeds=predecessor,
     )
+    # A review is of one task of one cycle, whoever is asked to make it: the task is the
+    # successor's now, and its grant is the one a checkout is handed to.
+    await connection.execute(
+        "UPDATE review_tasks SET assignment_id = %s, command_message_id = "
+        "(SELECT command_message_id FROM assignments WHERE assignment_id = %s) "
+        "WHERE assignment_id = %s",
+        (successor, successor, predecessor),
+    )
+    return successor
 
 
 async def ask_instead(connection: Connection, assignment_id: uuid.UUID) -> None:

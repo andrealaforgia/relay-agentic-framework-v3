@@ -318,7 +318,17 @@ class Invocations:
             state, reason = _ending(result, problem)
             if late and result.terminal is None and result.outcome is not Outcome.NOT_STARTED:
                 return "uncertain"  # nothing more is known than was
-            if state == "returned" and assignment["kind"] in (BUILD, REMEDIATE) and not retained:
+            asked = (
+                result.terminal is not None
+                and isinstance(result.terminal.structured_output, dict)
+                and result.terminal.structured_output.get("question") is not None
+            )
+            if (
+                state == "returned"
+                and assignment["kind"] in (BUILD, REMEDIATE)
+                and not retained
+                and not asked
+            ):
                 # What a build returns is a tree. Without the tree kept there is nothing
                 # to apply, whatever the model said about it.
                 state, reason = "rejected", "nothing was kept of what the build made"
