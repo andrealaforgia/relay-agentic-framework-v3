@@ -9,6 +9,7 @@ it is settled by what the repository says, never by what a push call seemed to d
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import uuid
 from collections.abc import Awaitable, Callable
@@ -209,9 +210,7 @@ class Integration:
         if source is None:
             raise LookupError(f"unknown project {project_id!r}")
         head = await trunk_head(source["repository"], source["trunk"])
-        return await self._finish(
-            await self._start_batch(project_id, behaviour_id, request_id, head)
-        )
+        return await self._begun(self._start_batch(project_id, behaviour_id, request_id, head))
 
     async def take_up(self, assignment_id: uuid.UUID) -> IntegrationReceipt | None:
         """Take up an integration that is owed: the first of a candidate whose review
@@ -253,11 +252,13 @@ class Integration:
         head = await trunk_head(source["repository"], source["trunk"], timeout=self._push_timeout)
         # The cycle is looked at again where the batch is made: what was satisfied a
         # moment ago may have been replaced while the repository was being asked.
-        return await self._finish(
-            await self._start_batch(
+        return await self._begun(
+            self._start_batch(
                 owed["project_id"],
                 owed["behaviour_id"],
-                f"cycle-{cycle_id}",
+                # One request per time the integration was owed: the first for a cycle,
+                # or one a person allowed again after the repository refused a push.
+                f"owed-{assignment_id}",
                 head,
                 first=(assignment_id, cycle_id),
             )
@@ -290,8 +291,8 @@ class Integration:
         if owed is None:
             raise LookupError(f"no integration is owed under {assignment_id}")
         head = await trunk_head(owed["repository"], owed["trunk"], timeout=self._push_timeout)
-        return await self._finish(
-            await self._start_batch(
+        return await self._begun(
+            self._start_batch(
                 owed["project_id"],
                 owed["behaviour_id"],
                 owed["request_id"],
@@ -315,6 +316,25 @@ class Integration:
                 f"{self._oracle.isolation.name} execution cannot open a gate; "
                 "checks must be observed in a container"
             )
+
+    async def _begun(
+        self, starting: Awaitable[dict[str, Any] | IntegrationReceipt]
+    ) -> IntegrationReceipt:
+        """Start a batch and see it through. A caller cut short while the batch is being
+        made does not leave it running with nobody running it: the making is let finish,
+        and what it made is given up as any batch whose checks could not be completed."""
+        making = asyncio.ensure_future(starting)
+        try:
+            started = await asyncio.shield(making)
+        except asyncio.CancelledError:
+            try:
+                made = await asyncio.shield(making)
+            except BaseException:  # noqa: BLE001 - nothing was made; the cancel stands
+                raise asyncio.CancelledError from None
+            if not isinstance(made, IntegrationReceipt):
+                await asyncio.shield(self._abandon(made["batch_id"]))
+            raise
+        return await self._finish(started)
 
     async def _finish(self, started: dict[str, Any] | IntegrationReceipt) -> IntegrationReceipt:
         if isinstance(started, IntegrationReceipt):
@@ -381,7 +401,7 @@ class Integration:
             require_open(await closure_of_behaviour(connection, project_id, behaviour_id))
             last = await (
                 await connection.execute(
-                    "SELECT i.state, c.state AS cycle_state FROM integration_intents i "
+                    "SELECT i.state, c.state AS cycle_state, c.cycle_id FROM integration_intents i "
                     "JOIN review_cycles c USING (cycle_id) WHERE i.project_id = %s "
                     "AND i.behaviour_id = %s ORDER BY i.created_at DESC LIMIT 1",
                     (project_id, behaviour_id),
@@ -397,6 +417,25 @@ class Integration:
                 "integration.retry_allowed",
                 subject_id=behaviour_id,
                 payload={"reason": reason},
+            )
+            # The first integration of this cycle was taken up and refused. Nothing else
+            # will owe another: the review gate was satisfied once and stays so. The
+            # person's retry owes it, here, and the pass takes it up.
+            await owe(
+                connection,
+                INTEGRATE,
+                Envelope(
+                    message_kind=MessageKind.COMMAND,
+                    event_type="integration.requested",
+                    project_id=project_id,
+                    behaviour_id=behaviour_id,
+                    sender=CONTROL_PLANE,
+                    recipient="integrator",
+                    idempotency_key=f"integrate:retry:{uuid.uuid7()}",
+                    correlation_id=uuid.uuid7(),
+                    payload={"cycle_id": str(last["cycle_id"]), "retry": reason},
+                ),
+                issued_on={"cycle_id": str(last["cycle_id"])},
             )
 
     async def _start_batch(

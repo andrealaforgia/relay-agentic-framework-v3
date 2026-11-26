@@ -885,3 +885,49 @@ async def test_a_first_integration_taken_up_late_starts_nothing_for_a_cycle_it_w
     assert await world.column("SELECT state FROM assignments WHERE kind = 'integrate'") == [
         "retired"
     ]
+
+
+async def test_a_refused_integration_a_person_allows_again_reaches_trunk_with_nothing_else_asked(
+    world: StoryWorld,
+) -> None:
+    """3B-S3-2.8: the retry owes the integration, and the pass takes it up."""
+    candidate = await reviewed_and_owed_to_relay(world)
+    world.hook_flag("refuse").touch()
+    await world.features.reconcile(PROJECT)
+    assert await world.column("SELECT state FROM integration_intents") == ["rejected"]
+    await world.features.reconcile(PROJECT)  # and Relay does not try again by itself
+    assert await world.column("SELECT count(*) FROM integration_intents") == [1]
+    world.hook_flag("refuse").unlink()
+
+    await world.features.retry_integration(PROJECT, "B1", "the hook was misconfigured")
+
+    assert world.trunk() == candidate
+    assert await world.column("SELECT state FROM integration_intents ORDER BY created_at") == [
+        "rejected",
+        "integrated",
+    ]
+
+
+async def test_a_pass_cut_short_as_its_first_batch_is_made_leaves_the_integration_owed(
+    world: StoryWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S3-2.9: with the process alive, and put right by an ordinary pass."""
+    candidate = await reviewed_and_owed_to_relay(world)
+    real = integration_module.Integration._start_batch
+    committed = asyncio.Event()
+
+    async def slow_to_say_so(self: Any, *arguments: Any, **named: Any) -> Any:
+        made = await real(self, *arguments, **named)
+        committed.set()
+        await asyncio.sleep(0.2)  # committed, and the caller has not been told yet
+        return made
+
+    with monkeypatch.context() as patched:
+        patched.setattr(integration_module.Integration, "_start_batch", slow_to_say_so)
+        passing = asyncio.create_task(world.features.reconcile(PROJECT))
+        await committed.wait()
+        await killed(passing)
+
+    assert [str(each).split(":", 1)[1] for each in await batches(world)] == ["1:interrupted"]
+    await world.features.reconcile(PROJECT)
+    assert world.trunk() == candidate

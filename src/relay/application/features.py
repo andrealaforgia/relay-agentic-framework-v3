@@ -71,6 +71,12 @@ class Features:
         await self.reconcile(gate["project_id"])
         return receipt
 
+    async def retry_integration(self, project_id: str, behaviour_id: str, reason: str) -> None:
+        """A person allows an integration the repository refused to be tried again, and
+        Relay tries it: the retry owes the integration, and the pass takes it up."""
+        await self._integration.retry_integration(project_id, behaviour_id, reason)
+        await self.reconcile(project_id)
+
     async def summary_of(self, project_id: str, feature_id: str) -> dict[str, Any] | None:
         """The summary of a completed feature; none until it is completed."""
         return await self._completion.summary_of(project_id, feature_id)

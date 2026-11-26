@@ -220,36 +220,21 @@ class Behaviours:
     async def observe_owed_reds(self, project_id: str) -> None:
         """Carry out every red that is owed: the pass's to call. One that cannot be
         observed now (the repository does not answer, its scope is stopped) stays owed."""
-        async with self._pool.connection() as connection, connection.transaction():
-            # Taken before anything is launched: of two passes that look at the same
-            # moment, one observes each red and the other finds it taken.
-            taken = await (
+        async with self._pool.connection() as connection:
+            owed = await (
                 await connection.execute(
-                    "UPDATE assignments SET state = 'granted', grant_id = gen_random_uuid(), "
-                    "granted_to = %s WHERE project_id = %s AND kind = 'red' AND state = 'wanted' "
-                    # A behaviour proposed as the replacement of something on trunk waits
-                    # for the Product Owner: built before that is decided, its candidate
-                    # would only fail the very check it is meant to replace.
-                    "AND NOT EXISTS (SELECT 1 FROM supersessions s WHERE s.project_id = "
-                    "assignments.project_id AND s.behaviour_id = assignments.behaviour_id "
-                    "AND s.state = 'proposed') "
-                    "RETURNING assignment_id, behaviour_id",
-                    (CONTROL_PLANE, project_id),
+                    "SELECT behaviour_id FROM assignments WHERE project_id = %s "
+                    "AND kind = 'red' AND state = 'wanted' ORDER BY created_at",
+                    (project_id,),
                 )
             ).fetchall()
-        for each in taken:
+        for each in owed:
             try:
                 await self.run_red(_RELAY, project_id, each["behaviour_id"])
             except CheckoutFailed, ActionRefused, TransitionRefused:
-                pass
-            finally:
-                # Whatever was not settled by a verdict is owed still.
-                async with self._pool.connection() as connection, connection.transaction():
-                    await connection.execute(
-                        "UPDATE assignments SET state = 'wanted', grant_id = NULL, "
-                        "granted_to = NULL WHERE assignment_id = %s AND state = 'granted'",
-                        (each["assignment_id"],),
-                    )
+                # Not now: it waits for a decision, or is being observed by another
+                # pass, or the repository did not answer. It is owed still.
+                continue
 
     async def run_red(self, principal: Principal, project_id: str, behaviour_id: str) -> RedVerdict:
         """Observe the registered contract on the project's own trunk and judge the result.
@@ -261,6 +246,24 @@ class Behaviours:
         """
         if principal.kind is not PrincipalKind.CONTROL_PLANE:
             raise ActionRefused("observing a red is for the control plane to ask for")
+        taken: list[uuid.UUID] = []
+        try:
+            return await self._observe_red(project_id, behaviour_id, taken)
+        finally:
+            if taken:
+                # Whatever a verdict did not settle is owed still: under the grant
+                # that took it, and no other that may hold it by now.
+                async with self._pool.connection() as connection, connection.transaction():
+                    await connection.execute(
+                        "UPDATE assignments SET state = 'wanted', grant_id = NULL, "
+                        "granted_to = NULL, first_effect_at = NULL "
+                        "WHERE grant_id = %s AND state = 'granted'",
+                        (taken[0],),
+                    )
+
+    async def _observe_red(
+        self, project_id: str, behaviour_id: str, taken: list[uuid.UUID]
+    ) -> RedVerdict:
         async with self._changing(project_id, behaviour_id, starts="evidence") as (
             connection,
             behaviour,
@@ -268,6 +271,16 @@ class Behaviours:
         ):
             contract = behaviour.require_awaiting_red()
             cycle = behaviour.red_cycle
+            if await _replaces_undecided(connection, project_id, behaviour_id):
+                # Built before that is decided, its candidate would only fail the very
+                # check it is meant to replace. Whoever asks, the pass or a caller.
+                raise ActionRefused(
+                    f"{behaviour_id} is proposed as a replacement the Product Owner has "
+                    "yet to decide: its red waits for that"
+                )
+            grant = await _take_red(connection, project_id, behaviour_id, cycle)
+            if grant is not None:
+                taken.append(grant)
             story_id = await _story_of(connection, project_id, behaviour_id)
             launched_on = await story_basis(connection, project_id, story_id)
             isolation = self._oracle.isolation
@@ -311,11 +324,9 @@ class Behaviours:
                 # The red that was owed has been observed, whichever way it went. One
                 # that was overtaken in flight observed nothing of what is owed now.
                 await connection.execute(
-                    "UPDATE assignments SET state = 'done', grant_id = %s, granted_to = %s, "
-                    "first_effect_at = now() WHERE project_id = %s AND behaviour_id = %s "
-                    "AND kind = 'red' AND state IN ('wanted', 'granted') "
-                    "AND issued_on->>'red_cycle' = %s",
-                    (uuid.uuid7(), CONTROL_PLANE, project_id, behaviour_id, str(cycle)),
+                    "UPDATE assignments SET state = 'done' WHERE grant_id = %s "
+                    "AND state = 'granted'",
+                    (taken[0] if taken else None,),
                 )
             if not verdict.is_valid:
                 await self._red_rejected(
@@ -909,3 +920,43 @@ async def rewrite_contract_in(
         correlation_id=row["correlation_id"],
     )
     await owe_red(connection, project_id, behaviour_id)
+
+
+async def _replaces_undecided(connection: Connection, project_id: str, behaviour_id: str) -> bool:
+    row = await (
+        await connection.execute(
+            "SELECT 1 FROM supersessions WHERE project_id = %s AND behaviour_id = %s "
+            "AND state = 'proposed'",
+            (project_id, behaviour_id),
+        )
+    ).fetchone()
+    return row is not None
+
+
+async def _take_red(
+    connection: Connection, project_id: str, behaviour_id: str, cycle: int
+) -> uuid.UUID | None:
+    """Take the red that is owed for this cycle, before anything is launched, and return
+    the grant it is observed under: its launch, its verdict and its giving back are all
+    that grant's. A grant that has launched is a first effect, so a pause leaves it to
+    be judged. Refused if another caller is observing it at this moment. None if no red
+    is on record as owed for the cycle: a caller's own, then, and nobody else's."""
+    owed = await (
+        await connection.execute(
+            "SELECT assignment_id, state FROM assignments WHERE project_id = %s "
+            "AND behaviour_id = %s AND kind = 'red' AND state IN ('wanted', 'granted') "
+            "AND issued_on->>'red_cycle' = %s FOR UPDATE",
+            (project_id, behaviour_id, str(cycle)),
+        )
+    ).fetchone()
+    if owed is None:
+        return None
+    if owed["state"] == "granted":
+        raise ActionRefused(f"the red of {behaviour_id} is being observed already")
+    grant = uuid.uuid7()
+    await connection.execute(
+        "UPDATE assignments SET state = 'granted', grant_id = %s, granted_to = %s, "
+        "first_effect_at = now() WHERE assignment_id = %s",
+        (grant, CONTROL_PLANE, owed["assignment_id"]),
+    )
+    return grant

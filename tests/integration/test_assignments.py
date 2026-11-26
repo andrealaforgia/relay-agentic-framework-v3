@@ -550,3 +550,31 @@ async def test_a_decided_review_answers_only_those_it_was_handed_to(world: Story
         task_id, Review(findings=(INJECTION,)), grant, handed.receipt
     )
     assert second_thoughts.disposition == "conflicting"
+
+
+async def test_a_red_being_observed_across_a_pause_and_a_resume_is_observed_once(
+    world: StoryWorld,
+) -> None:
+    """3B-S3-2.3: the launch is the grant's first effect, so the pause leaves it; the
+    resume's pass finds it taken; and what the first caller lets go of is its own."""
+    await world.behaviours.propose(
+        VERIFIER, PROJECT, "S1", "B1", "standard rate", ["AC1"], basis=0, story_revision=1
+    )
+    await world.behaviours.begin_test_design(VERIFIER, PROJECT, "B1")
+    await world.behaviours.register_acceptance_test(VERIFIER, PROJECT, "B1", CONTRACT, basis=0)
+    barrier, behaviours = held(world)
+    running = asyncio.create_task(behaviours.observe_owed_reds(PROJECT))
+    await held_at_the_barrier(running, barrier)
+
+    await world.close("pause", reason="budget review")
+    await world.close("resume")
+    await world.behaviours.observe_owed_reds(PROJECT)  # another pass, while the first runs
+    with pytest.raises(ActionRefused, match="being observed already"):
+        await world.behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")
+    assert await world.column("SELECT count(*) FROM executions WHERE purpose = 'red'") == [0]
+    barrier.release.set()
+    await running
+
+    assert await world.column("SELECT count(*) FROM executions WHERE purpose = 'red'") == [1]
+    assert await world.column("SELECT state FROM assignments WHERE kind = 'red'") == ["done"]
+    assert await assignments(world) == ["build:wanted"]
