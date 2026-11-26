@@ -67,3 +67,10 @@ def test_a_schema_is_refused_whole_before_any_reply_is_paid_for() -> None:
         require_checkable(deep)
     with pytest.raises(ValueError, match="null"):
         require_checkable({"type": "array", "items": {"type": "null"}})
+
+
+def test_a_schema_for_the_extra_properties_is_one_relay_does_not_check() -> None:
+    """Astra's reservation in round three: only the yes-or-no form is understood."""
+    with pytest.raises(ValueError, match="additionalProperties"):
+        require_checkable({"type": "object", "additionalProperties": {"type": "integer"}})
+    require_checkable({"type": "object", "additionalProperties": True})

@@ -6,7 +6,6 @@ as a model with a shell would, and replies."""
 from __future__ import annotations
 
 import asyncio
-import shutil
 import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -28,7 +27,12 @@ from relay.git.checkout import CheckoutFailed, RemoteUnavailable
 from relay.git.mirror import Mirror
 from relay.providers.claude import ProviderResult, Request
 from tests.integration.decision_world import DecisionWorld
-from tests.integration.fixtures import BUILDER, VAT_APPLIES_STANDARD_RATE, VAT_RETURNS_NET
+from tests.integration.fixtures import (
+    BUILDER,
+    VAT_APPLIES_STANDARD_RATE,
+    VAT_RETURNS_NET,
+    VERIFIER,
+)
 from tests.integration.story_world import STANDARD_RATE
 from tests.integration.test_review_task import replying
 from tests.integration.test_worker import RUNTIME, SeenToHold
@@ -261,7 +265,7 @@ async def test_a_build_whose_worker_went_just_after_it_replied_loses_nothing(
         await worker.carry_out(await building.owed())
     building.invocations.apply = real  # type: ignore[method-assign]
     await building.sessions[-1].stop()
-    shutil.rmtree(provider.asked[0].workdir.parent)
+    assert not provider.asked[0].workdir.parent.exists()
 
     await building.invocations.recover(PROJECT)
 
@@ -616,3 +620,70 @@ async def test_the_build_task_asks_for_its_own_commit_and_stays_answerable_for_i
 
     [kept] = await building.world.column("SELECT retained FROM invocations")
     assert heard == [kept, True, False]
+
+
+async def test_a_green_found_while_its_story_gained_a_behaviour_opens_no_review(
+    building: Building,
+) -> None:
+    """3B-S2-3.2: the Verifier adds a behaviour to the story while the candidate is
+    being observed. The call was admitted on the story as it was, so its result is
+    overtaken, and that has to be known where the green would be accepted: a review
+    opened from a result the record then calls overtaken is a contradiction on record.
+    What was observed is kept; the build is owed again."""
+    world = building.world
+    provider = Builder(RIGHT)
+    worker = await building.worker(provider)
+    oracle = world.behaviours._oracle
+    observe = oracle.execute
+
+    async def execute(*arguments: Any) -> Any:
+        execution = await observe(*arguments)
+        await world.behaviours.propose(
+            VERIFIER,
+            PROJECT,
+            "S1",
+            "B2",
+            "the reduced rate is applied",
+            ["AC1"],
+            basis=await world.basis(),
+            story_revision=await world.revision(),
+        )
+        return execution
+
+    oracle.execute = execute  # type: ignore[method-assign]
+
+    assert await worker.carry_out(await building.owed()) == "overtaken"
+
+    assert await world.column("SELECT count(*) FROM review_cycles") == [0]
+    assert await world.state("B1") is BehaviourState.IMPLEMENTING
+    assert await world.column("SELECT state FROM green_runs") == ["finished"]
+    assert await world.column(
+        "SELECT payload->>'rejection' FROM events WHERE event_type = 'behaviour.green_rejected'"
+    ) == ["assignment_superseded"]
+    owed = await world.column("SELECT state FROM assignments WHERE kind = 'build'")
+    assert owed == ["wanted"]
+
+
+async def test_no_tree_and_no_base_is_kept_once_a_build_is_finished_with(
+    building: Building,
+) -> None:
+    """3B-S2-3.8."""
+    worker = await building.worker(Builder(WRONG, RIGHT))
+
+    assert await worker.carry_out(await building.owed()) == "applied"
+
+    assert list(building.task._workspaces._root.iterdir()) == []
+    assert building.task._bases == {}
+
+
+async def test_no_base_is_kept_for_a_build_that_was_prepared_and_never_called(
+    building: Building,
+) -> None:
+    """3B-S2-3.8: a call refused at admission was prepared all the same."""
+    worker = await building.worker(Builder(WRONG, RIGHT))
+    worker._boundaries.holding = False  # type: ignore[attr-defined]
+
+    assert (await worker.carry_out(await building.owed())).startswith("refused")
+
+    assert list(building.task._workspaces._root.iterdir()) == []
+    assert building.task._bases == {}

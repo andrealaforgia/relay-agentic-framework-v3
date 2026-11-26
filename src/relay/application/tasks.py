@@ -9,6 +9,7 @@ its run has no tool that could change one.
 from __future__ import annotations
 
 import json
+import shutil
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -171,6 +172,9 @@ class ReviewTask:
         self, assignment: Mapping[str, Any], call: Call, invocation_id: uuid.UUID
     ) -> str | None:
         return None  # a review's reply is all there is of it
+
+    def discard(self, call: Call) -> None:
+        shutil.rmtree(call.workdir.parent, ignore_errors=True)
 
     def effects(self, invocation: Mapping[str, Any]) -> list[Effect]:
         return [Effect("submit", self._submit)]
@@ -391,6 +395,10 @@ class BuildTask:
         return await self._mirror(str(assignment["project_id"])).retain(
             call.workdir, base, f"refs/relay/invocations/{invocation_id}"
         )
+
+    def discard(self, call: Call) -> None:
+        self._bases.pop(call.workdir, None)
+        shutil.rmtree(call.workdir.parent, ignore_errors=True)
 
     def effects(self, invocation: Mapping[str, Any]) -> list[Effect]:
         return [Effect("publish", self._publish), Effect("green", self._green)]

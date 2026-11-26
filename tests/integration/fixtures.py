@@ -240,6 +240,16 @@ async def submit_review(
                 (task_id,),
             )
         ).fetchone()
+        if held is None:
+            # Nobody holds the review now. Its last reviewer, arriving late, still has
+            # the grant and the receipt it was given.
+            held = await (
+                await connection.execute(
+                    "SELECT grant_id, receipt_id AS receipt FROM review_checkouts "
+                    "WHERE task_id = %s ORDER BY prepared_at DESC, receipt_id DESC LIMIT 1",
+                    (task_id,),
+                )
+            ).fetchone()
     grant = held["grant_id"] if held else uuid.uuid7()
     receipt = (held["receipt"] if held else None) or uuid.uuid7()
     return await reviews.submit_review(task_id, review, grant, receipt)

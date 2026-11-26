@@ -1724,3 +1724,33 @@ async def test_an_effect_that_could_not_be_let_go_on_record_is_not_busy_for_ever
 
     assert await calling.invocations.apply(invocation, worker) == "applied"
     assert calling.applying.ran == ["first:1", "first:2", "second:1"]
+
+
+async def test_a_refusal_cut_short_before_it_was_on_record_does_not_leave_the_effect_taken(
+    calling: Calling, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S2-3.4: the service refused, and the call was cancelled while it waited to
+    put that on record. Its worker lives on. The effect must not stay on record as
+    being carried out by it: the pass would find it busy for ever."""
+    worker = await calling.worker()
+    invocation = await calling.admitted(worker)
+    await calling.invocations.record(invocation, said(), retained=KEPT)
+    calling.applying.failing["first"] = ActionRefused("the service would not have it")
+    waiting = asyncio.Event()
+
+    async def waits_for_a_lock(self: Invocations, *arguments: Any, **named: Any) -> str:
+        waiting.set()
+        await asyncio.Event().wait()
+        return ""
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Invocations, "_reject", waits_for_a_lock)
+        applying = asyncio.create_task(calling.invocations.apply(invocation, worker))
+        await waiting.wait()
+        applying.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await applying
+
+    await calling.invocations.recover(PROJECT)
+
+    assert await calling.states() == ["rejected"]

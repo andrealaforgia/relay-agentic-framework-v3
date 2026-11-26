@@ -13,7 +13,7 @@ from datetime import timedelta
 
 from psycopg.types.json import Jsonb
 
-from relay.persistence.database import Pool
+from relay.persistence.database import Connection, Pool
 from relay.providers.boundary_suite import SuiteResult, as_recorded
 
 
@@ -28,18 +28,21 @@ class Boundaries:
 
     async def record(self, result: SuiteResult) -> None:
         """Record what a run of the suite found, whichever way it went, and raise if the
-        boundary did not hold. A failure is kept: it takes away an earlier pass."""
+        boundary did not hold. A failure is kept: it takes away an earlier pass. A run is
+        recorded once however often it is handed over, as of when it was made."""
         async with self._pool.connection() as connection, connection.transaction():
             await connection.execute(
                 "INSERT INTO boundary_passes (pass_id, digest, role, runtime, observations, "
-                "passed) VALUES (%s, %s, %s, %s, %s, %s)",
+                "passed, observed_at) VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (pass_id) DO NOTHING",
                 (
-                    uuid.uuid7(),
+                    result.run_id,
                     result.digest,
                     result.role,
                     Jsonb(result.runtime),
                     Jsonb(as_recorded(result)),
                     result.passed,
+                    result.observed_at,
                 ),
             )
         if not result.passed:
@@ -50,11 +53,19 @@ class Boundaries:
         """Whether the latest run of the suite on this exact boundary passed, and not too
         long ago."""
         async with self._pool.connection() as connection:
-            row = await (
-                await connection.execute(
-                    "SELECT passed AND passed_at > clock_timestamp() - %s AS holds "
-                    "FROM boundary_passes WHERE digest = %s ORDER BY passed_at DESC LIMIT 1",
-                    (self._good_for, digest),
-                )
-            ).fetchone()
-        return bool(row and row["holds"])
+            return await self.authorising(connection, digest) is not None
+
+    async def authorising(self, connection: Connection, digest: str) -> uuid.UUID | None:
+        """The assessment that allows a launch within this boundary now, or None: the
+        run of the suite most lately made on it, if it passed and is not stale. Asked on
+        the connection, and so in the transaction, of whoever is about to launch."""
+        row = await (
+            await connection.execute(
+                "SELECT pass_id, passed AND observed_at > clock_timestamp() - %s AS holds "
+                "FROM boundary_passes WHERE digest = %s "
+                "ORDER BY observed_at DESC, pass_id DESC LIMIT 1",
+                (self._good_for, digest),
+            )
+        ).fetchone()
+        held: uuid.UUID | None = row["pass_id"] if row and row["holds"] else None
+        return held

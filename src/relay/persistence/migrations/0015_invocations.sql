@@ -108,9 +108,10 @@ CREATE TABLE boundary_passes (
     -- Every run of the suite is kept, whichever way it went. The latest one of a
     -- boundary is what is true of it.
     passed       boolean NOT NULL,
-    passed_at    timestamptz NOT NULL DEFAULT clock_timestamp()
+    -- When the run was made, as the run says: not when it came to be recorded.
+    observed_at  timestamptz NOT NULL
 );
-CREATE INDEX boundary_passes_by_digest ON boundary_passes (digest, passed_at DESC);
+CREATE INDEX boundary_passes_by_digest ON boundary_passes (digest, observed_at DESC);
 
 -- The attempt number a call's candidate is published under. One sequence per behaviour
 -- across builds and remediations, allocated once per call: asked again, a call is given

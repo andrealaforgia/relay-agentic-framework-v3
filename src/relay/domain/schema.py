@@ -38,6 +38,10 @@ def _require_understood(schema: dict[str, Any]) -> None:
         raise ValueError(f"a reply schema uses {sorted(beyond)}, which Relay does not check")
     if "type" in schema and schema["type"] not in _TYPES:
         raise ValueError(f"a reply schema asks for a {schema['type']}, which Relay does not check")
+    if schema.get("additionalProperties", True) not in (True, False):
+        raise ValueError(
+            "a reply schema gives additionalProperties a schema, which Relay does not check"
+        )
 
 
 def problem_with(value: Any, schema: dict[str, Any], at: str = "the reply") -> str | None:

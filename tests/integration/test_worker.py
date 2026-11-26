@@ -15,10 +15,12 @@ from typing import Any
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
+from relay.application.boundaries import Boundaries, BoundaryNotShown
 from relay.application.invocations import Effect, EffectRun, Invocations
 from relay.application.worker import Call, Worker
 from relay.application.workers import WorkerSession
 from relay.domain.story import ActionRefused
+from relay.providers.boundary_suite import Observation, SuiteResult
 from relay.providers.claude import (
     ClaudeAdapter,
     Confinement,
@@ -45,9 +47,9 @@ class SeenToHold:
         self.holding = True
         self.asked: list[str] = []
 
-    async def holds(self, digest: str) -> bool:
+    async def authorising(self, connection: Any, digest: str) -> uuid.UUID | None:
         self.asked.append(digest)
-        return self.holding
+        return uuid.uuid7() if self.holding else None
 
 
 class Scripted:
@@ -97,6 +99,7 @@ class Summing:
         self.keeping: asyncio.Event | None = None
         self.at_keeping = asyncio.Event()
         self.during_preparation: Any = None
+        self.discarded: list[Call] = []
 
     async def prepare(
         self, assignment: Mapping[str, Any], grant: uuid.UUID, last_problem: str | None
@@ -124,6 +127,9 @@ class Summing:
         if self.cannot_keep is not None:
             raise self.cannot_keep
         return KEPT
+
+    def discard(self, call: Call) -> None:
+        self.discarded.append(call)
 
     def problem_with(self, reply: Any) -> str | None:
         if self.check_faults:
@@ -216,11 +222,11 @@ async def test_the_grant_a_worker_works_under_is_recorded_as_that_workers(bench:
     seen: list[object] = []
     real = bench.invocations.admit
 
-    async def admit_and_look(*arguments: Any) -> Any:
+    async def admit_and_look(*arguments: Any, **named: Any) -> Any:
         seen.extend(
             await bench.world.column("SELECT granted_worker FROM assignments WHERE kind = 'build'")
         )
-        return await real(*arguments)
+        return await real(*arguments, **named)
 
     bench.invocations.admit = admit_and_look  # type: ignore[method-assign]
     await worker.carry_out(owed)
@@ -481,10 +487,13 @@ async def test_a_caller_cancelled_while_the_tree_is_being_kept_still_has_its_cal
     with pytest.raises(asyncio.CancelledError):
         await carrying
     assert await bench.states() == ["intended"]
+    assert bench.task.discarded == []  # what is being kept from is not thrown away yet
     bench.task.keeping.set()
 
     await until(bench, "returned")
     assert await bench.world.column("SELECT retained FROM invocations") == [KEPT]
+    await asyncio.sleep(0)
+    assert len(bench.task.discarded) == 1
 
 
 async def test_a_caller_cancelled_while_the_record_is_being_made_still_has_it_made(
@@ -627,6 +636,7 @@ async def test_a_runtime_that_changed_since_the_worker_started_is_asked_about_as
 ) -> None:
     """3B-S2-1.1: a policy file that changed is another boundary, with no pass."""
     worker = await bench.worker(Scripted(said(), said()))
+    bench.boundaries.holding = False  # so that the work is still there to be asked about
     owed = await bench.owed()
     await worker.carry_out(owed)
     # As a policy file changing on the host would show: what is read now is other than
@@ -737,3 +747,106 @@ async def test_work_whose_last_call_gave_nothing_is_handed_back_when_the_bounds_
     assert await worker.carry_out(await bench.owed()) == "applied"
     assert await bench.states() == ["rejected", "applied"]
     assert bench.task.problems[-1] == "the service would not have it"
+
+
+def shown(digest: str, passed: bool = True) -> SuiteResult:
+    return SuiteResult("builder", digest, RUNTIME, (Observation("every probe", passed, ""),), None)
+
+
+async def test_a_launch_is_allowed_by_an_assessment_of_its_boundary_which_is_recorded(
+    bench: Bench,
+) -> None:
+    """3B-S2-3.6."""
+    bench.boundaries = Boundaries(bench.world.database)  # type: ignore[assignment]
+    allowed = shown(boundary_digest(Confinement((), {}), RUNTIME))
+    await bench.boundaries.record(allowed)  # type: ignore[attr-defined]
+    worker = await bench.worker(Scripted(said()))
+
+    assert await worker.carry_out(await bench.owed()) == "applied"
+
+    assert await bench.world.column(
+        "SELECT admitted_on->>'boundary_assessment' FROM invocations"
+    ) == [str(allowed.run_id)]
+
+
+async def test_a_boundary_that_failed_while_admission_waited_launches_nothing(
+    bench: Bench,
+) -> None:
+    """3B-S2-3.6: whether the boundary holds is asked where the call is admitted, after
+    admission has waited for its locks. Here the suite fails on this boundary while
+    admission waits, and the answer from before the wait would have been yes."""
+    database = bench.world.database
+    bench.boundaries = Boundaries(database)  # type: ignore[assignment]
+    digest = boundary_digest(Confinement((), {}), RUNTIME)
+    await bench.boundaries.record(shown(digest))  # type: ignore[attr-defined]
+    provider = Scripted(said())
+    worker = await bench.worker(provider)
+    held, background = asyncio.Event(), []
+
+    async def holding_the_work() -> None:
+        async with database.connection() as connection, connection.transaction():
+            await connection.execute("SELECT 1 FROM assignments WHERE kind = 'build' FOR UPDATE")
+            held.set()
+            waiting = 0
+            while not waiting:  # until admission is waiting for this lock
+                await asyncio.sleep(0.05)
+                async with database.connection() as other:
+                    [waiting] = [
+                        row["waiting"]
+                        for row in await (
+                            await other.execute(
+                                "SELECT count(*) AS waiting FROM pg_stat_activity "
+                                "WHERE wait_event_type = 'Lock' AND datname = current_database()"
+                            )
+                        ).fetchall()
+                    ]
+            with pytest.raises(BoundaryNotShown):
+                await bench.boundaries.record(shown(digest, passed=False))  # type: ignore[attr-defined]
+
+    async def once_the_call_is_prepared() -> None:
+        background.append(asyncio.create_task(holding_the_work()))
+        await held.wait()
+
+    bench.task.during_preparation = once_the_call_is_prepared
+
+    left = await worker.carry_out(await bench.owed())
+    await background[0]
+
+    assert left == "refused: the bounds of this run have not been shown to hold on this host"
+    assert provider.asked == []
+    assert await bench.states() == []
+    assert (await bench.owed())["state"] == "wanted"
+
+
+async def test_work_whose_call_could_not_be_prepared_is_not_left_with_the_worker(
+    bench: Bench,
+) -> None:
+    """3B-S2-3.3: a failure nobody planned for, while the call was being prepared. It is
+    not swallowed, and the grant does not stay with a worker that is alive and doing
+    nothing under it."""
+
+    async def fails() -> None:
+        raise RuntimeError("the disk is full")
+
+    bench.task.during_preparation = fails
+    worker = await bench.worker(Scripted(said()))
+
+    with pytest.raises(RuntimeError, match="the disk is full"):
+        await worker.carry_out(await bench.owed())
+
+    owed = await bench.owed()
+    assert (owed["state"], owed["grant_id"]) == ("wanted", None)
+
+
+async def test_what_was_set_up_for_a_call_is_let_go_of_whatever_became_of_the_call(
+    bench: Bench,
+) -> None:
+    """3B-S2-3.8: once for each call prepared, used or not."""
+    worker = await bench.worker(Scripted(said(), said()))
+    bench.refusing.append("the service would not have it")
+
+    assert await worker.carry_out(await bench.owed()) == "applied"
+    assert len(bench.task.discarded) == 2
+
+    bench.boundaries.holding = False
+    assert (await worker.carry_out(await bench.owed())).startswith(("refused", "finished"))

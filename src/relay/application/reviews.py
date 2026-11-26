@@ -3,9 +3,10 @@
 Reviewers are callers of this API. Nothing here trusts what a caller says about what it
 looked at: what was reviewed is a tree this code prepared from the pinned commit. What
 lets a caller act on a review is the grant that holds the review's assignment now, which
-`claim` gives to one enrolled worker process of the review's role. There is no secret
-that stands for a review: nothing is stored, delivered or shown that would let whoever
-read it act as a reviewer.
+`claim` gives to a caller of the review's role: an enrolled, live worker process, or a
+caller inside the control plane's own process. There is no secret that stands for a
+review: nothing is stored, delivered or shown that would let whoever read it act as a
+reviewer.
 """
 
 from __future__ import annotations
@@ -536,10 +537,16 @@ class Reviews:
         """Record one reviewer's review. Every request gets exactly one answer however often
         it is retried, and only the first accepted submission of a task has any effect.
         That first submission names the checkout it was written from: one made under the
-        grant that holds the review now, and under the decisions in force now."""
+        grant that holds the review now, and under the decisions in force now.
+
+        Whatever the review's state, nothing is answered and nothing is written for a
+        caller that was never handed this review's tree under the grant it names: not a
+        receipt for a submission somebody else made, and not a record that it disagreed."""
         await self._task(task_id)
         async with self._pool.connection() as connection, connection.transaction():
             task = await _locked_task(connection, task_id)
+            if not await _was_handed(connection, task_id, grant, checkout):
+                raise SubmissionRefused("no tree was prepared for this review under this grant")
             closed_by = await closure_of_behaviour(
                 connection, task["project_id"], task["behaviour_id"]
             )
@@ -926,6 +933,21 @@ async def _locked_task(connection: Connection, task_id: uuid.UUID) -> dict[str, 
     ).fetchone()
     assert task is not None
     return task
+
+
+async def _was_handed(
+    connection: Connection, task_id: uuid.UUID, grant: uuid.UUID, receipt: uuid.UUID
+) -> bool:
+    """Whether this receipt is for a tree of this review handed over under this grant,
+    at any time: what makes a caller one of the review's reviewers, past or present."""
+    row = await (
+        await connection.execute(
+            "SELECT 1 FROM review_checkouts WHERE task_id = %s AND receipt_id = %s "
+            "AND grant_id = %s",
+            (task_id, receipt, grant),
+        )
+    ).fetchone()
+    return row is not None
 
 
 async def _has_checkout(

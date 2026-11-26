@@ -25,7 +25,8 @@ import secrets
 import shutil
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -116,6 +117,10 @@ class SuiteResult:
     runtime: dict[str, str]
     observations: tuple[Observation, ...]
     cost_usd: Decimal | None
+    # Which run this is and when it was made, said by the run and not by whoever records
+    # it: recorded twice it is one assessment, and recorded late it is no fresher.
+    run_id: uuid.UUID = field(default_factory=uuid.uuid7)
+    observed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     @property
     def passed(self) -> bool:

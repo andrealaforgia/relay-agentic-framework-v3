@@ -501,8 +501,50 @@ async def test_a_worker_whose_grant_was_taken_back_cannot_submit_on_its_successo
     )
     assert blocked.disposition == "effective"
     assert await world.column("SELECT count(*) FROM review_submissions") == [1]
-    assert (
+    # An exact replay of what was accepted is answered, to the reviewer it was handed to
+    # and to nobody else.
+    replay = await world.reviews.submit_review(
+        task_id, Review(findings=(INJECTION,)), second, handed_over.receipt
+    )
+    assert replay == blocked
+    with pytest.raises(SubmissionRefused, match="no tree was prepared"):
         await world.reviews.submit_review(
             task_id, Review(findings=(INJECTION,)), first, uuid.uuid7()
         )
-    ) == blocked  # an exact replay of what was accepted is answered, whoever asks
+
+
+async def test_a_decided_review_answers_only_those_it_was_handed_to(world: StoryWorld) -> None:
+    """3B-S2-3.1: once a review has an accepted submission, a caller that names it gets
+    that submission's receipt for the same content, and a record of its disagreement for
+    different content. Neither is for a caller the review's tree was never handed to
+    under the grant it names: it would be writing a reviewer's evidence."""
+    reviews = await awaiting_review(world)
+    claims = Assignments(world.database)
+    task_id, owed = reviews["qa"]
+    grant = await claims.claim(reviewer("qa"), owed)
+    handed = await world.reviews.prepare_review(task_id, world.tmp_path / "tree", grant)
+    accepted = await world.reviews.submit_review(task_id, Review(), grant, handed.receipt)
+    others_task, others_owed = reviews["sentinel"]
+    others_grant = await claims.claim(reviewer("sentinel"), others_owed)
+    theirs = await world.reviews.prepare_review(
+        others_task, world.tmp_path / "theirs", others_grant
+    )
+    [recorded] = await world.column("SELECT count(*) FROM review_submissions")
+
+    for presented in (
+        (uuid.uuid7(), uuid.uuid7()),
+        (others_grant, theirs.receipt),  # a real grant and receipt, of another review
+        (grant, theirs.receipt),
+        (others_grant, handed.receipt),
+    ):
+        for said in (Review(), Review(findings=(INJECTION,))):
+            with pytest.raises(SubmissionRefused, match="no tree was prepared"):
+                await world.reviews.submit_review(task_id, said, *presented)
+
+    assert await world.column("SELECT count(*) FROM review_submissions") == [recorded]
+    # The reviewer it was handed to is still answered, and its disagreement still kept.
+    assert await world.reviews.submit_review(task_id, Review(), grant, handed.receipt) == accepted
+    second_thoughts = await world.reviews.submit_review(
+        task_id, Review(findings=(INJECTION,)), grant, handed.receipt
+    )
+    assert second_thoughts.disposition == "conflicting"

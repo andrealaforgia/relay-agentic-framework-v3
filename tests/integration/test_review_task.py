@@ -4,7 +4,6 @@ The provider is scripted; what is real is everything around it."""
 
 from __future__ import annotations
 
-import os
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -268,7 +267,7 @@ async def test_a_reviewers_workspace_is_one_the_bounds_hold_for(reviewing: Revie
     assert workdir.is_absolute() and workdir.name == "tree"
     assert not workdir.is_relative_to(Path.home())
     assert uuid.UUID(workdir.parent.name)  # a directory of its own
-    assert os.listdir(workdir.parent) == ["tree"]
+    assert not workdir.parent.exists()  # and gone once the review is finished with
 
 
 async def test_a_reviewer_is_asked_how_its_earlier_findings_stand_and_its_answer_is_recorded(
@@ -449,3 +448,21 @@ async def test_a_malformed_review_handed_straight_to_the_record_becomes_no_findi
         "SELECT envelope->'structured_output'->'findings'->0->>'claim' FROM invocations"
     )
     assert kept == "7"
+
+
+async def test_no_tree_is_left_behind_by_a_review_or_by_a_delivery_that_came_to_nothing(
+    reviewing: Reviewing,
+) -> None:
+    """3B-S2-3.8: every preparation exports a tree, and a worker given the same review
+    again and again while it may launch nothing would otherwise keep every one."""
+    root = reviewing.task._workspaces._root
+    worker = await reviewing.worker("qa", Reviewer(NOTHING_FOUND))
+    worker._boundaries.holding = False  # type: ignore[attr-defined]
+
+    for _ in range(3):
+        assert (await worker.carry_out(await reviewing.owed("qa"))).startswith("refused")
+    assert list(root.iterdir()) == []
+
+    worker._boundaries.holding = True  # type: ignore[attr-defined]
+    assert await worker.carry_out(await reviewing.owed("qa")) == "applied"
+    assert list(root.iterdir()) == []

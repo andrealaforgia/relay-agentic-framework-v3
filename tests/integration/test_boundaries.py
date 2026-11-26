@@ -3,7 +3,8 @@ and goes stale."""
 
 from __future__ import annotations
 
-from datetime import timedelta
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -59,10 +60,10 @@ async def test_a_later_failure_takes_an_earlier_pass_away_until_it_passes_again(
 ) -> None:
     """3B-S2-1.2: the latest run of the suite is what is true of a boundary."""
     boundaries = Boundaries(database)
-    failing = suite("d" * 64, Observation("the shell is refused the network", False, "200"))
     await boundaries.record(suite())
     assert await boundaries.holds("d" * 64)
 
+    failing = suite("d" * 64, Observation("the shell is refused the network", False, "200"))
     with pytest.raises(BoundaryNotShown):
         await boundaries.record(failing)
     assert not await boundaries.holds("d" * 64)
@@ -79,7 +80,65 @@ async def test_a_suite_that_observed_nothing_is_not_a_pass(database: AsyncConnec
 async def test_a_pass_goes_stale(database: AsyncConnectionPool) -> None:
     """Part of what bounds a run is policy Relay cannot read, so a pass is evidence only
     for a while."""
-    await Boundaries(database).record(suite())
+    # Two hours old, by the clock of the host that made it: the database's own clock
+    # need not agree with that one to the millisecond.
+    made = datetime.now(UTC) - timedelta(hours=2)
+    await Boundaries(database).record(replace(suite(), observed_at=made))
 
-    assert await Boundaries(database, good_for=timedelta(hours=1)).holds("d" * 64)
-    assert not await Boundaries(database, good_for=timedelta(0)).holds("d" * 64)
+    assert await Boundaries(database, good_for=timedelta(hours=3)).holds("d" * 64)
+    assert not await Boundaries(database, good_for=timedelta(hours=1)).holds("d" * 64)
+
+
+async def test_an_earlier_pass_handed_over_again_does_not_undo_a_later_failure(
+    database: AsyncConnectionPool,
+) -> None:
+    """3B-S2-3.5: a run of the suite is one assessment however often it is recorded, as
+    of when it was made."""
+    boundaries = Boundaries(database)
+    now = datetime.now(UTC)
+    passed = replace(suite(), observed_at=now - timedelta(minutes=10))
+    failed = replace(
+        suite("d" * 64, Observation("the shell is refused the network", False, "200")),
+        observed_at=now - timedelta(minutes=5),
+    )
+    await boundaries.record(passed)
+    with pytest.raises(BoundaryNotShown):
+        await boundaries.record(failed)
+
+    await boundaries.record(passed)
+
+    assert not await boundaries.holds("d" * 64)
+    async with database.connection() as connection:
+        rows = await (await connection.execute("SELECT pass_id FROM boundary_passes")).fetchall()
+    assert sorted(row["pass_id"] for row in rows) == sorted([passed.run_id, failed.run_id])
+
+
+async def test_the_latest_assessment_is_the_one_observed_last_not_the_one_made_up_last(
+    database: AsyncConnectionPool,
+) -> None:
+    """3B-S2-3.5: a run's identity may be newer than what it observed."""
+    boundaries = Boundaries(database)
+    now = datetime.now(UTC)
+    failed = replace(
+        suite("d" * 64, Observation("the shell is refused the network", False, "200")),
+        observed_at=now - timedelta(minutes=5),
+    )
+    passed = replace(suite(), observed_at=now - timedelta(minutes=10))
+    assert passed.run_id > failed.run_id
+    with pytest.raises(BoundaryNotShown):
+        await boundaries.record(failed)
+
+    await boundaries.record(passed)
+
+    assert not await boundaries.holds("d" * 64)
+
+
+async def test_a_pass_recorded_late_is_as_old_as_the_run_it_is_of(
+    database: AsyncConnectionPool,
+) -> None:
+    """3B-S2-3.5: a delayed write gives old observations no new lease."""
+    boundaries = Boundaries(database)
+
+    await boundaries.record(replace(suite(), observed_at=datetime.now(UTC) - timedelta(hours=25)))
+
+    assert not await boundaries.holds("d" * 64)

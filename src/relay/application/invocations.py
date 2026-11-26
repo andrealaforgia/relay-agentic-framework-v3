@@ -162,8 +162,14 @@ class Invocations:
         assignment_id: uuid.UUID,
         grant_id: uuid.UUID,
         prepared: Prepared,
+        *,
+        authorised: Callable[[Connection], Awaitable[uuid.UUID | None]] | None = None,
     ) -> Admission:
-        """Decide, under the assignment's lock, whether a provider may be called now."""
+        """Decide, under the assignment's lock, whether a provider may be called now.
+
+        `authorised` says, asked here and not before, which assessment of the run's
+        boundary allows the launch, or None if none does. Admission can wait a long time
+        for its locks, and an answer got before that wait is about another moment."""
         async with self._pool.connection() as connection, connection.transaction():
             assignment = await _locked_assignment(connection, assignment_id)
             if assignment["state"] in ("done", "retired"):
@@ -206,9 +212,18 @@ class Invocations:
             # Before anything is paid for: a reply could not be checked against a schema
             # that asks for what Relay does not check.
             require_checkable(dict(prepared.schema))
+            assessment = await authorised(connection) if authorised is not None else None
+            if authorised is not None and assessment is None:
+                return Admission(
+                    "refused",
+                    reason="the bounds of this run have not been shown to hold on this host",
+                )
             invocation_id = uuid.uuid7()
             attempt = (latest["attempt"] if latest is not None else 0) + 1
             admitted_on = {**stands, "grant_id": str(grant_id), "attempt": attempt}
+            if assessment is not None:
+                # Which run of the boundary suite allowed this launch.
+                admitted_on["boundary_assessment"] = str(assessment)
             await connection.execute(
                 "INSERT INTO invocations (invocation_id, assignment_id, project_id, grant_id, "
                 "attempt, worker_id, role, provider, model, effort, agent_name, agent_path, "
@@ -432,15 +447,18 @@ class Invocations:
                     detail = await effect.perform(run)
                     marked = await self._mark(invocation_id, effect, run, detail)
                 except Overtaken as overtaken:
-                    settled = True
-                    return await self._reject(
+                    disposed = await self._reject(
                         invocation_id, effect.name, taken, str(overtaken), blameless=True
                     )
+                    settled = True
+                    return disposed
                 except ActionRefused as refused:
                     # By the service, in `perform`, or in `settle`, whose transaction
-                    # has been rolled back by now.
+                    # has been rolled back by now. Settled only once that is on record:
+                    # a call cut short while it waits to say so still lets the effect go.
+                    disposed = await self._reject(invocation_id, effect.name, taken, str(refused))
                     settled = True
-                    return await self._reject(invocation_id, effect.name, taken, str(refused))
+                    return disposed
                 settled = True
                 if marked != "done":
                     return marked
@@ -748,17 +766,29 @@ class Invocations:
     async def is_current_try(
         connection: Connection, invocation_id: uuid.UUID, name: str, attempt: int
     ) -> bool:
-        """Whether this try of an effect is still the one that may decide. Asked inside
-        a transaction that is about to accept what the try did."""
+        """Whether this try of an effect is still the one that may decide, and what its
+        invocation is about is still as the invocation expects. Asked inside a
+        transaction that is about to accept what the try did: afterwards is too late,
+        since what was accepted would stand beside a record saying it was overtaken."""
         row = await (
             await connection.execute(
-                "SELECT 1 FROM invocation_effects e JOIN invocations v USING (invocation_id) "
+                "SELECT v.expects, v.assignment_id FROM invocation_effects e "
+                "JOIN invocations v USING (invocation_id) "
                 "WHERE e.invocation_id = %s AND e.name = %s AND e.state = 'started' "
                 "AND e.try = %s AND v.state = 'returned'",
                 (invocation_id, name, attempt),
             )
         ).fetchone()
-        return row is not None
+        if row is None:
+            return False
+        assignment = await (
+            await connection.execute(
+                "SELECT * FROM assignments WHERE assignment_id = %s", (row["assignment_id"],)
+            )
+        ).fetchone()
+        assert assignment is not None
+        now = await _as_it_stands(connection, assignment)
+        return all(row["expects"].get(name) == value for name, value in now.items())
 
     async def last_problem(self, assignment_id: uuid.UUID) -> str | None:
         """Why the last call for this work gave nothing usable, if that is how it ended:

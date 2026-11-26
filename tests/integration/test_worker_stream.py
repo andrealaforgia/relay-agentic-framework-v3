@@ -13,6 +13,7 @@ import redis.asyncio as redis
 from psycopg_pool import AsyncConnectionPool
 
 from relay.application.worker import Worker
+from relay.domain.review import SubmissionRefused
 from relay.domain.story import HumanAction
 from relay.persistence.outbox import OutboxPublisher
 from relay.providers.claude import ProviderResult, Request
@@ -194,3 +195,30 @@ async def test_a_reviewer_whose_bounds_stop_holding_after_a_reply_it_could_not_u
         "applied",
     ]
     assert "findings of the reply is not a array" in provider.asked[1].briefing
+
+
+async def test_a_review_that_could_not_be_prepared_is_taken_up_when_the_repository_answers(
+    served: Served, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S2-3.3: the reviewer has claimed the work when its repository does not answer.
+    It stays alive. The work must not stay with it: when the repository answers again
+    the work is announced, and whoever reads the stream does it. Nothing was paid for
+    in between."""
+    first_provider, second_provider = Reviewer(), Reviewer(NOTHING_FOUND)
+    first = await served.worker("qa", first_provider)
+    real = served.world.reviews.prepare_review
+
+    async def unreachable(*_: Any) -> Any:
+        raise SubmissionRefused("the repository cannot be reached: it did not answer")
+
+    monkeypatch.setattr(served.world.reviews, "prepare_review", unreachable)
+
+    [left] = await first.serve_once(served.streams, PROJECT)
+
+    assert left == "refused: the repository cannot be reached: it did not answer"
+    assert (await served.owed("qa"))["state"] == "wanted"
+    monkeypatch.setattr(served.world.reviews, "prepare_review", real)
+    second = await served.worker("qa", second_provider)
+    await served.publisher.publish_pending()
+    assert await second.serve_once(served.streams, PROJECT) == ["applied"]
+    assert (len(first_provider.asked), len(second_provider.asked)) == (0, 1)

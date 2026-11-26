@@ -19,7 +19,9 @@ from typing import Any, Protocol
 from relay.application.assignments import Assignments
 from relay.application.invocations import Invocations, Prepared, reply_problem
 from relay.application.workers import WorkerSession
+from relay.domain.review import SubmissionRefused
 from relay.domain.story import ActionRefused
+from relay.persistence.database import Connection
 from relay.providers.boundary_suite import UNATTESTED
 from relay.providers.claude import (
     Confinement,
@@ -69,6 +71,11 @@ class Task(Protocol):
         as. None for work whose reply is all there is."""
         ...
 
+    def discard(self, call: Call) -> None:
+        """Let go of what was set up for a call that is finished with, whatever became
+        of it: the tree it was to run in."""
+        ...
+
 
 class Provider(Protocol):
     async def invoke(
@@ -84,8 +91,10 @@ class Provider(Protocol):
 
 
 class Shown(Protocol):
-    async def holds(self, digest: str) -> bool:
-        """Whether this boundary has been shown to hold on this host, recently."""
+    async def authorising(self, connection: Connection, digest: str) -> uuid.UUID | None:
+        """The assessment that allows a launch within this boundary now, or None if it
+        has not been shown to hold on this host, recently. Asked on the connection of
+        the transaction that admits the call."""
         ...
 
 
@@ -162,53 +171,90 @@ class Worker:
         # earlier one: the next briefing says what was wrong with it.
         problem = await self._invocations.last_problem(assignment_id)
         stale = 0
-        while True:
-            call = await task.prepare(assignment, grant, problem)
-            runtime = self._runtime()
-            if runtime.get("remote_policy", UNATTESTED) == UNATTESTED:
-                # Part of what bounds a run is policy this host may be given from
-                # elsewhere, which Relay cannot read. Until the operator has stated what
-                # it is, nothing is launched.
-                await self._claims.give_back(assignment_id, grant)
-                return "refused: nobody has stated what policy this host is given from elsewhere"
-            boundary = boundary_digest(call.confinement, runtime)
-            if not await self._boundaries.holds(boundary):
-                # No call is made within bounds nobody has seen hold here: not on a new
-                # version of the CLI, not under changed settings, not after a pass has
-                # gone stale or a later run of the suite has failed.
-                await self._claims.give_back(assignment_id, grant)
-                return "refused: the bounds of this run have not been shown to hold on this host"
-            admission = await self._invocations.admit(
-                self._session, assignment_id, grant, call.prepared
-            )
-            if admission.outcome == "stale" and stale < _PREPARATIONS:
-                # What the briefing was written from moved while it was being written.
-                stale += 1
-                continue
-            if admission.outcome in ("refused", "stale"):
-                # Nothing will be done under this grant now. If nothing was ever called
-                # under it, it is handed back, so that the work can be taken up again
-                # when whatever refused it has cleared.
-                await self._claims.give_back(assignment_id, grant)
-                return f"refused: {admission.reason}"
-            if admission.outcome == "finished":
-                return "finished"
-            assert admission.invocation_id is not None
-            if admission.outcome == "apply":
-                # A result is already known for this work. Nothing is called.
-                return await self._invocations.apply(admission.invocation_id, self._session)
-            state = await self._call(admission.invocation_id, task, assignment, call)
-            if state == "returned":
-                state = await self._invocations.apply(admission.invocation_id, self._session)
-                if state != "rejected":
+        prepared: list[Call] = []
+        try:
+            while True:
+                try:
+                    call = await task.prepare(assignment, grant, problem)
+                except BaseException as failed:
+                    # Nothing will be done under this grant by a worker that could not
+                    # so much as prepare the call, or was stopped while it did. The grant
+                    # is handed back, if it owns nothing, so that the work is not left
+                    # with a worker that is alive and not doing it.
+                    await asyncio.shield(self._claims.give_back(assignment_id, grant))
+                    if isinstance(failed, ActionRefused | SubmissionRefused):
+                        return f"refused: {failed}"
+                    raise
+                prepared.append(call)
+                runtime = self._runtime()
+                if runtime.get("remote_policy", UNATTESTED) == UNATTESTED:
+                    # Part of what bounds a run is policy this host may be given from
+                    # elsewhere, which Relay cannot read. Until the operator has stated
+                    # what it is, nothing is launched.
+                    await self._claims.give_back(assignment_id, grant)
+                    return (
+                        "refused: nobody has stated what policy this host is given from elsewhere"
+                    )
+                boundary = boundary_digest(call.confinement, runtime)
+
+                async def authorised(
+                    connection: Connection, boundary: str = boundary
+                ) -> uuid.UUID | None:
+                    # No call is made within bounds nobody has seen hold here: not on a
+                    # new version of the CLI, not under changed settings, not after a
+                    # pass has gone stale or a later run of the suite has failed. Asked
+                    # where the call is admitted, after admission has its locks.
+                    return await self._boundaries.authorising(connection, boundary)
+
+                admission = await self._invocations.admit(
+                    self._session, assignment_id, grant, call.prepared, authorised=authorised
+                )
+                if admission.outcome == "stale" and stale < _PREPARATIONS:
+                    # What the briefing was written from moved while it was being written.
+                    stale += 1
+                    continue
+                if admission.outcome in ("refused", "stale"):
+                    # Nothing will be done under this grant now. If it owns nothing, it
+                    # is handed back, so that the work can be taken up again when
+                    # whatever refused it has cleared.
+                    await self._claims.give_back(assignment_id, grant)
+                    return f"refused: {admission.reason}"
+                if admission.outcome == "finished":
+                    return "finished"
+                assert admission.invocation_id is not None
+                if admission.outcome == "apply":
+                    # A result is already known for this work. Nothing is called.
+                    return await self._invocations.apply(admission.invocation_id, self._session)
+                state = await self._call(admission.invocation_id, task, assignment, call)
+                if state == "returned":
+                    state = await self._invocations.apply(admission.invocation_id, self._session)
+                    if state != "rejected":
+                        return state
+                    problem = await self._invocations.reason_of(admission.invocation_id)
+                elif state in ("errored", "rejected"):
+                    problem = await self._invocations.reason_of(admission.invocation_id)
+                else:
                     return state
-                problem = await self._invocations.reason_of(admission.invocation_id)
-            elif state in ("errored", "rejected"):
-                problem = await self._invocations.reason_of(admission.invocation_id)
-            else:
-                return state
-            # The call gave nothing usable. Whether another is allowed is admission's to
-            # say, and the next briefing says what was wrong with this one.
+                # The call gave nothing usable. Whether another is allowed is admission's
+                # to say, and the next briefing says what was wrong with this one.
+        finally:
+            self._let_go(task, prepared)
+
+    def _let_go(self, task: Task, calls: list[Call]) -> None:
+        """Discard what was set up for these calls, once nothing is still being kept
+        from it: a record being made for a caller that was cancelled may be keeping a
+        build's workspace as a commit at this moment."""
+        recording = set(self._recording)
+
+        def discard(_: object = None) -> None:
+            if all(each.done() for each in recording):
+                for call in calls:
+                    task.discard(call)
+                calls.clear()
+
+        for each in recording:
+            each.add_done_callback(discard)
+        discard()
 
     async def _call(
         self, invocation_id: uuid.UUID, task: Task, assignment: Mapping[str, Any], call: Call
