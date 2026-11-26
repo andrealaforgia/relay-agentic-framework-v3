@@ -247,8 +247,10 @@ async def test_an_approval_that_comes_after_the_replacement_went_in_the_ordinary
     world: Superseding,
 ) -> None:
     base = await world.awaiting_builder("Z", GREETING, "S2")  # contradicts nothing
-    gate = await world.propose()
+    # Proposed once its candidate was already built and reviewed: nothing is built for
+    # a behaviour whose replacement the Product Owner has yet to decide.
     await world.reviewed("Z", {"greeting.txt": "hello\n"}, on=base)
+    gate = await world.propose()
     assert (await world.integrate("Z")).outcome is Outcome.INTEGRATED
 
     assert (await world.decide(gate)).disposition == "stale"
@@ -404,8 +406,10 @@ async def test_an_approval_is_stale_while_the_replacement_is_being_pushed_withou
     world: Superseding, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     base = await world.awaiting_builder("Z", GREETING, "S2")
-    gate = await world.propose()
+    # Proposed once its candidate was already built and reviewed: nothing is built for
+    # a behaviour whose replacement the Product Owner has yet to decide.
     await world.reviewed("Z", {"greeting.txt": "hello\n"}, on=base)
+    gate = await world.propose()
 
     async def unreachable(*_: Any, **__: Any) -> None:
         raise RemoteUnavailable("no route to host")
@@ -557,8 +561,10 @@ async def test_checks_that_ran_across_an_approval_do_not_let_the_replacement_in_
     it did not start with: Z would be on trunk with B1 never retired."""
     await world.integration.require_check(PROJECT, CONTRACT.as_check())
     base = await world.awaiting_builder("Z", GREETING, "S2")
-    gate = await world.propose()
+    # Proposed once its candidate was already built and reviewed: nothing is built for
+    # a behaviour whose replacement the Product Owner has yet to decide.
     await world.reviewed("Z", {"greeting.txt": "hello\n"}, on=base)
+    gate = await world.propose()
     barrier = HeldAtABarrier(ContainerIsolation(world.image))
     running = asyncio.create_task(world.integration_with(barrier).integrate(PROJECT, "Z", "first"))
     await held_at_the_barrier(running, barrier)
@@ -600,8 +606,10 @@ async def test_an_ordinary_push_of_the_replacement_ends_its_proposal_there_and_t
     """3AII-S3-II-1.4, the proposal first. The push is refused and the behaviour is
     parked before anyone looks at the proposal again: it has ended all the same."""
     base = await world.awaiting_builder("Z", GREETING, "S2")
-    gate = await world.propose()
+    # Proposed once its candidate was already built and reviewed: nothing is built for
+    # a behaviour whose replacement the Product Owner has yet to decide.
     await world.reviewed("Z", {"greeting.txt": "hello\n"}, on=base)
+    gate = await world.propose()
     world.hook_flag("refuse").touch()
 
     assert (await world.integrate("Z")).outcome is Outcome.REJECTED

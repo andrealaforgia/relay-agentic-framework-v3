@@ -474,6 +474,13 @@ async def test_a_red_in_flight_when_the_red_is_reopened_cannot_fill_the_new_cycl
         )
     )
     await held_at_the_barrier(late, held)
+    # As when the control plane starts again: the red its predecessor was observing is
+    # owed again, and the oracle the predecessor launched may still report, late.
+    async with database.connection() as connection:
+        await connection.execute(
+            "UPDATE assignments SET state = 'wanted', grant_id = NULL, granted_to = NULL, "
+            "first_effect_at = NULL WHERE kind = 'red'"
+        )
 
     assert (await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
     await behaviours.reopen_red(VERIFIER, PROJECT, "B1", reason="trunk moved")
@@ -574,6 +581,13 @@ async def test_a_red_released_after_the_replacement_red_was_accepted_is_still_re
         )
     )
     await held_at_the_barrier(late, held)
+    # As when the control plane starts again: the red its predecessor was observing is
+    # owed again, and the oracle the predecessor launched may still report, late.
+    async with database.connection() as connection:
+        await connection.execute(
+            "UPDATE assignments SET state = 'wanted', grant_id = NULL, granted_to = NULL, "
+            "first_effect_at = NULL WHERE kind = 'red'"
+        )
 
     assert (await behaviours.run_red(RELAY_ITSELF, PROJECT, "B1")).is_valid
     await behaviours.reopen_red(VERIFIER, PROJECT, "B1", reason="trunk moved")
