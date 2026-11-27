@@ -9,6 +9,7 @@ import contextlib
 import dataclasses
 import getpass
 import json
+import os
 import signal
 import sys
 import uuid
@@ -22,9 +23,13 @@ from relay import processes
 from relay.application import authority
 from relay.application.boundaries import Boundaries
 from relay.application.boundary_runs import Attempt, BoundaryRuns, RunRefused
+from relay.application.inbox import Inbox
+from relay.application.integration import IntegrationRefused
 from relay.application.leadership import AlreadyLed, installation_of
-from relay.cli import doctor, journal, terminal
+from relay.cli import deciding, doctor, journal, reading, terminal
 from relay.cli.enrolment import DEFAULT_IMAGE, Asked, CannotEnrol, enrol
+from relay.cli.selection import NoProject, select_project
+from relay.domain.story import ActionRefused
 from relay.git.checkout import require_credential_free
 from relay.persistence.database import Pool, migrate, open_pool, schema_state
 from relay.providers.boundary_suite import SuiteResult, run_suite, runtime_now
@@ -36,6 +41,7 @@ from relay.runtime import (
     bootstrap,
     settings_of,
     stated_policy,
+    wake,
 )
 
 
@@ -113,7 +119,12 @@ async def _worker(role: str) -> int:
 
 
 async def _handle(
-    pool: Pool, command: Sequence[str], given: str | None, action: str, asked: str
+    pool: Pool,
+    command: Sequence[str],
+    given: str | None,
+    action: str,
+    asked: str,
+    project: str | None = None,
 ) -> journal.Request:
     """The handle this command acts under: the one it was given, or a new one. It is
     taken in the database first, for this action asking this thing: a handle that is
@@ -124,7 +135,7 @@ async def _handle(
     installation = await _installation(pool)
     request_id = given or str(uuid.uuid7())
     await authority.take_handle(pool, request_id, action, asked)
-    request = journal.note(journal.journal_file(), command, installation, None, request_id)
+    request = journal.note(journal.journal_file(), command, installation, project, request_id)
     if request.installation != installation:
         raise authority.Refused(
             f"request {request.request_id} was made of installation {request.installation}, "
@@ -399,6 +410,103 @@ async def _doctor(asked: argparse.Namespace, command: Sequence[str]) -> int:
     )
 
 
+async def _project(pool: Pool, asked: argparse.Namespace) -> str:
+    """The project this command means. A request sent again means the project it was
+    resolved to when it was first made, wherever it is sent again from."""
+    if getattr(asked, "request_id", None):
+        for known in journal.read(journal.journal_file()):
+            if known.request_id == asked.request_id and known.project:
+                return known.project
+    return await select_project(pool, asked.project, os.environ, Path.cwd())
+
+
+async def _decide(asked: argparse.Namespace, command: Sequence[str]) -> int:
+    """One decision of the Product Owner's: resolved against the record, shown on the
+    terminal, confirmed by the passphrase, carried out under a handle taken first, and
+    answered with the service's receipt."""
+    verb = asked.verb
+    async with _opened() as (pool, broker):
+        try:
+            project = await _project(pool, asked)
+            if asked.request_id and (
+                done := await deciding.receipt_on_record(pool, asked.request_id)
+            ):
+                # Sent again: it decided what it decided, and decides nothing now. No
+                # passphrase is asked for, and what it was about need no longer be there.
+                print(f"request {asked.request_id}")
+                print(f"{done.disposition}: {done.outcome} (as on record)")
+                return 0
+            relay = await assemble(pool, broker)
+            decision = await deciding.resolve(
+                relay,
+                project,
+                verb,
+                getattr(asked, "target", "") or "",
+                getattr(asked, "text", None),
+                getattr(asked, "reason", None),
+            )
+            request = await _handle(
+                pool, command, asked.request_id, command[0], decision.asked, project
+            )
+            print(f"request {request.request_id}", flush=True)
+            # Shown where the passphrase is then read: what is confirmed is what is seen.
+            terminal.say(decision.shown)
+            await authority.require(pool, terminal.read_secret("The Product Owner's passphrase: "))
+            receipt = await decision.carry_out(request.request_id)
+            # Whatever the decision leaves for Relay to do by itself is the control
+            # plane's: it is told, here, after the decision has committed.
+            await wake(pool, relay.installation, project)
+        except (
+            deciding.CannotDecide,
+            NoProject,
+            authority.Refused,
+            terminal.NoTerminal,
+            ActionRefused,
+            IntegrationRefused,
+            NotConfigured,
+            LookupError,
+        ) as refused:
+            print(f"relay: {refused}", file=sys.stderr)
+            return 1
+    print(f"{receipt.disposition}: {receipt.outcome}")
+    return 0 if receipt.disposition == "effective" else 1
+
+
+async def _read(asked: argparse.Namespace) -> int:
+    """What may be read by anyone: no terminal, no passphrase, and nothing changed."""
+    async with _opened() as (pool, _):
+        try:
+            project = await select_project(pool, asked.project, os.environ, Path.cwd())
+            facts: object
+            if asked.command == "status":
+                facts = await reading.status(pool, project)
+                said = reading.status_text(facts)
+            elif asked.command == "inbox":
+                items = await Inbox(pool).items(project)
+                facts, said = (
+                    [reading.item_facts(each) for each in items],
+                    reading.inbox_text(items),
+                )
+            elif asked.command == "show":
+                item = await Inbox(pool).item(project, asked.target)
+                if item is None:
+                    raise LookupError(
+                        f"nothing waiting in {project} is {asked.target!r}: see `relay inbox`"
+                    )
+                facts, said = reading.item_facts(item), reading.item_text(item)
+            elif asked.command == "roadmap":
+                facts = await reading.roadmap(pool, project, asked.feature)
+                said = reading.roadmap_text(facts)
+            else:
+                facts = await reading.ledger(pool, project, asked.subject, asked.since)
+                said = reading.ledger_text(facts)
+        except (NoProject, LookupError) as refused:
+            print(f"relay: {refused}", file=sys.stderr)
+            return 1
+    print(json.dumps(facts, indent=2, default=str) if asked.json else said)
+    return 0
+
+
 def _requests() -> int:
     for request in journal.read(journal.journal_file()):
         project = f" [{request.project}]" if request.project else ""
@@ -451,6 +559,59 @@ def main(argv: Sequence[str] | None = None) -> int:
     doctoring.add_argument(
         "--request-id", help="repeat a request: what it did is returned, nothing is run again"
     )
+    which = "the project meant (default: RELAY_PROJECT, or this checkout's)"
+    # What anyone may read.
+    for name, about in (
+        ("status", "where each feature, story and behaviour stands, and what is owed"),
+        ("inbox", "everything waiting for the Product Owner"),
+        ("show", "one item of the inbox in full, as it will be decided on"),
+        ("roadmap", "a feature's roadmap, and whether a proposal is waiting"),
+        ("ledger", "the events of the project, in order"),
+    ):
+        looking = commands.add_parser(name, help=about)
+        looking.add_argument("--project", help=which)
+        looking.add_argument("--json", action="store_true", help="the same facts, as JSON")
+        if name == "show":
+            looking.add_argument("target", metavar="ITEM")
+        if name == "roadmap":
+            looking.add_argument("feature", nargs="?")
+        if name == "ledger":
+            looking.add_argument("--subject", help="only the events about this")
+            looking.add_argument("--since", type=int, default=0, help="only events after this one")
+    # What only the Product Owner may do: each asks for the passphrase at the terminal.
+    for verb, about, takes in (
+        ("approve", "approve what is put to you at a gate", ("ITEM",)),
+        ("request-changes", "send a proposal back, saying why", ("ITEM", "--reason")),
+        ("reject", "reject a story, at its gate or at work, saying why", ("ITEM", "--reason")),
+        (
+            "retry",
+            "allow another try: a call, a refused push, a final check",
+            ("ITEM", "--reason?"),
+        ),
+        ("set-aside", "leave work stopped and take its question out of the inbox", ("ITEM",)),
+        ("answer", "answer a question a role asked", ("ITEM", "TEXT")),
+        ("replace-decision", "replace a decision in force with another", ("ITEM", "TEXT")),
+        ("pause", "pause a feature, saying why", ("ITEM", "--reason")),
+        ("resume", "resume a paused feature", ("ITEM",)),
+        ("cancel", "cancel a feature for good, saying why", ("ITEM", "--reason")),
+    ):
+        acting = commands.add_parser(verb, help=about)
+        acting.set_defaults(verb=verb)
+        acting.add_argument("--project", help=which)
+        acting.add_argument("--request-id", help=repeat)
+        if "ITEM" in takes:
+            acting.add_argument("target", metavar="ITEM")
+        if "TEXT" in takes:
+            acting.add_argument("text", metavar="TEXT")
+        if "--reason" in takes or "--reason?" in takes:
+            acting.add_argument("--reason", required="--reason" in takes)
+    feature = commands.add_parser("feature", help="a feature")
+    of_feature = feature.add_subparsers(dest="doing", required=True)
+    starting = of_feature.add_parser("start", help="start a feature from a stated problem")
+    starting.set_defaults(verb="start")
+    starting.add_argument("text", metavar="PROBLEM")
+    starting.add_argument("--project", help=which)
+    starting.add_argument("--request-id", help=repeat)
     given = list(sys.argv[1:] if argv is None else argv)
     asked = parser.parse_args(given)
     try:
@@ -466,6 +627,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _requests()
         if asked.command == "doctor":
             return asyncio.run(_doctor(asked, given))
+        if asked.command in ("status", "inbox", "show", "roadmap", "ledger"):
+            return asyncio.run(_read(asked))
+        if getattr(asked, "verb", None):
+            return asyncio.run(_decide(asked, given))
         return asyncio.run(_worker(asked.role))
     except NotConfigured as missing:
         print(f"relay: {missing}", file=sys.stderr)

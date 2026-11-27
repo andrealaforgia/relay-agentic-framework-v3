@@ -78,15 +78,17 @@ class Features:
         reason: str,
         request_id: str | None = None,
         refusal: uuid.UUID | None = None,
-    ) -> None:
+        action: HumanAction | None = None,
+    ) -> Receipt | None:
         """A person allows an integration the repository refused to be tried again, and
         Relay tries it: the retry owes the integration, and the pass takes it up. The
         same request sent again allows no further push; the pass is run again, which
         changes nothing if there is nothing owed."""
-        await self._integration.retry_integration(
-            project_id, behaviour_id, reason, request_id, refusal
+        receipt = await self._integration.retry_integration(
+            project_id, behaviour_id, reason, request_id, refusal, action
         )
         await self.reconcile(project_id)
+        return receipt
 
     async def usage_of(self, project_id: str, feature_id: str) -> Any:
         """What the feature's calls have used, as known now: the summary of a completed

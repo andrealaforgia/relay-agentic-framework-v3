@@ -46,7 +46,13 @@ from relay.application.closure import (
 from relay.application.final_checks import Completion
 from relay.application.owed import owe_red
 from relay.application.reviews import gate_of
-from relay.application.stories import evaluate_story_gate, lock_story, require_story_at_work
+from relay.application.stories import (
+    _record,
+    _recorded,
+    evaluate_story_gate,
+    lock_story,
+    require_story_at_work,
+)
 from relay.application.supersessions import (
     add_obligation,
     ended_by_an_ordinary_integration,
@@ -65,6 +71,7 @@ from relay.domain.integration import (
     regression_digest,
 )
 from relay.domain.review import GateState
+from relay.domain.story import HumanAction, Receipt, answer_again
 from relay.git.checkout import CheckoutFailed, NotStarted, RemoteRejected, trunk_head
 from relay.git.mirror import Mirror, NotFastForward
 from relay.persistence.database import Connection, Pool
@@ -422,7 +429,8 @@ class Integration:
         reason: str,
         request_id: str | None = None,
         refusal: uuid.UUID | None = None,
-    ) -> None:
+        action: HumanAction | None = None,
+    ) -> Receipt | None:
         """Put a behaviour whose integration the repository refused back where it can be
         integrated again. A person decides this, once the cause has been dealt with.
 
@@ -433,11 +441,23 @@ class Integration:
         `refusal` names the refused intent the person was shown. If the behaviour has
         been retried and refused again since, that is another refusal, for whatever
         reason the repository had then, and this retry answers the old one: it is
-        refused as stale."""
+        refused as stale.
+
+        `action` is the Product Owner's request as a command made it. With it, the
+        outcome is a receipt committed with whatever was done, the same request sent
+        again is given that receipt, and a retry that answers nothing is a `stale`
+        receipt and not an error."""
         if not reason.strip():
             raise ValueError("retrying an integration needs a stated reason")
         async with self._pool.connection() as connection, connection.transaction():
             behaviour, _ = await _locked_behaviour(connection, project_id, behaviour_id)
+            given = (
+                answer_again(action, await _recorded(connection, action))
+                if action is not None
+                else None
+            )
+            if given is not None:
+                return given
             if request_id is not None:
                 seen = await (
                     await connection.execute(
@@ -447,7 +467,7 @@ class Integration:
                     )
                 ).fetchone()
                 if seen is not None:
-                    return
+                    return None
             require_open(await closure_of_behaviour(connection, project_id, behaviour_id))
             last = await (
                 await connection.execute(
@@ -458,13 +478,21 @@ class Integration:
                     (project_id, behaviour_id),
                 )
             ).fetchone()
+            why_not = None
             if last is None or last["state"] != "rejected" or last["cycle_state"] != "satisfied":
-                raise IntegrationRefused("this behaviour has no failed integration to retry")
-            if refusal is not None and last["intent_id"] != refusal:
-                raise IntegrationRefused(
+                why_not = "this behaviour has no failed integration to retry"
+            elif refusal is not None and last["intent_id"] != refusal:
+                why_not = (
                     "stale: that refusal is not this behaviour's latest. It has been tried "
                     "again since, and what the repository said then is another matter"
                 )
+            if why_not is not None:
+                if action is None:
+                    raise IntegrationRefused(why_not)
+                stale = Receipt("stale", f"nothing changed: {why_not.removeprefix('stale: ')}")
+                await _record(connection, action, stale)
+                return stale
+            assert last is not None
             behaviour.retry_integration()
             await save_behaviour(connection, project_id, behaviour)
             await append_event(
@@ -494,6 +522,11 @@ class Integration:
                 issued_on={"cycle_id": str(last["cycle_id"])}
                 | ({"retry_request": request_id} if request_id is not None else {}),
             )
+            if action is not None:
+                allowed = Receipt("effective", "retry_allowed")
+                await _record(connection, action, allowed)
+                return allowed
+        return None
 
     async def _start_batch(
         self,
