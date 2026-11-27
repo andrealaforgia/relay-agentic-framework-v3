@@ -307,6 +307,56 @@ Reservations:
 - **Briefings are tested for the facts in them, not as prose.** Whether a real model does good work from them is step 4's smoke.
 - **The pass run by a worker is the control plane's own object in the same process.** Across processes it is 3c's.
 
+### Step 4 as built: the real provider
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 54 | CHALLENGE, 12 of 12 reachable | The smoke able to pass with the product wrong; stand-in agent definitions in place of the canonical ones; missing token counts shown as totals; contradictory review verdicts decided by order; "demonstrated" discarding a behaviour given beside it; a known reply made defective by a change of form; earlier findings passed over in silence; reconfirmations offered verdicts they cannot take; a pass for an earlier CLI version; no dollar cap per call; a late "nothing was launched" counted as a call; no live read of usage |
+| 55 | CHALLENGE, 2 blocking of 7 | A late report releasing its successor's grant or clearing its park; the version checked differing from the version launched; the version asked in the supervisor's environment; a completed suite run losing its observations; a released story offered a verdict Relay refuses; an empty report of use counted as a report; a race test that excluded a valid outcome |
+| 56 | CHALLENGE, 2 blocking of 7 | The authorised executable not determining which executable is briefed; the suite able to certify a version its probes did not run on; a failed probe leaving an earlier pass usable; a late report revoking a grant claimed since and not yet admitted; a version query with no deadline; two suites at once sharing one marker; an unreadable policy file stranding a grant |
+
+Twenty-six findings, every one reachable. **Step 4 was not accepted.** Round 56 was the third and last round (D-8). All seven of its findings are fixed, each with a test that fails without the fix, at commit `ba48cab`; **Astra has not seen those fixes.** In round 56 Astra closed the findings on the smoke and on usage: the smoke uses the installed canonical agents and checks the product result independently, and the usage tests tell an unreported counter from an observed zero.
+
+**What the step is for, and what it showed.** `tests/integration/test_feature_real.py`, run with `RELAY_REAL_CLAUDE=1`, delivers one small feature with every role a real run of the cheapest model on its installed canonical `alf-*` definition, within bounds the boundary suite has just shown to hold on the same installation. It then has Relay's own oracle run the program on the commit the feature's summary names and requires the right answer. It has passed four times, three of them with the canonical agents; in one of those a real reviewer sent a real build back, and the remediation, the second reviews and the integration followed with nothing scripted.
+
+Four runs failed before the first pass, and each failure was a defect of Relay's that no scripted test could have found:
+
+- **No real call could return a structured answer.** Relay hands each agent its own tool list, and that list left out the tool the CLI answers a schema with. Every reply was prose and was refused. Nothing through the adapter had ever produced a usable reply from the real provider: every test below this one scripts it.
+- **An agent definition with no description is refused by the CLI, after launch.**
+- **Offered two reply forms, a real model fills in both.**
+- **Replies were refused for what was not in doubt**: an empty list left out, fields filled in empty beside a plain statement, an unchanged contract restated.
+
+Deliberate breakage: 13 breakages of the step as first built, then 18, 7 and 10 against the three rounds of fixes. Of the last 10, all were caught, each by the test written for it. The whole suite passed one commit before the record: 1223 tests, 3 skipped (the ones that make paid calls). Paid calls for this step, all on the cheapest model: eight runs of the smoke, each preceded by two runs of the boundary suite, and five single probes of the CLI. The four passing runs cost 1.6, 2.8, 2.6 and 3.2 US cents by the features' own summaries; I did not total the failed ones, and estimate the whole at under fifty cents.
+
+Decided during the build:
+
+- **One reply form for every kind of work**: `outcome`, what was delivered under `delivered`, or one question, and what was assumed. Each call is offered that form alone. A build's or a review's task still reads the flat form those two had before; no stored reply needs it.
+- **A reply whose meaning is plain is taken; one that could be read two ways is refused.** A field a call cannot use is not offered in its schema, because a real model fills in what it is offered. This is the rule between Astra's push towards strict validation and the provider's push the other way.
+- **A feature's summary states usage as known when it completed**, by role, and what was not reported is `unknown` and never zero: a total is a total only if nothing that goes into it is missing. `Features.usage_of` is the same account read now.
+- **What is launched is the installation there was when the adapter was made**, every link followed, and that file and what it says its version is are part of what a boundary pass is of. The run's own start event is held to that version.
+- **A late report from a call settles its own record**: nothing of a successor's, and only a grant that is its own.
+- **A role's profile carries a cap on what one call may cost**, enforced by the CLI.
+
+Reservations:
+
+- **Astra has not reviewed the round 56 fixes.**
+- **Four passing paid runs, on the cheapest model.** Not a rate, and nothing about another model.
+- **One feature, one story, one behaviour, and a person who approves everything.** Rejection, a proposal sent back, a replacement and a question answered are step 3's scripted tests, not the smoke's.
+- **The remote policy is stated by the test** (D-10): a launch condition, and nothing about the provider's servers.
+- **The executable is bound by its path with every link followed.** An installation replaced in place at the same path with the same version string is not detected; one replaced with another version is caught only when the run reports that it has started, after its briefing was handed over.
+- **The boundary suite's markers were written against Claude Code 2.1.330 on macOS**; the installed CLI became 2.1.331 during this step and the suite passed on it each time the smoke ran.
+- **Two review effects already admitted are not forced into the order that once deadlocked.** That rests on the gate being taken exclusively.
+- **One timing-sensitive unit test** (a Git command stopped for taking too long) failed once under load during a breakage run and passes on its own.
+- **The smoke is not part of `make check`**: it costs money and needs the CLI signed in.
+
+### Slice 3b, closed
+
+Four steps, each reviewed in three rounds, none accepted: 28, 28, 36 and 26 findings, 118 in all, every one reachable through a real entry point and every one fixed with a test, except 3B-S2-3.7 (a duplicate refusal on record after a pre-launch green refusal), which is open. The last round of each step's fixes was not reviewed.
+
+What the slice set out to do, it does: workers and the Claude adapter drive the canonical agents through a whole feature, with Relay deciding every transition and observing every red, green and check itself, and token use captured on every call and stated in the feature's summary. That is shown against the real provider, four times, on one small feature.
+
+What it does not do is in the reservations of each step. The ones that bear most on using it: the worker processes, the pass and the control plane are one process here, and wiring them across processes is 3c's; nothing runs on a timer; and a project's admissions and marks are serialised behind one lock whose cost has not been measured.
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.
