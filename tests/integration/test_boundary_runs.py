@@ -316,15 +316,20 @@ async def test_a_verdict_and_what_became_of_its_call_are_on_record_together_or_n
     records. There is no moment at which the failed verdict is on record without the
     fact that the call was lost: a new ordinary request launches nothing, and a named
     retry may launch one."""
+    from relay.application import boundary_runs
+
     suite.call, suite.holds = "uncertain", False
-    boundaries = runs._boundaries
-    record_in = boundaries.record_in
+    read = boundary_runs._attempt
 
-    async def lost_as_it_records(connection: Any, result: SuiteResult) -> None:
-        await record_in(connection, result)
-        raise ConnectionError("the process was lost")
+    async def lost_once_the_verdict_is_written(connection: Any, where: str, values: Any) -> Any:
+        # The first reading after the run: the verdict has been written in this
+        # transaction, and so has what became of the call. The process is lost here,
+        # before either is committed.
+        if suite.launched and where == "r.attempt_id = %s":
+            raise ConnectionError("the process was lost")
+        return await read(connection, where, values)
 
-    monkeypatch.setattr(boundaries, "record_in", lost_as_it_records)
+    monkeypatch.setattr(boundary_runs, "_attempt", lost_once_the_verdict_is_written)
     with pytest.raises(ConnectionError):
         await asked(runs, "request-1")
     monkeypatch.undo()

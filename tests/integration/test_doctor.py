@@ -400,3 +400,34 @@ async def test_doctor_does_not_take_another_branch_for_the_trunk(
     trunk = (await examined(enrolled, broker))["the repository of vat"]
 
     assert not trunk.ok and "there is no refs/heads/main" in trunk.saw
+
+
+async def test_the_command_refuses_a_request_made_for_the_bounds_of_another_runtime(
+    enrolled: AsyncConnectionPool, broker: redis.Redis
+) -> None:
+    """3C-S1B-2.3, at the command's own dispatch: the request was recorded and stopped
+    before its first attempt, and the policy has been restated since. Sent again it is
+    told which bounds a run made now would be of, and buys nothing."""
+    policy = await authority.state_policy(enrolled, PASSPHRASE, "none applies here", "andrea")
+    settings = await settings_of(enrolled)
+    then = runtime_now(policy.statement, str(settings["cli"]))
+    async with enrolled.connection() as connection:
+        installation = await installation_of(connection)
+    launched: list[str] = []
+    said: list[list[str]] = []
+    runs = BoundaryRuns(enrolled, Boundaries(enrolled), passing(settings, launched))
+
+    async def owed() -> Mapping[str, str]:
+        return await doctor.owed_runs(enrolled, settings, then)
+
+    asked = await runs.open_request("r-1", installation, None, owed)  # and then it was stopped
+    restated = await authority.state_policy(enrolled, PASSPHRASE, "managed settings v7", "andrea")
+    now = runtime_now(restated.statement, str(settings["cli"]))
+
+    made = await doctor.run_boundaries(
+        enrolled, runs, settings, now, "r-1", installation, None, said.append
+    )
+
+    assert len(made) == len(asked) > 0
+    assert all("make a new request" in str(each) for each in made)
+    assert launched == []

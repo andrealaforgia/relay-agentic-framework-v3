@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from relay.cli import journal
 
 
@@ -75,26 +77,35 @@ def test_a_record_cut_short_with_no_line_end_does_not_take_the_next_request_with
 
 
 def test_two_commands_using_one_identity_for_the_first_time_at_once_write_one_request(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """3C-S1B-2.7: each of another installation. The second to take the lock finds what
-    the first wrote, and is given that: it then knows the handle is not its own."""
+    """3C-S1B-2.7: each of another installation. Looking the identity up and writing it
+    down are one step under the file's lock: the second finds what the first wrote, and
+    is given that, so it then knows the handle is not its own."""
     import threading
+    import time
 
     file = tmp_path / "requests.jsonl"
-    together = threading.Barrier(8)
+    read = journal.read
+
+    def slowly(of: Path) -> list[journal.Request]:
+        found = read(of)
+        time.sleep(0.2)  # long enough for the other command to have looked as well
+        return found
+
+    monkeypatch.setattr(journal, "read", slowly)
     given: list[journal.Request] = []
 
     def uses(installation: str) -> None:
-        together.wait()
         given.append(journal.note(file, ["doctor", "--boundary"], installation, None, "one-handle"))
 
-    commands = [threading.Thread(target=uses, args=(f"installation-{n}",)) for n in range(8)]
+    commands = [threading.Thread(target=uses, args=(f"installation-{n}",)) for n in range(2)]
     for each in commands:
         each.start()
     for each in commands:
         each.join()
+    monkeypatch.undo()
 
     written = journal.read(file)
     assert len(written) == 1
-    assert given == written * 8  # every one of them was told the same installation
+    assert given == written * 2  # both were told the same installation
