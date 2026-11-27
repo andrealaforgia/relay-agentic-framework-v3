@@ -127,6 +127,19 @@ async def trunk_head(repository: str, trunk: str, *, timeout: float | None = Non
     return await _resolve(repository, f"refs/heads/{trunk}", f"branch {trunk!r}", timeout)
 
 
+# The installation whose attempts these are, as part of every attempt ref: set once by
+# the process when it has read which installation it serves. Empty in a process that has
+# not said, where there is one installation and nothing to tell apart.
+_ATTEMPTS_OF = ""
+
+
+def name_attempts_under(installation: str) -> None:
+    """Two installations may manage branches of one repository, each with a project, a
+    behaviour and an attempt of the same names. Their candidates are kept apart."""
+    global _ATTEMPTS_OF
+    _ATTEMPTS_OF = f"{require_identifier('installation', installation)}/" if installation else ""
+
+
 def attempt_ref(project_id: str, behaviour_id: str, attempt: int) -> str:
     """Where a Builder publishes the candidate for one attempt at one behaviour of one
     project. The project is part of the name: several projects may share a repository."""
@@ -137,7 +150,7 @@ def attempt_ref(project_id: str, behaviour_id: str, attempt: int) -> str:
         raise CheckoutFailed(f"not usable in a ref name: {invalid}") from None
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
         raise CheckoutFailed("an attempt is a positive whole number")
-    return f"refs/relay/attempts/{project_id}/{behaviour_id}/{attempt}"
+    return f"refs/relay/{_ATTEMPTS_OF}attempts/{project_id}/{behaviour_id}/{attempt}"
 
 
 async def attempt_head(repository: str, project_id: str, behaviour_id: str, attempt: int) -> str:

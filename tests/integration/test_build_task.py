@@ -107,6 +107,28 @@ class Building:
             lambda: RUNTIME,
         )
 
+    async def carry(self, worker: Worker) -> str:
+        """What the stream, the Builder's worker and the control plane's pass do between
+        them for a build: the worker makes the call and keeps what it left; the control
+        plane publishes and observes it; and work the control plane hands back is
+        delivered again. Returns where the build's last call was left."""
+        left = "nothing"
+        for _ in range(4):
+            left = await worker.carry_out(await self.owed())
+            if left != "handed_on":
+                return left
+            await self.invocations.recover(PROJECT)
+            [left, wanted] = (
+                await self.world.column(
+                    "SELECT v.state || '|' || (a.state = 'wanted' AND a.parked IS NULL) "
+                    "FROM invocations v JOIN assignments a USING (assignment_id) "
+                    "ORDER BY v.started_at DESC LIMIT 1"
+                )
+            )[0].split("|")  # type: ignore[union-attr]
+            if left != "rejected" or wanted != "true":
+                return left
+        return left
+
     async def owed(self) -> dict[str, Any]:
         async with self.world.database.connection() as connection:
             row = await (
@@ -157,7 +179,7 @@ async def test_what_the_builder_left_is_published_as_an_attempt_and_found_green(
     provider = Builder(RIGHT)
     worker = await building.worker(provider)
 
-    assert await worker.carry_out(await building.owed()) == "applied"
+    assert await building.carry(worker) == "applied"
 
     candidate = building.at(f"refs/relay/attempts/{PROJECT}/B1/1")
     assert candidate
@@ -196,7 +218,7 @@ async def test_a_candidate_that_is_not_green_is_tried_again_under_a_new_attempt(
     provider = Builder(WRONG, RIGHT)
     worker = await building.worker(provider)
 
-    assert await worker.carry_out(await building.owed()) == "applied"
+    assert await building.carry(worker) == "applied"
 
     assert await building.states() == ["rejected", "applied"]
     assert "not green" in provider.asked[1].briefing
@@ -212,7 +234,7 @@ async def test_a_workspace_left_with_git_metadata_in_it_is_not_a_candidate(
     provider = Builder({**RIGHT, ".git/config": "[core]\n\thooksPath = /tmp/x\n"}, RIGHT)
     worker = await building.worker(provider)
 
-    assert await worker.carry_out(await building.owed()) == "applied"
+    assert await building.carry(worker) == "applied"
 
     assert await building.states() == ["rejected", "applied"]
     assert "Git metadata" in provider.asked[1].briefing
@@ -233,7 +255,7 @@ async def test_a_build_whose_worker_went_after_publishing_is_judged_without_aski
 
     building.task._green = the_worker_stops  # type: ignore[method-assign]
     with pytest.raises(KeyboardInterrupt):
-        await worker.carry_out(await building.owed())
+        await building.carry(worker)
     building.task._green = real  # type: ignore[method-assign]
     candidate = building.at(f"refs/relay/attempts/{PROJECT}/B1/1")
     assert candidate and await building.world.column("SELECT count(*) FROM green_runs") == [0]
@@ -261,7 +283,7 @@ async def test_a_build_whose_worker_went_just_after_it_replied_loses_nothing(
 
     building.invocations.apply = the_worker_stops  # type: ignore[method-assign]
     with pytest.raises(KeyboardInterrupt):
-        await worker.carry_out(await building.owed())
+        await building.carry(worker)
     building.invocations.apply = real  # type: ignore[method-assign]
     await building.sessions[-1].stop()
     assert not provider.asked[0].workdir.parent.exists()
@@ -292,7 +314,7 @@ async def test_a_repair_starts_from_the_candidate_that_was_sent_back(
     assert owed["kind"] == "remediate"
     provider = Builder({"helper.py": "int('1')\n"})
 
-    assert await (await building.worker(provider)).carry_out(owed) == "applied"
+    assert await building.carry(await building.worker(provider)) == "applied"
 
     [tree] = provider.found
     assert tree["helper.py"] == "eval('1')\n"  # the candidate being repaired, not the red's tree
@@ -309,7 +331,7 @@ async def test_a_reply_that_says_nothing_of_what_was_done_is_asked_for_again(
     provider = Builder(RIGHT, RIGHT, replies=[{"wrote": "vat.py"}])
     worker = await building.worker(provider)
 
-    assert await worker.carry_out(await building.owed()) == "applied"
+    assert await building.carry(worker) == "applied"
 
     assert await building.states() == ["rejected", "applied"]
     assert "the reply has no outcome" in provider.asked[1].briefing
@@ -336,7 +358,7 @@ async def test_a_push_that_was_accepted_and_not_heard_of_is_not_made_again(
     with monkeypatch.context() as patched:
         patched.setattr(Mirror, "publish", accepted_and_then_the_worker_stops)
         with pytest.raises(KeyboardInterrupt):
-            await worker.carry_out(await building.owed())
+            await building.carry(worker)
     candidate = building.at(f"refs/relay/attempts/{PROJECT}/B1/1")
     assert candidate
     await building.sessions[-1].stop()
@@ -355,7 +377,7 @@ async def test_an_attempt_that_is_already_someone_elses_candidate_is_not_overwri
     provider = Builder(RIGHT, RIGHT)
     worker = await building.worker(provider)
 
-    assert await worker.carry_out(await building.owed()) == "applied"
+    assert await building.carry(worker) == "applied"
 
     assert await building.states() == ["rejected", "applied"]
     assert "already another candidate" in provider.asked[1].briefing
@@ -377,7 +399,7 @@ async def test_a_candidate_already_judged_is_not_judged_again(building: Building
 
     building.task._green = judged_and_then_the_worker_stops  # type: ignore[method-assign]
     with pytest.raises(KeyboardInterrupt):
-        await worker.carry_out(await building.owed())
+        await building.carry(worker)
     building.task._green = real  # type: ignore[method-assign]
     await building.sessions[-1].stop()
 
@@ -405,7 +427,7 @@ async def test_a_candidate_found_not_green_is_not_taken_for_green_when_taken_up_
 
     building.task._green = judged_and_then_the_worker_stops  # type: ignore[method-assign]
     with pytest.raises(KeyboardInterrupt):
-        await worker.carry_out(await building.owed())
+        await building.carry(worker)
     building.task._green = real  # type: ignore[method-assign]
     await building.sessions[-1].stop()
 
@@ -416,7 +438,7 @@ async def test_a_candidate_found_not_green_is_not_taken_for_green_when_taken_up_
     [reason] = await building.world.column("SELECT reason FROM invocations")
     assert isinstance(reason, str) and reason.startswith("the candidate is not green")
     again = await building.worker(provider)
-    assert await again.carry_out(await building.owed()) == "applied"
+    assert await building.carry(again) == "applied"
     assert "not green" in provider.asked[1].briefing
 
 
@@ -491,7 +513,7 @@ async def test_an_attempt_that_is_no_longer_the_candidate_is_not_observed_and_is
 
     building.task._publish = published_and_then_interfered_with  # type: ignore[method-assign]
 
-    assert await worker.carry_out(await building.owed()) == "overtaken"
+    assert await building.carry(worker) == "overtaken"
 
     assert await building.states() == ["overtaken"]
     assert await building.world.column("SELECT count(*) FROM review_cycles") == [0]
@@ -499,7 +521,7 @@ async def test_an_attempt_that_is_no_longer_the_candidate_is_not_observed_and_is
     assert (await building.owed())["state"] == "wanted"
     await building.invocations.recover(PROJECT)  # nothing is left for the pass to retry
     assert await building.states() == ["overtaken"]
-    assert await worker.carry_out(await building.owed()) == "applied"
+    assert await building.carry(worker) == "applied"
     assert await building.states() == ["overtaken", "applied"]
     assert await building.world.column("SELECT attempt FROM build_attempts ORDER BY attempt") == [
         1,
@@ -527,7 +549,7 @@ async def test_a_repository_that_does_not_answer_is_not_a_candidate_that_is_gone
     monkeypatch.setattr(behaviours_module, "attempt_head", unreachable_once)
 
     with pytest.raises(RemoteUnavailable):
-        await worker.carry_out(await building.owed())
+        await building.carry(worker)
 
     assert await building.states() == ["returned"]
     await building.invocations.recover(PROJECT)
@@ -539,12 +561,15 @@ async def test_a_repository_that_does_not_answer_is_not_a_candidate_that_is_gone
 async def test_what_a_try_saw_after_it_was_taken_over_is_nobodys_verdict(
     building: Building, the_first_try_ends: str
 ) -> None:
-    """3B-S2-2.2: the first try of the green effect is still observing when its worker is
-    taken for gone, and the pass takes the effect over. Whenever the first try then
-    ends, what it saw is kept as what was seen and judges nothing: the second try does
-    not take it for a verdict, and observes for itself."""
+    """3B-S2-2.2: the first try of the green effect is still observing when the control
+    plane that took it is taken for gone, and another takes the effect over. Whenever
+    the first try then ends, what it saw is kept as what was seen and judges nothing:
+    the second try does not take it for a verdict, and observes for itself."""
     provider = Builder(RIGHT)
     worker = await building.worker(provider)
+    assert await worker.carry_out(await building.owed()) == "handed_on"
+    successor = Invocations(building.world.database)
+    Tasks({"build": building.task, "remediate": building.task}).attach(successor)
     oracle = building.world.behaviours._oracle
     observe, observed = oracle.execute, 0
     first_is_observing, first_may_end = asyncio.Event(), asyncio.Event()
@@ -560,23 +585,25 @@ async def test_what_a_try_saw_after_it_was_taken_over_is_nobodys_verdict(
         return execution
 
     oracle.execute = execute  # type: ignore[method-assign]
-    first = asyncio.create_task(worker.carry_out(await building.owed()))
+    first = asyncio.create_task(building.invocations.recover(PROJECT))
     await first_is_observing.wait()
-    await building.sessions[-1].stop()  # gone, to everyone else; its run goes on
+    assert building.invocations._session is not None
+    await building.invocations._session.stop()  # gone, to everyone else; its run goes on
     attempt_of = building.task._attempt
 
     async def as_the_second_try_is_about_to_read_the_record(invocation: Any) -> int:
         number = await attempt_of(invocation)
         if the_first_try_ends != "last" and not first_may_end.is_set():
             first_may_end.set()
-            assert await first == "superseded"
+            await first
         return number
 
     building.task._attempt = as_the_second_try_is_about_to_read_the_record  # type: ignore[method-assign]
 
-    await building.invocations.recover(PROJECT)
+    await successor.recover(PROJECT)
     first_may_end.set()
     await first
+    await successor.close()
 
     assert observed == 2
     assert await building.states() == ["applied"]
@@ -615,7 +642,7 @@ async def test_the_build_task_asks_for_its_own_commit_and_stays_answerable_for_i
 
     building.world.behaviours.run_green = looked_at  # type: ignore[method-assign]
 
-    assert await worker.carry_out(await building.owed()) == "applied"
+    assert await building.carry(worker) == "applied"
 
     [kept] = await building.world.column("SELECT retained FROM invocations")
     assert heard == [kept, True, False]
@@ -651,7 +678,7 @@ async def test_a_green_found_while_its_story_gained_a_behaviour_opens_no_review(
 
     oracle.execute = execute  # type: ignore[method-assign]
 
-    assert await worker.carry_out(await building.owed()) == "overtaken"
+    assert await building.carry(worker) == "overtaken"
 
     assert await world.column("SELECT count(*) FROM review_cycles") == [0]
     assert await world.state("B1") is BehaviourState.IMPLEMENTING
@@ -669,7 +696,7 @@ async def test_no_tree_and_no_base_is_kept_once_a_build_is_finished_with(
     """3B-S2-3.8."""
     worker = await building.worker(Builder(WRONG, RIGHT))
 
-    assert await worker.carry_out(await building.owed()) == "applied"
+    assert await building.carry(worker) == "applied"
 
     assert list(building.task._workspaces._root.iterdir()) == []
     assert building.task._bases == {}
@@ -682,7 +709,7 @@ async def test_no_base_is_kept_for_a_build_that_was_prepared_and_never_called(
     worker = await building.worker(Builder(WRONG, RIGHT))
     worker._boundaries.holding = False  # type: ignore[attr-defined]
 
-    assert (await worker.carry_out(await building.owed())).startswith("refused")
+    assert (await building.carry(worker)).startswith("refused")
 
     assert list(building.task._workspaces._root.iterdir()) == []
     assert building.task._bases == {}
@@ -720,7 +747,10 @@ async def test_a_builder_that_asks_keeps_and_publishes_nothing_and_builds_after_
     await world.answer(question.question_id, "yes")
     await world.reconfirm_everything()
     await publisher.publish_pending()
-    assert await worker.serve_once(streams, PROJECT) == ["applied"]
+    # The Builder's worker keeps what it made and hands it on; the control plane
+    # publishes and observes it.
+    assert await worker.serve_once(streams, PROJECT) == ["handed_on"]
+    await building.invocations.recover(PROJECT)
 
     assert await world.column(
         "SELECT state FROM assignments WHERE kind = 'build' ORDER BY created_at"

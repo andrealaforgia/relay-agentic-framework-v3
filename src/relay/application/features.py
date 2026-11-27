@@ -145,8 +145,8 @@ class Features:
             # A red is the control plane's to observe, and nobody else asks for one.
             await self._behaviours.observe_owed_reds(project_id)
         # The completions are taken up once, at the end of this pass.
-        await self._integration.reconcile(then_completions=False)
-        await self._reviews.publish_candidates()
+        await self._integration.reconcile(then_completions=False, project_id=project_id)
+        await self._reviews.publish_candidates(project_id)
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id)
             await announce_again(connection, project_id)

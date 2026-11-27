@@ -178,21 +178,25 @@ class Delivering:
     async def work(self) -> None:
         """Every worker takes up whatever is wanted of it, until nothing more comes of
         that. Nobody but a worker and the pass does anything here."""
-        tried: set[tuple[object, str]] = set()
+        tried: set[tuple[object, object]] = set()
         while True:
             async with self.world.database.connection() as connection:
                 wanted = await (
                     await connection.execute(
-                        "SELECT * FROM assignments WHERE project_id = %s AND state = 'wanted' "
-                        "AND role = ANY(%s) ORDER BY created_at",
+                        # With how many calls each has had: work the control plane handed
+                        # back after refusing a result is wanted again, and is offered
+                        # again, as its command would be delivered again.
+                        "SELECT a.*, (SELECT count(*) FROM invocations v WHERE v.assignment_id "
+                        "= a.assignment_id) AS calls FROM assignments a WHERE a.project_id = %s "
+                        "AND a.state = 'wanted' AND a.role = ANY(%s) ORDER BY a.created_at",
                         (PROJECT, list(self.workers)),
                     )
                 ).fetchall()
-            fresh = [each for each in wanted if (each["assignment_id"], "wanted") not in tried]
+            fresh = [each for each in wanted if (each["assignment_id"], each["calls"]) not in tried]
             if not fresh:
                 return
             for assignment in fresh:
-                tried.add((assignment["assignment_id"], "wanted"))
+                tried.add((assignment["assignment_id"], assignment["calls"]))
                 left = await self.workers[assignment["role"]].carry_out(assignment)
                 self.left.append(f"{assignment['kind']}: {left}")
 

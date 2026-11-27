@@ -211,7 +211,7 @@ class Reviews:
     def _mirror(self, project_id: str) -> Mirror:
         return Mirror(self._mirrors / f"{require_identifier('project', project_id)}.git")
 
-    async def publish_candidates(self) -> int:
+    async def publish_candidates(self, project_id: str | None = None) -> int:
         """Publish every candidate still pending, then announce its review tasks. Safe to
         run any number of times, and after a crash at any point."""
         async with self._pool.connection() as connection:
@@ -223,7 +223,8 @@ class Reviews:
                     "WHERE c.publication = 'pending' AND c.state = 'open' "
                     "AND standing(s.project_id, s.feature_id, s.story_id) IS NULL "
                     "AND not_current(s.project_id, s.story_id, b.behaviour_id) IS NULL "
-                    "ORDER BY c.created_at"
+                    "AND (%s::text IS NULL OR c.project_id = %s) ORDER BY c.created_at",
+                    (project_id, project_id),
                 )
             ).fetchall()
         published = 0

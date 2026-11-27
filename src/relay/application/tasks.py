@@ -20,7 +20,14 @@ from typing import Any
 from relay.application.assignments import ask_instead
 from relay.application.behaviours import Behaviours
 from relay.application.decisions import ask_in, assume_in
-from relay.application.invocations import Effect, EffectRun, Invocations, Overtaken, Prepared
+from relay.application.invocations import (
+    CONTROL_PLANE,
+    Effect,
+    EffectRun,
+    Invocations,
+    Overtaken,
+    Prepared,
+)
 from relay.application.reviews import NewFinding, Review, Reviews
 from relay.application.worker import Call
 from relay.domain.review import Carried, Severity, SubmissionRefused
@@ -658,7 +665,12 @@ class BuildTask:
         if asks(plain(invocation["reply"])):
             # Nothing was kept of what a call that asks left, and nothing is published.
             return [ASK]
-        return [Effect("publish", self._publish), Effect("green", self._green)]
+        # Both the control plane's: publishing needs its access to the repository, and
+        # observing the candidate needs its oracle. The Builder's worker has neither.
+        return [
+            Effect("publish", self._publish, by=CONTROL_PLANE),
+            Effect("green", self._green, by=CONTROL_PLANE),
+        ]
 
     async def _attempt(self, invocation: Mapping[str, Any]) -> int:
         """The attempt number of this call's candidate: one more than the behaviour has

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from relay.application.leadership import require_term
 from relay.domain.story import ActionRefused
 from relay.persistence.database import Connection
 
@@ -29,7 +30,10 @@ async def lock_project(connection: Connection, project_id: str) -> None:
 
 
 async def lock_gate(connection: Connection, project_id: str, *, exclusive: bool = False) -> None:
-    """Taken before any other row of the project, in every workflow transaction."""
+    """Taken before any other row of the project, in every workflow transaction. And
+    so the place where a control plane whose term is over is refused: whatever its
+    transaction was about to change, start or end."""
+    await require_term(connection)
     strength = "UPDATE" if exclusive else "SHARE"
     await connection.execute(
         f"SELECT 1 FROM project_gates WHERE project_id = %s FOR {strength}",

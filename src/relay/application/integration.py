@@ -371,15 +371,20 @@ class Integration:
             return settled
         return await self._drive(settled)
 
-    async def reconcile(self, *, then_completions: bool = True) -> int:
+    async def reconcile(
+        self, *, then_completions: bool = True, project_id: str | None = None
+    ) -> int:
         """Settle every authorised integration whose outcome is not yet on record, from
         what trunk holds now. Run on start and whenever a push went unanswered. A caller
         that goes on to take up completions itself says so, and they are left to it."""
         async with self._pool.connection() as connection:
             outstanding = await (
                 await connection.execute(
+                    # One project's, when a pass for one project asks: a pass for B does
+                    # nothing for A, whose own pass may be waiting on its repository.
                     "SELECT intent_id FROM integration_intents WHERE state = 'outstanding' "
-                    "ORDER BY created_at"
+                    "AND (%s::text IS NULL OR project_id = %s) ORDER BY created_at",
+                    (project_id, project_id),
                 )
             ).fetchall()
         settled = 0

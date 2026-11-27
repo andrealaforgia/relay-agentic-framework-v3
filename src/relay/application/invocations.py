@@ -40,6 +40,7 @@ from relay.application.closure import (
     require_startable,
     story_basis,
 )
+from relay.application.leadership import current_term, term
 from relay.application.stories import _record as record_receipt
 from relay.application.stories import _recorded as recorded_receipt
 from relay.application.workers import WorkerSession, is_alive
@@ -61,6 +62,8 @@ from relay.providers.pricing import PRICES, PriceTable, estimate
 
 # Calls that gave nothing usable, per assignment, before a person is asked.
 ATTEMPTS_BEFORE_ASKING = 3
+# The role of the control plane's own session, and whose an effect is when it is its.
+CONTROL_PLANE = "control-plane"
 ON_A_PARKED_CALL = {"retry": frozenset[str](), "set_aside": frozenset[str]()}
 _UNCERTAIN = "a paid call may have completed and its result was not received"
 
@@ -135,6 +138,10 @@ class Effect:
     name: str
     perform: Callable[[EffectRun], Awaitable[Mapping[str, Any] | None]]
     settle: Callable[[Connection, EffectRun], Awaitable[Mapping[str, Any] | None]] | None = None
+    # Whose it is to carry out. A worker never takes a control plane's: publishing a
+    # candidate and observing it need access and an oracle that a worker is not given.
+    # The control plane's pass takes any effect that nobody is carrying out.
+    by: str = "worker"
 
 
 @dataclass(frozen=True)
@@ -489,7 +496,7 @@ class Invocations:
                     marked = await self._mark(invocation_id, effect, run, detail)
                 except Overtaken as overtaken:
                     disposed = await self._reject(
-                        invocation_id, effect.name, taken, str(overtaken), blameless=True
+                        invocation_id, effect.name, taken, str(overtaken), worker, blameless=True
                     )
                     settled = True
                     return disposed
@@ -497,7 +504,9 @@ class Invocations:
                     # By the service, in `perform`, or in `settle`, whose transaction
                     # has been rolled back by now. Settled only once that is on record:
                     # a call cut short while it waits to say so still lets the effect go.
-                    disposed = await self._reject(invocation_id, effect.name, taken, str(refused))
+                    disposed = await self._reject(
+                        invocation_id, effect.name, taken, str(refused), worker
+                    )
                     settled = True
                     return disposed
                 settled = True
@@ -580,6 +589,10 @@ class Invocations:
             assert effect is not None
             if effect["state"] == "done":
                 return "done"
+            if effects[position].by == CONTROL_PLANE and worker.role != CONTROL_PLANE:
+                # Not this worker's to do. The result is known and kept: the control
+                # plane takes it from here.
+                return "handed_on"
             key = (invocation_id, str(effect["name"]))
             # Asked first: an effect that is being carried out is its carrier's to
             # dispose of, when it comes to mark it, and nobody else's meanwhile.
@@ -592,6 +605,10 @@ class Invocations:
                     if effect["worker_id"] == worker.worker_id
                     else await is_alive(connection, effect["worker_id"])
                 )
+                if effect["term"] is not None and effect["term"] < await current_term(connection):
+                    # Started by a control plane whose term is over. It can no longer
+                    # say the effect is done, whatever its locks still look like.
+                    being_carried_out = False
                 if being_carried_out:
                     return "busy"
             ended = await _ended_for_good(connection, assignment, invocation)
@@ -609,9 +626,9 @@ class Invocations:
                 # stop is cleared.
                 return "held"
             await connection.execute(
-                "UPDATE invocation_effects SET state = 'started', try = try + 1, worker_id = %s "
-                "WHERE invocation_id = %s AND name = %s",
-                (worker.worker_id, invocation_id, effect["name"]),
+                "UPDATE invocation_effects SET state = 'started', try = try + 1, worker_id = %s, "
+                "term = %s WHERE invocation_id = %s AND name = %s",
+                (worker.worker_id, term(), invocation_id, effect["name"]),
             )
             # Said before this transaction commits: nobody can see the effect as started
             # by this process and not being carried out by it.
@@ -691,6 +708,7 @@ class Invocations:
         name: str,
         attempt: int,
         reason: str,
+        by: WorkerSession,
         *,
         blameless: bool = False,
     ) -> str:
@@ -730,6 +748,16 @@ class Invocations:
                     assignment,
                     invocation_id,
                     f"{ATTEMPTS_BEFORE_ASKING} calls gave nothing that could be used",
+                )
+            elif assignment["state"] == "granted" and assignment["granted_worker"] != by.worker_id:
+                # Refused by other hands than the grant's holder: the control plane,
+                # which took the result after its worker had dealt with the delivery and
+                # gone on. That worker is alive and is not coming back to this by
+                # itself. The work is given back and announced again, here.
+                await _release(connection, assignment)
+                await connection.execute(
+                    "UPDATE outbox SET published_at = NULL WHERE message_id = %s",
+                    (assignment["command_message_id"],),
                 )
             await _note(
                 connection, assignment, "invocation.rejected", invocation_id, invocation["attempt"]
@@ -921,7 +949,7 @@ class Invocations:
             async with self._starting:
                 # One session for this object's recoveries, however many passes ask at once.
                 if self._session is None:
-                    self._session = await WorkerSession.start(self._pool, "control-plane")
+                    self._session = await WorkerSession.start(self._pool, CONTROL_PLANE)
             for each in known:
                 await self.apply(each["invocation_id"], self._session)
         # Last, so that a grant whose known result was just found unusable is taken back

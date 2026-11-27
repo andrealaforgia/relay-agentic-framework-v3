@@ -167,7 +167,8 @@ class Worker:
         that is done before this returns."""
         left = await self._carry_out(assignment)
         if self._then is not None and (
-            left in ("applied", "finished") or left == "refused: this work is no longer wanted"
+            left in ("applied", "finished", "handed_on")
+            or left == "refused: this work is no longer wanted"
         ):
             # Something was applied, or the work was found already done: a worker cut
             # short after its result was applied never ran the pass that follows, and
