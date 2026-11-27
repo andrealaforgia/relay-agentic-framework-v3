@@ -364,3 +364,58 @@ async def test_a_code_expires_unused_and_is_for_the_project_it_was_prepared_for(
     assert "passphrase" not in expired.shown
     assert "expired unused" in desk.anyone("confirm", code).printed
     assert await world.column("SELECT state FROM gates") == ["open"]
+
+
+async def test_a_refused_push_is_retried_with_a_reason_and_its_request_repeated_by_its_handle(
+    desk: Desk,
+) -> None:
+    """3C-1.6 and 3C-1.7: the retry answers the refusal shown, says why, and commits its
+    receipt with what it allows. Sent again, the request is given that receipt, though
+    the push is by then no longer waiting."""
+    from relay.application.integration import Outcome
+
+    world = desk.world
+    # The checkout is left on no branch by the Builder's work: the person says which
+    # project they mean, since Relay will not guess.
+    desk.shell["RELAY_PROJECT"] = PROJECT
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    base = await world.awaiting_builder("B1")
+    await world.reviewed("B1", on=base)
+    world.hook_flag("refuse").touch()
+    assert (await world.integrate("B1")).outcome is Outcome.REJECTED
+    [push] = desk.read("inbox")
+    assert push["kind"] == "refused_push" and push["actions"] == ["retry"]
+    world.hook_flag("refuse").unlink()
+
+    unsaid = desk.po("retry", push["item_id"][:8])
+    retried = desk.po("retry", push["item_id"][:8], "--reason", "the hook was put right")
+
+    assert unsaid.code == 1 and "say why with --reason" in unsaid.printed
+    assert retried.code == 0 and "effective: retry_allowed" in retried.printed
+    assert "declined" in retried.shown and "the hook was put right" in retried.shown
+    assert desk.read("inbox") == []
+    assert await world.column(
+        "SELECT count(*) FROM assignments WHERE kind = 'integrate' AND state = 'wanted'"
+    ) == [1]
+    handle = retried.printed.split()[1]
+    again = desk.anyone("retry", push["item_id"][:8], "--request-id", handle)
+    assert again.code == 0 and "retry_allowed (as on record)" in again.printed
+    assert await world.column(
+        "SELECT count(*) FROM assignments WHERE kind = 'integrate' AND state = 'wanted'"
+    ) == [1]
+
+
+async def test_a_story_at_its_gate_or_at_work_is_rejected_saying_why(desk: Desk) -> None:
+    from tests.integration.story_world import at_the_story_gate
+
+    world = desk.world
+    desk.shell["RELAY_PROJECT"] = PROJECT
+    gate, _ = await at_the_story_gate(world)
+
+    [item] = desk.read("inbox")
+    assert item["item_id"] == str(gate) and "reject" in item["actions"]
+    rejected = desk.po("reject", str(gate)[:8], "--reason", "it does not do what was asked")
+
+    assert rejected.code == 0, rejected.printed
+    assert "it does not do what was asked" in rejected.shown
+    assert await world.story("S1") is StoryState.REJECTED
