@@ -2,29 +2,14 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from relay.application import authority
 from relay.cli import journal
-from tests.integration.conftest import DATABASE_URL, REDIS_URL
 from tests.integration.person import at_a_terminal, with_no_terminal
 from tests.integration.test_enrolment import IMAGE, PASSPHRASE, checkout_of
-
-
-@pytest.fixture
-def shell(namespace: str, tmp_path: Path) -> dict[str, str]:
-    """The environment of the person's shell."""
-    return {
-        **os.environ,
-        "RELAY_DATABASE_URL": DATABASE_URL,
-        "RELAY_REDIS_URL": REDIS_URL,
-        "RELAY_DATABASE_SCHEMA": namespace,
-        "RELAY_STATE_DIR": str(tmp_path / "state"),
-    }
 
 
 def init(tmp_path: Path) -> list[str]:

@@ -125,3 +125,15 @@ def as_installation() -> Iterator[str]:
     name_attempts_under("installation-a")
     yield "installation-a"
     name_attempts_under("")
+
+
+@pytest.fixture
+def shell(namespace: str, tmp_path: Path) -> dict[str, str]:
+    """The environment of the person's shell."""
+    return {
+        **os.environ,
+        "RELAY_DATABASE_URL": DATABASE_URL,
+        "RELAY_REDIS_URL": REDIS_URL,
+        "RELAY_DATABASE_SCHEMA": namespace,
+        "RELAY_STATE_DIR": str(tmp_path / "state"),
+    }

@@ -42,3 +42,25 @@ CREATE TABLE integration_sends (
 );
 
 CREATE INDEX integration_sends_of_intent ON integration_sends (intent_id);
+
+-- A run of the boundary suite is paid for. Each is on record before anything is
+-- launched, under the request that asked for it, so that asking again buys nothing
+-- more. Its result is the row of `boundary_passes` with the same identity. With no
+-- result, it is running while the process that launched it lives (that process holds a
+-- session lock named by the attempt), and uncertain once it does not: launched, perhaps,
+-- and nothing known of it. An uncertain attempt is never repeated by itself. A retry is
+-- an attempt of its own, naming the one it retries, and that one is retried once.
+CREATE TABLE boundary_runs (
+    attempt_id uuid PRIMARY KEY,
+    request_id text NOT NULL,
+    role       text NOT NULL,
+    digest     text NOT NULL,
+    runtime    jsonb NOT NULL,
+    retries    uuid UNIQUE REFERENCES boundary_runs,
+    -- Known never to have been launched: nothing was spent, and nobody needs asking.
+    not_launched text,
+    started_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (request_id, role)
+);
+
+CREATE INDEX boundary_runs_by_digest ON boundary_runs (digest, started_at DESC);

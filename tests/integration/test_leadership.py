@@ -902,3 +902,36 @@ async def test_a_worker_told_to_stop_while_it_asks_whose_redis_it_is_on_may_laun
         stop.set()
         await serving_qa
         await broker.delete(processes._marker(installation))
+
+
+async def test_a_project_registered_while_the_control_plane_runs_is_served_without_a_restart(
+    database: AsyncConnectionPool, broker: Any
+) -> None:
+    """3C-1.4: `relay init` in a second repository wakes the control plane for a project
+    it has not met. It is given a pass of its own, and its first is its start."""
+    from relay import processes
+    from relay.runtime import wake
+
+    relay = await serving(database, broker, 600.0)
+    stop = asyncio.Event()
+
+    async def the_control_plane() -> None:
+        await processes.control_plane(relay, broker, stop, every=600.0)
+
+    running = asyncio.create_task(the_control_plane(), context=contextvars.copy_context())
+    try:
+        async with asyncio.timeout(20):
+            await relay.features.again.wait()
+            async with database.connection() as connection:
+                await connection.execute(
+                    "INSERT INTO projects (project_id, repository, trunk) "
+                    "VALUES ('beta', 'r2', 'main')"
+                )
+            await wake(database, relay.installation, "beta")
+            while ("beta", True) not in relay.features.starting:
+                await asyncio.sleep(0.05)
+        assert relay.features.starting == [("alpha", True), ("beta", True)]
+    finally:
+        stop.set()
+        await running
+        await broker.delete(processes._marker(relay.installation))

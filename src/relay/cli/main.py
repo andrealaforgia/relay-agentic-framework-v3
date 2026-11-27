@@ -6,10 +6,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import getpass
+import json
 import signal
 import sys
-from collections.abc import AsyncIterator, Sequence
+import uuid
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -17,13 +20,22 @@ import redis.asyncio as redis
 
 from relay import processes
 from relay.application import authority
+from relay.application.boundaries import Boundaries
+from relay.application.boundary_runs import Attempt, BoundaryRuns, RunRefused
 from relay.application.leadership import AlreadyLed, installation_of
-from relay.cli import journal, terminal
+from relay.cli import doctor, journal, terminal
 from relay.cli.enrolment import DEFAULT_IMAGE, Asked, CannotEnrol, enrol
 from relay.persistence.database import Pool, migrate, open_pool
-from relay.providers.boundary_suite import runtime_now
+from relay.providers.boundary_suite import SuiteResult, run_suite, runtime_now
 from relay.providers.claude import ClaudeAdapter
-from relay.runtime import ROLES, NotConfigured, assemble, bootstrap, stated_policy
+from relay.runtime import (
+    ROLES,
+    NotConfigured,
+    assemble,
+    bootstrap,
+    settings_of,
+    stated_policy,
+)
 
 
 @asynccontextmanager
@@ -187,6 +199,73 @@ async def _policy(asked: argparse.Namespace, command: Sequence[str]) -> int:
     return 0
 
 
+async def _doctor(asked: argparse.Namespace, command: Sequence[str]) -> int:
+    async with _opened() as (pool, broker):
+        await migrate(pool)
+        installation = await _installation(pool)
+        if not asked.boundary:
+            found = await doctor.examine(pool, broker, installation)
+            if asked.json:
+                print(json.dumps([dataclasses.asdict(each) for each in found], indent=2))
+            else:
+                print(doctor.report(found))
+            return 0 if all(each.ok for each in found) else 1
+        settings, policy = await settings_of(pool), await authority.policy_of(pool)
+        if policy is None or any(not settings.get(name) for name in doctor.NEEDED):
+            print(
+                "relay: the bounds cannot be tried until the installation is set up and the "
+                "policy stated: see `relay doctor`",
+                file=sys.stderr,
+            )
+            return 1
+        binary = str(settings.get("cli", "claude"))
+        runtime = runtime_now(policy.statement, binary)
+        request = journal.note(
+            journal.journal_file(), command, installation, None, asked.request_id
+        )
+        print(f"request {request.request_id}")
+        if not asked.retry and not asked.request_id:
+            owed = await doctor.owed_runs(pool, settings, runtime)
+            if not owed:
+                print("every role's bounds have lately been seen to hold: nothing is run")
+                return 0
+            # Said before anything is launched.
+            print(
+                f"{len(owed)} paid run(s) of {doctor.SUITE_MODEL}, for the "
+                f"{', '.join(owed)}: at most {doctor.A_RUN_COSTS_AT_MOST} US dollars each"
+            )
+
+        async def suite(role: str, on: Mapping[str, str]) -> SuiteResult:
+            return await run_suite(
+                role,
+                Path(settings["workspaces"]),
+                binary=binary,
+                model=doctor.SUITE_MODEL,
+                withheld=[Path(settings["mirrors"])] if role == "builder" else [],
+                remote_policy=policy.statement,
+            )
+
+        made = await doctor.run_boundaries(
+            pool,
+            BoundaryRuns(pool, Boundaries(pool), suite),
+            settings,
+            runtime,
+            request.request_id,
+            uuid.UUID(asked.retry) if asked.retry else None,
+        )
+    for each in made:
+        if isinstance(each, RunRefused):
+            print(f"NOT  {each}")
+        else:
+            how = "run now" if each.launched_now else "as on record"
+            detail = f": {each.detail}" if each.detail else ""
+            print(
+                f"{'ok ' if each.state == 'passed' else 'NOT'}  the bounds of a {each.role}: "
+                f"{each.state}{detail} (attempt {each.attempt_id}, {how})"
+            )
+    return 0 if all(isinstance(each, Attempt) and each.state == "passed" for each in made) else 1
+
+
 def _requests() -> int:
     for request in journal.read(journal.journal_file()):
         project = f" [{request.project}]" if request.project else ""
@@ -219,6 +298,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     of_policy.add_parser("state", help="state it, with the passphrase").add_argument("statement")
     of_policy.add_parser("show", help="show the statement in force")
     commands.add_parser("requests", help="the requests made from this machine, to repeat one")
+    doctoring = commands.add_parser(
+        "doctor", help="what would stop Relay working here, and what to do about each"
+    )
+    doctoring.add_argument("--json", action="store_true", help="the same facts, as JSON")
+    doctoring.add_argument(
+        "--boundary",
+        action="store_true",
+        help="run the boundary suite where no fresh pass is on record (paid calls)",
+    )
+    doctoring.add_argument(
+        "--retry", metavar="ATTEMPT", help="buy another run for an uncertain one"
+    )
+    doctoring.add_argument(
+        "--request-id", help="repeat a request: what it did is returned, nothing is run again"
+    )
     given = list(sys.argv[1:] if argv is None else argv)
     asked = parser.parse_args(given)
     try:
@@ -232,6 +326,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(_policy(asked, given))
         if asked.command == "requests":
             return _requests()
+        if asked.command == "doctor":
+            return asyncio.run(_doctor(asked, given))
         return asyncio.run(_worker(asked.role))
     except NotConfigured as missing:
         print(f"relay: {missing}", file=sys.stderr)
