@@ -32,6 +32,21 @@ async def open_pool(url: str, schema: str | None = None) -> AsyncIterator[Pool]:
         await pool.close()
 
 
+# A migration that was once pushed with other content, by mistake, and may have been
+# applied in that form. An installation that recorded that exact content is brought to
+# this build by name: the content it applied already holds what the migrations listed
+# beside it add, so those are recorded as applied and are not run. This is for the
+# listed checksums and for nothing else: any other difference is still drift.
+#   0018 as pushed in 5f6da3d held, besides the table, the three additions that are 0019.
+SUPERSEDED = {
+    "0018_prepared.sql": {
+        "f0d231f0075b53b3624c44ef53f16b3444ac4d3c366165cd0fefccecf03081eb": (
+            "0019_confirmation.sql",
+        )
+    }
+}
+
+
 class MigrationDrift(Exception):
     """A migration that was already applied no longer has the content that was applied."""
 
@@ -60,6 +75,25 @@ async def migrate(pool: Pool) -> list[str]:
         present = {script.name for script in migrations.iterdir()}
         if missing := sorted(set(recorded) - present):
             raise MigrationDrift(f"applied migrations are missing from this build: {missing}")
+        for name, known in SUPERSEDED.items():
+            if name in recorded and recorded[name] in known:
+                # Applied in a form that already holds what these add: said to be
+                # applied, as they are, and the record brought to this build's content.
+                script = migrations / name
+                now = hashlib.sha256(script.read_bytes()).hexdigest()
+                for held in known[recorded[name]]:
+                    if held not in recorded:
+                        content = (migrations / held).read_bytes()
+                        checksum = hashlib.sha256(content).hexdigest()
+                        await connection.execute(
+                            "INSERT INTO schema_migrations (version, checksum) VALUES (%s, %s)",
+                            (held, checksum),
+                        )
+                        recorded[held] = checksum
+                await connection.execute(
+                    "UPDATE schema_migrations SET checksum = %s WHERE version = %s", (now, name)
+                )
+                recorded[name] = now
         for script in sorted(migrations.iterdir(), key=lambda entry: entry.name):
             if not script.name.endswith(".sql"):
                 continue

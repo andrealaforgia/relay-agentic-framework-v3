@@ -97,6 +97,11 @@ async def status(pool: Pool, project_id: str) -> dict[str, Any]:
                     if each["state"] == "asked"
                     else "taken up"
                     if each["taken"]
+                    # A red, an integration and a final check are the control plane's to
+                    # take up: no worker can claim one, and starting another worker
+                    # moves none of them on.
+                    else "waiting for the control plane (`relay up`)"
+                    if each["kind"] in ("red", "integrate", "complete")
                     else "waiting for a worker"
                 ),
             }

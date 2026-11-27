@@ -729,17 +729,47 @@ async def transition_in(connection: Connection, project_id: str, feature_id: str
     paused, resumed or cancelled, and the last thing that was put to a person about it.
     A final check retried and failed again leaves the feature in the state it was in,
     with another gate: this is what tells the two apart."""
+    return (await _progress(connection, project_id, feature_id))[0]
+
+
+async def _progress(
+    connection: Connection, project_id: str, feature_id: str
+) -> tuple[str, list[str]]:
+    """How far a feature has come, as this build says it, and as each earlier build that
+    was pushed said it."""
     row = await (
         await connection.execute(
             "SELECT (SELECT max(sequence) FROM events WHERE project_id = %s AND subject_id = %s "
             "AND event_type IN ('feature.paused', 'feature.resumed', 'feature.cancelled')) "
             "AS closure, (SELECT gate_id FROM gates WHERE project_id = %s AND feature_id = %s "
-            "ORDER BY opened_at DESC, gate_id DESC LIMIT 1) AS gate",
-            (project_id, feature_id, project_id, feature_id),
+            "ORDER BY opened_at DESC, gate_id DESC LIMIT 1) AS gate, "
+            # Each time the feature became ready to be checked is a request of its own:
+            # sent back to delivery by an answer and ready again, it is checking as it
+            # was, with no new gate and no pause, under another request.
+            "(SELECT request_id FROM completion_requests WHERE project_id = %s "
+            "AND feature_id = %s ORDER BY created_at DESC, request_id DESC LIMIT 1) AS checking",
+            (project_id, feature_id, project_id, feature_id, project_id, feature_id),
         )
     ).fetchone()
     assert row is not None
-    return f"{row['closure'] or '-'}.{row['gate'] or '-'}"
+    closure, gate = row["closure"] or "-", row["gate"] or "-"
+    paused_by = await closure_in(connection, project_id, feature_id)
+    return (
+        f"{closure}.{gate}.{row['checking'] or '-'}",
+        # As pushed before: the pause alone; then the last pause, resume or
+        # cancellation; then that and the last gate.
+        [str(paused_by or "-"), str(closure), f"{closure}.{gate}"],
+    )
+
+
+async def standings_in(
+    connection: Connection, project_id: str, feature_id: str, feature: Mapping[str, Any]
+) -> tuple[str, tuple[str, ...]]:
+    """How a feature stands, and the same in the words of each earlier build: an action
+    prepared by one of those is held to the feature as that build described it, and is
+    not stale merely because this build describes the same feature another way."""
+    now, earlier = await _progress(connection, project_id, feature_id)
+    return standing_of(feature, now), tuple(standing_of(feature, each) for each in earlier)
 
 
 async def closure_in(connection: Connection, project_id: str, feature_id: str) -> int | None:

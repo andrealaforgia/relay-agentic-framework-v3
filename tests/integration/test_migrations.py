@@ -64,7 +64,13 @@ SHIPPED = {
     "0016_installation.sql": "11e9895fb1d31021ff63c82f5b413fa98264d5eba2f1b3aff9c2191409a0c389",
     "0017_enrolment.sql": "b69abf31a36f0792569da7ff3c0e6f2490b29076479e792c2a708221c6f75231",
     "0018_prepared.sql": "c45e8b0533564ba622bc13245be79bc42d0944b4af4194e495a2870679c8c79b",
+    "0019_confirmation.sql": "0d7c50dfe5e722383092875f82b0464d2d022fa15cea7b92c1f78dce7feb5ff5",
 }
+
+
+# What a build pushed before step 2's second round of fixes had: the installation such a
+# build made is the one the upgrade tests start from.
+BEFORE_0019 = {name for name in SHIPPED if name < "0019"}
 
 
 def test_the_migrations_a_shipped_build_applied_read_as_they_did_then() -> None:
@@ -76,9 +82,12 @@ def test_the_migrations_a_shipped_build_applied_read_as_they_did_then() -> None:
     now = {
         script.name: hashlib.sha256(script.read_bytes()).hexdigest()
         for script in migrations.iterdir()
-        if script.name in SHIPPED
+        if script.name.endswith(".sql")
     }
 
+    # Every migration there is, and none left out: one that is not in the list fails
+    # this until it is added, which is done in the commit that first pushes it; and
+    # from then on a change to it fails this for good.
     assert now == SHIPPED
 
 
@@ -99,7 +108,7 @@ async def test_an_installation_made_by_the_last_build_keeps_what_it_is_across_th
     as_shipped = tmp_path / "persistence" / "migrations"
     as_shipped.mkdir(parents=True)
     for script in real.iterdir():
-        if script.name in SHIPPED:
+        if script.name in BEFORE_0019:
             (as_shipped / script.name).write_bytes(script.read_bytes())
 
     class TheLastBuild:
@@ -113,7 +122,7 @@ async def test_an_installation_made_by_the_last_build_keeps_what_it_is_across_th
         async with open_pool(DATABASE_URL, schema=namespace) as pool:
             with monkeypatch.context() as then:
                 then.setattr(database_module, "resources", TheLastBuild)
-                assert sorted(await migrate(pool)) == sorted(SHIPPED)
+                assert sorted(await migrate(pool)) == sorted(BEFORE_0019)
 
             async def led() -> None:
                 await (await Leadership.take(pool)).release()
@@ -147,7 +156,7 @@ async def test_an_installation_made_by_the_last_build_keeps_what_it_is_across_th
 
             applied = await migrate(pool)
 
-            assert applied and all(name not in SHIPPED for name in applied)
+            assert applied and all(name not in BEFORE_0019 for name in applied)
             async with pool.connection() as connection:
                 after = await (
                     await connection.execute("SELECT installation_id, term FROM installation")
@@ -212,12 +221,110 @@ async def test_two_commands_setting_up_one_empty_database_at_once_both_succeed(
             applied = await asyncio.gather(*(migrate(each) for each in (one, other, one, other)))
 
             assert sorted(len(each) for each in applied)[:3] == [0, 0, 0]
-            assert max(len(each) for each in applied) > len(SHIPPED)
+            assert max(len(each) for each in applied) == len(SHIPPED)
             async with one.connection() as connection:
                 installations = await (
                     await connection.execute("SELECT count(*) AS n FROM installation")
                 ).fetchone()
             assert installations is not None and installations["n"] == 1
+    finally:
+        async with open_pool(DATABASE_URL) as admin, admin.connection() as connection:
+            await connection.execute(f'DROP SCHEMA "{namespace}" CASCADE')
+
+
+@pytest.mark.parametrize("as_pushed_in", ["ba8611d", "5f6da3d"])
+async def test_an_installation_opened_by_either_build_that_was_pushed_with_0018_upgrades(
+    namespace: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, as_pushed_in: str
+) -> None:
+    """3C-S2-3.1: `0018` was pushed in two forms. One build had it as it is now. The build
+    after had it with the three additions that are now `0019`, and an installation that
+    build opened has those columns already, perhaps with something in them. Both are
+    brought to this build, and what the second had recorded in those columns is kept."""
+    from importlib import resources
+
+    from relay.persistence import database as database_module
+    from relay.persistence.database import open_pool
+    from tests.integration.conftest import DATABASE_URL
+
+    real = resources.files("relay.persistence") / "migrations"
+    then = tmp_path / "persistence" / "migrations"
+    then.mkdir(parents=True)
+    for script in real.iterdir():
+        if script.name.endswith(".sql") and script.name < "0019":
+            (then / script.name).write_bytes(script.read_bytes())
+    if as_pushed_in == "5f6da3d":
+        fixture = Path(__file__).resolve().parent.parent / "fixtures" / "migrations"
+        (then / "0018_prepared.sql").write_bytes(
+            (fixture / "0018_prepared.as_pushed_in_5f6da3d.sql").read_bytes()
+        )
+
+    class ThatBuild:
+        @staticmethod
+        def files(_: str) -> Path:
+            return tmp_path / "persistence"
+
+    async with open_pool(DATABASE_URL) as admin, admin.connection() as connection:
+        await connection.execute(f'CREATE SCHEMA "{namespace}"')
+    try:
+        async with open_pool(DATABASE_URL, schema=namespace) as pool:
+            with monkeypatch.context() as that:
+                that.setattr(database_module, "resources", ThatBuild)
+                await migrate(pool)
+            async with pool.connection() as connection:
+                await connection.execute(
+                    "INSERT INTO projects (project_id, repository, trunk) VALUES ('vat', 'r', 'main')"
+                )
+                await connection.execute(
+                    "INSERT INTO prepared_actions (code, project_id, verb, target, why, shown, "
+                    "basis, expires_at) VALUES ('c0de0001', 'vat', 'approve', 'a-gate', 'why', "
+                    "'shown', 'sha256:b', now() + interval '1 hour')"
+                )
+                if as_pushed_in == "5f6da3d":
+                    # What only that build could have left: a code taken, a passphrase
+                    # numbered, and a receipt saying how its decision was confirmed.
+                    await connection.execute(
+                        "UPDATE prepared_actions SET consumed_by = 'confirm:c0de0001'"
+                    )
+                    await connection.execute(
+                        "UPDATE installation SET passphrase = 'scrypt$kept', passphrase_revision = 3"
+                    )
+                    await connection.execute(
+                        "INSERT INTO human_actions (principal, request_id, target, action, "
+                        "payload, digest, disposition, outcome, confirmed) VALUES "
+                        "('product-owner', 'r-1', 'vat', 'start', '{}', 'd', 'effective', "
+                        "'started F1', '{\"passphrase_revision\": 3}')"
+                    )
+
+            applied = await migrate(pool)
+            assert await migrate(pool) == []  # and it is settled: nothing more to do
+
+            async with pool.connection() as connection:
+                recorded = await (
+                    await connection.execute(
+                        "SELECT version, checksum FROM schema_migrations WHERE version >= '0018'"
+                    )
+                ).fetchall()
+                code = await (
+                    await connection.execute("SELECT consumed_by FROM prepared_actions")
+                ).fetchone()
+                which = await (
+                    await connection.execute("SELECT passphrase_revision FROM installation")
+                ).fetchone()
+                kept = await (
+                    await connection.execute("SELECT confirmed FROM human_actions")
+                ).fetchall()
+            assert {each["version"]: each["checksum"] for each in recorded} == {
+                name: SHIPPED[name] for name in ("0018_prepared.sql", "0019_confirmation.sql")
+            }
+            assert code is not None and which is not None
+            if as_pushed_in == "5f6da3d":
+                assert applied == []  # what 0019 adds was there: said to be applied, not run
+                assert code["consumed_by"] == "confirm:c0de0001"
+                assert which["passphrase_revision"] == 3
+                assert [each["confirmed"] for each in kept] == [{"passphrase_revision": 3}]
+            else:
+                assert applied == ["0019_confirmation.sql"]
+                assert code["consumed_by"] is None and which["passphrase_revision"] == 0
     finally:
         async with open_pool(DATABASE_URL) as admin, admin.connection() as connection:
             await connection.execute(f'DROP SCHEMA "{namespace}" CASCADE')

@@ -23,7 +23,7 @@ from relay.application.inbox import (
     Inbox,
     Item,
 )
-from relay.application.stories import closure_in, standing_of, transition_in
+from relay.application.stories import closure_in, standings_in
 from relay.cli.terminal import visible
 from relay.domain.story import (
     HumanAction,
@@ -36,6 +36,10 @@ from relay.domain.story import (
 from relay.runtime import Relay
 
 PRODUCT_OWNER = Principal(PrincipalKind.HUMAN, "product-owner")
+
+# The verbs that carry words of the person's own, and which.
+TAKES_TEXT = ("answer", "replace-decision", "start")
+TAKES_A_REASON = ("request-changes", "reject", "retry", "pause", "cancel")
 
 VERBS = (
     "approve",
@@ -74,6 +78,9 @@ class Decision:
     target_id: str = ""
     # In Relay's own words and from identifiers only: what the passphrase is asked for.
     to: str = ""
+    # The same basis as earlier builds of Relay worked it out: an action one of them
+    # prepared is not stale merely because this build describes the record another way.
+    also: tuple[str, ...] = ()
 
 
 def _evidence(item: Item) -> str:
@@ -94,6 +101,13 @@ async def resolve(
 ) -> Decision:
     """What this verb on this target is, as the record has it now. Refuses what cannot be
     done to it, naming what can."""
+    # What each verb has a place for, asked before anything else: a word that is taken
+    # is shown, decided on and recorded, and a word with no place is refused here,
+    # before a code is given for it or a passphrase asked.
+    if (text or "").strip() and verb not in TAKES_TEXT:
+        raise CannotDecide(f"to {verb} carries no text: say it again without {text!r}")
+    if (reason or "").strip() and verb not in TAKES_A_REASON:
+        raise CannotDecide(f"to {verb} carries no reason: say it again without --reason")
     if verb == "start":
         problem = (text or "").strip()
         if not problem:
@@ -143,7 +157,9 @@ async def resolve(
         )
     if (text or "").strip() and verb != "answer":
         raise CannotDecide(f"to {verb} this carries no text: say it again without {text!r}")
-    said = (text if verb == "answer" else reason) or ""
+    # Trimmed once, here: what is shown, what is decided on, what the receipt records
+    # and what a request sent again is compared with are the same words.
+    said = ((text if verb == "answer" else reason) or "").strip()
     shown = (
         f"In {project_id}, you are about to {verb}: {item.about}\n\n{_evidence(item)}\n"
         + (f"\nYou say: {visible(said.strip())}\n" if said.strip() else "")
@@ -195,7 +211,11 @@ async def _on_a_feature(
             )
         ).fetchone()
         closure = await closure_in(connection, project_id, feature_id)
-        transition = await transition_in(connection, project_id, feature_id)
+        standing_now, as_earlier_builds_said = (
+            await standings_in(connection, project_id, feature_id, feature)
+            if feature is not None
+            else ("", ())
+        )
     if feature is None:
         raise CannotDecide(f"there is no feature {feature_id!r} in {project_id}")
     standing = feature["closed_by"] or feature["state"]
@@ -218,7 +238,7 @@ async def _on_a_feature(
 
     # Its state, whether it is closed, and the last time it was paused, resumed or
     # cancelled: paused and resumed since, it is open as it was and not as it was shown.
-    basis = standing_of(feature, transition)
+    basis = standing_now
     # Held, in the transaction that decides, to the feature as the person is shown it
     # now: they may take their time over the passphrase, and it may move meanwhile.
     held_to = basis
@@ -244,7 +264,7 @@ async def _on_a_feature(
 
     return Decision(
         verb, shown, f"{project_id}:{verb}:{feature_id}:{reason or ''}:{closure}", basis, carry_out,
-        feature_id, f"{verb} feature {feature_id} in {project_id}",
+        feature_id, f"{verb} feature {feature_id} in {project_id}", as_earlier_builds_said,
     )  # fmt: skip
 
 
@@ -390,20 +410,48 @@ async def receipt_on_record(
         ).fetchone()
     if row is None:
         return None
-    # A feature and a story are recorded under their project; an item by its identity,
-    # which the person may have named by its start; a feature started, by the project.
-    named = str(row["target"]).rsplit("/", 1)[-1]
-    same_target = (
-        row["target"] == project_id
-        if verb == "start"
-        else bool(target) and (named == target or (len(target) >= 6 and named.startswith(target)))
-    )
-    said = dict(row["payload"])
-    same_words = (
-        said.get("problem", "") == (text or "").strip()
-        if verb == "start"
-        else said.get("text", "") == (text or "").strip()
-        and said.get("reason", "") == (reason or "").strip()
+    recorded, said = str(row["target"]), dict(row["payload"])
+    typed = (target or "").strip()
+    async with pool.connection() as connection:
+        if verb == "start":
+            # Recorded against the project it was started in.
+            same_target = recorded == project_id
+        elif verb in ("pause", "resume", "cancel") or (verb == "reject" and "/" in recorded):
+            # A feature or a story, recorded under its project and named in full: these
+            # names are not abbreviated, and the same name in another project is
+            # another feature.
+            same_target = recorded == f"{project_id}/{typed}"
+        else:
+            # An item or a decision, recorded by its identity. It is this request's only
+            # if it is of this project, and if what was typed names it: its identity, the
+            # start of it, or for a decision its feature and number.
+            of = await (
+                await connection.execute(
+                    "SELECT project_id FROM gates WHERE gate_id::text = %s UNION ALL "
+                    "SELECT project_id FROM questions WHERE question_id::text = %s UNION ALL "
+                    "SELECT project_id FROM invocations WHERE invocation_id::text = %s UNION ALL "
+                    "SELECT project_id FROM integration_intents WHERE intent_id::text = %s "
+                    "UNION ALL SELECT project_id FROM decisions WHERE decision_id::text = %s",
+                    (recorded,) * 5,
+                )
+            ).fetchone()
+            named = recorded == typed or (len(typed) >= 6 and recorded.startswith(typed))
+            if not named and verb == "replace-decision" and "/" in typed:
+                feature_id, _, number = typed.partition("/D")
+                numbered = await (
+                    await connection.execute(
+                        "SELECT 1 FROM decisions WHERE decision_id::text = %s AND project_id = %s "
+                        "AND feature_id = %s AND number::text = %s",
+                        (recorded, project_id, feature_id, number),
+                    )
+                ).fetchone()
+                named = numbered is not None
+            same_target = named and of is not None and of["project_id"] == project_id
+    # The same words, trimmed on both sides: an earlier build recorded them as typed.
+    words = ("problem",) if verb == "start" else ("text", "reason")
+    given = {"problem": text, "text": text, "reason": reason}
+    same_words = all(
+        str(said.get(each, "")).strip() == (given[each] or "").strip() for each in words
     )
     if row["action"] != _ACTION.get(verb) or not same_target or not same_words:
         raise CannotDecide(

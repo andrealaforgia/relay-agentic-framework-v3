@@ -1046,3 +1046,250 @@ async def test_two_terminals_confirming_one_code_are_given_one_answer(
     assert "stale" not in said
     kept = await prepared.find(world.database, code)
     assert kept is not None and kept.ended is None
+
+
+async def test_a_receipt_is_its_projects_and_a_feature_is_named_in_full(desk: Desk) -> None:
+    """3C-S2-3.2: from another state directory, someone who means project B repeats the
+    handle, the verb, the feature's name and the reason of a cancellation in A. It is A's
+    receipt, and is not given to them. A feature's name is not abbreviated."""
+    from relay.cli import deciding
+
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    await world.behaviours.open_project("another", str(world.remote), "next")
+    cancelled = desk.po("cancel", "F1", "--reason", "no longer wanted")
+    handle = cancelled.printed.split()[1]
+    pool = world.database
+
+    mine = await deciding.receipt_on_record(
+        pool, handle, PROJECT, "cancel", "F1", None, "no longer wanted"
+    )
+    assert mine is not None and mine.outcome == "cancelled"
+    for project, name in (("another", "F1"), (PROJECT, "F"), (PROJECT, "F1x")):
+        with pytest.raises(deciding.CannotDecide, match="a request for something else"):
+            await deciding.receipt_on_record(
+                pool, handle, project, "cancel", name, None, "no longer wanted"
+            )
+    elsewhere = {
+        **desk.shell,
+        "RELAY_PROJECT": "another",
+        "RELAY_STATE_DIR": desk.shell["RELAY_STATE_DIR"] + "-2",
+    }
+    replayed = with_no_terminal(
+        ["cancel", "F1", "--reason", "no longer wanted", "--request-id", handle],
+        elsewhere,
+        desk.here,
+    )
+    assert replayed.code == 1 and "effective" not in replayed.printed
+
+
+async def test_a_request_sent_again_exactly_as_it_was_typed_is_answered_whatever_it_named(
+    desk: Desk,
+) -> None:
+    """3C-S2-3.3: a decision named as FEATURE/Dnumber, and an answer typed with space
+    around it, are each answered by their receipt once what they were about has closed."""
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    question = await world.ask()
+
+    answered = desk.po("answer", str(question), "  the standard rate, always  ")
+    replaced = desk.po("replace-decision", "F1/D1", "the reduced rate for books")
+
+    assert answered.code == 0 and replaced.code == 0, answered.printed + replaced.printed
+    assert await world.column("SELECT text FROM decisions ORDER BY number") == [
+        "the standard rate, always",  # trimmed once: shown, decided on and recorded alike
+        "the reduced rate for books",
+    ]
+    again = desk.anyone(
+        "answer", str(question), "  the standard rate, always  ",
+        "--request-id", answered.printed.split()[1],
+    )  # fmt: skip
+    renamed = desk.anyone(
+        "replace-decision", "F1/D1", "the reduced rate for books",
+        "--request-id", replaced.printed.split()[1],
+    )  # fmt: skip
+    assert again.code == 0 and "as on record" in again.printed, again.printed
+    assert renamed.code == 0 and "as on record" in renamed.printed, renamed.printed
+    # And a confirmed code whose text was typed with space around it.
+    second = await world.ask()
+    code = code_of(desk.anyone("prepare", "answer", str(second), "  zero  ", "--why", "as briefed"))
+    assert desk.po("confirm", code).code == 0
+    assert "as on record" in desk.anyone("confirm", code).printed
+
+
+async def test_a_terminal_that_did_not_settle_a_code_does_not_say_how_it_was_settled(
+    desk: Desk, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """3C-S2-3.4: this terminal read the code as unused and past its hour. Another had
+    taken it in time, between that reading and now. Its attempt to end the code changes
+    nothing, and it does not report an expiry that did not happen: it carries on as far
+    as the person, as the other confirmation would."""
+    import argparse
+    import dataclasses
+
+    from relay.application import prepared
+    from relay.cli import main
+
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    code = code_of(desk.anyone("prepare", "approve", str(gate), "--why", "it looks right"))
+    assert await prepared.consume(world.database, code, f"confirm:{code}")  # taken in time
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "UPDATE prepared_actions SET expires_at = now() - interval '1 minute'"
+        )
+    for name, value in desk.shell.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.chdir(desk.here)
+    read, looked = prepared.find, [0]
+
+    async def as_it_was_before_the_other_took_it(pool: Any, of: str) -> Any:
+        looked[0] += 1
+        now = await read(pool, of)
+        assert now is not None
+        return dataclasses.replace(now, expired=True, consumed_by=None) if looked[0] == 1 else now
+
+    monkeypatch.setattr(prepared, "find", as_it_was_before_the_other_took_it)
+    capsys.readouterr()
+
+    code_exit = await main._confirm(argparse.Namespace(code=code, project=None), ["confirm", code])
+
+    said = capsys.readouterr()
+    assert "expired" not in said.out + said.err
+    assert code_exit == 1 and "needs a person at a terminal" in said.err  # as far as the person
+    kept = await read(world.database, code)
+    assert kept is not None and kept.ended is None
+
+
+async def test_two_identical_decisions_sent_at_once_are_both_given_the_one_receipt(
+    desk: Desk, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """3C-S2-3.5: the second looked for a receipt while the first was still deciding. By
+    the time it looks at the gate, the first has approved and the gate is closed. It is
+    given the approval's receipt, and one decision has taken effect."""
+    import argparse
+
+    from relay.cli import deciding, main
+
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    approved = desk.po("approve", str(gate))
+    handle = approved.printed.split()[1]
+    for name, value in desk.shell.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.chdir(desk.here)
+    looked, real = [0], deciding.receipt_on_record
+
+    async def not_there_the_first_time(*arguments: Any) -> Any:
+        looked[0] += 1
+        return None if looked[0] == 1 else await real(*arguments)
+
+    monkeypatch.setattr(deciding, "receipt_on_record", not_there_the_first_time)
+    capsys.readouterr()
+    asked = argparse.Namespace(
+        verb="approve", target=str(gate), project=None, request_id=handle, command="approve"
+    )
+
+    code_exit = await main._decide(asked, ["approve", str(gate), "--request-id", handle])
+
+    said = capsys.readouterr().out
+    assert code_exit == 0 and "effective" in said and "as on record" in said, said
+    assert await world.column("SELECT count(*) FROM human_actions WHERE action = 'approve'") == [1]
+
+
+async def test_no_verb_takes_a_word_it_has_no_place_for(desk: Desk) -> None:
+    """3C-S2-3.7: asked before the verb is dispatched, so a feature's cancellation and a
+    decision's replacement are held to it as an item's decision is."""
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    question = await world.ask()
+    await world.answer(question)
+
+    extra_text = desk.anyone(
+        "prepare", "cancel", "F1", "some text", "--reason", "dropped", "--why", "asked"
+    )
+    extra_reason = desk.anyone(
+        "prepare", "replace-decision", "F1/D1", "the reduced rate", "--reason", "why not",
+        "--why", "asked",
+    )  # fmt: skip
+    resumed_with_a_reason = desk.anyone("prepare", "resume", "F1", "--reason", "x", "--why", "y")
+
+    assert extra_text.code == 1 and "carries no text" in extra_text.printed
+    assert extra_reason.code == 1 and "carries no reason" in extra_reason.printed
+    assert resumed_with_a_reason.code == 1 and "carries no reason" in resumed_with_a_reason.printed
+    assert await world.column("SELECT count(*) FROM prepared_actions") == [0]
+
+
+async def test_no_command_may_take_the_name_a_confirmation_gives_its_request(desk: Desk) -> None:
+    """3C-S2-3.8: asked where every caller-chosen handle is admitted. A pending code's
+    confirmation is not shut out by an installation command that took its name."""
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    code = code_of(desk.anyone("prepare", "approve", str(gate), "--why", "it looks right"))
+
+    stated = desk.po("policy", "state", "none applies", "--request-id", f"confirm:{code}")
+    rotated = desk.anyone("passphrase", "--request-id", f"confirm:{code}")
+    probed = desk.anyone("doctor", "--boundary", "--request-id", f"confirm:{code}")
+
+    for ran in (stated, rotated):
+        assert ran.code == 1 and "does not begin with `confirm:`" in ran.printed
+    assert probed.code == 1
+    assert await world.column("SELECT count(*) FROM request_handles") == [0]
+    assert await authority.policy_of(world.database) is None
+    assert desk.po("confirm", code).code == 0  # and the code is confirmed as it should be
+
+
+async def test_an_action_prepared_by_an_earlier_build_is_not_stale_for_how_it_was_described(
+    desk: Desk,
+) -> None:
+    """3C-S2-3.9: prepared by a build that described a feature's standing in fewer words.
+    Nothing of the feature has changed. It is confirmed, not marked stale."""
+    from relay.application import prepared
+
+    world = desk.world
+    await world.stories.open_feature(
+        (await _po()), PROJECT, "F1", "a newly opened feature with no gate and no pause"
+    )
+    made = await prepared.prepare(
+        world.database, PROJECT, "pause", "F1", None, "waiting on legal", "asked to",
+        "as that build showed it", "planning/open/-",
+    )  # fmt: skip
+
+    confirmed = desk.po("confirm", made.code)
+
+    assert confirmed.code == 0 and "effective: paused" in confirmed.printed, confirmed.printed
+    # One that has changed since is stale still, in whichever words.
+    later = await prepared.prepare(
+        world.database, PROJECT, "cancel", "F1", None, "dropped", "asked to",
+        "as that build showed it", "planning/open/-",
+    )  # fmt: skip
+    stale = desk.po("confirm", later.code)
+    assert stale.code == 1 and "stale" in stale.printed
+
+
+async def _po() -> Any:
+    from tests.integration.fixtures import PRODUCT_OWNER
+
+    return PRODUCT_OWNER
+
+
+async def test_status_says_who_takes_up_work_that_is_the_control_planes(desk: Desk) -> None:
+    """3C-S2-3.10: a red, an integration and a final check are not a worker's to claim.
+    With the control plane stopped, starting another worker moves none of them on."""
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    async with world.database.connection() as connection:
+        kinds = await (
+            await connection.execute(
+                "SELECT kind FROM assignments WHERE state = 'wanted' AND grant_id IS NULL"
+            )
+        ).fetchall()
+
+    owed = {each["work"]: each["state"] for each in desk.read("status")["owed"]}
+
+    assert {each["kind"] for each in kinds} & {"red", "integrate", "complete"} or owed
+    for work, state in owed.items():
+        if work in ("red", "integrate", "complete"):
+            assert state == "waiting for the control plane (`relay up`)"
+        elif state.startswith("waiting for a"):
+            assert state == "waiting for a worker"

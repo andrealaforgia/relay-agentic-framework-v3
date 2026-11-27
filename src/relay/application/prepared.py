@@ -72,16 +72,20 @@ async def find(pool: Pool, code: str) -> Prepared | None:
     return Prepared(**row) if row else None
 
 
-async def end(pool: Pool, code: str, why: str) -> None:
-    """A prepared action that will never be confirmed: stale, or expired. Said once."""
+async def end(pool: Pool, code: str, why: str) -> bool:
+    """A prepared action that will never be confirmed: stale, or expired. Said once. True
+    if this is what settled it. False if it changed nothing: a confirmation took the
+    code a moment before, or it had ended already, and what is true of it is to be read
+    again and not assumed."""
     async with pool.connection() as connection:
-        await connection.execute(
+        ended = await connection.execute(
             # Never of a code a confirmation has taken: that one is settled by what its
             # confirmation decides, and by nothing said of it meanwhile.
             "UPDATE prepared_actions SET ended = %s WHERE code = %s AND ended IS NULL "
             "AND consumed_by IS NULL",
             (why, code),
         )
+    return ended.rowcount == 1
 
 
 async def consume(pool: Pool, code: str, request_id: str) -> bool:

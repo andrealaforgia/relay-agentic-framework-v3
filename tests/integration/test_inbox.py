@@ -547,3 +547,41 @@ async def test_a_final_check_that_timed_out_says_so(
 
     [failed] = [each for each in item.evidence["observed"] if not each["satisfied"]]
     assert failed["why_the_run_does_not_count"] == "timed_out" and failed["exit_code"] is None
+
+
+async def test_a_cancellation_does_not_survive_the_feature_becoming_ready_a_second_time(
+    world: DecisionWorld,
+) -> None:
+    """3C-S2-3.6: checking, sent back to delivery by an answer, and ready to be checked
+    again under another request: no new gate and no pause, and not as it was shown."""
+    from relay.application.stories import standing_of, transition_in
+
+    await world.decide(await world.roadmap(STANDARD_RATE))
+
+    async def standing() -> str:
+        async with world.database.connection() as connection:
+            feature = await (
+                await connection.execute("SELECT state, closed_by FROM features")
+            ).fetchone()
+            assert feature is not None
+            return standing_of(feature, await transition_in(connection, PROJECT, "F1"))
+
+    async def ready_to_be_checked() -> None:
+        async with world.database.connection() as connection:
+            # Whatever request there was is overtaken: the feature stopped being ready.
+            await connection.execute("UPDATE completion_requests SET state = 'overtaken'")
+            await connection.execute(
+                "INSERT INTO completion_requests (request_id, project_id, feature_id) "
+                "VALUES (gen_random_uuid(), %s, 'F1')",
+                (PROJECT,),
+            )
+
+    await ready_to_be_checked()
+    shown = await standing()
+    await ready_to_be_checked()  # a second request, the feature reading as it did
+
+    old = await world.close("cancel", reason="as I saw it", as_seen=shown)
+
+    assert shown != await standing()
+    assert old.disposition == "stale"
+    assert await world.column("SELECT closed_by FROM features") == [None]

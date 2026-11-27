@@ -133,6 +133,14 @@ async def _handle(
     then is it written in the journal, where a handle of another installation, or of
     another command, is refused in its turn."""
     installation = await _installation(pool)
+    if given is not None and given.startswith("confirm:") and action != "confirm":
+        # The name a confirmation gives its own request, and nobody else's to choose:
+        # asked here, where every handle a caller chose is admitted, before one is
+        # written or anything is paid for under it.
+        raise authority.Refused(
+            "a request's identity does not begin with `confirm:`: that is how a prepared "
+            "action names its confirmation"
+        )
     request_id = given or str(uuid.uuid7())
     await authority.take_handle(pool, request_id, action, asked)
     request = journal.note(journal.journal_file(), command, installation, project, request_id)
@@ -482,14 +490,34 @@ async def _decide(asked: argparse.Namespace, command: Sequence[str]) -> int:
                     print(f"{done.disposition}: {done.outcome} (as on record)")
                     return 0 if done.disposition == "effective" else 1
             relay = await assemble(pool, broker)
-            decision = await deciding.resolve(
-                relay,
-                project,
-                verb,
-                getattr(asked, "target", "") or "",
-                getattr(asked, "text", None),
-                getattr(asked, "reason", None),
-            )
+            try:
+                decision = await deciding.resolve(
+                    relay,
+                    project,
+                    verb,
+                    getattr(asked, "target", "") or "",
+                    getattr(asked, "text", None),
+                    getattr(asked, "reason", None),
+                )
+            except deciding.CannotDecide:
+                # Sent twice at once: the other one decided while this one was looking,
+                # and what it was about is no longer waiting. The receipt is there now,
+                # written in the transaction that closed it: both are given it.
+                if asked.request_id and (
+                    done := await deciding.receipt_on_record(
+                        pool,
+                        asked.request_id,
+                        project,
+                        verb,
+                        getattr(asked, "target", "") or "",
+                        getattr(asked, "text", None),
+                        getattr(asked, "reason", None),
+                    )
+                ):
+                    print(f"request {asked.request_id}")
+                    print(f"{done.disposition}: {done.outcome} (as on record)")
+                    return 0 if done.disposition == "effective" else 1
+                raise
             request = await _handle(
                 pool, command, asked.request_id, command[0], _typed(project, asked), project
             )
@@ -580,6 +608,7 @@ async def _confirm(asked: argparse.Namespace, command: Sequence[str]) -> int:
             async def answered() -> Receipt | None:
                 # The receipt on record under this code's request, if it is the receipt
                 # of the action that was prepared and of no other.
+                assert made is not None
                 return await deciding.receipt_on_record(
                     pool, request_id, project, made.verb, made.target, made.said, made.reason
                 )
@@ -594,10 +623,20 @@ async def _confirm(asked: argparse.Namespace, command: Sequence[str]) -> int:
                 # expired, however long ago: it is settled by what that confirmation
                 # decides, and a second terminal, or the same one after a crash,
                 # carries that same confirmation on.
-                await prepared.end(pool, code, "this expired unused, an hour after it was prepared")
-                raise deciding.CannotDecide(
-                    "this expired unused, an hour after it was prepared. Nothing was done"
-                )
+                if await prepared.end(
+                    pool, code, "this expired unused, an hour after it was prepared"
+                ):
+                    raise deciding.CannotDecide(
+                        "this expired unused, an hour after it was prepared. Nothing was done"
+                    )
+                # It was not this that settled it: a confirmation took the code in time,
+                # a moment before, or it had ended some other way. What is true of it is
+                # read again, and this terminal says that and not what it supposed.
+                again = await prepared.find(pool, code)
+                assert again is not None
+                if again.ended is not None:
+                    raise deciding.CannotDecide(f"{again.ended}. Nothing was done under this code")
+                made = again
             relay = await assemble(pool, broker)
             try:
                 # Resolved against the record as it stands, and compared with the record
@@ -607,7 +646,8 @@ async def _confirm(asked: argparse.Namespace, command: Sequence[str]) -> int:
                 decision = await deciding.resolve(
                     relay, project, made.verb, made.target, made.said, made.reason
                 )
-                moved = decision.basis != made.basis
+                # As this build describes the record, or as the build that prepared it did.
+                moved = made.basis not in (decision.basis, *decision.also)
             except deciding.CannotDecide:
                 moved = True
             if moved and (done := await answered()):
