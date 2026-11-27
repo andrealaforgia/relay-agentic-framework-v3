@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -190,3 +191,120 @@ async def test_which_project_a_command_means_is_said_or_is_this_checkouts_and_is
     stranger = checkout_of(tmp_path / "unknown.git", tmp_path / "stranger")
     with pytest.raises(NoProject, match="No registered project is of this repository"):
         await select_project(database, None, {}, stranger)
+
+
+async def test_a_first_enrolment_refused_at_the_terminal_leaves_nothing_of_itself(
+    database: AsyncConnectionPool, broker: redis.Redis, tmp_path: Path, places: Asked
+) -> None:
+    """3C-S1B-1.6: no settings, no project and no wake before the passphrase is had. What
+    was refused can be run again as a first enrolment."""
+    here = checkout_of(tmp_path / "remote.git", tmp_path / "vat")
+
+    with pytest.raises(CannotEnrol, match="did not match"):
+        await enrol(database, broker, here, places, Person(PASSPHRASE, "something else"), pin=str)
+    with pytest.raises(CannotEnrol, match="at least"):
+        await enrol(database, broker, here, places, Person("short", "short"), pin=str)
+
+    assert await settings_of(database) == {}
+    assert not await authority.is_set(database)
+    async with database.connection() as connection:
+        projects = await (await connection.execute("SELECT project_id FROM projects")).fetchall()
+    assert projects == []
+    said = await enrol(database, broker, here, places, Person(PASSPHRASE, PASSPHRASE), pin=str)
+    assert any("project vat: registered" in line for line in said)
+
+
+async def test_two_first_enrolments_at_once_are_one_after_the_other(
+    database: AsyncConnectionPool, broker: redis.Redis, tmp_path: Path
+) -> None:
+    """3C-S1B-1.6: each read the installation as having been told nothing. One decides
+    first; the other finds its settings and its passphrase and keeps them whole, and
+    registers its own project beside."""
+    import asyncio
+
+    root = tmp_path.resolve()
+    one = checkout_of(tmp_path / "a.git", tmp_path / "a")
+    other = checkout_of(tmp_path / "b.git", tmp_path / "b")
+    both_looked, looked = asyncio.Event(), 0
+
+    def slowly(image: str) -> str:
+        return image
+
+    async def enrolled(here: Path, name: str, phrase: str) -> list[str]:
+        nonlocal looked
+        asked = Asked(
+            workspaces=str(root / name / "w"), mirrors=str(root / name / "m"), image=f"{IMAGE}"
+        )
+
+        def person(prompt: str) -> str:
+            return phrase
+
+        # Each gathers everything before either decides.
+        looked += 1
+        if looked == 2:
+            both_looked.set()
+        await both_looked.wait()
+        return await enrol(database, broker, here, asked, person, pin=slowly)
+
+    first, second = await asyncio.gather(
+        enrolled(one, "one", "the first one's phrase"),
+        enrolled(other, "other", "the other one's phrase"),
+    )
+
+    settings = await settings_of(database)
+    whose = Path(settings["workspaces"]).parent.name
+    assert whose in ("one", "other")
+    assert settings["mirrors"] == str(root / whose / "m")  # one enrolment's, whole
+    phrase = "the first one's phrase" if whose == "one" else "the other one's phrase"
+    await authority.require(database, phrase)
+    assert sum("set by someone else meanwhile" in " ".join(each) for each in (first, second)) == 1
+    async with database.connection() as connection:
+        projects = await (
+            await connection.execute("SELECT project_id FROM projects ORDER BY project_id")
+        ).fetchall()
+    assert [each["project_id"] for each in projects] == ["a", "b"]
+
+
+async def test_a_repository_whose_name_ends_in_a_space_is_not_taken_for_its_neighbour(
+    database: AsyncConnectionPool, broker: redis.Redis, tmp_path: Path, places: Asked
+) -> None:
+    """3C-S1B-1.9: Git ends what it says with a newline, and only that is taken off."""
+    plain = checkout_of(tmp_path / "remote.git", tmp_path / "plain")
+    spaced = checkout_of(tmp_path / "remote.git ", tmp_path / "spaced")
+
+    await enrol(database, broker, spaced, places, Person(PASSPHRASE, PASSPHRASE), pin=str)
+
+    async with database.connection() as connection:
+        [project] = await (
+            await connection.execute("SELECT project_id, repository FROM projects")
+        ).fetchall()
+    assert project["repository"] == str((tmp_path / "remote.git ").resolve()) + ""
+    assert project["repository"].endswith("remote.git ")
+    assert await select_project(database, None, {}, spaced) == "spaced"
+    with pytest.raises(NoProject, match="No registered project is of this repository"):
+        await select_project(database, None, {}, plain)
+
+
+async def test_init_sets_nothing_a_worker_would_then_refuse(
+    database: AsyncConnectionPool,
+    broker: redis.Redis,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """3C-S1B-1.10: a workspace root is checked by the worker's own rule before it is set,
+    and where definitions are looked for is kept as a whole path."""
+    here = checkout_of(tmp_path / "remote.git", tmp_path / "vat")
+    shared = Asked(workspaces=f"/tmp/claude-{os.getuid()}/relay-workspaces", image=IMAGE)
+
+    with pytest.raises(CannotEnrol, match="workspaces cannot be at"):
+        await enrol(database, broker, here, shared, Person(PASSPHRASE, PASSPHRASE), pin=str)
+    assert await settings_of(database) == {}
+
+    root = tmp_path.resolve()
+    monkeypatch.chdir(tmp_path)
+    relative = Asked(
+        workspaces=str(root / "w"), mirrors=str(root / "m"), image=IMAGE, definitions=["agents"]
+    )
+    await enrol(database, broker, here, relative, Person(PASSPHRASE, PASSPHRASE), pin=str)
+
+    assert (await settings_of(database))["definitions"] == [str(root / "agents")]

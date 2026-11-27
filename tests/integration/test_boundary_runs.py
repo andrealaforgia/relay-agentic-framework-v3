@@ -10,12 +10,30 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from relay.application.boundaries import Boundaries
-from relay.application.boundary_runs import BoundaryRuns, RunRefused
+from relay.application.boundary_runs import Attempt, BoundaryRuns, RunRefused
 from relay.application.workers import _lock_key
-from relay.providers.boundary_suite import Observation, SuiteResult
+from relay.providers.boundary_suite import NotLaunched, Observation, SuiteResult
 
 RUNTIME = {"cli": "9.9.9 (stub)", "os": "test", "remote_policy": "none, says the operator"}
 DIGEST = "d" * 64
+INSTALLATION = "01a20000-0000-7000-8000-000000000001"
+
+
+async def asked(
+    runs: BoundaryRuns,
+    request: str,
+    role: str = "qa",
+    retry: uuid.UUID | None = None,
+    digest: str = DIGEST,
+) -> Attempt:
+    """As the command does: the request on record first, with what it asks for, then the
+    run it asks for."""
+
+    async def what() -> Mapping[str, str]:
+        return {role: digest}
+
+    await runs.open_request(request, INSTALLATION, retry, what)
+    return await runs.run(request, role, digest, RUNTIME, retry=retry)
 
 
 class Suite:
@@ -27,6 +45,7 @@ class Suite:
         self.hold: asyncio.Event | None = None
         self.started = asyncio.Event()
         self.fails_with: Exception | None = None
+        self.call = "returned"
 
     async def __call__(self, role: str, runtime: Mapping[str, str]) -> SuiteResult:
         self.launched += 1
@@ -38,7 +57,12 @@ class Suite:
         if self.fails_with is not None:
             raise self.fails_with
         return SuiteResult(
-            role, DIGEST, dict(runtime), (Observation("writes stay inside", self.holds, ""),), None
+            role,
+            DIGEST,
+            dict(runtime),
+            (Observation("writes stay inside", self.holds, ""),),
+            None,
+            call=self.call,
         )
 
 
@@ -55,8 +79,8 @@ def runs(database: AsyncConnectionPool, suite: Suite) -> BoundaryRuns:
 async def test_a_run_is_made_once_for_a_request_however_often_the_request_is_sent(
     database: AsyncConnectionPool, runs: BoundaryRuns, suite: Suite
 ) -> None:
-    first = await runs.run("request-1", "qa", DIGEST, RUNTIME)
-    again = await runs.run("request-1", "qa", DIGEST, RUNTIME)
+    first = await asked(runs, "request-1", "qa")
+    again = await asked(runs, "request-1", "qa")
 
     assert (first.state, first.launched_now) == ("passed", True)
     assert (again.state, again.launched_now, again.attempt_id) == (
@@ -73,11 +97,11 @@ async def test_a_run_that_showed_the_bounds_not_to_hold_is_a_result_and_says_whi
 ) -> None:
     suite.holds = False
 
-    made = await runs.run("request-1", "qa", DIGEST, RUNTIME)
+    made = await asked(runs, "request-1", "qa")
 
     assert (made.state, made.detail) == ("failed", "writes stay inside")
     assert not await Boundaries(database).holds(DIGEST)
-    assert (await runs.run("request-1", "qa", DIGEST, RUNTIME)).state == "failed"
+    assert (await asked(runs, "request-1", "qa")).state == "failed"
     assert suite.launched == 1
 
 
@@ -103,41 +127,42 @@ async def test_a_running_run_is_not_an_uncertain_one_and_neither_is_bought_again
     end. Running while its process lives; uncertain once it does not; retried only when
     asked, by name, once, and the retry has a receipt of its own."""
     suite.hold = asyncio.Event()
-    first = asyncio.create_task(runs.run("request-1", "qa", DIGEST, RUNTIME))
+    first = asyncio.create_task(asked(runs, "request-1", "qa"))
     await suite.started.wait()
 
-    replayed = await runs.run("request-1", "qa", DIGEST, RUNTIME)
+    replayed = await asked(runs, "request-1", "qa")
     assert (replayed.state, replayed.launched_now) == ("running", False)
     with pytest.raises(RunRefused, match="is being made now"):
-        await runs.run("request-2", "qa", DIGEST, RUNTIME)
+        await asked(runs, "request-2", "qa")
     with pytest.raises(RunRefused, match="running, not uncertain"):
-        await runs.run("request-3", "qa", DIGEST, RUNTIME, retry=replayed.attempt_id)
+        await asked(runs, "request-3", "qa", replayed.attempt_id)
     assert suite.launched == 1
 
     await end_the_process_of(database, replayed.attempt_id)
     first.cancel()
     await asyncio.gather(first, return_exceptions=True)
 
-    lost = await runs.run("request-1", "qa", DIGEST, RUNTIME)
+    lost = await asked(runs, "request-1", "qa")
     assert (lost.state, lost.attempt_id) == ("uncertain", replayed.attempt_id)
     with pytest.raises(RunRefused, match=f"--retry {lost.attempt_id}"):
-        await runs.run("request-2", "qa", DIGEST, RUNTIME)
+        await asked(runs, "request-2", "qa")
     assert suite.launched == 1  # never repeated by itself
 
     suite.hold = None
-    retried = await runs.run("request-4", "qa", DIGEST, RUNTIME, retry=lost.attempt_id)
+    retried = await asked(runs, "request-4", "qa", lost.attempt_id)
 
     assert (retried.state, retried.launched_now) == ("passed", True)
     assert retried.attempt_id != lost.attempt_id and suite.launched == 2
-    again = await runs.run("request-4", "qa", DIGEST, RUNTIME, retry=lost.attempt_id)
+    again = await asked(runs, "request-4", "qa", lost.attempt_id)
     assert (again.attempt_id, again.launched_now) == (retried.attempt_id, False)
     with pytest.raises(RunRefused, match="was retried already"):
-        await runs.run("request-5", "qa", DIGEST, RUNTIME, retry=lost.attempt_id)
+        await asked(runs, "request-5", "qa", lost.attempt_id)
     assert suite.launched == 2
-    assert (await runs.run("request-1", "qa", DIGEST, RUNTIME)).state == "uncertain"  # as it was
-    # With the uncertain one answered for, a new request for these bounds is an ordinary one.
-    assert (await runs.run("request-6", "qa", DIGEST, RUNTIME)).launched_now
-    assert suite.launched == 3
+    assert (await asked(runs, "request-1", "qa")).state == "uncertain"  # as it was
+    # With the uncertain one answered for, a new request for these bounds is an ordinary
+    # one: and these bounds have just been seen to hold, so it runs nothing.
+    assert (await asked(runs, "request-6", "qa")).state == "fresh"
+    assert suite.launched == 2
 
 
 async def test_a_run_that_ended_without_a_result_is_uncertain_and_says_how_to_retry(
@@ -146,14 +171,14 @@ async def test_a_run_that_ended_without_a_result_is_uncertain_and_says_how_to_re
     suite.fails_with = RuntimeError("the terminal went away")
 
     with pytest.raises(RunRefused, match="may have been paid for") as refused:
-        await runs.run("request-1", "qa", DIGEST, RUNTIME)
+        await asked(runs, "request-1", "qa")
 
     known = await runs.of_request("request-1", "qa")
     assert known is not None and known.state == "uncertain"
     assert f"--retry {known.attempt_id}" in str(refused.value)
     suite.fails_with = None
     with pytest.raises(RunRefused, match="not repeated by itself"):
-        await runs.run("request-2", "qa", DIGEST, RUNTIME)
+        await asked(runs, "request-2", "qa")
     assert suite.launched == 1
 
 
@@ -161,10 +186,113 @@ async def test_a_retry_names_an_attempt_there_is_for_that_role(
     runs: BoundaryRuns, suite: Suite
 ) -> None:
     with pytest.raises(RunRefused, match="there is no attempt"):
-        await runs.run("request-1", "qa", DIGEST, RUNTIME, retry=uuid.uuid4())
-    made = await runs.run("request-2", "qa", DIGEST, RUNTIME)
+        await asked(runs, "request-1", "qa", uuid.uuid4())
+    made = await asked(runs, "request-2", "qa")
     with pytest.raises(RunRefused, match="there is no attempt"):
-        await runs.run("request-3", "builder", DIGEST, RUNTIME, retry=made.attempt_id)
+        await asked(runs, "request-3", "builder", made.attempt_id)
     with pytest.raises(RunRefused, match="passed, not uncertain"):
-        await runs.run("request-3", "qa", DIGEST, RUNTIME, retry=made.attempt_id)
+        await asked(runs, "request-3", "qa", made.attempt_id)
     assert suite.launched == 1
+
+
+async def test_a_second_request_finds_the_pass_the_first_paid_for_and_buys_nothing(
+    database: AsyncConnectionPool, runs: BoundaryRuns, suite: Suite
+) -> None:
+    """3C-S1B-1.2: two operators each worked out that these bounds were owed a run. The
+    first finishes before the second has its turn. Whether a pass is fresh is asked
+    again there, under the boundary's lock."""
+
+    async def owed() -> Mapping[str, str]:
+        return {"qa": DIGEST}
+
+    await runs.open_request("request-1", INSTALLATION, None, owed)
+    await runs.open_request("request-2", INSTALLATION, None, owed)  # owed, as it then saw
+
+    first = await runs.run("request-1", "qa", DIGEST, RUNTIME)
+    second = await runs.run("request-2", "qa", DIGEST, RUNTIME)
+
+    assert (first.state, first.launched_now) == ("passed", True)
+    assert (second.state, second.launched_now) == ("fresh", False)
+    assert suite.launched == 1
+    # And sent again after that pass is stale, the second still buys nothing.
+    async with database.connection() as connection:
+        await connection.execute(
+            "UPDATE boundary_passes SET observed_at = now() - interval '3 days'"
+        )
+    assert (await runs.run("request-2", "qa", DIGEST, RUNTIME)).state == "fresh"
+    assert suite.launched == 1
+
+
+async def test_a_request_is_on_record_with_all_it_asked_for_before_anything_is_run(
+    runs: BoundaryRuns, suite: Suite
+) -> None:
+    """3C-S1B-1.1: what a request asks to have tried is fixed when it is first made, an
+    empty set included. Sent again it asks for that, whatever has come to be owed since;
+    and it is a request of one installation."""
+    looked = 0
+
+    async def nothing_owed() -> Mapping[str, str]:
+        nonlocal looked
+        looked += 1
+        return {}
+
+    async def owed_by_now() -> Mapping[str, str]:
+        nonlocal looked
+        looked += 1
+        return {"qa": DIGEST}
+
+    assert await runs.open_request("request-1", INSTALLATION, None, nothing_owed) == {}
+    assert await runs.open_request("request-1", INSTALLATION, None, owed_by_now) == {}
+    assert looked == 1 and suite.launched == 0
+    assert await runs.to_launch("request-1", {}) == []
+
+    with pytest.raises(RunRefused, match="another installation"):
+        await runs.open_request(
+            "request-1", "01a20000-0000-7000-8000-00000000000b", None, owed_by_now
+        )
+    with pytest.raises(RunRefused, match="for something else"):
+        await runs.open_request("request-1", INSTALLATION, uuid.uuid4(), owed_by_now)
+    assert await runs.open_request("request-2", INSTALLATION, None, owed_by_now) == {"qa": DIGEST}
+    assert await runs.to_launch("request-2", {"qa": DIGEST}) == ["qa"]
+    await runs.run("request-2", "qa", DIGEST, RUNTIME)
+    assert await runs.to_launch("request-2", {"qa": DIGEST}) == []
+
+
+async def test_a_run_that_never_reached_the_provider_cost_nothing_and_needs_nobody_asked(
+    database: AsyncConnectionPool, runs: BoundaryRuns, suite: Suite
+) -> None:
+    """3C-S1B-1.3: the scene could not be made, or the CLI said it started nothing. Known,
+    and not uncertain: the next ordinary request tries the bounds again."""
+    suite.fails_with = NotLaunched("the suite could not listen for the run's connections")
+
+    never = await asked(runs, "request-1")
+
+    assert (never.state, never.launched_now) == ("not_launched", False)
+    assert "could not listen" in never.detail
+    assert not await Boundaries(database).holds(DIGEST)
+    suite.fails_with, suite.call, suite.holds = None, "not_started", False
+    refused_to_start = await asked(runs, "request-2")
+    assert refused_to_start.state == "not_launched"
+    assert not await Boundaries(database).holds(DIGEST)
+    suite.call, suite.holds = "returned", True
+    assert (await asked(runs, "request-3")).state == "passed"  # with nobody asked
+
+
+async def test_a_call_that_was_launched_and_ended_with_no_result_is_uncertain_whatever_its_verdict(
+    database: AsyncConnectionPool, runs: BoundaryRuns, suite: Suite
+) -> None:
+    """3C-S1B-1.3: the verdict of such a run is a failure, and is recorded as one, so
+    nothing is authorised by it. But it is not a result to be bought again unasked: the
+    call may have been paid for, and only a named retry buys another."""
+    suite.call, suite.holds = "uncertain", False
+
+    lost = await asked(runs, "request-1")
+
+    assert lost.state == "uncertain" and "no result" in lost.detail
+    assert not await Boundaries(database).holds(DIGEST)
+    suite.call, suite.holds = "returned", True
+    with pytest.raises(RunRefused, match=f"--retry {lost.attempt_id}"):
+        await asked(runs, "request-2")
+    assert suite.launched == 1
+    assert (await asked(runs, "request-3", retry=lost.attempt_id)).state == "passed"
+    assert suite.launched == 2 and await Boundaries(database).holds(DIGEST)

@@ -7,10 +7,11 @@ a request on record (`boundary_runs`).
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import subprocess
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,9 +21,9 @@ import redis.asyncio as redis
 from relay.application import authority
 from relay.application.boundaries import Boundaries
 from relay.application.boundary_runs import Attempt, BoundaryRuns, RunRefused
-from relay.application.leadership import lock_key
+from relay.application.leadership import installation_of, lock_key
 from relay.application.workers import is_alive
-from relay.persistence.database import Pool
+from relay.persistence.database import Pool, schema_state
 from relay.providers.boundary_suite import runtime_now
 from relay.providers.claude import _ALWAYS_PASSED, ClaudeAdapter, resolved
 from relay.providers.confinement import boundary_digest, confinement_for
@@ -30,6 +31,8 @@ from relay.providers.definitions import DEFAULT_DEFINITIONS, find_definition
 from relay.runtime import ROLES, settings_of
 
 NEEDED = ("workspaces", "mirrors", "image")
+# How long the database is waited for before it is said not to answer.
+DATABASE_WITHIN = 8.0
 
 
 @dataclass(frozen=True)
@@ -68,9 +71,44 @@ def boundaries_of(settings: Mapping[str, Any], runtime: Mapping[str, str]) -> di
     }
 
 
-async def examine(pool: Pool, broker: redis.Redis, installation: str) -> list[Finding]:
+async def examine(pool: Pool, broker: redis.Redis) -> list[Finding]:
+    """Look, and change nothing: not a migration, not a row."""
+    try:
+        pending, drifted = await asyncio.wait_for(schema_state(pool), DATABASE_WITHIN)
+    except Exception as unreachable:  # noqa: BLE001 - whatever it is, it is the finding
+        return [
+            Finding(
+                "the database",
+                False,
+                f"cannot be reached: {unreachable!r}"[:300],
+                "start it (`docker compose up -d`) and check RELAY_DATABASE_URL",
+            )
+        ]
+    if drifted:
+        return [
+            Finding(
+                "the database",
+                False,
+                f"its schema was made by another build of Relay: {', '.join(drifted)} differ",
+                "use the build that made it, or a database of this build's own",
+            )
+        ]
+    if pending:
+        return [
+            Finding(
+                "the database",
+                False,
+                "reached; it has never been set up for Relay"
+                if len(pending) > 1 and pending[0].startswith("0001")
+                else f"reached; its schema is behind this build by {', '.join(pending)}",
+                "run `relay init` in the project's checkout (or `relay up`, which brings an "
+                "installation's schema up to date)",
+            )
+        ]
     found = [Finding("the database", True, "reached, and its schema is current")]
     settings = await settings_of(pool)
+    async with pool.connection() as connection:
+        installation = await installation_of(connection)
 
     # Redis, and whether it is the one the control plane uses.
     async with pool.connection() as connection:
@@ -344,36 +382,41 @@ async def run_boundaries(
     settings: Mapping[str, Any],
     runtime: Mapping[str, str],
     request_id: str,
+    installation: str,
     retry: uuid.UUID | None = None,
+    before_launching: Callable[[list[str]], None] | None = None,
 ) -> list[Attempt | RunRefused]:
-    """Make the runs this request asks for: every boundary with no fresh pass, or the one
-    retry it names. What is on record for the request already is returned as it is."""
-    if retry is not None:
+    """Make the runs this request asks for. The request is put on record first, with the
+    whole of what it asks to have tried, which may be nothing: every boundary with no
+    fresh pass, or the one retry it names. Sent again, it asks for what it asked for
+    then. `before_launching` is told which roles may still be bought a run, before any
+    is: that is where the cost is said."""
+
+    async def work_out() -> Mapping[str, str]:
+        if retry is None:
+            return await owed_runs(pool, settings, runtime)
         async with pool.connection() as connection:
             row = await (
                 await connection.execute(
-                    "SELECT role, digest FROM boundary_runs WHERE attempt_id = %s", (retry,)
+                    "SELECT role FROM boundary_runs WHERE attempt_id = %s", (retry,)
                 )
             ).fetchone()
         if row is None:
-            return [RunRefused(f"there is no attempt {retry} to retry")]
-        owed = {str(row["role"]): str(row["digest"])}
-    else:
-        async with pool.connection() as connection:
-            asked = await (
-                await connection.execute(
-                    "SELECT role, digest FROM boundary_runs WHERE request_id = %s ORDER BY role",
-                    (request_id,),
-                )
-            ).fetchall()
-        # A request sent again asks for what it asked for, not for what is owed by now.
-        owed = (
-            {str(each["role"]): str(each["digest"]) for each in asked}
-            if asked
-            else await owed_runs(pool, settings, runtime)
-        )
+            raise RunRefused(f"there is no attempt {retry} to retry")
+        # The bounds as they are on the runtime about to be exercised, not as they were
+        # when the attempt was made: that is what the run will be a run of.
+        role = str(row["role"])
+        return {role: boundaries_of(settings, runtime)[role]}
+
+    try:
+        asked = await runs.open_request(request_id, installation, retry, work_out)
+    except RunRefused as refused:
+        return [refused]
+    buying = await runs.to_launch(request_id, asked)
+    if buying and before_launching is not None:
+        before_launching(buying)
     made: list[Attempt | RunRefused] = []
-    for role, digest in owed.items():
+    for role, digest in asked.items():
         try:
             made.append(await runs.run(request_id, role, digest, runtime, retry=retry))
         except RunRefused as refused:

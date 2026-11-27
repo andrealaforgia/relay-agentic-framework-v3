@@ -92,3 +92,60 @@ async def test_a_statement_of_policy_is_the_product_owners_and_each_is_a_revisio
             )
         ).fetchone()
     assert row is not None and row["earlier"] == ["none is applied"]
+
+
+async def test_a_passphrase_changed_a_moment_ago_authorises_no_statement_of_policy(
+    database: AsyncConnectionPool,
+) -> None:
+    """3C-S1B-1.5: the rotation holds the installation's row. A statement made with the
+    old passphrase waits for it, and is then checked against the one there is."""
+    import asyncio
+
+    await authority.set_first(database, PASSPHRASE)
+    async with database.connection() as rotating, rotating.transaction():
+        await rotating.execute("SELECT 1 FROM installation FOR UPDATE")
+        stating = asyncio.create_task(
+            authority.state_policy(database, PASSPHRASE, "whatever suits", "a model")
+        )
+        await asyncio.sleep(0.5)
+        assert not stating.done()
+        await rotating.execute(
+            "UPDATE installation SET passphrase = %s", (authority.hashed("a new one altogether"),)
+        )
+
+    with pytest.raises(Refused, match="not the passphrase"):
+        await stating
+    assert await authority.policy_of(database) is None
+
+
+async def test_a_request_that_stated_the_policy_or_changed_the_passphrase_does_it_once(
+    database: AsyncConnectionPool,
+) -> None:
+    """3C-S1B-1.11: the reply may be lost after the change has committed. Sent again
+    under its identity the request is answered from its receipt: no second revision, and
+    no refusal of a rotation that in fact succeeded."""
+    await authority.set_first(database, PASSPHRASE)
+
+    first = await authority.state_policy(database, PASSPHRASE, "none applies", "andrea", "r-1")
+    again = await authority.state_policy(database, "not even needed", "none applies", "x", "r-1")
+
+    assert again == first and first.revision == 1
+    assert (await authority.policy_of(database)) == first
+    assert (await authority.receipt_of(database, "r-1") or {})["revision"] == 1
+    with pytest.raises(Refused, match="for something else"):
+        await authority.state_policy(database, PASSPHRASE, "another statement", "andrea", "r-1")
+    assert (
+        await authority.state_policy(database, PASSPHRASE, "none applies", "a", "r-2")
+    ).revision == 2
+
+    assert await authority.change(database, PASSPHRASE, "a new one altogether", "r-3") == "changed"
+    # Asked again with the old passphrase, as someone who never heard the reply would.
+    assert (
+        await authority.change(database, PASSPHRASE, "a new one altogether", "r-3")
+        == "changed, as on record"
+    )
+    await authority.require(database, "a new one altogether")
+    kept = await authority.receipt_of(database, "r-3")
+    assert kept == {"action": "passphrase", "changed": True}  # and nothing of either secret
+    with pytest.raises(Refused, match="for something else"):
+        await authority.state_policy(database, "a new one altogether", "x", "y", "r-3")

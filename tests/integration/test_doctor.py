@@ -64,9 +64,7 @@ async def enrolled(
 
 
 async def examined(database: AsyncConnectionPool, broker: redis.Redis) -> dict[str, doctor.Finding]:
-    async with database.connection() as connection:
-        installation = await installation_of(connection)
-    return {each.what: each for each in await doctor.examine(database, broker, installation)}
+    return {each.what: each for each in await doctor.examine(database, broker)}
 
 
 def passing(settings: Mapping[str, Any], launched: list[str]) -> Any:
@@ -117,19 +115,40 @@ async def test_doctor_says_whose_bounds_have_not_been_seen_to_hold_and_a_run_put
     owed = await doctor.owed_runs(enrolled, settings, runtime)
     assert len(set(owed.values())) == len(owed) <= len(ROLES)
 
-    made = await doctor.run_boundaries(enrolled, runs, settings, runtime, "request-1")
+    async with enrolled.connection() as connection:
+        installation = await installation_of(connection)
+    said: list[list[str]] = []
+
+    async def requested(request: str, retry: Any = None) -> list[Any]:
+        return await doctor.run_boundaries(
+            enrolled, runs, settings, runtime, request, installation, retry, said.append
+        )
+
+    made = await requested("request-1")
 
     assert [each.state for each in made if isinstance(each, Attempt)] == ["passed"] * len(owed)
     assert launched == list(owed)
     found = await examined(enrolled, broker)
     assert all(found[f"the bounds of a {role}"].ok for role in ROLES)
     assert await doctor.owed_runs(enrolled, settings, runtime) == {}
-    again = await doctor.run_boundaries(enrolled, runs, settings, runtime, "request-1")
+    assert said == [list(owed)]  # what would be bought, said before any of it was
+    again = await requested("request-1")
     assert [
         (each.attempt_id, each.launched_now) for each in again if isinstance(each, Attempt)
     ] == [(each.attempt_id, False) for each in made if isinstance(each, Attempt)]
-    assert await doctor.run_boundaries(enrolled, runs, settings, runtime, "request-2") == []
+    assert await requested("request-2") == []
+    assert launched == list(owed) and said == [list(owed)]
+    # 3C-S1B-1.1: every pass goes stale. The request that found nothing owed is sent
+    # again: it asked for nothing, and it buys nothing. A new request is another matter.
+    async with enrolled.connection() as connection:
+        await connection.execute(
+            "UPDATE boundary_passes SET observed_at = now() - interval '3 days'"
+        )
+    assert await requested("request-2") == []
+    assert [each.launched_now for each in await requested("request-1")] == [False] * len(owed)
     assert launched == list(owed)
+    assert all(each.launched_now for each in await requested("request-3"))
+    assert launched == [*owed, *owed]
 
 
 async def test_doctor_names_a_redis_that_is_not_the_control_planes(
@@ -182,3 +201,86 @@ async def test_relay_doctor_is_a_command_that_needs_no_terminal_and_exits_by_wha
     assert untried.code == 1 and "until the installation is set up and the policy stated" in (
         untried.printed
     )
+
+
+async def test_doctor_leaves_a_database_it_has_never_set_up_as_it_found_it(
+    namespace: str, shell: dict[str, str], tmp_path: Path
+) -> None:
+    """3C-S1B-1.8: diagnosis applies no migration and creates no installation."""
+    from relay.persistence.database import open_pool
+    from tests.integration.conftest import DATABASE_URL
+
+    async with open_pool(DATABASE_URL) as admin, admin.connection() as connection:
+        await connection.execute(f'CREATE SCHEMA "{namespace}"')
+    try:
+        said = with_no_terminal(["doctor", "--json"], shell, tmp_path)
+
+        [finding] = json.loads(said.out)
+        assert said.code == 1 and finding["what"] == "the database" and not finding["ok"]
+        assert "never been set up" in finding["saw"] and "relay init" in finding["do"]
+        untried = with_no_terminal(["doctor", "--boundary"], shell, tmp_path)
+        assert untried.code == 1 and "not set up for this build" in untried.printed
+        async with open_pool(DATABASE_URL) as admin, admin.connection() as connection:
+            tables = await (
+                await connection.execute(
+                    "SELECT count(*) AS n FROM information_schema.tables WHERE table_schema = %s",
+                    (namespace,),
+                )
+            ).fetchone()
+        assert tables is not None and tables["n"] == 0
+    finally:
+        async with open_pool(DATABASE_URL) as admin, admin.connection() as connection:
+            await connection.execute(f'DROP SCHEMA "{namespace}" CASCADE')
+
+
+def test_doctor_says_so_in_the_form_asked_for_when_the_database_cannot_be_reached(
+    shell: dict[str, str], tmp_path: Path
+) -> None:
+    """3C-S1B-1.8: valid JSON, one finding with what to do, and exit 1."""
+    nowhere = {**shell, "RELAY_DATABASE_URL": "postgresql://relay:x@127.0.0.1:9/relay"}
+
+    said = with_no_terminal(["doctor", "--json"], nowhere, tmp_path)
+
+    [finding] = json.loads(said.out)
+    assert said.code == 1
+    assert finding["what"] == "the database" and "cannot be reached" in finding["saw"]
+    assert "RELAY_DATABASE_URL" in finding["do"]
+
+
+async def test_a_retry_is_a_run_of_the_bounds_as_they_are_on_the_runtime_it_will_exercise(
+    enrolled: AsyncConnectionPool, broker: redis.Redis
+) -> None:
+    """3C-S1B-1.2: the attempt was of the bounds on one runtime. The policy has been
+    restated since, which is another runtime and another boundary. The retry asks for
+    today's, and is said to cost before it is launched."""
+    policy = await authority.state_policy(enrolled, PASSPHRASE, "none applies here", "andrea")
+    settings = await settings_of(enrolled)
+    then = runtime_now(policy.statement, str(settings["cli"]))
+    async with enrolled.connection() as connection:
+        installation = await installation_of(connection)
+    launched: list[str] = []
+    said: list[list[str]] = []
+
+    async def lost(role: str, runtime: Mapping[str, str]) -> SuiteResult:
+        raise RuntimeError("the terminal went away")
+
+    losing = BoundaryRuns(enrolled, Boundaries(enrolled), lost)
+    first = await doctor.run_boundaries(enrolled, losing, settings, then, "r-1", installation)
+    uncertain = await losing.of_request(
+        "r-1", next(iter(await losing.open_request("r-1", installation, None, dict)))
+    )
+    assert uncertain is not None and uncertain.state == "uncertain" and first
+
+    restated = await authority.state_policy(enrolled, PASSPHRASE, "managed settings v7", "andrea")
+    now = runtime_now(restated.statement, str(settings["cli"]))
+    runs = BoundaryRuns(enrolled, Boundaries(enrolled), passing(settings, launched))
+
+    [retried] = await doctor.run_boundaries(
+        enrolled, runs, settings, now, "r-2", installation, uncertain.attempt_id, said.append
+    )
+
+    assert isinstance(retried, Attempt) and retried.state == "passed"
+    assert said == [[uncertain.role]] and launched == [uncertain.role]
+    asked = await runs.open_request("r-2", installation, uncertain.attempt_id, dict)
+    assert asked == {uncertain.role: doctor.boundaries_of(settings, now)[uncertain.role]}
+    assert asked[uncertain.role] != doctor.boundaries_of(settings, then)[uncertain.role]

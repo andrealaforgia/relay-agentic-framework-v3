@@ -71,3 +71,28 @@ async def migrate(pool: Pool) -> list[str]:
             )
             applied.append(script.name)
     return applied
+
+
+async def schema_state(pool: Pool) -> tuple[list[str], list[str]]:
+    """What a migration would do, without doing it: the migrations this build has that
+    the database has not had, and those the database had with other content. Reads only.
+    A database Relay has never touched has had none."""
+    migrations = resources.files("relay.persistence") / "migrations"
+    scripts = {
+        script.name: hashlib.sha256(script.read_bytes()).hexdigest()
+        for script in migrations.iterdir()
+        if script.name.endswith(".sql")
+    }
+    async with pool.connection() as connection:
+        there = await (
+            await connection.execute("SELECT to_regclass('schema_migrations') AS there")
+        ).fetchone()
+        recorded: dict[str, str] = {}
+        if there is not None and there["there"] is not None:
+            rows = await (await connection.execute("SELECT * FROM schema_migrations")).fetchall()
+            recorded = {row["version"]: row["checksum"] for row in rows}
+    pending = sorted(name for name in scripts if name not in recorded)
+    drifted = sorted(
+        name for name, checksum in recorded.items() if scripts.get(name, checksum) != checksum
+    ) + sorted(name for name in recorded if name not in scripts)
+    return pending, drifted

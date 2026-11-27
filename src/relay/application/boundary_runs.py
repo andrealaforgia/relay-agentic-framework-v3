@@ -19,9 +19,12 @@ from psycopg.types.json import Jsonb
 from relay.application.boundaries import Boundaries, BoundaryNotShown
 from relay.application.workers import _lock_key, is_alive
 from relay.persistence.database import Connection, Pool
-from relay.providers.boundary_suite import SuiteResult
+from relay.providers.boundary_suite import NotLaunched, SuiteResult
 
 Suite = Callable[[str, Mapping[str, str]], Awaitable[SuiteResult]]
+
+
+FRESH = "these bounds had lately been seen to hold: nothing was run"
 
 
 class RunRefused(Exception):
@@ -33,6 +36,7 @@ class Attempt:
     attempt_id: uuid.UUID
     request_id: str
     role: str
+    # fresh: a pass of these bounds was on record when its turn came: nothing was run.
     # passed, failed: the suite ran and that is what it showed.
     # running: its process is alive and has recorded nothing yet.
     # uncertain: its process is gone and nothing was recorded. It may have been paid for.
@@ -48,6 +52,57 @@ class BoundaryRuns:
         self._pool = pool
         self._boundaries = boundaries
         self._suite = suite
+
+    async def open_request(
+        self,
+        request_id: str,
+        installation: str,
+        retry: uuid.UUID | None,
+        work_out: Callable[[], Awaitable[Mapping[str, str]]],
+    ) -> dict[str, str]:
+        """Put the request on record, with everything it asks to have tried, before
+        anything is launched; or, if it is on record, say what it asked for then. What
+        has come to be owed since is no part of a request sent again."""
+        async with self._pool.connection() as connection, connection.transaction():
+            await connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 1))", (request_id,)
+            )
+            known = await (
+                await connection.execute(
+                    "SELECT installation::text AS installation, retries, asked "
+                    "FROM boundary_requests WHERE request_id = %s",
+                    (request_id,),
+                )
+            ).fetchone()
+            if known is not None:
+                if known["installation"] != installation:
+                    raise RunRefused(
+                        f"request {request_id} was made of another installation "
+                        f"({known['installation']}): it is not answered from this one"
+                    )
+                if known["retries"] != retry:
+                    raise RunRefused(
+                        f"request {request_id} was for something else: a request's identity "
+                        "is used again only to ask for the same thing"
+                    )
+                return {str(each["role"]): str(each["digest"]) for each in known["asked"]}
+            asked = dict(await work_out())
+            await connection.execute(
+                "INSERT INTO boundary_requests (request_id, installation, retries, asked) "
+                "VALUES (%s, %s, %s, %s)",
+                (
+                    request_id,
+                    installation,
+                    retry,
+                    Jsonb([{"role": role, "digest": digest} for role, digest in asked.items()]),
+                ),
+            )
+            return asked
+
+    async def to_launch(self, request_id: str, asked: Mapping[str, str]) -> list[str]:
+        """The roles of a request for which no attempt is on record yet: what sending it
+        now may still buy."""
+        return [role for role in asked if await self.of_request(request_id, role) is None]
 
     async def of_request(self, request_id: str, role: str) -> Attempt | None:
         async with self._pool.connection() as connection:
@@ -85,34 +140,72 @@ class BoundaryRuns:
                 if known is not None:
                     return known
                 await self._require_may_launch(connection, role, digest, retry)
+                # Asked again here, under the boundary's lock: another request may have
+                # paid for a pass of these bounds while this one waited its turn.
+                fresh = (
+                    retry is None
+                    and await self._boundaries.authorising(connection, digest) is not None
+                )
                 await connection.execute(
                     "INSERT INTO boundary_runs (attempt_id, request_id, role, digest, runtime, "
-                    "retries) VALUES (%s, %s, %s, %s, %s, %s)",
-                    (attempt_id, request_id, role, digest, Jsonb(dict(runtime)), retry),
+                    "retries, not_launched) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        attempt_id,
+                        request_id,
+                        role,
+                        digest,
+                        Jsonb(dict(runtime)),
+                        retry,
+                        FRESH if fresh else None,
+                    ),
                 )
+                if fresh:
+                    made = await _attempt(connection, "r.attempt_id = %s", (attempt_id,))
+                    assert made is not None
+                    return made
             try:
                 result = await self._suite(role, runtime)
+            except NotLaunched as never:
+                # Established before the provider was called: nothing was spent, and
+                # nobody needs asking before these bounds are tried again.
+                return await self._settled(attempt_id, not_launched=str(never))
             except Exception as failed:
-                # Whether anything was launched before this is not known here: the
-                # attempt is left without a result, and is uncertain once this process
-                # lets go of it. It is not tried again by itself.
+                # After the provider may have been called, and with nothing to show for
+                # it: the attempt is left without a result, and is uncertain once this
+                # process lets go of it. It is not tried again by itself.
                 raise RunRefused(
                     f"the run for the {role} ended without a result, and may have been paid "
                     f"for: attempt {attempt_id} is uncertain ({failed!r}). "
                     f"`relay doctor --boundary --retry {attempt_id}` buys another"
                 ) from failed
-            # The result is this attempt's: recorded under its identity, once.
+            # The verdict is this attempt's: recorded under its identity, once. A run
+            # whose call did not come back with a result showed nothing to hold, and its
+            # verdict is recorded as the failure it is: nothing is authorised by it.
             with contextlib.suppress(BoundaryNotShown):
                 await self._boundaries.record(dataclasses.replace(result, run_id=attempt_id))
-            async with self._pool.connection() as connection:
-                made = await _attempt(connection, "r.attempt_id = %s", (attempt_id,))
-            assert made is not None
-            return dataclasses.replace(made, launched_now=True)
+            if result.call == "not_started":
+                return await self._settled(
+                    attempt_id, not_launched="the provider's CLI did not start the run"
+                )
+            return await self._settled(attempt_id, call=result.call)
         finally:
             with contextlib.suppress(Exception):
                 await held.execute("SELECT pg_advisory_unlock_all()")
                 await held.set_autocommit(False)
             await self._pool.putconn(held)
+
+    async def _settled(
+        self, attempt_id: uuid.UUID, *, not_launched: str | None = None, call: str | None = None
+    ) -> Attempt:
+        """Put on record what became of the call itself, beside whatever its verdict is."""
+        async with self._pool.connection() as connection, connection.transaction():
+            await connection.execute(
+                "UPDATE boundary_runs SET not_launched = %s, call = %s WHERE attempt_id = %s",
+                (not_launched, call, attempt_id),
+            )
+            made = await _attempt(connection, "r.attempt_id = %s", (attempt_id,))
+        assert made is not None
+        return dataclasses.replace(made, launched_now=not_launched is None)
 
     async def _require_may_launch(
         self, connection: Connection, role: str, digest: str, retry: uuid.UUID | None
@@ -162,7 +255,8 @@ async def _attempt(
 ) -> Attempt | None:
     row = await (
         await connection.execute(
-            "SELECT r.attempt_id, r.request_id, r.role, r.not_launched, p.passed, p.observations "
+            "SELECT r.attempt_id, r.request_id, r.role, r.not_launched, r.call, p.passed, "
+            "p.observations "
             "FROM boundary_runs r LEFT JOIN boundary_passes p ON p.pass_id = r.attempt_id "
             f"WHERE {where}",
             values,
@@ -170,15 +264,21 @@ async def _attempt(
     ).fetchone()
     if row is None:
         return None
-    if row["passed"] is not None:
-        failed = [
-            str(each.get("probe"))
-            for each in row["observations"]
-            if isinstance(each, dict) and not each.get("passed", True)
-        ]
-        state, detail = ("passed", "") if row["passed"] else ("failed", "; ".join(failed))
+    failed = [
+        str(each.get("probe"))
+        for each in (row["observations"] or [])
+        if isinstance(each, dict) and not each.get("passed", True)
+    ]
+    if row["not_launched"] == FRESH:
+        state, detail = "fresh", FRESH
     elif row["not_launched"] is not None:
         state, detail = "not_launched", str(row["not_launched"])
+    elif row["call"] == "uncertain":
+        # Launched, and it ended with no result: whatever verdict is beside it, the
+        # call may have been paid for, and only a person buys another.
+        state, detail = "uncertain", "the call was launched and ended with no result"
+    elif row["passed"] is not None:
+        state, detail = ("passed", "") if row["passed"] else ("failed", "; ".join(failed))
     elif await is_alive(connection, row["attempt_id"]):
         state, detail = "running", ""
     else:

@@ -74,6 +74,28 @@ def _require_verifier(principal: Principal, to: str) -> None:
         raise ActionRefused(f"{to} is for the verifier to do")
 
 
+async def open_project_in(
+    connection: Connection, project_id: str, repository: str, trunk: str = "main"
+) -> None:
+    """Register a project in the caller's transaction: with whatever else the caller is
+    deciding, or not at all."""
+    require_identifier("project", project_id)
+    address = canonical_repository(repository)
+    managed = await (
+        await connection.execute(
+            "INSERT INTO projects (project_id, repository, trunk) VALUES (%s, %s, %s) "
+            "ON CONFLICT (repository, trunk) DO NOTHING RETURNING project_id",
+            (project_id, address, trunk),
+        )
+    ).fetchone()
+    if managed is None:
+        raise ValueError(
+            f"branch {trunk!r} of that repository is already managed by another project"
+        )
+    await connection.execute("INSERT INTO project_gates (project_id) VALUES (%s)", (project_id,))
+    await append_event(connection, project_id, "project.opened", payload={"trunk": trunk})
+
+
 class Behaviours:
     def __init__(self, pool: Pool, mirrors: Path, oracle: ProcessOracle) -> None:
         """`mirrors` is a directory on the control plane's own disk where every commit
@@ -89,24 +111,8 @@ class Behaviours:
         """One project per managed trunk: what a candidate must still satisfy is recorded
         per project, and a project's lock covers only its own pushes. Projects may share
         a repository on different branches."""
-        require_identifier("project", project_id)
-        address = canonical_repository(repository)
         async with self._pool.connection() as connection, connection.transaction():
-            managed = await (
-                await connection.execute(
-                    "INSERT INTO projects (project_id, repository, trunk) VALUES (%s, %s, %s) "
-                    "ON CONFLICT (repository, trunk) DO NOTHING RETURNING project_id",
-                    (require_identifier("project", project_id), address, trunk),
-                )
-            ).fetchone()
-            if managed is None:
-                raise ValueError(
-                    f"branch {trunk!r} of that repository is already managed by another project"
-                )
-            await connection.execute(
-                "INSERT INTO project_gates (project_id) VALUES (%s)", (project_id,)
-            )
-            await append_event(connection, project_id, "project.opened", payload={"trunk": trunk})
+            await open_project_in(connection, project_id, repository, trunk)
 
     async def propose(
         self,

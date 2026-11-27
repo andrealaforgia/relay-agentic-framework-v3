@@ -13,12 +13,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import redis.asyncio as redis
+from psycopg.types.json import Jsonb
 
 from relay.application import authority
+from relay.application.behaviours import open_project_in
 from relay.cli.selection import Checkout, checkout_at
 from relay.git.checkout import canonical_repository
 from relay.persistence.database import Pool, migrate
-from relay.runtime import assemble, configure, settings_of, wake
+from relay.providers.confinement import confinement_for
+from relay.runtime import wake
 
 DEFAULT_IMAGE = "python:3.14-alpine"
 
@@ -88,104 +91,141 @@ async def enrol(
     read_secret: Callable[[str], str],
     pin: Callable[[str], str] = pinned,
 ) -> list[str]:
-    """Do what is not yet done, and say what was done and what was found already so."""
-    said = []
+    """Do what is not yet done, and say what was done and what was found already so.
+
+    Everything is gathered and checked first: where the project comes from, where the
+    installation would keep its work, the image, and the passphrase from the person.
+    Then it is decided in one transaction, under the installation's lock: what the
+    installation has not been told, the first passphrase, and the project. An enrolment
+    that is refused, at the terminal or anywhere before, leaves nothing of itself; two
+    at once are one after the other, and the second finds the first's."""
+    said: list[str] = []
     await migrate(pool)
     async with pool.connection() as connection:
         row = await (
-            await connection.execute("SELECT installation_id::text AS id FROM installation")
+            await connection.execute(
+                "SELECT installation_id::text AS id, settings, passphrase IS NOT NULL AS has "
+                "FROM installation"
+            )
         ).fetchone()
     assert row is not None
-    installation = row["id"]
+    installation, at_first_look = row["id"], dict(row["settings"])
 
-    # Worked out before anything is changed: an enrolment that cannot name its project
-    # leaves no half of itself behind.
     checkout = checkout_at(directory)
     repository, trunk = _source(asked, checkout)
+    proposed = _places(asked, installation, at_first_look)
+    if not at_first_look.get("image"):
+        proposed["image"] = pin(asked.image or DEFAULT_IMAGE)
+    first: str | None = None
+    if not row["has"]:
+        first = read_secret(
+            f"Set the Product Owner's passphrase (at least {authority.SHORTEST} characters): "
+        )
+        if first != read_secret("Again: "):
+            raise CannotEnrol("the two did not match: nothing was set up. Run `relay init` again")
+        try:
+            authority.require_usable(first)
+        except authority.Refused as refused:
+            raise CannotEnrol(f"{refused}: nothing was set up. Run `relay init` again") from refused
+    for name in ("workspaces", "mirrors"):
+        if name in proposed:
+            Path(str(proposed[name])).mkdir(parents=True, exist_ok=True, mode=0o700)
 
-    # 1. The installation's settings: each is set once.
-    settings = await settings_of(pool)
-    root = default_root(installation)
-    wanted = {
-        "workspaces": asked.workspaces or str(root / "workspaces"),
-        "mirrors": asked.mirrors or str(root / "mirrors"),
-    }
-    setting: dict[str, object] = {}
-    for name, value in wanted.items():
-        if settings.get(name):
-            if getattr(asked, name) and settings[name] != str(Path(value).resolve()):
-                said.append(f"{name}: left at {settings[name]} (already set; not changed by init)")
-            continue
-        place = Path(value).resolve()
-        if place.is_relative_to(Path.home()):
-            raise CannotEnrol(
-                f"{name} cannot be under the home directory, which is hidden from every run: "
-                f"{place}"
+    registered: str | None = None
+    async with pool.connection() as connection, connection.transaction():
+        held = await (
+            await connection.execute("SELECT settings, passphrase FROM installation FOR UPDATE")
+        ).fetchone()
+        assert held is not None
+        # What another enrolment set while this one was gathering is kept as it set it.
+        setting = {
+            name: value for name, value in proposed.items() if not held["settings"].get(name)
+        }
+        if setting:
+            await connection.execute(
+                "UPDATE installation SET settings = settings || %s", (Jsonb(setting),)
             )
-        place.mkdir(parents=True, exist_ok=True, mode=0o700)
-        setting[name] = str(place)
-        said.append(f"{name}: {place}")
-    if not settings.get("image"):
-        setting["image"] = pin(asked.image or DEFAULT_IMAGE)
-        said.append(f"the oracle's image: {setting['image']}")
-    elif asked.image:
-        said.append(f"the oracle's image: left at {settings['image']} (already set)")
-    if "definitions" not in settings:
-        setting["definitions"] = asked.definitions or [str(Path.home() / ".claude" / "agents")]
-        said.append(f"agent definitions are looked for in: {', '.join(setting['definitions'])}")  # type: ignore[arg-type]
-    if setting:
-        await configure(pool, **setting)
-    else:
-        said.append(f"installation {installation}: already set up")
-
-    # 2. The project: this checkout's, unless said otherwise.
-    async with pool.connection() as connection:
+        for name in ("workspaces", "mirrors", "image", "definitions"):
+            if name in setting:
+                shown = setting[name]
+                said.append(f"{name}: {', '.join(shown) if isinstance(shown, list) else shown}")
+            elif getattr(asked, name):
+                said.append(
+                    f"{name}: left at {held['settings'].get(name)} (already set; not changed "
+                    "by init)"
+                )
+        if not setting:
+            said.append(f"installation {installation}: already set up")
+        if held["passphrase"] is None and first is not None:
+            await connection.execute(
+                "UPDATE installation SET passphrase = %s", (authority.hashed(first),)
+            )
+            said.append("the passphrase: set")
+        elif first is not None:
+            said.append("the passphrase: set by someone else meanwhile, and left as they set it")
+        else:
+            said.append("the passphrase: already set (change it with `relay passphrase`)")
         there = await (
             await connection.execute(
                 "SELECT project_id FROM projects WHERE repository = %s AND trunk = %s",
                 (repository, trunk),
             )
         ).fetchone()
-    if there is not None:
-        if asked.project and asked.project != there["project_id"]:
-            raise CannotEnrol(
-                f"branch {trunk} of this repository is already registered, as "
-                f"{there['project_id']}: it cannot also be {asked.project}"
+        if there is not None:
+            if asked.project and asked.project != there["project_id"]:
+                raise CannotEnrol(
+                    f"branch {trunk} of this repository is already registered, as "
+                    f"{there['project_id']}: it cannot also be {asked.project}"
+                )
+            said.append(f"project {there['project_id']}: already registered (branch {trunk})")
+        else:
+            registered = asked.project or _identifier_from(
+                (checkout.root if checkout else Path(repository)).name
             )
-        said.append(f"project {there['project_id']}: already registered (branch {trunk})")
-    else:
-        project = asked.project or _identifier_from(
-            (checkout.root if checkout else Path(repository)).name
-        )
-        relay = await assemble(pool, broker)
-        try:
-            await relay.behaviours.open_project(project, repository, trunk)
-        except ValueError as refused:
-            raise CannotEnrol(str(refused)) from refused
-        await wake(pool, installation, project)
-        said.append(f"project {project}: registered, branch {trunk} of {repository}")
-
-    # 3. The Product Owner's passphrase: set once, by a person at the terminal.
-    if await authority.is_set(pool):
-        said.append("the passphrase: already set (change it with `relay passphrase`)")
-    else:
-        first = read_secret(
-            f"Set the Product Owner's passphrase (at least {authority.SHORTEST} characters): "
-        )
-        if first != read_secret("Again: "):
-            raise CannotEnrol(
-                "the two did not match: no passphrase was set. Run `relay init` again"
-            )
-        try:
-            was_set = await authority.set_first(pool, first)
-        except authority.Refused as refused:
-            raise CannotEnrol(
-                f"{refused}: no passphrase was set. Run `relay init` again"
-            ) from refused
-        said.append(
-            "the passphrase: set" if was_set else "the passphrase: set by someone else meanwhile"
-        )
+            try:
+                await open_project_in(connection, registered, repository, trunk)
+            except ValueError as refused:
+                raise CannotEnrol(str(refused)) from refused
+            said.append(f"project {registered}: registered, branch {trunk} of {repository}")
+    if registered is not None:
+        await wake(pool, installation, registered)
     return said
+
+
+def _places(asked: Asked, installation: str, settings: dict[str, object]) -> dict[str, object]:
+    """Where the installation would keep its work and look for definitions, for whatever
+    it has not been told: each checked as a worker will check it, before anything is
+    set, so that nothing is set that a worker would then refuse."""
+    root = default_root(installation)
+    proposed: dict[str, object] = {}
+    for name, said in (("workspaces", asked.workspaces), ("mirrors", asked.mirrors)):
+        if settings.get(name):
+            continue
+        place = Path(said or str(root / name)).resolve()
+        if place.is_relative_to(Path.home()):
+            raise CannotEnrol(
+                f"{name} cannot be under the home directory, which is hidden from every run: "
+                f"{place}"
+            )
+        proposed[name] = str(place)
+    if "workspaces" in proposed:
+        mirrors = Path(str(proposed.get("mirrors") or settings.get("mirrors")))
+        try:
+            # The rule a worker applies to every workspace it is about to run in.
+            confinement_for(
+                "builder", Path(str(proposed["workspaces"])) / "run" / "tree", withheld=[mirrors]
+            )
+        except ValueError as unusable:
+            raise CannotEnrol(
+                f"workspaces cannot be at {proposed['workspaces']}: {unusable}"
+            ) from unusable
+    if "definitions" not in settings:
+        # Resolved now: a worker started from another directory looks in the same places.
+        proposed["definitions"] = [
+            str(Path(each).expanduser().resolve())
+            for each in (asked.definitions or [str(Path.home() / ".claude" / "agents")])
+        ]
+    return proposed
 
 
 def _source(asked: Asked, checkout: Checkout | None) -> tuple[str, str]:

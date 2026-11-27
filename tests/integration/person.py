@@ -20,6 +20,8 @@ class Ran:
     printed: str
     # What was shown on the terminal itself: prompts, and what is about to be decided.
     shown: str
+    # Standard output alone, where a command's JSON is.
+    out: str = ""
 
 
 def at_a_terminal(
@@ -101,4 +103,4 @@ def with_no_terminal(
         timeout=60,
         check=False,
     )
-    return Ran(done.returncode, (done.stdout + done.stderr).decode(), "")
+    return Ran(done.returncode, (done.stdout + done.stderr).decode(), "", done.stdout.decode())

@@ -56,3 +56,19 @@ def test_the_journal_is_in_the_users_state_directory_unless_told(tmp_path: Path)
         "/state/relay/requests.jsonl"
     )
     assert journal.journal_file({"RELAY_STATE_DIR": str(tmp_path)}) == tmp_path / "requests.jsonl"
+
+
+def test_a_record_cut_short_with_no_line_end_does_not_take_the_next_request_with_it(
+    tmp_path: Path,
+) -> None:
+    """3C-S1B-1.12: a write interrupted part-way leaves no newline. The next record is not
+    joined to the fragment: the fragment is ended first."""
+    file = tmp_path / "requests.jsonl"
+    first = journal.note(file, ["init"], "installation-a", None)
+    with file.open("a") as cut_short:
+        cut_short.write('{"request_id": "0199", "at": "2026')
+
+    second = journal.note(file, ["passphrase"], "installation-a", None)
+    third = journal.note(file, ["policy", "state", "none"], "installation-a", None)
+
+    assert journal.read(file) == [first, second, third]

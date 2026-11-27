@@ -118,6 +118,10 @@ class Scene:
         return (self.workspace / "made.txt").exists()
 
 
+class NotLaunched(Exception):
+    """A run of the suite that never reached the provider: nothing was spent."""
+
+
 @dataclass(frozen=True)
 class SuiteResult:
     role: str
@@ -129,6 +133,10 @@ class SuiteResult:
     # it: recorded twice it is one assessment, and recorded late it is no fresher.
     run_id: uuid.UUID = field(default_factory=uuid.uuid7)
     observed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    # What became of the paid call itself, which is not the verdict: `returned`, or
+    # `errored`, or `uncertain` (launched, and nobody can say how it ended), or
+    # `not_started` (the provider established that nothing was launched).
+    call: str = "returned"
 
     @property
     def passed(self) -> bool:
@@ -432,8 +440,14 @@ async def run_suite(
         connections += 1
         writer.close()
 
-    listener = await asyncio.start_server(connected, "127.0.0.1", 0)
+    try:
+        listener = await asyncio.start_server(connected, "127.0.0.1", 0)
+    except OSError as failed:
+        raise NotLaunched(
+            f"the suite could not listen for the run's connections: {failed}"
+        ) from failed
     port = listener.sockets[0].getsockname()[1]
+    reached = False
     try:
         for directory in (workspace / ".claude" / "agents", beside, at_home, other):
             directory.mkdir(parents=True)
@@ -466,6 +480,7 @@ async def run_suite(
         events: list[Event] = []
         # Held to the version it was launched as: a run that starts and says another
         # exercised nothing of this one.
+        reached = True
         result = await adapter.invoke(
             replace(_request(scene, bounds, model, timeout), cli_version=capabilities.version),
             on_event=events.append,
@@ -506,7 +521,14 @@ async def run_suite(
             launched_on,
             tuple(observations),
             ended[-1].provider_cost_usd if ended else None,
+            call=result.outcome.value,
         )
+    except Exception as failed:
+        if not reached:
+            # The scene could not be made, or the CLI could not be asked what it is:
+            # the provider was never called, and nothing was spent.
+            raise NotLaunched(f"the run was not launched: {failed}") from failed
+        raise
     finally:
         listener.close()
         with contextlib.suppress(OSError):

@@ -39,17 +39,21 @@ def checkout_at(directory: Path) -> Checkout | None:
             text=True,
             check=False,
         )
-        return done.stdout.strip() if done.returncode == 0 else None
+        # Git ends what it says with one newline, and that is all that is taken off: a
+        # path or an address may itself end in a space, and is another place without it.
+        return done.stdout.removesuffix("\n") if done.returncode == 0 else None
 
     root = git("rev-parse", "--show-toplevel")
     if root is None:
         return None
     remotes = []
-    for name in (git("remote") or "").split():
+    for name in filter(None, (git("remote") or "").split("\n")):
         address = git("remote", "get-url", name)
         if address:
             remotes.append(address)
-    return Checkout(Path(root), git("symbolic-ref", "--short", "-q", "HEAD"), tuple(remotes))
+    return Checkout(
+        Path(root), git("symbolic-ref", "--short", "-q", "HEAD") or None, tuple(remotes)
+    )
 
 
 async def select_project(

@@ -12,6 +12,7 @@ handles are here.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import uuid
@@ -58,11 +59,20 @@ def note(
         project=project,
     )
     file.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(asdict(request), sort_keys=True) + "\n"
-    # One write of one line, appended: two commands at once each leave a whole line.
-    descriptor = os.open(file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    line = (json.dumps(asdict(request), sort_keys=True) + "\n").encode()
+    descriptor = os.open(file, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     try:
-        os.write(descriptor, line.encode())
+        # One command at a time: what is found at the end of the file is then the whole
+        # of what the last one left.
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        size = os.fstat(descriptor).st_size
+        if size and os.pread(descriptor, 1, size - 1) != b"\n":
+            # A record cut short by a crash. It is ended here, as a line that is no
+            # request, so that this record is not joined to it and lost with it.
+            line = b"\n" + line
+        written = 0
+        while written < len(line):
+            written += os.write(descriptor, line[written:])
         os.fsync(descriptor)
     finally:
         os.close(descriptor)

@@ -13,11 +13,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from relay.persistence.database import Pool
+from psycopg.types.json import Jsonb
+
+from relay.persistence.database import Connection, Pool
 
 # scrypt's cost: about a tenth of a second to check a guess, on purpose.
 _N, _R, _P, _LENGTH = 2**15, 8, 1, 32
@@ -70,7 +73,7 @@ async def require(pool: Pool, passphrase: str) -> None:
 async def set_first(pool: Pool, passphrase: str) -> bool:
     """Set the passphrase if none is set. False, and nothing changed, if one is: a second
     enrolment finds the installation and leaves it alone."""
-    _require_usable(passphrase)
+    require_usable(passphrase)
     async with pool.connection() as connection:
         cursor = await connection.execute(
             "UPDATE installation SET passphrase = %s WHERE passphrase IS NULL",
@@ -79,21 +82,94 @@ async def set_first(pool: Pool, passphrase: str) -> bool:
     return cursor.rowcount == 1
 
 
-async def change(pool: Pool, current: str, new: str) -> None:
-    """Change the passphrase, by whoever knows the one it is now."""
-    _require_usable(new)
+async def change(pool: Pool, current: str, new: str, request_id: str | None = None) -> str:
+    """Change the passphrase, by whoever knows the one it is now. Says "changed", or, for
+    a request that did this already, "changed, as on record": the reply to a request may
+    be lost, and asked again with the old passphrase it must not look like a refusal."""
+    require_usable(new)
     async with pool.connection() as connection, connection.transaction():
-        row = await (
-            await connection.execute("SELECT passphrase FROM installation FOR UPDATE")
-        ).fetchone()
-        if row is None or row["passphrase"] is None:
-            raise Refused("no passphrase has been set: run `relay init`")
-        if not matches(current, row["passphrase"]):
-            raise Refused("that is not the passphrase")
+        row = await _locked_installation(connection)
+        done = await _receipt(connection, request_id, "passphrase", "")
+        if done is not None:
+            return "changed, as on record"
+        _require_matches(current, row["passphrase"])
         await connection.execute("UPDATE installation SET passphrase = %s", (hashed(new),))
+        await _keep_receipt(connection, row, request_id, "passphrase", "", {"changed": True})
+    return "changed"
 
 
-def _require_usable(passphrase: str) -> None:
+async def receipt_of(pool: Pool, request_id: str) -> dict[str, Any] | None:
+    """What a request did, if it did anything: asked before a passphrase is asked for."""
+    async with pool.connection() as connection:
+        row = await (
+            await connection.execute(
+                "SELECT action, outcome FROM installation_receipts WHERE request_id = %s",
+                (request_id,),
+            )
+        ).fetchone()
+    return {"action": row["action"], **row["outcome"]} if row else None
+
+
+async def _locked_installation(connection: Connection) -> dict[str, Any]:
+    row = await (
+        await connection.execute(
+            "SELECT installation_id, passphrase, policy FROM installation FOR UPDATE"
+        )
+    ).fetchone()
+    assert row is not None
+    return row
+
+
+def _require_matches(passphrase: str, kept: str | None) -> None:
+    if kept is None:
+        raise Refused("no passphrase has been set: run `relay init`")
+    if not matches(passphrase, kept):
+        raise Refused("that is not the passphrase")
+
+
+def _digest(asked: str) -> str:
+    return hashlib.sha256(asked.encode()).hexdigest()
+
+
+async def _receipt(
+    connection: Connection, request_id: str | None, action: str, asked: str
+) -> dict[str, Any] | None:
+    if request_id is None:
+        return None
+    row = await (
+        await connection.execute(
+            "SELECT action, asked, outcome FROM installation_receipts WHERE request_id = %s",
+            (request_id,),
+        )
+    ).fetchone()
+    if row is None:
+        return None
+    if row["action"] != action or row["asked"] != _digest(asked):
+        raise Refused(
+            f"request {request_id} was for something else: a request's identity is used "
+            "again only to ask for the same thing"
+        )
+    return dict(row["outcome"])
+
+
+async def _keep_receipt(
+    connection: Connection,
+    installation: Mapping[str, Any],
+    request_id: str | None,
+    action: str,
+    asked: str,
+    outcome: Mapping[str, Any],
+) -> None:
+    if request_id is None:
+        return
+    await connection.execute(
+        "INSERT INTO installation_receipts (request_id, installation, action, asked, outcome) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (request_id, installation["installation_id"], action, _digest(asked), Jsonb(dict(outcome))),
+    )
+
+
+def require_usable(passphrase: str) -> None:
     if len(passphrase) < SHORTEST:
         raise Refused(f"a passphrase has at least {SHORTEST} characters")
 
@@ -109,15 +185,24 @@ class Policy:
     stated_at: datetime
 
 
-async def state_policy(pool: Pool, passphrase: str, statement: str, stated_by: str) -> Policy:
+async def state_policy(
+    pool: Pool, passphrase: str, statement: str, stated_by: str, request_id: str | None = None
+) -> Policy:
     """Put the operator's statement on record as a new revision. It is a launch
-    condition, so it is the Product Owner's to make: the passphrase is asked for. A
-    call being admitted under the statement as it was holds this until it is on record."""
+    condition, so it is the Product Owner's to make: the passphrase is asked for, and
+    checked in the transaction that writes, under the installation's lock: a passphrase
+    changed a moment ago authorises nothing. A call being admitted under the statement
+    as it was holds this until it is on record. A request that did this already is
+    answered with the revision it made, and makes no other."""
     statement = statement.strip()
     if not statement:
         raise Refused("a statement of policy says something")
-    await require(pool, passphrase)
     async with pool.connection() as connection, connection.transaction():
+        installation = await _locked_installation(connection)
+        done = await _receipt(connection, request_id, "policy", statement)
+        if done is not None:
+            return _policy(done)
+        _require_matches(passphrase, installation["passphrase"])
         row = await (
             await connection.execute(
                 "UPDATE installation SET policy = jsonb_build_object("
@@ -125,11 +210,14 @@ async def state_policy(pool: Pool, passphrase: str, statement: str, stated_by: s
                 "'revision', coalesce((policy->>'revision')::int, 0) + 1, "
                 "'earlier', coalesce(policy->'earlier', '[]'::jsonb) || CASE WHEN policy ? "
                 "'statement' THEN jsonb_build_array(policy - 'earlier') ELSE '[]'::jsonb END) "
-                "RETURNING policy",
+                "RETURNING policy - 'earlier' AS policy",
                 (statement, stated_by),
             )
         ).fetchone()
-    assert row is not None
+        assert row is not None
+        await _keep_receipt(
+            connection, installation, request_id, "policy", statement, row["policy"]
+        )
     return _policy(row["policy"])
 
 
@@ -158,7 +246,9 @@ __all__ = [
     "is_set",
     "matches",
     "policy_of",
+    "receipt_of",
     "require",
+    "require_usable",
     "set_first",
     "state_policy",
 ]

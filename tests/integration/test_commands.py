@@ -91,3 +91,52 @@ async def test_enrolment_with_no_terminal_sets_no_passphrase_and_says_why(
 
     assert enrolled.code == 1 and "needs a person at a terminal" in enrolled.printed
     assert not await authority.is_set(database)
+
+
+async def test_an_address_with_a_secret_in_it_is_refused_and_kept_nowhere(
+    database: AsyncConnectionPool, shell: dict[str, str], tmp_path: Path
+) -> None:
+    """3C-S1B-1.7: not in the journal, and not in anything the command says."""
+    here = checkout_of(tmp_path / "remote.git", tmp_path / "vat")
+    secret = "hunter2-in-the-address"
+    address = f"https://someone:{secret}@example.invalid/vat.git"
+
+    refused = with_no_terminal([*init(tmp_path), "--repository", address], shell, here)
+
+    assert refused.code == 1 and "cannot be used" in refused.printed
+    assert secret not in refused.printed
+    file = Path(shell["RELAY_STATE_DIR"]) / "requests.jsonl"
+    assert not file.exists() or secret not in file.read_text()
+    assert secret not in with_no_terminal(["requests"], shell, here).printed
+
+
+async def test_a_request_that_changed_the_installation_is_repeated_by_its_handle_and_changes_nothing(
+    database: AsyncConnectionPool, shell: dict[str, str], tmp_path: Path
+) -> None:
+    """3C-S1B-1.11: the reply was lost. The handle that was printed first says what the
+    request did, to anyone, at no terminal, and does it no second time."""
+    here = checkout_of(tmp_path / "remote.git", tmp_path / "vat")
+    assert at_a_terminal(init(tmp_path), [PASSPHRASE, PASSPHRASE], shell, here).code == 0
+    stated = at_a_terminal(["policy", "state", "none applies here"], [PASSPHRASE], shell, here)
+    handle = stated.printed.split()[1]
+
+    again = with_no_terminal(
+        ["policy", "state", "none applies here", "--request-id", handle], shell, here
+    )
+    another = with_no_terminal(
+        ["policy", "state", "something else", "--request-id", handle], shell, here
+    )
+
+    assert again.code == 0 and "revision 1" in again.printed and "as on record" in again.printed
+    assert another.code == 1 and "for something else" in another.printed
+    policy = await authority.policy_of(database)
+    assert policy is not None and (policy.revision, policy.statement) == (1, "none applies here")
+
+    changed = at_a_terminal(
+        ["passphrase"], [PASSPHRASE, "a new one altogether", "a new one altogether"], shell, here
+    )
+    replayed = with_no_terminal(
+        ["passphrase", "--request-id", changed.printed.split()[1]], shell, here
+    )
+    assert replayed.code == 0 and "as on record" in replayed.printed
+    await authority.require(database, "a new one altogether")
