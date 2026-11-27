@@ -311,7 +311,7 @@ async def test_a_reply_that_says_nothing_of_what_was_done_is_asked_for_again(
     assert await worker.carry_out(await building.owed()) == "applied"
 
     assert await building.states() == ["rejected", "applied"]
-    assert "the reply has wrote, which was not asked for" in provider.asked[1].briefing
+    assert "the reply has no outcome" in provider.asked[1].briefing
     assert await building.world.column(
         "SELECT retained IS NULL FROM invocations ORDER BY started_at"
     ) == [True, False]  # nothing was kept of the reply that was not one

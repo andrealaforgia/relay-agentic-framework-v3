@@ -41,7 +41,28 @@ NO_USAGE_MESSAGE = {
 }
 
 
+_ITS_OWN = {"findings", "carried", "note"}
+
+
+def as_offered(reply: Any) -> Any:
+    """A scripted build's or review's reply, written in these tests as what it delivers
+    or asks, in the form every call is offered: `outcome`, with what was delivered under
+    `delivered`. A reply already in that form, or one that is nothing like either, is
+    left as it is."""
+    if not isinstance(reply, dict) or {"outcome", "delivered"} & set(reply):
+        return reply
+    if not ((_ITS_OWN | {"question"}) & set(reply)):
+        return reply
+    said = {name: value for name, value in reply.items() if name in ("question", "assumptions")}
+    said.setdefault("assumptions", [])
+    rest = {name: value for name, value in reply.items() if name not in said}
+    if "question" in reply and not rest:
+        return {"outcome": "question", **said}
+    return {"outcome": "delivered", **said, "delivered": rest}
+
+
 def replying(reply: Any) -> ProviderResult:
+    reply = as_offered(reply)
     return ProviderResult(
         Outcome.RETURNED,
         Terminal(
@@ -444,9 +465,9 @@ async def test_a_malformed_review_handed_straight_to_the_record_becomes_no_findi
     assert await reviewing.world.column("SELECT count(*) FROM findings") == [0]
     assert await reviewing.world.column("SELECT count(*) FROM review_submissions") == [0]
     [reason] = await reviewing.world.column("SELECT reason FROM invocations")
-    assert reason == "claim of item 1 of findings of the reply is not a string"
+    assert reason == "claim of item 1 of findings of delivered of the reply is not a string"
     [kept] = await reviewing.world.column(
-        "SELECT envelope->'structured_output'->'findings'->0->>'claim' FROM invocations"
+        "SELECT envelope->'structured_output'->'delivered'->'findings'->0->>'claim' FROM invocations"
     )
     assert kept == "7"
 

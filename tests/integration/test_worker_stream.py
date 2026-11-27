@@ -194,7 +194,7 @@ async def test_a_reviewer_whose_bounds_stop_holding_after_a_reply_it_could_not_u
         "rejected",
         "applied",
     ]
-    assert "findings of the reply is not a array" in provider.asked[1].briefing
+    assert "findings of delivered of the reply is not a array" in provider.asked[1].briefing
 
 
 async def test_a_review_that_could_not_be_prepared_is_taken_up_when_the_repository_answers(

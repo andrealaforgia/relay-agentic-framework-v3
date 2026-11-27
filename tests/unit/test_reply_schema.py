@@ -12,43 +12,52 @@ from relay.domain.schema import problem_with, require_checkable
 from relay.domain.story import ActionRefused
 
 FINDING = {"severity": "high", "claim": "c", "evidence": "e", "remediation": "r"}
+QUESTION = {"text": "Refuse negatives?", "why": "no criterion says", "options": ["yes", "no"]}
+NOTHING = {"findings": [], "carried": []}
+
+
+def delivering(delivered: Any, **beside: Any) -> dict[str, Any]:
+    return {"outcome": "delivered", "assumptions": [], "delivered": delivered, **beside}
+
+
+ASKING = {"outcome": "question", "assumptions": [], "question": QUESTION}
 
 
 def test_a_reply_in_the_form_asked_for_has_no_problem() -> None:
-    assert problem_with({"findings": [FINDING], "carried": []}, REVIEW_REPLY) is None
-    assert problem_with({"note": "done"}, BUILD_REPLY) is None
+    assert problem_with(delivering({"findings": [FINDING], "carried": []}), REVIEW_REPLY) is None
+    assert problem_with(delivering({"note": "done"}), BUILD_REPLY) is None
+    assert problem_with(ASKING, REVIEW_REPLY) is None
+    assert problem_with(ASKING, BUILD_REPLY) is None
 
 
 @pytest.mark.parametrize(
-    ("reply", "says"),
+    ("delivered", "says"),
     [
-        ([], "not a object"),
-        (
-            {"findings": [{"severity": "high", "claim": "c", "evidence": "e"}], "carried": []},
-            "has no remediation",
-        ),
-        ({"findings": [], "carried": [], "extra": 1}, "extra, which was not asked for"),
-        ({"findings": [{**FINDING, "claim": 17}], "carried": []}, "claim of item 1"),
-        ({"findings": [{**FINDING, "evidence": None}], "carried": []}, "evidence of item 1"),
-        ({"findings": [{**FINDING, "remediation": True}], "carried": []}, "remediation of item 1"),
-        ({"findings": [{**FINDING, "severity": "enormous"}], "carried": []}, "not one of"),
-        ({"findings": "none", "carried": []}, "findings of the reply is not a array"),
+        ([], "delivered of the reply is not a object"),
+        ({"findings": [{"severity": "high", "claim": "c", "evidence": "e"}]}, "has no remediation"),
+        ({**NOTHING, "extra": 1}, "extra, which was not asked for"),
+        ({"findings": [{**FINDING, "claim": 17}]}, "claim of item 1"),
+        ({"findings": [{**FINDING, "evidence": None}]}, "evidence of item 1"),
+        ({"findings": [{**FINDING, "remediation": True}]}, "remediation of item 1"),
+        ({"findings": [{**FINDING, "severity": "enormous"}]}, "not one of"),
+        ({"findings": "none", "carried": []}, "findings of delivered of the reply is not a array"),
         (
             {"findings": [], "carried": [{"finding_id": "F-1", "verdict": "fixed"}]},
             "verdict of item 1",
         ),
     ],
 )
-def test_a_reply_that_is_not_in_that_form_is_told_where(reply: object, says: str) -> None:
+def test_a_reply_that_is_not_in_that_form_is_told_where(delivered: object, says: str) -> None:
     """3B-S2-1.11."""
-    found = problem_with(reply, REVIEW_REPLY)
+    found = problem_with(delivering(delivered), REVIEW_REPLY)
 
     assert found is not None and says in found
 
 
 def test_a_note_with_anything_beside_it_is_not_a_build_reply() -> None:
-    assert problem_with({"note": "done", "also": "this"}, BUILD_REPLY) is not None
-    assert problem_with({"note": 5}, BUILD_REPLY) is not None
+    found = problem_with(delivering({"note": "done", "commit": "abc"}), BUILD_REPLY)
+
+    assert found is not None and "commit, which was not asked for" in found
 
 
 def test_true_is_not_a_number() -> None:
@@ -83,9 +92,6 @@ def test_a_schema_for_the_extra_properties_is_one_relay_does_not_check() -> None
     require_checkable({"type": "object", "additionalProperties": True})
 
 
-QUESTION = {"text": "Refuse negatives?", "why": "no criterion says", "options": ["yes", "no"]}
-
-
 @pytest.mark.parametrize(
     ("task", "schema", "delivered"),
     [
@@ -93,89 +99,58 @@ QUESTION = {"text": "Refuse negatives?", "why": "no criterion says", "options": 
         (BuildTask, BUILD_REPLY, {"note": "done"}),
     ],
 )
-def test_a_build_or_a_review_replies_in_one_form_and_the_schema_offers_no_other(
+def test_a_build_or_a_review_is_offered_the_one_form_every_kind_of_work_replies_in(
     task: Any, schema: dict[str, Any], delivered: dict[str, Any]
 ) -> None:
-    """Offered two forms, a real model filled in both at once (the smoke against the
-    provider, three paid builds refused). The schema it is given now has the one."""
-    for reply in (delivered, {**delivered, "assumptions": ["x"]}, {"question": QUESTION}):
+    """3B-S3-2.12 and 3B-S4-1.6. Offered two forms, a real model filled in both: the
+    schema of a new call has the common one alone. A reply recorded under the form these
+    two had before is still read by the task, so that a result already bought is not
+    made defective by the change; the schema of a new call would not take it."""
+    for reply in (delivering(delivered), delivering(delivered, assumptions=["x"]), ASKING):
         assert problem_with(reply, schema) is None
         assert task.problem_with(None, reply) is None
-    wrapped = {"outcome": "delivered", "assumptions": [], "delivered": delivered}
-    for reply in (wrapped, {**wrapped, **delivered}, {"outcome": "question", "question": QUESTION}):
-        assert "which was not asked for" in str(problem_with(reply, schema))
-        assert task.problem_with(None, reply) is not None
-
-
-@pytest.mark.parametrize(
-    ("reply", "says"),
-    [
-        ({"note": "done", "assumptions": [" "]}, "an assumption says nothing"),
-        ({"note": "done", "question": QUESTION}, "no note of work done"),
-    ],
-)
-def test_what_a_schema_cannot_say_of_a_build_reply_its_task_says(
-    reply: dict[str, Any], says: str
-) -> None:
-    """3B-S3-2.7 and 3B-S3-2.11."""
-    assert problem_with(reply, BUILD_REPLY) is None  # the schema takes it
-    found = BuildTask.problem_with(None, reply)  # type: ignore[arg-type]
-
-    assert found is not None and says in found
-
-
-def test_a_reply_its_task_would_not_take_is_applied_as_a_refusal_whoever_recorded_it() -> None:
-    """3B-S3-2.11: read where it is applied, not only where a recorder chose to."""
-
-    class Build:
-        problem_with = BuildTask.problem_with
-
-        def effects(self, invocation: Any) -> list[Any]:
-            raise AssertionError("a reply that was refused has no effects of its own")
-
-    reply = {"note": "done", "question": QUESTION}
-    [effect] = Tasks({"build": Build()}).effects_for(
-        {"kind": "build", "role": "builder", "reply": reply}
-    )
-
-    with pytest.raises(ActionRefused, match="no note of work done"):
-        asyncio.run(effect.perform(None))  # type: ignore[arg-type]
+    for earlier in (delivered, {**delivered, "assumptions": ["x"]}, {"question": QUESTION}):
+        assert problem_with(earlier, schema) is not None  # not what a new call is offered
+        assert task.problem_with(None, earlier) is None  # and still read, as it was bought
 
 
 @pytest.mark.parametrize(
     ("task", "reply", "says"),
     [
-        (
-            ReviewTask,
-            {
-                "outcome": "delivered",
-                "assumptions": [],
-                "delivered": {"findings": "", "carried": {}},
-            },
-            "not asked for",
-        ),
-        (
-            BuildTask,
-            {"outcome": "delivered", "delivered": {"note": "done", "question": QUESTION}},
-            "not asked for",
-        ),
-        (BuildTask, {"delivered": {"note": "done"}, "note": "also"}, "not asked for"),
-        (BuildTask, {"outcome": "delivered", "delivered": "done"}, "not asked for"),
-        (ReviewTask, {"delivered": {"findings": [], "carried": [], "extra": 1}}, "not asked for"),
+        # A review of nothing, got by putting what is not a review under delivered.
+        (ReviewTask, delivering({"findings": "", "carried": {}}), "is not a array"),
+        # A build that also asks, one inside the other.
+        (BuildTask, delivering({"note": "done", "question": QUESTION}), "not asked for"),
+        # The two forms at once.
+        (BuildTask, delivering({"note": "done"}, note="also"), "not asked for"),
+        (BuildTask, {"note": "done", "outcome": "delivered", "assumptions": []}, "not asked for"),
+        (BuildTask, delivering("done"), "is not a object"),
+        (ReviewTask, delivering({**NOTHING, "extra": 1}), "not asked for"),
+        # What the schema cannot say.
+        (BuildTask, delivering({"note": "done"}, question=QUESTION), "no question"),
+        (BuildTask, {**ASKING, "delivered": {"note": "x"}}, "delivers nothing"),
+        (BuildTask, {"outcome": "question", "assumptions": []}, "has a question"),
+        (BuildTask, {"outcome": "delivered", "assumptions": []}, "has what was asked for"),
+        (BuildTask, delivering({"note": "done"}, assumptions=[" "]), "an assumption says nothing"),
+        # The earlier form, mixed or blank.
+        (BuildTask, {"note": "done", "question": QUESTION}, "no note of work done"),
+        (BuildTask, {"note": "done", "assumptions": [" "]}, "an assumption says nothing"),
     ],
 )
-def test_a_reply_in_the_other_form_or_in_both_has_no_effect_of_the_work(
+def test_a_reply_that_is_neither_form_whole_has_no_effect_of_the_work(
     task: Any, reply: dict[str, Any], says: str
 ) -> None:
-    """3B-S3-3.1: neither a review of nothing nor a build that also asks. The one form
-    is the whole of what is accepted."""
+    """3B-S3-2.7, 3B-S3-2.11 and 3B-S3-3.1: read where it is applied, whoever recorded
+    it, and applied as a refusal."""
     found = task.problem_with(None, reply)
 
-    assert found is not None and says in found
+    assert found is not None and says in found, found
     [effect] = Tasks({"work": task.__new__(task)}).effects_for(
         {"kind": "work", "role": "any", "reply": reply}
     )
-    assert effect.name == "read"  # and so no effect of the work itself
+    assert effect.name == "read"
+    with pytest.raises(ActionRefused):
+        asyncio.run(effect.perform(None))  # type: ignore[arg-type]
 
 
 def test_what_a_real_model_leaves_out_or_fills_in_harmlessly_is_not_a_paid_call_refused() -> None:
@@ -184,7 +159,7 @@ def test_what_a_real_model_leaves_out_or_fills_in_harmlessly_is_not_a_paid_call_
     from relay.application.authoring import SpecifyTask
 
     # A reviewer with nothing to carry leaves the list out.
-    assert ReviewTask.problem_with(None, {"findings": []}) is None  # type: ignore[arg-type]
-    # "Demonstrated", with the other fields of the schema filled in beside it.
+    assert ReviewTask.problem_with(None, delivering({"findings": []})) is None  # type: ignore[arg-type]
+    # "Demonstrated", with the other fields of the schema filled in empty beside it.
     demonstrated = {"demonstrated": True, "summary": "", "demonstrates": []}
     assert SpecifyTask._problem_with_delivered(None, demonstrated) is None  # type: ignore[arg-type]

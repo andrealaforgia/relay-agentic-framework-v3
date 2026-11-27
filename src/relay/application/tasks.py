@@ -44,10 +44,12 @@ QUESTION = {
 _ASSUMPTIONS = {"type": "array", "items": {"type": "string"}}
 
 ASKING_INSTEAD = (
-    "If you cannot do this without a decision that is the Product Owner's to make (what "
-    "the product should do, not how), reply with a question instead and nothing else: its "
-    "text, why it matters, and the options you see. Do not ask what you can settle by "
-    "reading. Under assumptions, list anything you took to be so without being told."
+    'Reply with outcome "delivered", and under delivered what is asked for above. If you '
+    "cannot do this without a decision that is the Product Owner's to make (what the "
+    'product should do, not how), reply with outcome "question" instead: one question (its '
+    "text, why it matters, and the options you see) and nothing delivered. Do not ask what "
+    "you can settle by reading. Under assumptions, list anything you took to be so without "
+    "being told: an empty list if there is nothing."
 )
 
 
@@ -67,15 +69,59 @@ def plain(reply: Any) -> Any:
     return {**rest, **delivered} if isinstance(delivered, dict) else rest
 
 
-def _shape_problem(reply: Any, flat: Mapping[str, Any]) -> str | None:
-    """What is wrong with a reply as its schema has it, or with what the schema cannot
-    say, or None. A build or a review replies in its own form and no other: the whole
-    of the reply is held to the whole of the schema, here as where it is recorded."""
+def reply_schema(delivered: Mapping[str, Any]) -> dict[str, Any]:
+    """The shape every reply has, whatever the kind of work: what was asked for, or a
+    question in its place, and what was assumed either way. Each call is offered this
+    one form and no other: offered two, a real model filled in both."""
+    return {
+        "type": "object",
+        "properties": {
+            "outcome": {"enum": ["delivered", "question"]},
+            "assumptions": {"type": "array", "items": {"type": "string"}},
+            "delivered": dict(delivered),
+            "question": QUESTION,
+        },
+        "required": ["outcome", "assumptions"],
+        "additionalProperties": False,
+    }
+
+
+def _shape_problem(reply: Any, delivered: Mapping[str, Any]) -> str | None:
+    """What is wrong with a build's or a review's reply as its schema has it, or with
+    what the schema cannot say, or None.
+
+    New calls are offered the common form and are held to the whole of it. A reply
+    recorded under the form these two kinds of work had before (flat: what was
+    delivered at the top, beside `question` and `assumptions`) is still read, held to
+    the whole of that: it was bought, and is not made defective by a change of form.
+    Never a mixture of the two."""
     if not isinstance(reply, dict):
         return "the reply is an object"
-    said = schema_problem(reply, dict(flat))
-    if said:
-        return said
+    if {"outcome", "delivered"} & set(reply):
+        said = schema_problem(reply, reply_schema(delivered))
+        if said:
+            return said
+        if reply["outcome"] == "question" and (
+            reply.get("question") is None or "delivered" in reply
+        ):
+            return "a reply that asks has a question and delivers nothing"
+        if reply["outcome"] == "delivered" and (
+            reply.get("question") is not None or "delivered" not in reply
+        ):
+            return "a reply that delivers has what was asked for and no question"
+    else:
+        earlier = {
+            **delivered,
+            "properties": {
+                **delivered["properties"],
+                "question": QUESTION,
+                "assumptions": _ASSUMPTIONS,
+            },
+            "required": [],
+        }
+        said = schema_problem(reply, earlier)
+        if said:
+            return said
     if not all(str(text).strip() for text in reply.get("assumptions") or ()):
         return "an assumption says nothing"
     return None
@@ -152,7 +198,7 @@ async def _nothing(run: EffectRun) -> None:
 ASK = Effect("ask", _nothing, put_question)
 
 
-REVIEW_REPLY = {
+_REVIEW = {
     "type": "object",
     "properties": {
         "findings": {
@@ -183,25 +229,12 @@ REVIEW_REPLY = {
                 "additionalProperties": False,
             },
         },
-        "question": QUESTION,
-        "assumptions": _ASSUMPTIONS,
     },
-    # A review, with its findings and how the earlier ones stand; or a question. One
-    # form only: offered this and the form other kinds of work reply in, a real model
-    # filled in both at once, and each such reply was a paid call refused.
-    "required": [],
+    "required": ["findings"],
     "additionalProperties": False,
 }
-
-
-def _flat(schema: Mapping[str, Any]) -> dict[str, Any]:
-    """A reply schema as its own flat form alone: what a reply is held to once read."""
-    properties = {
-        name: inner
-        for name, inner in schema["properties"].items()
-        if name not in ("outcome", "delivered")
-    }
-    return {**schema, "properties": properties}
+# A review, with its findings and how the earlier ones stand; or a question.
+REVIEW_REPLY = reply_schema(_REVIEW)
 
 
 @dataclass(frozen=True)
@@ -305,7 +338,7 @@ class ReviewTask:
         )
 
     def problem_with(self, reply: Any) -> str | None:
-        shape = _shape_problem(reply, _flat(REVIEW_REPLY))
+        shape = _shape_problem(reply, _REVIEW)
         if shape:
             return shape
         reply = plain(reply)
@@ -490,17 +523,14 @@ class Tasks:
         invocations.meaning_problem = self.problem_with
 
 
-BUILD_REPLY = {
+_BUILD = {
     "type": "object",
-    "properties": {
-        "note": {"type": "string"},
-        "question": QUESTION,
-        "assumptions": _ASSUMPTIONS,
-    },
-    # A note of what was built; or a question, and then nothing that was left is kept.
-    "required": [],
+    "properties": {"note": {"type": "string"}},
+    "required": ["note"],
     "additionalProperties": False,
 }
+# A note of what was built; or a question, and then nothing that was left is kept.
+BUILD_REPLY = reply_schema(_BUILD)
 
 
 class BuildTask:
@@ -574,7 +604,7 @@ class BuildTask:
         )
 
     def problem_with(self, reply: Any) -> str | None:
-        shape = _shape_problem(reply, _flat(BUILD_REPLY))
+        shape = _shape_problem(reply, _BUILD)
         if shape:
             return shape
         reply = plain(reply)

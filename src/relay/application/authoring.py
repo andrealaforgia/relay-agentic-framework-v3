@@ -39,13 +39,13 @@ from relay.application.stories import (
 )
 from relay.application.supersessions import propose_in
 from relay.application.tasks import (
-    QUESTION,
     Profile,
     Workspaces,
     caller_of,
     put_question,
     question_problem,
     record_assumptions,
+    reply_schema,
 )
 from relay.application.tasks import work_of as _work
 from relay.application.worker import Call
@@ -59,23 +59,6 @@ from relay.persistence.database import Connection, Pool
 from relay.persistence.ledger import append_event
 from relay.providers.confinement import confinement_for, effective_agent_sha256
 from relay.providers.definitions import DEFAULT_DEFINITIONS, find_definition
-
-
-def reply_schema(delivered: Mapping[str, Any]) -> dict[str, Any]:
-    """The shape every reply of this kind of work has: what was asked for, or a question
-    in its place, and what was assumed either way."""
-    return {
-        "type": "object",
-        "properties": {
-            "outcome": {"enum": ["delivered", "question"]},
-            "assumptions": {"type": "array", "items": {"type": "string"}},
-            "delivered": dict(delivered),
-            "question": QUESTION,
-        },
-        "required": ["outcome", "assumptions"],
-        "additionalProperties": False,
-    }
-
 
 _HOW_TO_REPLY = [
     "",
