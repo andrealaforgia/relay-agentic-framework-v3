@@ -409,8 +409,18 @@ async def test_a_parked_call_shows_what_was_charged_estimated_and_not_known_and_
     assert late.disposition == "stale" and "changed since it was shown" in late.outcome
     [now] = await inbox.items(PROJECT)
     assert now.basis != item.basis and now.evidence["charged_usd"] == "0.42"
+    # A call that never started was not made: it is counted apart, and is no call launched.
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "UPDATE invocations SET state = 'not_started', provider_cost_usd = NULL, "
+            "estimated_cost_usd = NULL WHERE attempt = 1"
+        )
+    [recounted] = await inbox.items(PROJECT)
+    assert recounted.evidence["calls_launched"] == 2
+    assert recounted.evidence["calls_that_never_started"] == 1
+    assert recounted.evidence["calls_whose_cost_is_not_known"] == 0
     assert await calling.invocations.decide(
-        by("r-2", item.item_id, "retry", as_seen=now.basis)
+        by("r-2", item.item_id, "retry", as_seen=recounted.basis)
     ) == Receipt("effective", "retry_authorised")
 
 

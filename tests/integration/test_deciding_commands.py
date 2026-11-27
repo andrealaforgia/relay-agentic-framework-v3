@@ -779,3 +779,52 @@ async def test_a_prepared_action_means_the_item_it_named_whatever_is_waiting_whe
             await connection.execute("SELECT question_id FROM questions WHERE state = 'answered'")
         ).fetchall()
     assert [each["question_id"] for each in answered] == [first]
+
+
+async def test_a_retry_of_a_parked_call_is_held_to_what_the_person_was_shown_of_it(
+    desk: Desk, namespace: str
+) -> None:
+    """3C-S2-1.8, through the command: the person is shown what the work has cost and
+    takes their time. A bill for an earlier call arrives meanwhile. They decided on other
+    evidence than there now is: nothing is authorised, and they are shown it again."""
+    import asyncio
+    import threading
+
+    from relay.persistence.database import open_pool
+    from tests.integration.conftest import DATABASE_URL
+    from tests.integration.test_inbox import parked_call
+    from tests.integration.test_invocations import Calling
+
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    await world.awaiting_builder("B1")
+    calling = Calling(world)
+    try:
+        await parked_call(calling)
+        [item] = desk.read("inbox")
+
+        async def a_bill_arrives() -> None:
+            async with open_pool(DATABASE_URL, schema=namespace) as pool, pool.connection() as c:
+                await c.execute("UPDATE invocations SET provider_cost_usd = 0.40 WHERE attempt = 1")
+
+        def while_the_person_looks() -> None:
+            other = threading.Thread(target=lambda: asyncio.run(a_bill_arrives()))
+            other.start()
+            other.join()
+
+        late = at_a_terminal(
+            ["retry", item["handle"]],
+            [PASSPHRASE],
+            desk.shell,
+            desk.here,
+            before_typing=while_the_person_looks,
+        )
+
+        assert late.code == 1 and "stale" in late.printed, late.printed
+        assert await world.column(
+            "SELECT count(*) FROM invocations WHERE retry_authorised_by IS NOT NULL"
+        ) == [0]
+        again = desk.po("retry", item["handle"])
+        assert again.code == 0 and '"charged_usd": "0.4' in again.shown
+    finally:
+        await calling.close()
