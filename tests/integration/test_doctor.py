@@ -501,3 +501,39 @@ def test_the_suite_launches_nothing_when_what_bounds_a_run_is_not_what_it_was_as
 
     assert not (cli.parent / "launched.jsonl").exists()
     assert list(root.iterdir()) == []  # and what it had set up is cleared away
+
+
+async def test_a_cli_that_changes_between_two_roles_of_one_request_launches_no_second_run(
+    enrolled: AsyncConnectionPool, shell: dict[str, str], tmp_path: Path
+) -> None:
+    """3C-S1B-3.1, through the command: the first role's run is made on the CLI as it
+    was, and the CLI is then another version. The command read the runtime once; the
+    suite reads it again before each launch and is held to the boundary the request
+    recorded. The second role is not launched under the old request."""
+    await authority.state_policy(enrolled, PASSPHRASE, "none applies here", "andrea")
+    cli = Path((await settings_of(enrolled))["cli"])
+    version = cli.parent / "version.txt"
+    version.write_text("9.9.9")
+    acting = cli.read_text()
+    # A stand-in that is another version once it has made one run.
+    acting = acting.replace(
+        'VERSION = "9.9.9"', 'VERSION = (HERE / "version.txt").read_text().strip()'
+    ).replace(
+        '        launched.write(json.dumps(sys.argv[1:]) + "\\n")',
+        '        launched.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+        '        (HERE / "version.txt").write_text("10.0.0")',
+    )
+    assert "version.txt" in acting and '.write_text("10.0.0")' in acting
+    cli.write_text(acting)
+
+    said = with_no_terminal(["doctor", "--boundary"], shell, tmp_path / "vat")
+
+    runs = [
+        json.loads(line)
+        for line in (cli.parent / "launched.jsonl").read_text().splitlines()
+        if "--session-id" in line
+    ]
+    assert len(runs) == 1, said.printed
+    assert said.out.count("run now") == 1
+    assert "not_launched" in said.out and "no longer what this run was asked to try" in said.out
+    assert "paid run(s)" in said.out and said.code == 1
