@@ -223,3 +223,144 @@ async def test_a_request_sent_again_from_elsewhere_means_the_project_it_was_made
 
     assert elsewhere.code == 0 and "as on record" in elsewhere.printed
     assert unsaid.code == 1 and "which project is meant was not said" in unsaid.printed
+
+
+def code_of(ran: Ran) -> str:
+    assert ran.code == 0, ran.printed
+    return ran.out.split()[1]
+
+
+async def test_a_model_prepares_and_only_the_person_confirms(desk: Desk) -> None:
+    """PO-3 and S3-1.8: preparing needs no terminal and decides nothing. Confirming shows
+    what was prepared, and why, where the passphrase is then read, and is the Product
+    Owner's. The code is the handle to what it did, for good."""
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+
+    prepared = desk.anyone("prepare", "approve", str(gate), "--why", "it matches the brief")
+
+    code = code_of(prepared)
+    assert "Nothing has been decided" in prepared.out and f"relay confirm {code}" in prepared.out
+    assert await world.column("SELECT state FROM gates") == ["open"]
+    # A model cannot confirm what it prepared, and a guess at the passphrase confirms nothing.
+    as_a_model = with_no_terminal(["confirm", code], desk.shell, desk.here, given=PASSPHRASE + "\n")
+    assert as_a_model.code == 1 and "needs a person at a terminal" in as_a_model.printed
+    assert desk.po("confirm", code, typing=("a guess at it",)).code == 1
+    assert await world.column("SELECT state FROM gates") == ["open"]
+
+    confirmed = desk.po("confirm", code)
+
+    assert confirmed.code == 0, confirmed.printed
+    assert "effective:" in confirmed.printed
+    assert "the roadmap of F1" in confirmed.shown and "it matches the brief" in confirmed.shown
+    assert confirmed.shown.index("it matches the brief") < confirmed.shown.index("passphrase:")
+    assert await world.story("S1") is StoryState.RELEASED
+    again = desk.anyone("confirm", code)
+    assert again.code == 0 and "as on record" in again.printed
+    assert desk.anyone("confirm", "nonesuch").code == 1
+
+
+async def test_what_cannot_be_done_is_not_prepared_and_a_reason_is_carried_with_what_is(
+    desk: Desk,
+) -> None:
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+
+    wrong = desk.anyone("prepare", "answer", str(gate), "yes", "--why", "because")
+    unsaid = desk.anyone("prepare", "request-changes", str(gate), "--why", "because")
+    back = desk.anyone(
+        "prepare", "request-changes", str(gate), "--reason", "split it", "--why", "two outcomes"
+    )
+
+    assert wrong.code == 1 and "is not something to answer" in wrong.printed
+    assert unsaid.code == 1 and "say why with --reason" in unsaid.printed
+    confirmed = desk.po("confirm", code_of(back))
+    assert confirmed.code == 0 and "split it" in confirmed.shown
+    assert await world.column("SELECT outcome FROM gates") == ["changes_requested"]
+
+
+async def test_a_prepared_action_is_stale_once_what_it_was_prepared_against_is_decided(
+    desk: Desk,
+) -> None:
+    """3C-1.6: prepared against one gate, confirmed after that gate was decided another
+    way. Stale, and the code's answer is that for good."""
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    code = code_of(desk.anyone("prepare", "approve", str(gate), "--why", "it looks right"))
+    await world.decide(gate, "request_changes", reason="not yet")
+
+    late = desk.po("confirm", code)
+
+    assert late.code == 1 and late.printed.startswith("stale: nothing changed")
+    assert "passphrase" not in late.shown  # nothing was put to the person to confirm
+    assert await world.column("SELECT outcome FROM gates") == ["changes_requested"]
+    assert "Nothing was done under this code" in desk.anyone("confirm", code).printed
+
+
+async def test_a_prepared_retry_of_a_call_since_set_aside_authorises_no_call(desk: Desk) -> None:
+    """3C-3.5: the item was open when the retry was prepared. The person set the call
+    aside. The work is parked still; the prepared retry names an item that is closed."""
+    from tests.integration.test_inbox import parked_call
+    from tests.integration.test_invocations import Calling
+
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    await world.awaiting_builder("B1")
+    calling = Calling(world)
+    try:
+        await parked_call(calling)
+        [item] = desk.read("inbox")
+        assert item["kind"] == "parked_call"
+        code = code_of(desk.anyone("prepare", "retry", item["item_id"], "--why", "worth one more"))
+        assert desk.po("set-aside", item["item_id"][:8]).code == 0
+
+        late = desk.po("confirm", code)
+
+        assert late.code == 1 and "stale" in late.printed
+        _, parked, _ = await calling.assignment()
+        assert parked is not None
+        assert await world.column(
+            "SELECT count(*) FROM invocations WHERE retry_authorised_by IS NOT NULL"
+        ) == [0]
+    finally:
+        await calling.close()
+
+
+async def test_a_prepared_resume_lifts_the_pause_it_was_prepared_against_and_no_later_one(
+    desk: Desk,
+) -> None:
+    """3C-2.7."""
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    await world.close("pause", reason="waiting on legal")
+    code = code_of(desk.anyone("prepare", "resume", "F1", "--why", "legal have answered"))
+    await world.close("resume")
+    await world.close("pause", reason="waiting on finance")
+
+    late = desk.po("confirm", code)
+
+    assert late.code == 1 and "stale" in late.printed
+    assert await world.column("SELECT closed_by FROM features") == ["paused"]
+
+
+async def test_a_code_expires_unused_and_is_for_the_project_it_was_prepared_for(
+    desk: Desk, tmp_path: Path
+) -> None:
+    """3C-2.6 and the hour a code is good for."""
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    await world.behaviours.open_project("another", str(world.remote), "next")
+    code = code_of(desk.anyone("prepare", "approve", str(gate), "--why", "it looks right"))
+
+    elsewhere = desk.po("confirm", code, "--project", "another")
+
+    assert elsewhere.code == 1 and f"prepared for {PROJECT}" in elsewhere.printed
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "UPDATE prepared_actions SET expires_at = now() - interval '1 minute'"
+        )
+    expired = desk.po("confirm", code)
+    assert expired.code == 1 and "expired unused" in expired.printed
+    assert "passphrase" not in expired.shown
+    assert "expired unused" in desk.anyone("confirm", code).printed
+    assert await world.column("SELECT state FROM gates") == ["open"]

@@ -20,7 +20,7 @@ from pathlib import Path
 import redis.asyncio as redis
 
 from relay import processes
-from relay.application import authority
+from relay.application import authority, prepared
 from relay.application.boundaries import Boundaries
 from relay.application.boundary_runs import Attempt, BoundaryRuns, RunRefused
 from relay.application.inbox import Inbox
@@ -472,6 +472,106 @@ async def _decide(asked: argparse.Namespace, command: Sequence[str]) -> int:
     return 0 if receipt.disposition == "effective" else 1
 
 
+async def _prepare(asked: argparse.Namespace) -> int:
+    """Record an action for the Product Owner to confirm. It decides nothing, asks for no
+    passphrase and needs no terminal: this is what a model in the session may do."""
+    async with _opened() as (pool, broker):
+        try:
+            project = await select_project(pool, asked.project, os.environ, Path.cwd())
+            relay = await assemble(pool, broker)
+            # Resolved now, against the record as it stands: what cannot be done is
+            # refused here, and what can is kept with the record as it was shown.
+            decision = await deciding.resolve(
+                relay, project, asked.verb, asked.target, asked.text, asked.reason
+            )
+            made = await prepared.prepare(
+                pool, project, asked.verb, asked.target, asked.text, asked.reason,
+                asked.why, decision.shown, decision.basis,
+            )  # fmt: skip
+        except (deciding.CannotDecide, NoProject, NotConfigured, LookupError, ValueError) as no:
+            print(f"relay: {no}", file=sys.stderr)
+            return 1
+    print(f"prepared {made.code}")
+    print(
+        f"Nothing has been decided. The Product Owner confirms it at a terminal of their "
+        f"own, within the hour: `relay confirm {made.code}`"
+    )
+    return 0
+
+
+async def _confirm(asked: argparse.Namespace, command: Sequence[str]) -> int:
+    """The Product Owner takes a prepared action: shown as it was prepared, held to the
+    record as it was then, confirmed by the passphrase. The code is the handle: confirmed,
+    it returns its receipt for good; stale or expired, it does nothing, and says so."""
+    code = asked.code.strip().lower()
+    request_id = f"confirm:{code}"
+    async with _opened() as (pool, broker):
+        try:
+            made = await prepared.find(pool, code)
+            if made is None:
+                raise deciding.CannotDecide(f"nothing was prepared under the code {code!r}")
+            if done := await deciding.receipt_on_record(pool, request_id):
+                print(f"{done.disposition}: {done.outcome} (as on record: this code was confirmed)")
+                return 0
+            if made.ended is not None:
+                raise deciding.CannotDecide(f"{made.ended}. Nothing was done under this code")
+            project = await select_project(
+                pool, asked.project or made.project_id, os.environ, Path.cwd()
+            )
+            if project != made.project_id:
+                raise deciding.CannotDecide(
+                    f"this was prepared for {made.project_id}, and the project meant here is "
+                    f"{project}: nothing is done"
+                )
+            if made.expired:
+                await prepared.end(pool, code, "this expired unused, an hour after it was prepared")
+                raise deciding.CannotDecide(
+                    "this expired unused, an hour after it was prepared. Nothing was done"
+                )
+            relay = await assemble(pool, broker)
+            try:
+                decision = await deciding.resolve(
+                    relay, project, made.verb, made.target, made.said, made.reason
+                )
+                moved = decision.basis != made.basis
+            except deciding.CannotDecide:
+                moved = True
+            if moved:
+                # What it was prepared against is closed, or is no longer what was
+                # shown. That is this code's answer, for good.
+                await prepared.end(
+                    pool, code, "stale: what this was prepared against has changed since"
+                )
+                print(
+                    "stale: nothing changed. What this was prepared against has been "
+                    "decided, or has changed, since it was prepared"
+                )
+                return 1
+            await _handle(pool, command, request_id, "confirm", code, project)
+            print(f"request {request_id}", flush=True)
+            terminal.say(
+                f"Prepared for you to confirm, and nothing of it has been done:\n\n"
+                f"{decision.shown}\nWhy it is proposed: {made.why}\n"
+            )
+            await authority.require(pool, terminal.read_secret("The Product Owner's passphrase: "))
+            receipt = await decision.carry_out(request_id)
+            await wake(pool, relay.installation, project)
+        except (
+            deciding.CannotDecide,
+            NoProject,
+            authority.Refused,
+            terminal.NoTerminal,
+            ActionRefused,
+            IntegrationRefused,
+            NotConfigured,
+            LookupError,
+        ) as refused:
+            print(f"relay: {refused}", file=sys.stderr)
+            return 1
+    print(f"{receipt.disposition}: {receipt.outcome}")
+    return 0 if receipt.disposition == "effective" else 1
+
+
 async def _read(asked: argparse.Namespace) -> int:
     """What may be read by anyone: no terminal, no passphrase, and nothing changed."""
     async with _opened() as (pool, _):
@@ -605,6 +705,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             acting.add_argument("text", metavar="TEXT")
         if "--reason" in takes or "--reason?" in takes:
             acting.add_argument("--reason", required="--reason" in takes)
+    preparing = commands.add_parser(
+        "prepare", help="propose an action for the Product Owner to confirm (decides nothing)"
+    )
+    preparing.add_argument("verb", choices=[each for each in deciding.VERBS if each != "start"])
+    preparing.add_argument("target", metavar="ITEM")
+    preparing.add_argument("text", metavar="TEXT", nargs="?")
+    preparing.add_argument("--reason", help="the reason the action itself carries")
+    preparing.add_argument("--why", required=True, help="why this is proposed")
+    preparing.add_argument("--project", help=which)
+    confirming = commands.add_parser("confirm", help="take a prepared action, with the passphrase")
+    confirming.add_argument("code")
+    confirming.add_argument("--project", help=which)
     feature = commands.add_parser("feature", help="a feature")
     of_feature = feature.add_subparsers(dest="doing", required=True)
     starting = of_feature.add_parser("start", help="start a feature from a stated problem")
@@ -629,6 +741,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(_doctor(asked, given))
         if asked.command in ("status", "inbox", "show", "roadmap", "ledger"):
             return asyncio.run(_read(asked))
+        if asked.command == "prepare":
+            return asyncio.run(_prepare(asked))
+        if asked.command == "confirm":
+            return asyncio.run(_confirm(asked, given))
         if getattr(asked, "verb", None):
             return asyncio.run(_decide(asked, given))
         return asyncio.run(_worker(asked.role))
