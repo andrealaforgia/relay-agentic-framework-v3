@@ -663,6 +663,28 @@ async def test_a_repository_that_cannot_be_reached_leaves_the_intent_for_the_nex
     assert world.trunk() == candidate
 
 
+async def test_a_pass_for_another_project_leaves_this_projects_intent_alone(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-1.3: a pass for one project sends and reconciles nothing of another's, whose
+    own pass may be waiting on its repository."""
+    _, candidate = await ready_to_integrate(world)
+
+    async def unreachable(*_: Any, **__: Any) -> None:
+        raise RemoteUnavailable("no route to host")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Mirror, "_push", unreachable)
+        await world.integrate()
+
+    assert await world.integration.reconcile(project_id="another") == 0
+    assert world.trunk() != candidate
+    assert await world.column("SELECT state FROM integration_intents") == ["outstanding"]
+
+    assert await world.integration.reconcile(project_id=PROJECT) == 1
+    assert world.trunk() == candidate
+
+
 async def test_trunk_moved_by_someone_else_during_the_checks_sends_the_behaviour_for_a_fresh_red(
     world: TrunkWorld,
 ) -> None:
@@ -1114,7 +1136,15 @@ async def test_the_last_answer_to_arrive_settles_an_intent_already_refused(
         )
     [intent_id] = await world.column("SELECT intent_id FROM integration_intents")
 
-    receipt = await world.integration._send_never_left(intent_id, "no descriptors")  # type: ignore[arg-type]
+    send = uuid.uuid4()
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "INSERT INTO integration_sends (send_id, intent_id, heard, reason) "
+            "VALUES (%s, %s, 'never_left', 'no descriptors')",
+            (send, intent_id),
+        )
+
+    receipt = await world.integration._send_never_left(intent_id, "no descriptors", send)  # type: ignore[arg-type]
 
     assert receipt.outcome is Outcome.REJECTED
     assert receipt.reason == "pre-receive hook declined"
@@ -1256,3 +1286,127 @@ async def test_a_project_whose_git_output_cannot_be_closed_does_not_hold_up_anot
     assert await world.column(
         f"SELECT sends_started FROM integration_intents WHERE project_id = '{PROJECT}'"
     ) == [0]
+
+
+async def test_a_refusal_heard_by_a_control_plane_that_was_replaced_is_acted_on_by_its_successor(
+    world: TrunkWorld,
+) -> None:
+    """3C-3.1: the push is in flight when the control plane that sent it is replaced.
+    Git then refuses it, and the only one who hears is the old one. It puts on record
+    what it heard, and is refused the rest. Its successor acts on the record: one
+    refused push for a person to look at, and nothing sent again."""
+    import contextvars
+
+    from relay.application.leadership import Leadership, NotLeader
+
+    base, _ = await ready_to_integrate(world)
+    world.hook_flag("hold").touch()
+    world.hook_flag("refuse-once-let-go").touch()
+    world.hook_flag("reached").unlink(missing_ok=True)  # an earlier update of trunk's
+    ended: list[object] = []
+
+    async def the_old_one() -> None:
+        mine = await Leadership.take(world.database)
+        sending = asyncio.create_task(world.integrate())
+        await world.until_exists(world.hook_flag("reached"))
+        await mine.drop_connection()
+
+        async def the_new_one() -> None:
+            mine = await Leadership.take(world.database)
+            successor = world.integration_with()
+            world.hook_flag("hold").unlink()
+            async with asyncio.timeout(30):
+                while await world.column("SELECT heard FROM integration_sends") != ["refused"]:
+                    await asyncio.sleep(0.05)
+            assert await world.column("SELECT state FROM integration_intents") == ["outstanding"]
+            world.hook_flag("refuse-once-let-go").unlink()  # nothing would refuse a new send
+
+            assert await successor.reconcile() == 1
+            assert await successor.reconcile() == 0
+            await mine.release()
+
+        await asyncio.create_task(the_new_one(), context=contextvars.copy_context())
+        try:
+            ended.append(await sending)
+        except NotLeader as refused:
+            ended.append(refused)
+
+    await asyncio.create_task(the_old_one(), context=contextvars.copy_context())
+
+    assert isinstance(ended[0], NotLeader)
+    assert world.trunk() == base
+    assert await world.state() is BehaviourState.BLOCKED
+    assert await world.column("SELECT state FROM integration_intents") == ["rejected"]
+    assert await world.column(
+        "SELECT sends_started || ':' || sends_resolved FROM integration_intents"
+    ) == ["1:1"]
+    assert await world.column("SELECT counted FROM integration_sends") == [True]
+    assert (await world.events()).count("integration.rejected") == 1
+
+
+async def test_an_answer_to_a_send_is_acted_on_once_however_often_it_is_reported(
+    world: TrunkWorld,
+) -> None:
+    """The hearer and a pass may both come to act on one answer: it counts once."""
+    await ready_to_integrate(world)
+    world.hook_flag("refuse").touch()
+    refused = await world.integrate()
+    [intent] = await world.column("SELECT intent_id FROM integration_intents")
+    [send] = await world.column("SELECT send_id FROM integration_sends")
+
+    again = await world.integration._refused(intent, "said again", sent=True, send_id=send)  # type: ignore[arg-type]
+
+    assert again == refused
+    assert await world.column(
+        "SELECT sends_started || ':' || sends_resolved FROM integration_intents"
+    ) == ["1:1"]
+    assert await world.column("SELECT heard || ':' || counted FROM integration_sends") == [
+        "refused:true"
+    ]
+
+
+async def test_a_refusal_counted_late_while_another_send_is_unanswered_settles_and_sends_nothing(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two sends in flight, as in the test above set directly. One was refused, heard by
+    a control plane that could not act on it. The pass counts that answer once, however
+    often it runs: the intent stays owed to the send that may still land, the project
+    stays taken, and nothing is sent a third time."""
+    base, _ = await ready_to_integrate(world)
+
+    async def dies(*_: Any, **__: Any) -> None:
+        raise Crash
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Mirror, "advance", dies)
+        with pytest.raises(Crash):
+            await world.integrate()
+    [intent_id] = await world.column("SELECT intent_id FROM integration_intents")
+    async with world.database.connection() as connection:
+        await connection.execute("UPDATE integration_intents SET sends_started = 2")
+        await connection.execute(
+            "INSERT INTO integration_sends (send_id, intent_id, heard, reason) VALUES "
+            "(%s, %s, 'refused', 'pre-receive hook declined'), (%s, %s, NULL, NULL)",
+            (uuid.uuid4(), intent_id, uuid.uuid4(), intent_id),
+        )
+    sent: list[object] = []
+
+    async def no_send(*arguments: Any, **__: Any) -> None:
+        sent.append(arguments)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Mirror, "_push", no_send)
+        assert await world.integration.reconcile() == 0
+        assert await world.integration.reconcile() == 0
+        [heard] = await world.column(
+            "SELECT send_id FROM integration_sends WHERE heard = 'refused'"
+        )
+        await world.integration._refused(intent_id, "said again", sent=True, send_id=heard)  # type: ignore[arg-type]
+
+    assert sent == []
+    assert world.trunk() == base
+    assert await world.column(
+        "SELECT state || ':' || sends_started || ':' || sends_resolved || ':' || refusal "
+        "FROM integration_intents"
+    ) == ["outstanding:2:1:pre-receive hook declined"]
+    assert (await world.events()).count("integration.refusal_left_unsettled") == 1

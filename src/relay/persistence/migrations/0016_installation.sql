@@ -25,3 +25,20 @@ INSERT INTO installation (installation_id) VALUES (gen_random_uuid());
 -- started under an earlier term than the one there is now is nobody's: whoever started
 -- it can no longer say it is done.
 ALTER TABLE invocation_effects ADD COLUMN term bigint;
+
+-- Each send of an intent, recorded before it leaves. What Git said to it is recorded
+-- here once, by whoever hears it, whatever term it is by then: that a send was refused
+-- is a fact and not a decision. What follows from it is decided by the control plane of
+-- the day, which counts each answer once.
+CREATE TABLE integration_sends (
+    send_id    uuid PRIMARY KEY,
+    intent_id  uuid NOT NULL REFERENCES integration_intents,
+    heard      text CHECK (heard IN ('refused', 'never_left')),
+    reason     text,
+    counted    boolean NOT NULL DEFAULT false,
+    started_at timestamptz NOT NULL DEFAULT now(),
+    CHECK ((heard IS NULL) = (reason IS NULL)),
+    CHECK (NOT counted OR heard IS NOT NULL)
+);
+
+CREATE INDEX integration_sends_of_intent ON integration_sends (intent_id);

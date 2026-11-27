@@ -50,7 +50,8 @@ GREETING = ProcessContract(
     baseline=Baseline(exit_code=0, stdout="none\n"),
 )
 # Refuses any update of trunk while `refuse` exists beside the hook, and holds one while
-# `hold` exists. Other refs pass untouched, so candidates can still be published.
+# `hold` exists, refusing it when let go if `refuse-once-let-go` exists. Other refs pass
+# untouched, so candidates can still be published.
 _PRE_RECEIVE = """#!/bin/sh
 here="$(dirname "$0")"
 while read old new ref; do
@@ -58,6 +59,7 @@ while read old new ref; do
     if [ -e "$here/refuse" ]; then echo "trunk is closed" >&2; exit 1; fi
     touch "$here/reached"
     while [ -e "$here/hold" ]; do sleep 0.05; done
+    if [ -e "$here/refuse-once-let-go" ]; then echo "trunk is closed" >&2; exit 1; fi
   fi
 done
 exit 0

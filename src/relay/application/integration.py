@@ -881,6 +881,7 @@ class Integration:
         async with self._pool.connection() as connection:
             intent = await _intent(connection, intent_id)
         sent = False
+        send_id = uuid.uuid4()
 
         async def count_the_send() -> bool:
             nonlocal sent
@@ -895,6 +896,10 @@ class Integration:
                     "UPDATE integration_intents SET sends_started = sends_started + 1 "
                     "WHERE intent_id = %s",
                     (intent_id,),
+                )
+                await connection.execute(
+                    "INSERT INTO integration_sends (send_id, intent_id) VALUES (%s, %s)",
+                    (send_id, intent_id),
                 )
             sent = True
             return True
@@ -912,10 +917,12 @@ class Integration:
         except NotFastForward as never_sendable:
             return await self._refused(intent_id, str(never_sendable), sent=False)
         except RemoteRejected as refused:
-            return await self._refused_by_the_repository(intent, str(refused)[:500])
+            await self._heard(send_id, "refused", str(refused)[:500])
+            return await self._refused_by_the_repository(intent, str(refused)[:500], send_id)
         except NotStarted as never_ran:
             if sent:
-                return await self._send_never_left(intent_id, str(never_ran)[:500])
+                await self._heard(send_id, "never_left", str(never_ran)[:500])
+                return await self._send_never_left(intent_id, str(never_ran)[:500], send_id)
             return IntegrationReceipt(Outcome.PENDING, intent["batch_id"], str(never_ran)[:500])
         except CheckoutFailed as failure:
             if sent:
@@ -926,6 +933,39 @@ class Integration:
             async with self._pool.connection() as connection:
                 return _receipt_of(await _intent(connection, intent_id))
         return await self._converged(intent_id)
+
+    async def _heard(self, send_id: uuid.UUID, heard: str, reason: str) -> None:
+        """Put on record what Git said to one send. Not fenced by the term, and taking
+        no lock of the workflow's: whoever sent it is the only one who will ever hear,
+        and may by now be a control plane that has been replaced. Nothing is decided
+        here. The control plane of the day counts it (`_count_what_was_heard`)."""
+        async with self._pool.connection() as connection:
+            await connection.execute(
+                "UPDATE integration_sends SET heard = %s, reason = %s "
+                "WHERE send_id = %s AND heard IS NULL",
+                (heard, reason, send_id),
+            )
+
+    async def _count_what_was_heard(self, intent_id: uuid.UUID) -> IntegrationReceipt | None:
+        """Answers on record that nobody has acted on: heard by a control plane that was
+        refused before it could. Each is counted now, once, as its hearer would have."""
+        async with self._pool.connection() as connection:
+            heard = await (
+                await connection.execute(
+                    "SELECT send_id, heard, reason FROM integration_sends WHERE intent_id = %s "
+                    "AND heard IS NOT NULL AND NOT counted ORDER BY started_at",
+                    (intent_id,),
+                )
+            ).fetchall()
+        receipt = None
+        for send in heard:
+            if send["heard"] == "refused":
+                receipt = await self._refused(
+                    intent_id, send["reason"], sent=True, send_id=send["send_id"]
+                )
+            else:
+                receipt = await self._send_never_left(intent_id, send["reason"], send["send_id"])
+        return receipt
 
     async def _recover_the_pin(self, intent: dict[str, Any]) -> None:
         """A mirror can be lost between authorisation and the push. The candidate was
@@ -949,7 +989,9 @@ class Integration:
         ):
             raise CheckoutFailed("the authorised commit can no longer be obtained")
 
-    async def _send_never_left(self, intent_id: uuid.UUID, reason: str) -> IntegrationReceipt:
+    async def _send_never_left(
+        self, intent_id: uuid.UUID, reason: str, send_id: uuid.UUID
+    ) -> IntegrationReceipt:
         """The send was counted and then Git is known never to have run. That send does
         not exist, so it is answered. If it was the last one unanswered and a refusal is
         already on record, the intent is settled by that refusal now."""
@@ -959,7 +1001,7 @@ class Integration:
                 connection, located["project_id"], located["behaviour_id"]
             )
             intent = await _locked_intent(connection, intent_id)
-            if intent["state"] != "outstanding":
+            if not await _counted_now(connection, send_id) or intent["state"] != "outstanding":
                 return _receipt_of(intent)
             answered = intent["sends_resolved"] + 1
             await connection.execute(
@@ -980,7 +1022,7 @@ class Integration:
         return IntegrationReceipt(Outcome.PENDING, intent["batch_id"], reason)
 
     async def _refused_by_the_repository(
-        self, intent: dict[str, Any], reason: str
+        self, intent: dict[str, Any], reason: str, send_id: uuid.UUID
     ) -> IntegrationReceipt:
         """A refusal may only mean trunk has moved. One fresh reading says whether it has:
         if so, no push under this intent can land any more, whatever is still in flight."""
@@ -992,7 +1034,7 @@ class Integration:
             return await self._converged(intent["intent_id"])
         if reading is TrunkReading.CONFLICT:
             return await self._conflicted(intent["intent_id"], head)
-        return await self._refused(intent["intent_id"], reason, sent=True)
+        return await self._refused(intent["intent_id"], reason, sent=True, send_id=send_id)
 
     async def _read_trunk(self, intent: dict[str, Any]) -> tuple[TrunkReading, str]:
         seen = await self._mirror(intent["project_id"]).read_ref(
@@ -1026,6 +1068,13 @@ class Integration:
                 intent["batch_id"],
                 f"trunk was read at {head}, which is not at or beyond the expected head",
             )
+        if await self._count_what_was_heard(intent_id) is not None:
+            # An answer its hearer could not act on, acted on now. What the intent is
+            # after that is read again: settled, or refused and waiting.
+            async with self._pool.connection() as connection:
+                intent = await _intent(connection, intent_id)
+            if intent["state"] != "outstanding":
+                return _receipt_of(intent)
         if intent["refusal"] is not None:
             # Refused once already, with an earlier send still unanswered. Sending again
             # would learn nothing; only trunk moving can settle this.
@@ -1095,7 +1144,7 @@ class Integration:
             return IntegrationReceipt(Outcome.INTEGRATED, intent["batch_id"])
 
     async def _refused(
-        self, intent_id: uuid.UUID, reason: str, *, sent: bool
+        self, intent_id: uuid.UUID, reason: str, *, sent: bool, send_id: uuid.UUID | None = None
     ) -> IntegrationReceipt:
         async with self._pool.connection() as connection, connection.transaction():
             located = await _intent(connection, intent_id)
@@ -1103,6 +1152,8 @@ class Integration:
                 connection, located["project_id"], located["behaviour_id"]
             )
             intent = await _locked_intent(connection, intent_id)
+            if send_id is not None and not await _counted_now(connection, send_id):
+                return _receipt_of(intent)  # this answer has been acted on already
             if intent["state"] != "outstanding":
                 return _receipt_of(intent)
             answered = intent["sends_resolved"] + (1 if sent else 0)
@@ -1497,6 +1548,15 @@ async def _close_batch(
 
 
 _INTENT_QUERY = "SELECT i.* FROM integration_intents i WHERE i.intent_id = %s"
+
+
+async def _counted_now(connection: Connection, send_id: uuid.UUID) -> bool:
+    """Take one send's answer to act on. False if it has been acted on already."""
+    cursor = await connection.execute(
+        "UPDATE integration_sends SET counted = true WHERE send_id = %s AND NOT counted",
+        (send_id,),
+    )
+    return cursor.rowcount == 1
 
 
 async def _intent(connection: Connection, intent_id: uuid.UUID) -> dict[str, Any]:

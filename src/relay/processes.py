@@ -82,6 +82,7 @@ async def control_plane(
         try:
             await connection.set_autocommit(True)
             await connection.execute(f"LISTEN {channel(relay.installation)}")
+            listening_now.set()
             async for notice in connection.notifies():
                 if notice.payload in woken:
                     woken[notice.payload].set()
@@ -92,9 +93,12 @@ async def control_plane(
                 await connection.close()
             await relay.pool.putconn(connection)
 
-    woken_for_all = asyncio.Event()
+    woken_for_all, listening_now = asyncio.Event(), asyncio.Event()
     listening = asyncio.create_task(listen())
     try:
+        # Before the first pass: a wake sent while that pass runs is then heard, and
+        # makes one more pass follow it.
+        await listening_now.wait()
         try:
             await relay.features.start()
         except NotLeader as over:

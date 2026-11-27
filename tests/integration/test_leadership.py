@@ -210,3 +210,96 @@ async def test_every_process_but_the_control_plane_wakes_it_and_runs_no_pass(
         await listening.execute("UNLISTEN *")
         await listening.set_autocommit(False)
         await database.putconn(listening)
+
+
+class Passes:
+    """Stands where the pass does, and says when it was run and for which project."""
+
+    def __init__(self) -> None:
+        self.run: list[str] = []
+        self.again = asyncio.Event()
+
+    async def start(self) -> None:
+        return None
+
+    async def reconcile(self, project_id: str, *, starting: bool = False) -> None:
+        self.run.append(project_id)
+        self.again.set()
+
+
+async def serving(database: AsyncConnectionPool, broker: Any, every: float) -> Any:
+    from types import SimpleNamespace
+
+    from relay.application.leadership import installation_of
+    from relay.transport.streams import Streams
+
+    async with database.connection() as connection:
+        installation = await installation_of(connection)
+        await connection.execute(
+            "INSERT INTO projects (project_id, repository, trunk) VALUES ('alpha', 'r', 'main')"
+        )
+    return SimpleNamespace(
+        pool=database,
+        installation=installation,
+        features=Passes(),
+        streams=Streams(broker, prefix=installation),
+        invocations=Invocations(database),
+    )
+
+
+@pytest.mark.parametrize("every, woken", [(600.0, True), (0.2, False)])
+async def test_the_control_plane_runs_a_projects_pass_when_woken_and_on_its_timer_when_not(
+    database: AsyncConnectionPool, broker: Any, every: float, woken: bool
+) -> None:
+    """A wake is what makes work taken up soon. A wake that is lost costs only time:
+    the timer runs the pass anyway."""
+    from relay import processes
+    from relay.runtime import wake
+
+    relay = await serving(database, broker, every)
+    stop = asyncio.Event()
+
+    async def the_control_plane() -> None:
+        await processes.control_plane(relay, broker, stop, every=every)
+
+    running = asyncio.create_task(the_control_plane(), context=contextvars.copy_context())
+    try:
+        async with asyncio.timeout(20):
+            await relay.features.again.wait()  # the first pass, at start
+            relay.features.again.clear()
+            if woken:
+                await wake(database, relay.installation, "alpha")
+            await relay.features.again.wait()
+        assert relay.features.run == ["alpha", "alpha"]
+    finally:
+        stop.set()
+        await running
+        await broker.delete(processes._marker(relay.installation))
+
+
+async def test_only_the_control_plane_is_assembled_with_a_pass_that_runs(
+    database: AsyncConnectionPool, broker: Any, tmp_path: Path, runner_image: str
+) -> None:
+    """3C-1.1: whatever a worker or a command calls that would run a pass, a decision's
+    reconfirmations among them, wakes the control plane. And an installation that has
+    not been told where its work is kept says so."""
+    from relay.application.features import Features
+    from relay.runtime import Elsewhere, NotConfigured, assemble, configure
+
+    with pytest.raises(NotConfigured, match="relay init"):
+        await assemble(database, broker)
+    await configure(
+        database, workspaces=str(tmp_path / "w"), mirrors=str(tmp_path / "m"), image=runner_image
+    )
+    try:
+        elsewhere = await assemble(database, broker)
+        leading = await assemble(database, broker, control_plane=True)
+
+        assert type(elsewhere.features) is Elsewhere
+        assert elsewhere.features.installation == elsewhere.installation
+        assert type(leading.features) is Features
+        assert elsewhere.decisions._features is elsewhere.features
+    finally:
+        from relay.git.checkout import name_attempts_under
+
+        name_attempts_under("")

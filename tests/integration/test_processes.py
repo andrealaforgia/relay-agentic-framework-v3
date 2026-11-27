@@ -64,8 +64,10 @@ SCRIPT = {
 class Running:
     """The processes of one installation, as an operator would have started them."""
 
-    def __init__(self, world: CompletionWorld, namespace: str, tmp_path: Path) -> None:
-        self.world, self.tmp = world, tmp_path
+    def __init__(
+        self, world: CompletionWorld, namespace: str, tmp_path: Path, broker: redis.Redis
+    ) -> None:
+        self.world, self.tmp, self.broker = world, tmp_path, broker
         self.environment = {
             **os.environ,
             "RELAY_DATABASE_URL": DATABASE_URL,
@@ -171,7 +173,7 @@ async def running(
                 None,
             )
         )
-    running = Running(world, namespace, tmp_path)
+    running = Running(world, namespace, tmp_path, broker)
     running.installation = row["id"]
     yield running
     running.stop_all()
@@ -188,7 +190,9 @@ async def test_a_feature_is_delivered_between_processes_and_through_a_change_of_
     control plane does both. And a control plane whose lock connection is cut, alive, is
     replaced: the second one finishes the feature, and the first stops by itself."""
     world = running.world
-    first = running.start("up", "--every", "2")
+    # A timer far longer than the test: every step that needs the control plane is
+    # taken up because it was woken, by a worker or by a person's command.
+    first = running.start("up", "--every", "600")
     for role in ROLES:
         running.start("worker", "start", "--role", role)
     await world.stories.open_feature(PRODUCT_OWNER, PROJECT, "F1", "prices need VAT")
@@ -207,7 +211,7 @@ async def test_a_feature_is_delivered_between_processes_and_through_a_change_of_
         "SELECT pg_terminate_backend(l.pid) FROM pg_locks l WHERE l.locktype = 'advisory' "
         "AND l.objsubid = 2 AND l.granted AND l.pid <> pg_backend_pid()"
     )
-    second = running.start("up", "--every", "2")
+    second = running.start("up", "--every", "600")
 
     await running.until("a new term is open", "SELECT term FROM installation", 2)
     await running.until(
@@ -234,3 +238,17 @@ async def test_a_feature_is_delivered_between_processes_and_through_a_change_of_
     assert await world.column(
         "SELECT count(*) FROM events WHERE event_type = 'behaviour.green_verified'"
     ) == [1]
+    # Every effect that is the control plane's was carried out under a term: by a
+    # control plane, and by no worker's own pass.
+    assert await world.column(
+        "SELECT count(*) FROM invocation_effects WHERE name IN ('publish', 'green')"
+    ) == [2]
+    assert await world.column(
+        "SELECT count(*) FROM invocation_effects WHERE name IN ('publish', 'green') "
+        "AND term IS NULL"
+    ) == [0]
+    # And commands travelled on streams named under the installation.
+    streams = [
+        key async for key in running.broker.scan_iter(f"{running.installation}:*", _type="stream")
+    ]
+    assert streams != []

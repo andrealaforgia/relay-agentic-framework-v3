@@ -768,6 +768,17 @@ async def test_a_candidate_the_control_plane_finds_not_green_is_handed_back_with
     provider = Builder(WRONG, RIGHT)
     worker = await building.worker(provider)
     assert await worker.carry_out(await building.owed()) == "handed_on"
+    # 3C-2.1: the worker published nothing and observed nothing. Its result is kept.
+    assert await building.states() == ["returned"]
+    assert await building.world.column("SELECT count(*) FROM build_attempts") == [0]
+    assert await building.world.column("SELECT count(*) FROM green_runs") == [0]
+    async with building.world.database.connection() as connection:
+        invocation = await (await connection.execute("SELECT * FROM invocations")).fetchone()
+    assert invocation is not None
+    assert {each.name: each.by for each in building.task.effects(invocation)} == {
+        "publish": "control-plane",
+        "green": "control-plane",
+    }
     await building.world.column("UPDATE outbox SET published_at = now() RETURNING 1")
 
     await building.invocations.recover(PROJECT)
