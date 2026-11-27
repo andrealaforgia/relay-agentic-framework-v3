@@ -530,6 +530,10 @@ async def _confirm(asked: argparse.Namespace, command: Sequence[str]) -> int:
                 )
             relay = await assemble(pool, broker)
             try:
+                # Resolved against the record as it stands, and compared with the record
+                # as it was prepared against: if it has moved, the code is stale. What is
+                # then carried out is held, where the service decides it, to the record
+                # as it has just been shown.
                 decision = await deciding.resolve(
                     relay, project, made.verb, made.target, made.said, made.reason
                 )

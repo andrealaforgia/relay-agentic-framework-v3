@@ -419,3 +419,87 @@ async def test_a_story_at_its_gate_or_at_work_is_rejected_saying_why(desk: Desk)
     assert rejected.code == 0, rejected.printed
     assert "it does not do what was asked" in rejected.shown
     assert await world.story("S1") is StoryState.REJECTED
+
+
+async def test_a_story_being_worked_on_is_rejected_as_it_stands_when_the_person_is_shown_it(
+    desk: Desk,
+) -> None:
+    """A story at work is not one fixed thing, as a gate is: the rejection names the
+    revision and the decisions it stood under, read when the person is shown it."""
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    assert await world.story("S1") is StoryState.RELEASED
+
+    unsaid = desk.po("reject", "nonesuch", "--reason", "no such story")
+    rejected = desk.po("reject", "S1", "--reason", "the outcome is the wrong one")
+
+    assert unsaid.code == 1 and "there is no story of that name" in unsaid.printed
+    assert rejected.code == 0, rejected.printed
+    assert "which is being worked on" in rejected.shown and "at revision 1" in rejected.shown
+    assert await world.story("S1") is StoryState.REJECTED
+
+
+def meanwhile(namespace: str, *actions: tuple[str, str]) -> Any:
+    """Someone else pauses, resumes or cancels F1 while the person is at the prompt: done
+    from a thread of its own, with a connection of its own, as another command would."""
+    import asyncio
+    import threading
+    import uuid
+
+    from relay.application.stories import close_feature
+    from relay.domain.story import HumanAction
+    from relay.persistence.database import open_pool
+    from tests.integration.conftest import DATABASE_URL
+    from tests.integration.fixtures import PRODUCT_OWNER
+
+    async def done() -> None:
+        async with open_pool(DATABASE_URL, schema=namespace) as pool:
+            for action, reason in actions:
+                payload = {"reason": reason} if reason else {}
+                await close_feature(
+                    pool,
+                    PROJECT,
+                    HumanAction(PRODUCT_OWNER, str(uuid.uuid4()), "F1", action, payload),
+                )
+
+    def as_another_command() -> None:
+        other = threading.Thread(target=lambda: asyncio.run(done()))
+        other.start()
+        other.join()
+
+    return as_another_command
+
+
+async def test_a_decision_is_held_to_what_was_shown_while_the_person_looked_at_it(
+    desk: Desk, namespace: str
+) -> None:
+    """3C-2.7, in the window that matters: the person is shown the feature and takes
+    their time over the passphrase. Someone resumes it and pauses it again meanwhile.
+    The resume they then confirm names a pause that is over, and lifts nothing. The same
+    for a cancel prepared earlier and confirmed after the feature has moved."""
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    await world.close("pause", reason="waiting on legal")
+
+    resumed = at_a_terminal(
+        ["resume", "F1"],
+        [PASSPHRASE],
+        desk.shell,
+        desk.here,
+        before_typing=meanwhile(namespace, ("resume", ""), ("pause", "waiting on finance")),
+    )
+
+    assert resumed.code == 1 and "stale" in resumed.printed, resumed.printed
+    assert await world.column("SELECT closed_by FROM features") == ["paused"]
+
+    code = code_of(desk.anyone("prepare", "cancel", "F1", "--reason", "dropped", "--why", "asked"))
+    cancelled = at_a_terminal(
+        ["confirm", code],
+        [PASSPHRASE],
+        desk.shell,
+        desk.here,
+        before_typing=meanwhile(namespace, ("resume", "")),
+    )
+
+    assert cancelled.code == 1 and "stale" in cancelled.printed, cancelled.printed
+    assert await world.column("SELECT closed_by, state FROM features") == [None]

@@ -9,7 +9,7 @@ import subprocess
 import sys
 import termios
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +30,7 @@ def at_a_terminal(
     environment: Mapping[str, str],
     directory: Path,
     within: float = 60.0,
+    before_typing: Callable[[], None] | None = None,
 ) -> Ran:
     """Run `relay <command>` with a controlling terminal of its own, typing each of
     `typed` when the terminal asks for something (a prompt ending in a colon)."""
@@ -80,6 +81,9 @@ def at_a_terminal(
                 time.sleep(0.02)
             if to_type and shown.count(b": ") > answered and shown.rstrip(b" ").endswith(b":"):
                 answered = shown.count(b": ")
+                if before_typing is not None:
+                    # What happens while the person is looking at what they were shown.
+                    before_typing()
                 os.write(master, to_type.pop(0).encode() + b"\n")
         return Ran(child.wait(timeout=10), printed.decode(), shown.decode().replace("\r\n", "\n"))
     finally:

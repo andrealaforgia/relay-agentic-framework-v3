@@ -293,6 +293,15 @@ ON_A_FEATURE = {
     "lift": frozenset({"closure"}),
     "cancel": frozenset({"reason"}),
 }
+# The same three as a command makes them: each names the feature as the person was shown
+# it (its state, whether and by which pause it is closed), and is held to that where it
+# is decided. A feature that is no longer as it was shown is not paused, resumed or
+# cancelled on the strength of what was shown.
+ON_A_FEATURE_AS_SEEN = {
+    "pause": frozenset({"reason", "as_seen"}),
+    "lift": frozenset({"closure", "as_seen"}),
+    "cancel": frozenset({"reason", "as_seen"}),
+}
 # Starting a feature: the problem it starts from, said by the Product Owner.
 IN_A_PROJECT = {"start": frozenset({"problem"})}
 

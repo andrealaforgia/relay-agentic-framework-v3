@@ -53,6 +53,7 @@ from relay.domain.story import (
     HOLDING_THE_SLOT,
     IN_A_PROJECT,
     ON_A_FEATURE,
+    ON_A_FEATURE_AS_SEEN,
     ON_A_STORY,
     ActionRefused,
     Candidate,
@@ -699,6 +700,12 @@ async def _open_feature_in(
     )
 
 
+def standing_of(feature: Mapping[str, Any], closure: int | None) -> str:
+    """How a feature stands, as one thing a decision can be held to: its state, whether
+    it is closed, and by which pause."""
+    return f"{feature['state']}/{feature['closed_by'] or 'open'}/{closure or '-'}"
+
+
 async def closure_in(connection: Connection, project_id: str, feature_id: str) -> int | None:
     """Which pause a paused feature is closed by: the place in the ledger of the event
     that paused it. None if it is not paused. Two pauses are two closures."""
@@ -720,7 +727,9 @@ async def close_feature(pool: Pool, project_id: str, action: HumanAction) -> Rec
     the project's gate lock exclusively, so by the time it commits no transaction
     that authorises work is in flight, and every later one sees the closure."""
     require_human(action.principal)
-    require_well_formed(action, ON_A_FEATURE)
+    require_well_formed(
+        action, ON_A_FEATURE_AS_SEEN if "as_seen" in action.payload else ON_A_FEATURE
+    )
     feature_id = action.target
     # A feature's id is its project's own. The receipt is for this project's feature, so
     # the same request sent to another project is a different action, not a replay.
@@ -732,6 +741,17 @@ async def close_feature(pool: Pool, project_id: str, action: HumanAction) -> Rec
         if (seen := answer_again(action, await _recorded(connection, action))) is not None:
             return seen
         closed_by = feature["closed_by"]
+        if "as_seen" in action.payload:
+            now = standing_of(feature, await closure_in(connection, project_id, feature_id))
+            if now != action.payload["as_seen"]:
+                # Decided on what a person was shown, which is no longer how it is:
+                # paused, resumed, moved on or cancelled since.
+                receipt = Receipt(
+                    "stale",
+                    "nothing changed: the feature is no longer as it was when this was shown",
+                )
+                await _record(connection, action, receipt)
+                return receipt
         lifting = action.action == "lift"
         if lifting and closed_by == PAUSED:
             closure = await closure_in(connection, project_id, feature_id)

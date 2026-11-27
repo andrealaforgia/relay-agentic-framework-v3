@@ -23,7 +23,7 @@ from relay.application.inbox import (
     Inbox,
     Item,
 )
-from relay.application.stories import closure_in
+from relay.application.stories import closure_in, standing_of
 from relay.domain.story import HumanAction, Principal, PrincipalKind, Receipt
 from relay.runtime import Relay
 
@@ -185,18 +185,30 @@ async def _on_a_feature(
         )
     )
 
+    basis = standing_of(feature, closure)
+    # Held, in the transaction that decides, to the feature as the person is shown it
+    # now: they may take their time over the passphrase, and it may move meanwhile.
+    held_to = basis
+
     async def carry_out(request_id: str) -> Receipt:
         if verb == "resume":
             action = HumanAction(
-                PRODUCT_OWNER, request_id, feature_id, "lift", {"closure": str(closure)}
+                PRODUCT_OWNER,
+                request_id,
+                feature_id,
+                "lift",
+                {"closure": held_to.rsplit("/", 1)[-1], "as_seen": held_to},
             )
         else:
             action = HumanAction(
-                PRODUCT_OWNER, request_id, feature_id, verb, {"reason": (reason or "").strip()}
+                PRODUCT_OWNER,
+                request_id,
+                feature_id,
+                verb,
+                {"reason": (reason or "").strip(), "as_seen": held_to},
             )
         return await relay.features.close(project_id, action)
 
-    basis = f"{feature_id}:{standing}:{closure}"
     return Decision(
         verb, shown, f"{project_id}:{verb}:{feature_id}:{reason or ''}:{closure}", basis, carry_out
     )

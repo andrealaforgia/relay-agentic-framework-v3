@@ -257,3 +257,36 @@ async def test_starting_a_feature_is_a_request_with_a_receipt_that_names_it(
         await world.stories.start_feature(PROJECT, by("r-1", "", "start", problem="another"))
     with pytest.raises(ActionRefused):
         await world.stories.start_feature(PROJECT, by("r-2", "", "start", problem="  "))
+
+
+async def test_a_feature_is_paused_or_cancelled_only_as_it_was_when_the_person_was_shown_it(
+    world: DecisionWorld,
+) -> None:
+    """3C-2.7, where it is decided: the command sends how the feature stood when it was
+    shown, and the service compares that under the feature's lock. This is what holds a
+    prepared action in the moment between its being looked at again and its being
+    carried out."""
+    from relay.application.stories import standing_of
+
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    async with world.database.connection() as connection:
+        feature = await (
+            await connection.execute("SELECT state, closed_by FROM features")
+        ).fetchone()
+    assert feature is not None
+    shown = standing_of(feature, None)
+    await world.close("pause", reason="paused by someone else meanwhile")
+
+    cancelled = await world.close("cancel", reason="as I saw it", as_seen=shown)
+    paused = await world.close("pause", reason="as I saw it", as_seen=shown)
+
+    assert cancelled.disposition == "stale" and "no longer as it was" in cancelled.outcome
+    assert paused.disposition == "stale"
+    assert await world.column("SELECT closed_by FROM features") == ["paused"]
+    async with world.database.connection() as connection:
+        now = await (await connection.execute("SELECT state, closed_by FROM features")).fetchone()
+        closure = await closure_in(connection, PROJECT, "F1")
+    assert now is not None
+    assert await world.close(
+        "cancel", reason="as it is now", as_seen=standing_of(now, closure)
+    ) == Receipt("effective", "cancelled")
