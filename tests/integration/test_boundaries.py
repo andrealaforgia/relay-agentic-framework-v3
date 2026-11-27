@@ -33,6 +33,7 @@ async def test_a_boundary_holds_once_it_has_been_seen_to(database: AsyncConnecti
         row = await (await connection.execute("SELECT * FROM boundary_passes")).fetchone()
     assert row is not None
     assert (row["role"], row["runtime"]) == ("builder", RUNTIME)
+    assert row["cost_usd"] == Decimal("0.005")  # what the run cost is kept with it
     assert row["observations"] == [
         {"probe": "a file in the workspace is read", "passed": True, "saw": "INSIDE"}
     ]

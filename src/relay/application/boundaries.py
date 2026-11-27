@@ -33,7 +33,7 @@ class Boundaries:
         async with self._pool.connection() as connection, connection.transaction():
             await connection.execute(
                 "INSERT INTO boundary_passes (pass_id, digest, role, runtime, observations, "
-                "passed, observed_at) VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "passed, observed_at, cost_usd) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (pass_id) DO NOTHING",
                 (
                     result.run_id,
@@ -43,6 +43,7 @@ class Boundaries:
                     Jsonb(as_recorded(result)),
                     result.passed,
                     result.observed_at,
+                    result.cost_usd,
                 ),
             )
         if not result.passed:

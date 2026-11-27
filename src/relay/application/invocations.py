@@ -399,7 +399,9 @@ class Invocations:
                 )
             if not live:
                 pass
-            elif state == "not_started":
+            elif state == "not_started" and assignment["grant_id"] == invocation["grant_id"]:
+                # Its own grant, and nobody else's: the work may have been claimed again
+                # since, by a worker that has not yet been admitted a call of its own.
                 await _release(connection, assignment)
             elif state == "uncertain":
                 await _park(connection, assignment, invocation_id, _UNCERTAIN)

@@ -20,6 +20,7 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import signal
 import tempfile
 import uuid
@@ -112,6 +113,17 @@ class Capabilities:
     flags: frozenset[str] = field(default_factory=frozenset)
 
 
+# How long the CLI is given to say its version or its help.
+_ASKING_FOR = 30.0
+
+
+def resolved(binary: str) -> str:
+    """The file a name leads to now, every link followed; the name itself if it leads
+    nowhere, which then fails where it is launched."""
+    found = shutil.which(binary)
+    return os.path.realpath(found) if found else binary
+
+
 class ClaudeAdapter:
     name = "claude"
 
@@ -121,7 +133,11 @@ class ClaudeAdapter:
         environment: Mapping[str, str] | None = None,
         grace: float = 2.0,
     ) -> None:
-        self._binary = binary
+        # The installation itself, found once: where the name leads when this adapter is
+        # made, with every link followed. An update that points the name at another
+        # version does not change what this adapter launches, and the version asked, the
+        # pass recorded and the run launched are all of this one file.
+        self._binary = resolved(binary)
         # Given nothing, a run gets nothing of the supervisor's but what it needs to start.
         self._environment = dict(
             {name: value for name, value in os.environ.items() if name in _NEEDED_TO_START}
@@ -131,6 +147,11 @@ class ClaudeAdapter:
         # How long a run that has reported its result is given to exit by itself.
         self._grace = grace
         self._capabilities: Capabilities | None = None
+
+    @property
+    def executable(self) -> str:
+        """The file this adapter launches and asks."""
+        return self._binary
 
     async def capabilities(self) -> Capabilities:
         """What the installed CLI says of itself. Asked once."""
@@ -156,7 +177,15 @@ class ClaudeAdapter:
             )
         except OSError as failure:
             raise ProviderUnavailable(f"the Claude CLI could not be run: {failure}") from None
-        answered, _ = await process.communicate()
+        try:
+            answered, _ = await asyncio.wait_for(process.communicate(), _ASKING_FOR)
+        except TimeoutError:
+            # It started and does not answer. It is not waited for for ever, and not
+            # left behind either.
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+            raise ProviderUnavailable(f"the Claude CLI did not answer {flag} in time") from None
         if process.returncode != 0:
             raise ProviderUnavailable(f"the Claude CLI did not answer {flag}")
         return answered.decode(errors="replace")

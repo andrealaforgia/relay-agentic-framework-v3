@@ -876,3 +876,25 @@ async def test_what_was_set_up_for_a_call_is_let_go_of_whatever_became_of_the_ca
 
     bench.boundaries.holding = False
     assert (await worker.carry_out(await bench.owed())).startswith(("refused", "finished"))
+
+
+async def test_a_host_whose_policy_cannot_be_read_launches_nothing_and_keeps_no_grant(
+    bench: Bench,
+) -> None:
+    """3B-S4-3.7: a managed settings file that became unreadable says nothing of what
+    bounds a run. The work goes back to be taken up when it can be read."""
+    provider = Scripted(said())
+    worker = await bench.worker(provider)
+
+    def unreadable() -> dict[str, str]:
+        raise PermissionError(13, "Permission denied", "/Library/managed-settings.json")
+
+    worker._runtime = unreadable
+
+    left = await worker.carry_out(await bench.owed())
+
+    assert left.startswith("refused: what bounds a run on this host cannot be read")
+    assert provider.asked == []
+    assert await bench.world.column(
+        "SELECT state || ':' || (grant_id IS NULL) FROM assignments WHERE kind = 'build'"
+    ) == ["wanted:true"]

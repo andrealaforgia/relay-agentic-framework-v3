@@ -403,3 +403,43 @@ async def test_the_result_is_told_as_classified_before_the_process_is_waited_for
 
     assert told == [result]
     assert told[0].unusable
+
+
+async def test_what_is_launched_is_the_installation_there_was_when_the_adapter_was_made(
+    tmp_path: Path,
+) -> None:
+    """3B-S4-3.1: an update points the name at another version. The briefing goes to
+    the one that was asked its version, and none of it to the other."""
+    for version in ("a", "b"):
+        installed = tmp_path / f"claude-{version}"
+        installed.write_text(f"#!/bin/sh\ncat > {tmp_path}/briefed-{version}\n")
+        installed.chmod(0o755)
+    name = tmp_path / "claude"
+    name.symlink_to(tmp_path / "claude-a")
+    launcher = ClaudeAdapter(str(name), {"PATH": os.environ["PATH"]})
+    assert launcher.executable == str((tmp_path / "claude-a").resolve())
+
+    name.unlink()
+    name.symlink_to(tmp_path / "claude-b")
+    await launcher.invoke(request(tmp_path), checked=False)
+
+    assert (tmp_path / "briefed-a").read_text() != ""
+    assert not (tmp_path / "briefed-b").exists()
+
+
+async def test_a_cli_that_starts_and_never_says_its_version_is_not_waited_for_for_ever(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S4-3.5: bounded, and the process is not left behind."""
+    from relay.providers import claude
+
+    silent = tmp_path / "claude"
+    silent.write_text(f"#!/bin/sh\necho $$ > {tmp_path}/pid\nexec sleep 60\n")
+    silent.chmod(0o755)
+    monkeypatch.setattr(claude, "_ASKING_FOR", 0.5)
+
+    with pytest.raises(ProviderUnavailable, match="in time"):
+        await ClaudeAdapter(str(silent), {"PATH": os.environ["PATH"]}).version()
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(int((tmp_path / "pid").read_text()), 0)

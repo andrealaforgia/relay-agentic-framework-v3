@@ -573,6 +573,26 @@ async def test_a_call_found_late_never_to_have_been_launched_is_not_one_that_end
     assert await calling.invocations.apply(successor, second) == "applied"
 
 
+async def test_a_late_nothing_was_launched_leaves_the_grant_of_whoever_claimed_the_work_since(
+    calling: Calling,
+) -> None:
+    """3B-S4-3.4: claimed again and not yet admitted a call. The grant the late report
+    lets go of is its own, and that one is gone already."""
+    first = await calling.worker()
+    invocation = await calling.admitted(first)
+    await first.stop()
+    await calling.invocations.recover(PROJECT)
+    await calling.invocations.decide(calling.person(invocation, "retry"))
+    second = await calling.worker()
+    assignment, grant = await calling.claimed(second)
+
+    assert await calling.invocations.record(invocation, NOT_STARTED) == "not_started"
+
+    assert await calling.assignment() == ("granted", None, True)
+    admission = await calling.invocations.admit(second, assignment, grant, await calling.prepared())
+    assert admission.outcome == "admitted", admission.reason
+
+
 async def test_a_late_nothing_was_launched_does_not_clear_what_a_person_was_asked_of_its_successor(
     calling: Calling,
 ) -> None:

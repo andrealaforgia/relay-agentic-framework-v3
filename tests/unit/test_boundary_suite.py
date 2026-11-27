@@ -4,12 +4,15 @@ a probe nobody attempted has not passed, and that refusing everything is not a p
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from relay.providers.boundary_suite import Observation, Scene, evaluate, steps_for
+from relay.providers.claude import Request
 from relay.providers.stream import Event, Said, Started, ToolCall, ToolOutcome
 
 ROOT = Path("/srv/relay/ws/boundary-1")
@@ -564,8 +567,14 @@ async def test_a_run_after_which_the_cli_cannot_be_asked_its_version_is_kept_as_
 
     result = await boundary_suite.run_suite("qa", tmp_path / "ws", binary=STUB)
 
-    assert not result.passed
-    assert result.runtime["cli"] == "unavailable"
+    # 3B-S4-3.3: and it is a failure of what the run was launched on, so that it is the
+    # latest thing known of that boundary and an earlier pass of it does not outlive it.
+    [stable] = [each for each in result.observations if "did not change" in each.probe]
+    assert not result.passed and not stable.passed
+    assert result.runtime["cli"] == "9.9.9 (stub)"
+    assert result.digest == boundary_suite.boundary_digest(
+        boundary_suite.confinement_for("qa", tmp_path / "ws" / "run" / "tree"), result.runtime
+    )
 
 
 def test_the_version_is_asked_in_the_environment_any_run_is_given(
@@ -580,3 +589,55 @@ def test_the_version_is_asked_in_the_environment_any_run_is_given(
     monkeypatch.setenv("RELAY_ONLY_THE_SUPERVISORS", "leaked")
 
     assert runtime_now("stated", str(cli))["cli"] == "2.1.330 absent"
+
+
+async def test_the_suites_own_probe_is_held_to_the_version_it_was_launched_as(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S4-3.2: both version queries say one thing and the run's own start event may
+    say another (an update and a rollback around the run). The probe's request names the
+    version it was launched as, and the adapter ends a run that starts and says another
+    (its own test): such a run has not ended with a result, and the suite has not passed."""
+    from relay.providers import boundary_suite
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(boundary_suite, "_LOCAL_POLICY", (tmp_path / "no-policy.json",))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    asked: list[Request] = []
+    real = boundary_suite.ClaudeAdapter.invoke
+
+    async def noting(self: Any, request: Request, **named: Any) -> Any:
+        asked.append(request)
+        return await real(self, request, **named)
+
+    monkeypatch.setattr(boundary_suite.ClaudeAdapter, "invoke", noting)
+
+    result = await boundary_suite.run_suite("qa", tmp_path / "ws", binary=STUB)
+
+    assert [each.cli_version for each in asked] == ["9.9.9 (stub)"]
+    assert result.runtime["cli"] == "9.9.9 (stub)"
+    assert result.runtime["executable"] == os.path.realpath(STUB)
+
+
+async def test_two_suites_run_at_once_each_keep_their_own_marker_and_both_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S4-3.6: neither takes the other's away, and neither result is lost."""
+    import asyncio
+
+    from relay.providers import boundary_suite
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(boundary_suite, "_LOCAL_POLICY", (tmp_path / "no-policy.json",))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    before = dict(os.environ)
+
+    both = await asyncio.gather(
+        boundary_suite.run_suite("qa", tmp_path / "ws", binary=STUB),
+        boundary_suite.run_suite("builder", tmp_path / "ws", binary=STUB),
+    )
+
+    assert [each.role for each in both] == ["qa", "builder"]
+    assert dict(os.environ) == before  # and the supervisor's own environment is untouched

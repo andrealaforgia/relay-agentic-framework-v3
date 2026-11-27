@@ -205,7 +205,14 @@ class Worker:
                         return f"refused: {failed}"
                     raise
                 prepared.append(call)
-                runtime = self._runtime()
+                try:
+                    runtime = self._runtime()
+                except OSError as unreadable:
+                    # A policy file that cannot be read says nothing of what bounds a
+                    # run here. Nothing is launched, and the grant is not left with a
+                    # worker that will do nothing under it.
+                    await self._claims.give_back(assignment_id, grant)
+                    return f"refused: what bounds a run on this host cannot be read: {unreadable}"
                 if runtime.get("remote_policy", UNATTESTED) == UNATTESTED:
                     # Part of what bounds a run is policy this host may be given from
                     # elsewhere, which Relay cannot read. Until the operator has stated

@@ -26,7 +26,7 @@ import shutil
 import subprocess
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -38,6 +38,7 @@ from relay.providers.claude import (
     Outcome,
     ProviderUnavailable,
     Request,
+    resolved,
 )
 from relay.providers.confinement import (
     ROLE_TOOLS,
@@ -354,7 +355,9 @@ def evaluate(scene: Scene, events: Sequence[Event]) -> list[Observation]:
     return seen
 
 
-def runtime_of(cli_version: str, remote_policy: str | None = None) -> dict[str, str]:
+def runtime_of(
+    cli_version: str, remote_policy: str | None = None, executable: str = ""
+) -> dict[str, str]:
     """What a pass was tried on. A change to any of it is another runtime.
 
     Policy reaches a host in ways Relay can read (files, managed preferences) and in ways
@@ -369,6 +372,8 @@ def runtime_of(cli_version: str, remote_policy: str | None = None) -> dict[str, 
             found = True
             local.update(str(path).encode() + b"\0" + path.read_bytes() + b"\0")
     return {
+        # The file that is launched, every link followed, and what it says it is.
+        "executable": executable,
         "cli": cli_version,
         "os": platform.platform(),
         "suite": SUITE_VERSION,
@@ -381,6 +386,7 @@ def runtime_now(remote_policy: str | None = None, binary: str = "claude") -> dic
     """The runtime as it is at this moment, the installed CLI's version asked afresh: a
     pass for the version that was there when the worker started allows nothing once
     another has been installed. A CLI that cannot be asked is a runtime with no pass."""
+    binary = resolved(binary)
     try:
         asked = subprocess.run(
             [binary, "--version"],
@@ -394,7 +400,7 @@ def runtime_now(remote_policy: str | None = None, binary: str = "claude") -> dic
         version = asked.stdout.strip() if asked.returncode == 0 else "unavailable"
     except OSError, subprocess.TimeoutExpired:
         version = "unavailable"
-    return runtime_of(version or "unavailable", remote_policy)
+    return runtime_of(version or "unavailable", remote_policy, binary)
 
 
 async def run_suite(
@@ -449,19 +455,21 @@ async def run_suite(
         bounds = confinement_for(role, workspace, withheld=withheld)
         # The secret is in the supervisor's environment, and the run's environment is the
         # one Relay makes for any run.
-        os.environ["RELAY_SUITE_SECRET"] = secret
-        try:
-            adapter = ClaudeAdapter(binary, environment_for_a_run(os.environ))
-            capabilities = await adapter.capabilities()
-            # What bounds the run besides its own settings, read before it is launched
-            # and again after it has ended.
-            launched_on = runtime_of(capabilities.version, remote_policy)
-            events: list[Event] = []
-            result = await adapter.invoke(
-                _request(scene, bounds, model, timeout), on_event=events.append
-            )
-        finally:
-            del os.environ["RELAY_SUITE_SECRET"]
+        # A copy of its own: two suites run at once each have their own marker, and
+        # neither takes the other's away.
+        supervisors = {**os.environ, "RELAY_SUITE_SECRET": secret}
+        adapter = ClaudeAdapter(binary, environment_for_a_run(supervisors))
+        capabilities = await adapter.capabilities()
+        # What bounds the run besides its own settings, read before it is launched
+        # and again after it has ended.
+        launched_on = runtime_of(capabilities.version, remote_policy, adapter.executable)
+        events: list[Event] = []
+        # Held to the version it was launched as: a run that starts and says another
+        # exercised nothing of this one.
+        result = await adapter.invoke(
+            replace(_request(scene, bounds, model, timeout), cli_version=capabilities.version),
+            on_event=events.append,
+        )
         scene = Scene(**{**scene.__dict__, "connections": connections})
         observations = evaluate(scene, events)
         observations.append(
@@ -477,7 +485,7 @@ async def run_suite(
             # It answered before the run and does not now. The probes were made and
             # paid for: what they showed is kept, as a run of a runtime nobody can name.
             now = "unavailable"
-        runtime = runtime_of(now, remote_policy)
+        runtime = runtime_of(now, remote_policy, adapter.executable)
         # A policy file that changed while the run was being made leaves nobody able to
         # say which policy the run was made under. What it showed is then a pass of
         # neither: not of what was there before, and not of what is there now.
@@ -489,10 +497,13 @@ async def run_suite(
             )
         )
         ended = [each for each in events if isinstance(each, Terminal)]
+        # An assessment is of what the run was launched on. If that is no longer what
+        # is there, it is a failure of it all the same, and the latest thing known of
+        # it: an earlier pass of the same boundary does not outlive it.
         return SuiteResult(
             role,
-            boundary_digest(bounds, runtime),
-            runtime,
+            boundary_digest(bounds, launched_on),
+            launched_on,
             tuple(observations),
             ended[-1].provider_cost_usd if ended else None,
         )

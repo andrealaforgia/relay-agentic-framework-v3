@@ -134,7 +134,9 @@ CREATE TABLE boundary_passes (
     -- boundary is what is true of it.
     passed       boolean NOT NULL,
     -- When the run was made, as the run says: not when it came to be recorded.
-    observed_at  timestamptz NOT NULL
+    observed_at  timestamptz NOT NULL,
+    -- What the provider said the run cost; null if it did not say.
+    cost_usd     numeric
 );
 CREATE INDEX boundary_passes_by_digest ON boundary_passes (digest, observed_at DESC);
 
