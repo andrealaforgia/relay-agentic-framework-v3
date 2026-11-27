@@ -19,7 +19,8 @@ from relay.application.invocations import Invocations
 from relay.application.tasks import BuildTask, Profile, ReviewTask, Tasks, Workspaces
 from relay.application.worker import Worker
 from relay.application.workers import WorkerSession
-from relay.providers.claude import ProviderResult, Request
+from relay.providers.claude import Outcome, ProviderResult, Request
+from relay.providers.stream import Terminal
 from tests.integration.completion_world import CompletionWorld
 from tests.integration.fixtures import PRODUCT_OWNER, VAT_APPLIES_STANDARD_RATE
 from tests.integration.test_review_task import NOTHING_FOUND, replying
@@ -238,3 +239,92 @@ async def test_a_feature_is_delivered_by_workers_and_a_persons_decisions_alone(
     assert await world.column(
         "SELECT count(*) FROM assignments WHERE state IN ('wanted', 'granted')"
     ) == [0]
+
+
+def metered(reply: Any, *, cost: float | None = 0.01) -> ProviderResult:
+    """A reply as the real CLI reports one: with what it used and what it cost."""
+    envelope: dict[str, Any] = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "structured_output": reply,
+        "modelUsage": {
+            "claude-haiku-5-5": {
+                "inputTokens": 100,
+                "outputTokens": 20,
+                "cacheReadInputTokens": 5,
+                "cacheCreationInputTokens": 0,
+                "cacheCreationEphemeral5mInputTokens": 0,
+                "cacheCreationEphemeral1hInputTokens": 0,
+            }
+        },
+    }
+    if cost is not None:
+        envelope["total_cost_usd"] = cost
+    return ProviderResult(Outcome.RETURNED, Terminal(envelope))
+
+
+class Metered(Role):
+    async def invoke(self, request: Request, **named: Any) -> ProviderResult:
+        result = await super().invoke(request, **named)
+        assert result.terminal is not None
+        return metered(result.terminal.structured_output)
+
+
+async def test_a_features_summary_says_what_its_calls_used_by_role_as_known_when_it_completed(
+    delivering_world: Delivering,
+) -> None:
+    """S3-18.10: totals over the calls that had ended, and beside them how many had not.
+    Never shown as zero: what is not known is said to be unknown."""
+    at, world = delivering_world, delivering_world.world
+    await at.staff(
+        analyst=Metered(You_propose_the_roadmap=[proposing(S1)], You_are_asked_to_assess=[VOUCHED]),
+        verifier=Metered(
+            You_decide_how_a_user_story_is_shown=[B1, DEMONSTRATED],
+            You_are_asked_to_vouch=[VOUCHED],
+        ),
+        builder=Metered(You_are_the_Builder=[builds({"vat.py": VAT_APPLIES_STANDARD_RATE})]),
+        qa=Metered(You_are_reviewing=[NOTHING_FOUND]),
+        sentinel=Role(You_are_reviewing=[NOTHING_FOUND]),  # reports nothing of what it used
+    )
+    await world.stories.open_feature(PRODUCT_OWNER, PROJECT, "F1", "prices need VAT")
+    await at.work()
+    await world.decide(await world.gate())
+    await at.work()
+    # A call still in flight when the feature completes: its use is not known then.
+    await world.column(
+        "INSERT INTO invocations SELECT gen_random_uuid(), assignment_id, project_id, grant_id, "
+        "attempt + 1, worker_id, role, provider, model, effort, agent_name, agent_path, "
+        "agent_sha256, agent_revision, agent_dirty, effective_agent_sha256, briefing, "
+        "briefing_sha256, schema_sha256, schema, evidence, admitted_on, expects, NULL, "
+        "'uncertain' FROM invocations WHERE role = 'qa' RETURNING 1"
+    )
+    await world.decide(await world.gate())
+    await at.work()
+
+    summary = await world.summary()
+    assert summary is not None
+    usage = summary["usage"]
+    assert usage["calls_not_known"] == 1
+    assert usage["by_role"]["verifier"] == {
+        "calls": 3,
+        "input_tokens": 300,
+        "output_tokens": 60,
+        "cache_read_tokens": 15,
+        "cache_write_tokens": 0,
+        "provider_cost_usd": "0.03",
+        "estimated_cost_usd": usage["by_role"]["verifier"]["estimated_cost_usd"],
+        "calls_with_no_use_reported": 0,
+    }
+    assert usage["by_role"]["verifier"]["estimated_cost_usd"] != "unknown"
+    assert usage["by_role"]["analyst"]["calls"] == 2
+    assert usage["by_role"]["sentinel"] == {
+        "calls": 1,
+        "input_tokens": "unknown",
+        "output_tokens": "unknown",
+        "cache_read_tokens": "unknown",
+        "cache_write_tokens": "unknown",
+        "provider_cost_usd": "unknown",
+        "estimated_cost_usd": "unknown",
+        "calls_with_no_use_reported": 1,
+    }

@@ -16,6 +16,7 @@ import asyncio
 import tempfile
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -644,9 +645,59 @@ async def _summary(
         ],
         "trunk": batch["trunk"],
         "checked": _as_checked(receipts),
-        # Not measured yet, and never shown as zero.
-        "usage": "unknown",
+        "usage": await _usage(connection, project_id, feature_id),
     }
+
+
+_COUNTED = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+
+
+async def _usage(connection: Connection, project_id: str, feature_id: str) -> Any:
+    """What the feature's calls used, as it is known at this moment: totals by role over
+    the calls that have ended, and beside them how many had not ended or had ended
+    nobody knows how. A call that reports later does not change a summary that has been
+    written. What was not reported is said to be unknown and is never shown as zero:
+    a cost is a sum only if every call it is a sum of reported one.
+
+    A feature none of whose work was a recorded call says only that: unknown."""
+    calls = await (
+        await connection.execute(
+            "SELECT v.role, v.state, v.usage, v.provider_cost_usd, v.estimated_cost_usd "
+            "FROM invocations v JOIN assignments a USING (assignment_id) "
+            "WHERE a.project_id = %s AND a.feature_id = %s AND v.state <> 'not_started' "
+            "ORDER BY v.role, v.started_at",
+            (project_id, feature_id),
+        )
+    ).fetchall()
+    if not calls:
+        return "unknown"
+    by_role: dict[str, dict[str, Any]] = {}
+    costs: dict[str, dict[str, list[Any]]] = {}
+    not_known = 0
+    for call in calls:
+        if call["state"] in ("intended", "uncertain"):
+            not_known += 1
+            continue
+        role = by_role.setdefault(
+            call["role"],
+            {"calls": 0, **dict.fromkeys(_COUNTED, 0), "calls_with_no_use_reported": 0},
+        )
+        role["calls"] += 1
+        if not call["usage"]:
+            role["calls_with_no_use_reported"] += 1
+        for billed in call["usage"] or ():
+            for counted in _COUNTED:
+                role[counted] += billed.get(counted) or 0
+        cost = costs.setdefault(call["role"], {"provider_cost_usd": [], "estimated_cost_usd": []})
+        for kind in cost:
+            cost[kind].append(call[kind])
+    for name, role in by_role.items():
+        if role["calls"] == role["calls_with_no_use_reported"]:
+            # Nothing was reported for any of them: that is not a use of nothing.
+            role.update(dict.fromkeys(_COUNTED, "unknown"))
+        for kind, each in costs[name].items():
+            role[kind] = "unknown" if None in each else str(sum(each, Decimal(0)).normalize())
+    return {"by_role": by_role, "calls_not_known": not_known}
 
 
 async def _left_open(
