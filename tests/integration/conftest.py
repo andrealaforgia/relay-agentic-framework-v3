@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -114,3 +114,14 @@ async def building(
     await building.invocations.close()
     for session in building.sessions:
         await session.stop()
+
+
+@pytest.fixture
+def as_installation() -> Iterator[str]:
+    """A process that knows which installation it is, as every real one does: what it
+    publishes and looks for in a repository is under that name."""
+    from relay.git.checkout import name_attempts_under
+
+    name_attempts_under("installation-a")
+    yield "installation-a"
+    name_attempts_under("")

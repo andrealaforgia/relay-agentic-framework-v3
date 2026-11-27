@@ -16,6 +16,7 @@ from relay.application.reviews import Review, Reviews
 from relay.application.stories import Stories, StoryDraft
 from relay.domain.evidence import Baseline, Expected, GreenVerdict, Launch, ProcessContract
 from relay.domain.story import ActionRefused, HumanAction, Principal, PrincipalKind
+from relay.git.checkout import attempt_ref
 from relay.testing.oracle import Isolation, Run
 
 CONTRACT = ProcessContract(
@@ -75,7 +76,7 @@ def publish_attempt(
     _git(
         repository,
         "update-ref",
-        f"refs/relay/attempts/{project}/{behaviour_id}/{attempt}",
+        attempt_ref(project, behaviour_id, attempt),
         candidate,
     )
     _git(repository, "checkout", "-q", "main")
@@ -91,7 +92,7 @@ def publish_tag_as_attempt(
     _git(
         repository,
         "update-ref",
-        f"refs/relay/attempts/vat-calculator/{behaviour_id}/{attempt}",
+        attempt_ref("vat-calculator", behaviour_id, attempt),
         tag_object,
     )
     return tag_object

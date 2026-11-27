@@ -15,6 +15,7 @@ from relay.application.integration import Integration, IntegrationReceipt
 from relay.application.reviews import Review, Reviews
 from relay.domain.behaviour import BehaviourState
 from relay.domain.evidence import Baseline, CheckContract, Expected, Launch, ProcessContract
+from relay.git.checkout import attempt_ref
 from relay.persistence.ledger import read_events
 from relay.persistence.outbox import pending_messages
 from relay.testing.oracle import ContainerIsolation, Isolation, ProcessOracle
@@ -181,7 +182,7 @@ class TrunkWorld:
         self.git("add", "-A")
         self.git("commit", "-q", "--allow-empty", "-m", f"{behaviour} attempt {attempt}")
         candidate = self.git("rev-parse", "HEAD")
-        ref = f"refs/relay/attempts/{self.project}/{behaviour}/{attempt}"
+        ref = attempt_ref(self.project, behaviour, attempt)
         self.git("push", "-q", "origin", f"HEAD:{ref}")
         return candidate
 

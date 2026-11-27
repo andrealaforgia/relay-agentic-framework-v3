@@ -140,6 +140,11 @@ def name_attempts_under(installation: str) -> None:
     _ATTEMPTS_OF = f"{require_identifier('installation', installation)}/" if installation else ""
 
 
+def attempts_of(project_id: str, behaviour_id: str) -> str:
+    """What every attempt at one behaviour, of this installation, is named under."""
+    return f"refs/relay/{_ATTEMPTS_OF}attempts/{project_id}/{behaviour_id}/"
+
+
 def attempt_ref(project_id: str, behaviour_id: str, attempt: int) -> str:
     """Where a Builder publishes the candidate for one attempt at one behaviour of one
     project. The project is part of the name: several projects may share a repository."""

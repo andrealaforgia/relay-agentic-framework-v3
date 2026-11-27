@@ -669,6 +669,27 @@ async def test_a_legacy_review_is_adopted_from_an_attempt_that_has_since_moved_o
     assert await world.state() is BehaviourState.REVIEW
 
 
+async def test_a_judged_commit_is_recovered_from_this_installations_attempts_and_no_others(
+    world: World, as_installation: str
+) -> None:
+    """3C-3.3: the attempts searched for a commit that was lost are this installation's.
+    Another installation's attempt of the same project, behaviour and number is not."""
+    candidate = await world.green_candidate()
+    async with world.database.connection() as connection:
+        await connection.execute("DELETE FROM review_tasks")
+        await connection.execute("DELETE FROM review_cycles")
+    shutil.rmtree(world.mirrors)
+    publish_attempt(world.repository, "B1", 1, {"NOTES.md": "more work on top"}, on=candidate)
+    mine = f"refs/relay/{as_installation}/attempts/{PROJECT}/B1/1"
+    assert world.remote_ref(mine) != ""
+
+    assert await world.reviews.adopt_reviews_without_a_cycle() == 1
+    assert await world.reviews.publish_candidates() == 1
+
+    assert await Mirror(world.mirrors / f"{PROJECT}.git").holds(candidate)
+    assert await world.state() is BehaviourState.REVIEW
+
+
 async def test_a_remote_that_cannot_be_reached_defers_publication_and_does_not_block(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:

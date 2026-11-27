@@ -58,6 +58,7 @@ from relay.git.checkout import (
     CheckoutFailed,
     RemoteRejected,
     RemoteUnavailable,
+    attempts_of,
     refs_under,
     resolve_ref,
 )
@@ -467,7 +468,7 @@ class Reviews:
             return True
         attempts = await refs_under(
             record["repository"],
-            f"refs/relay/attempts/{project_id}/{behaviour_id}/",
+            attempts_of(project_id, behaviour_id),
             timeout=self._remote_timeout,
         )
         # The cycle knows the candidate ref's name from the start, but the ref exists only

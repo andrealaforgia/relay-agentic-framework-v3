@@ -799,3 +799,23 @@ async def test_a_candidate_the_control_plane_finds_not_green_is_handed_back_with
 
     assert len(provider.asked) == 2 and "not green" in provider.asked[1].briefing
     assert await building.states() == ["rejected", "applied"]
+
+
+async def test_two_installations_on_one_repository_keep_their_first_attempts_apart(
+    building: Building, as_installation: str
+) -> None:
+    """3C-3.3: another installation, managing another branch of this repository, has an
+    attempt of the same project, behaviour and number. This installation's Builder
+    publishes its own beside it. Both stand, and what is observed green is this one's."""
+    world = building.world
+    theirs = f"refs/relay/installation-b/attempts/{PROJECT}/B1/1"
+    world.git("push", "-q", "origin", f"{world.base}:{theirs}")
+    worker = await building.worker(Builder(RIGHT))
+
+    assert await building.carry(worker) == "applied"
+
+    mine = building.at(f"refs/relay/{as_installation}/attempts/{PROJECT}/B1/1")
+    assert mine != "" and building.show(mine, "vat.py") == VAT_APPLIES_STANDARD_RATE
+    assert building.at(theirs) == world.base
+    assert building.at(f"refs/relay/attempts/{PROJECT}/B1/1") == ""
+    assert await world.state("B1") is BehaviourState.REVIEW
