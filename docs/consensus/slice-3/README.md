@@ -369,6 +369,37 @@ Twenty-eight findings. **The design was not accepted.** Round 59's eight are fol
 
 Three things the review changed in the design's shape. A worker cannot finish a build once the processes are split, so effects say whose they are and the control plane takes a returned build. Holding a lock does not stop a former control plane, so a control plane has a term and every transaction of its that changes workflow state is fenced by it. And Relay hosts the Product Owner's conversation itself, a turn at a time, because the provider's interactive launch gives no account of what tools a session has.
 
+## Slice 3c, step 1a as built: processes and recovery
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 61 | CHALLENGE, 10 | A second push after Git's refusal was on record; the refusal lost at shutdown; the outbox publisher acting after its term; one unavailable repository stopping the installation's start; a worker launching after a change of Redis or a stop; a worker without its lock connection consuming commands for ever; a call admitted under an obsolete policy statement; a listener failure stranding leadership; an uncapped paid call; the handover test ending other sessions |
+| 62 | CHALLENGE, 8 | A refusal committing during the send's authorisation; a send authorised and never launched; the stop and the transport checked before the briefing was prepared; a drain returning after the only write failed; an unavailable repository taking another project's worker; an unavailable Redis ending both processes; a former leader overwriting its successor's marker; policy changing between the admission read and its commit |
+| 63 | CHALLENGE, 5 | A paid reply whose record failed, stranded under a live worker; a send left outstanding when the commit's answer was lost; shutdown waiting for ever before the drain's deadline; a stop during the last check before a call; a workspace leaked by every failed preparation |
+
+Twenty-three findings, every one reachable through `relay up` or `relay worker start`, every one fixed with a test. **The step was not accepted.** Round 63's five were fixed without a further round, as D-8 has it, and those fixes are not reviewed. Astra said in round 63 that it considers the ordering of a refusal against a send's authorisation closed, and the fences on the policy read and on letting an effect go as asked for.
+
+What the step does. Relay runs as separate processes: one control plane (`relay up`) and any number of workers, one role each (`relay worker start --role R`), with nothing in common but PostgreSQL, Redis and the filesystem. The installation is a row in the database. One control plane holds it at a time, by a lock, and each opens a term; a control plane whose term is over is refused in the transaction that would change anything, and stops. A build's publication and its green check are the control plane's, and a worker hands them on. A worker wakes the control plane, and a timer covers a wake that is lost. Each push has an identity, and what Git said to it is written down by whoever hears it, under the intent's lock and no other, and kept until it is written. A worker asks before every call, where the call is admitted and once more where the provider would be called, whether it is stopping, still itself, and on the Redis the control plane uses.
+
+The proof the contract asked for is `tests/integration/test_processes.py`: a feature delivered by six operating-system processes with a stand-in CLI acting each role, the first control plane's lock connection ended from outside part-way with the process left alive, a second control plane finishing the feature, and the first stopping by itself.
+
+Deliberate breakage across the step and its three rounds: 84 breakages, 66 caught at first. Of the 18 that were not, 10 had no test and got one, one led to the code being rewritten, two were aimed at text the formatter had rewrapped and were caught when aimed again, and five survive: four distinct breakages, one of them made in two rounds, each with a reason (the three fences below, and a second reading of an intent that the send's own check under its lock makes harmless to remove).
+
+Reservations:
+
+- **The fence is where the gate is taken.** Transactions of a control plane that write without taking the gate were found by a search and a reading, not a proof. Those found are fenced or left with a reason Astra accepted (giving a red back by its own grant; a final check's observation as evidence).
+- **Three fences have no test**: marking an invocation applied, not letting an effect go after the term is over, and the control plane waiting to be listening before its first pass.
+- **The process test replaces the control plane at one moment**, after the roadmap's approval. A change of term during a green check, during a push, with an outbox message pending and with a worker mid-preparation are each tested in one process.
+- **A repository unavailable at start-up, and to an Analyst's worker, are tested with a stand-in for the pass and for the worker**, not with one project reaching trunk while another's waits.
+- **Redis going away and coming back is tested with a client that raises connection errors**, not by stopping the server. The wrong-Redis history is tested with two real Redis databases.
+- **A send stopped after Git was started stays unanswered**, as before: it may have left.
+- **A worker stops only between calls**: told to stop during a call, it finishes the call.
+- **The policy statement is compared as text** at admission; its revision is step 1b's, with the command that states it.
+- **A call's cap defaults to two US dollars** when the installation's settings name none. The figure is Claude's.
+- **Round 63's fixes are not reviewed.**
+
+`make check` on the commit that closes the step: 1277 tests, 3 skipped (the ones that make paid calls).
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.
