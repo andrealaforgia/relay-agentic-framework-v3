@@ -318,3 +318,85 @@ async def test_a_handle_of_another_installations_request_buys_nothing_from_this_
     assert asked is not None and asked["n"] == 0
     policy = await authority.policy_of(enrolled)
     assert policy is not None and policy.statement == "none applies here"
+
+
+async def test_a_cli_that_cannot_be_asked_for_what_relay_needs_costs_nothing_and_needs_no_retry(
+    enrolled: AsyncConnectionPool, shell: dict[str, str], tmp_path: Path
+) -> None:
+    """3C-S1B-2.5, through the command with the stand-in CLI: the CLI does not offer a
+    flag the adapter must pass. That is established before anything is launched. The
+    attempt is one that never left, not one that may have been paid for, and after the
+    CLI is put right an ordinary request is enough."""
+    await authority.state_policy(enrolled, PASSPHRASE, "none applies here", "andrea")
+    cli = Path((await settings_of(enrolled))["cli"])
+    whole = cli.read_text()
+    cli.write_text(whole.replace("--json-schema <schema>", ""))
+    here = tmp_path / "vat"
+
+    first = with_no_terminal(["doctor", "--boundary"], shell, here)
+
+    assert first.code == 1, first.printed
+    assert "paid run(s)" in first.out and first.out.index("paid run(s)") < first.out.index("NOT")
+    assert "not_launched" in first.out and "--json-schema" in first.out
+    assert "uncertain" not in first.out and "--retry" not in first.out
+    launched = cli.parent / "launched.jsonl"
+    assert not launched.exists()  # no run of the provider was started
+    async with enrolled.connection() as connection:
+        verdicts = await (
+            await connection.execute("SELECT count(*) AS n FROM boundary_passes")
+        ).fetchone()
+    assert verdicts is not None and verdicts["n"] == 0
+
+    cli.write_text(whole)
+    second = with_no_terminal(["doctor", "--boundary"], shell, here)
+
+    # An ordinary request, with nobody asked to authorise a retry, and this time it runs.
+    assert "is not repeated by itself" not in second.out
+    assert launched.exists() and "run now" in second.out
+
+
+async def test_a_handle_names_one_request_for_one_thing(
+    enrolled: AsyncConnectionPool, shell: dict[str, str], tmp_path: Path
+) -> None:
+    """3C-S1B-2.6: the handle of a statement of policy is not a handle to paid runs, nor
+    the other way about."""
+    from tests.integration.person import at_a_terminal
+
+    here = tmp_path / "vat"
+    stated = at_a_terminal(["policy", "state", "none applies here"], [PASSPHRASE], shell, here)
+    policy_handle = stated.printed.split()[1]
+
+    probing = with_no_terminal(["doctor", "--boundary", "--request-id", policy_handle], shell, here)
+
+    assert probing.code == 1 and "only to ask for the same thing" in probing.printed
+    assert "paid run" not in probing.printed
+    async with enrolled.connection() as connection:
+        asked = await (
+            await connection.execute("SELECT count(*) AS n FROM boundary_requests")
+        ).fetchone()
+    assert asked is not None and asked["n"] == 0
+
+    probe = with_no_terminal(["doctor", "--boundary"], shell, here)
+    probe_handle = probe.out.split()[1]
+    restating = with_no_terminal(
+        ["policy", "state", "something else", "--request-id", probe_handle], shell, here
+    )
+    assert restating.code == 1 and "only to ask for the same thing" in restating.printed
+    policy = await authority.policy_of(enrolled)
+    assert policy is not None and policy.revision == 1
+
+
+async def test_doctor_does_not_take_another_branch_for_the_trunk(
+    enrolled: AsyncConnectionPool, broker: redis.Redis, tmp_path: Path
+) -> None:
+    """3C-S1B-2.10: `main` is gone and `release/main` is there. Git matches a name against
+    the tail of every ref; the workflow asks for the exact ref, and so does doctor."""
+    here = tmp_path / "vat"
+    assert (await examined(enrolled, broker))["the repository of vat"].ok
+    git(here, "push", "-q", "origin", "main:refs/heads/release/main")
+    git(tmp_path / "remote.git", "symbolic-ref", "HEAD", "refs/heads/release/main")
+    git(here, "push", "-q", "origin", "--delete", "main")
+
+    trunk = (await examined(enrolled, broker))["the repository of vat"]
+
+    assert not trunk.ok and "there is no refs/heads/main" in trunk.saw

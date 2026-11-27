@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Mapping
+from typing import Any
 
 import pytest
 from psycopg_pool import AsyncConnectionPool
@@ -145,8 +146,18 @@ async def test_a_running_run_is_not_an_uncertain_one_and_neither_is_bought_again
     lost = await asked(runs, "request-1", "qa")
     assert (lost.state, lost.attempt_id) == ("uncertain", replayed.attempt_id)
     with pytest.raises(RunRefused, match=f"--retry {lost.attempt_id}"):
-        await asked(runs, "request-2", "qa")
+        await asked(runs, "request-7", "qa")
     assert suite.launched == 1  # never repeated by itself
+    # 3C-S1B-2.4: a refusal is its request's answer, and is kept. The run that was
+    # being made is gone now, and the requests refused because of it are refused still.
+    for request, why in (("request-2", "being made now"), ("request-3", "running, not uncertain")):
+        answered = await runs.of_request(request, "qa")
+        assert answered is not None and answered.state == "refused" and why in answered.detail
+        again = await asked(
+            runs, request, "qa", replayed.attempt_id if request == "request-3" else None
+        )
+        assert (again.state, again.launched_now) == ("refused", False)
+    assert suite.launched == 1
 
     suite.hold = None
     retried = await asked(runs, "request-4", "qa", lost.attempt_id)
@@ -296,3 +307,91 @@ async def test_a_call_that_was_launched_and_ended_with_no_result_is_uncertain_wh
     assert suite.launched == 1
     assert (await asked(runs, "request-3", retry=lost.attempt_id)).state == "passed"
     assert suite.launched == 2 and await Boundaries(database).holds(DIGEST)
+
+
+async def test_a_verdict_and_what_became_of_its_call_are_on_record_together_or_not_at_all(
+    database: AsyncConnectionPool, runs: BoundaryRuns, suite: Suite, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S1B-2.1: the provider's stream was cut short, and the process is lost as it
+    records. There is no moment at which the failed verdict is on record without the
+    fact that the call was lost: a new ordinary request launches nothing, and a named
+    retry may launch one."""
+    suite.call, suite.holds = "uncertain", False
+    boundaries = runs._boundaries
+    record_in = boundaries.record_in
+
+    async def lost_as_it_records(connection: Any, result: SuiteResult) -> None:
+        await record_in(connection, result)
+        raise ConnectionError("the process was lost")
+
+    monkeypatch.setattr(boundaries, "record_in", lost_as_it_records)
+    with pytest.raises(ConnectionError):
+        await asked(runs, "request-1")
+    monkeypatch.undo()
+
+    async with database.connection() as connection:
+        verdicts = await (
+            await connection.execute("SELECT count(*) AS n FROM boundary_passes")
+        ).fetchone()
+    assert verdicts is not None and verdicts["n"] == 0
+    lost = await runs.of_request("request-1", "qa")
+    assert lost is not None and lost.state == "uncertain"
+    suite.call, suite.holds = "returned", True
+    with pytest.raises(RunRefused, match=f"--retry {lost.attempt_id}"):
+        await asked(runs, "request-2")
+    assert suite.launched == 1
+    assert (await asked(runs, "request-3", retry=lost.attempt_id)).state == "passed"
+    assert suite.launched == 2
+
+
+async def test_a_retry_is_not_made_beside_a_run_of_the_bounds_it_would_itself_run(
+    database: AsyncConnectionPool, runs: BoundaryRuns, suite: Suite
+) -> None:
+    """3C-S1B-2.2: an uncertain attempt of the bounds as they were. The runtime has
+    changed, and a run of today's bounds is being made. A retry of the old attempt would
+    run today's bounds: it is refused while that run is live."""
+    today = "e" * 64
+    suite.fails_with = RuntimeError("the terminal went away")
+    with pytest.raises(RunRefused, match="may have been paid for"):
+        await asked(runs, "request-1")
+    lost = await runs.of_request("request-1", "qa")
+    assert lost is not None and lost.state == "uncertain"
+    suite.fails_with, suite.launched, suite.hold = None, 0, asyncio.Event()
+    suite.started.clear()
+    live = asyncio.create_task(asked(runs, "request-2", digest=today))
+    await suite.started.wait()
+
+    with pytest.raises(RunRefused, match="is being made now"):
+        await asked(runs, "request-3", retry=lost.attempt_id, digest=today)
+
+    assert suite.launched == 1
+    suite.hold.set()
+    await live
+    assert suite.launched == 1
+
+
+async def test_a_request_is_not_spent_on_other_bounds_than_the_ones_it_asked_for(
+    runs: BoundaryRuns, suite: Suite
+) -> None:
+    """3C-S1B-2.3: the request recorded one boundary and was stopped before its attempt.
+    The CLI or the policy changed. Sent again it would be a run of another boundary: it
+    is refused, for good, and says to make a new request. One that completed before the
+    change still returns its receipt."""
+
+    async def what() -> Mapping[str, str]:
+        return {"qa": DIGEST}
+
+    today = "e" * 64
+    await runs.open_request("request-1", INSTALLATION, None, what)
+    await runs.open_request("request-2", INSTALLATION, None, what)
+    done = await runs.run("request-2", "qa", DIGEST, RUNTIME, exercising=DIGEST)
+
+    with pytest.raises(RunRefused, match="make a new request"):
+        await runs.run("request-1", "qa", DIGEST, RUNTIME, exercising=today)
+
+    assert suite.launched == 1
+    kept = await runs.run("request-1", "qa", DIGEST, RUNTIME, exercising=DIGEST)
+    assert (kept.state, kept.launched_now) == ("refused", False)  # though it would match now
+    replayed = await runs.run("request-2", "qa", DIGEST, RUNTIME, exercising=today)
+    assert (replayed.attempt_id, replayed.state) == (done.attempt_id, "passed")
+    assert suite.launched == 1

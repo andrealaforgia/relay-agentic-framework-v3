@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from psycopg.types.json import Jsonb
 
-from relay.application.boundaries import Boundaries, BoundaryNotShown
+from relay.application.boundaries import Boundaries
 from relay.application.workers import _lock_key, is_alive
 from relay.persistence.database import Connection, Pool
 from relay.providers.boundary_suite import NotLaunched, SuiteResult
@@ -25,6 +25,7 @@ Suite = Callable[[str, Mapping[str, str]], Awaitable[SuiteResult]]
 
 
 FRESH = "these bounds had lately been seen to hold: nothing was run"
+REFUSED = "refused: "
 
 
 class RunRefused(Exception):
@@ -37,6 +38,8 @@ class Attempt:
     request_id: str
     role: str
     # fresh: a pass of these bounds was on record when its turn came: nothing was run.
+    # refused: the request was answered with a refusal for this role, and that is its
+    # answer for good.
     # passed, failed: the suite ran and that is what it showed.
     # running: its process is alive and has recorded nothing yet.
     # uncertain: its process is gone and nothing was recorded. It may have been paid for.
@@ -118,9 +121,16 @@ class BoundaryRuns:
         runtime: Mapping[str, str],
         *,
         retry: uuid.UUID | None = None,
+        exercising: str | None = None,
     ) -> Attempt:
         """Make the run this request asks for, if it has not been made; otherwise say what
-        is known of the one that was. A request sent again launches nothing."""
+        is known of the one that was. A request sent again launches nothing.
+
+        `digest` is the boundary the request asked to have tried, and `exercising` the
+        boundary a run made now would be a run of. If they differ, the runtime has
+        changed since the request was made, and the request is not spent on another
+        boundary than its own. A refusal is the request's answer, and is kept: sent
+        again, the request is refused again and buys nothing, whatever has changed."""
         attempt_id = uuid.uuid7()
         held = await self._pool.getconn()
         try:
@@ -139,30 +149,59 @@ class BoundaryRuns:
                 )
                 if known is not None:
                     return known
-                await self._require_may_launch(connection, role, digest, retry)
+                refusal: RunRefused | None = None
+                try:
+                    if exercising is not None and exercising != digest:
+                        raise RunRefused(
+                            f"what bounds a {role} on this host has changed since request "
+                            f"{request_id} was made: it asked for a run of other bounds than "
+                            "a run made now would be of. Nothing is run: make a new request"
+                        )
+                    await self._require_may_launch(connection, role, digest, retry)
+                except RunRefused as refused:
+                    refusal = refused
+                if refusal is not None:
+                    # On record against the request and the role. It names no attempt it
+                    # retries: a refused retry does not use up the one retry there is.
+                    await connection.execute(
+                        "INSERT INTO boundary_runs (attempt_id, request_id, role, digest, "
+                        "runtime, not_launched) VALUES (%s, %s, %s, %s, %s, %s)",
+                        (
+                            attempt_id,
+                            request_id,
+                            role,
+                            digest,
+                            Jsonb(dict(runtime)),
+                            REFUSED + str(refusal),
+                        ),
+                    )
                 # Asked again here, under the boundary's lock: another request may have
                 # paid for a pass of these bounds while this one waited its turn.
                 fresh = (
-                    retry is None
+                    refusal is None
+                    and retry is None
                     and await self._boundaries.authorising(connection, digest) is not None
                 )
-                await connection.execute(
-                    "INSERT INTO boundary_runs (attempt_id, request_id, role, digest, runtime, "
-                    "retries, not_launched) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    (
-                        attempt_id,
-                        request_id,
-                        role,
-                        digest,
-                        Jsonb(dict(runtime)),
-                        retry,
-                        FRESH if fresh else None,
-                    ),
-                )
+                if refusal is None:
+                    await connection.execute(
+                        "INSERT INTO boundary_runs (attempt_id, request_id, role, digest, "
+                        "runtime, retries, not_launched) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            attempt_id,
+                            request_id,
+                            role,
+                            digest,
+                            Jsonb(dict(runtime)),
+                            retry,
+                            FRESH if fresh else None,
+                        ),
+                    )
                 if fresh:
                     made = await _attempt(connection, "r.attempt_id = %s", (attempt_id,))
                     assert made is not None
                     return made
+            if refusal is not None:
+                raise refusal
             try:
                 result = await self._suite(role, runtime)
             except NotLaunched as never:
@@ -181,13 +220,18 @@ class BoundaryRuns:
             # The verdict is this attempt's: recorded under its identity, once. A run
             # whose call did not come back with a result showed nothing to hold, and its
             # verdict is recorded as the failure it is: nothing is authorised by it.
-            with contextlib.suppress(BoundaryNotShown):
-                await self._boundaries.record(dataclasses.replace(result, run_id=attempt_id))
+            # In one transaction with what became of the call: there is no moment at
+            # which the failed verdict of a lost call is on record without the fact that
+            # the call was lost, to be read as an ordinary failure and bought again.
             if result.call == "not_started":
                 return await self._settled(
-                    attempt_id, not_launched="the provider's CLI did not start the run"
+                    attempt_id,
+                    not_launched="the provider's CLI did not start the run",
+                    verdict=dataclasses.replace(result, run_id=attempt_id),
                 )
-            return await self._settled(attempt_id, call=result.call)
+            return await self._settled(
+                attempt_id, call=result.call, verdict=dataclasses.replace(result, run_id=attempt_id)
+            )
         finally:
             with contextlib.suppress(Exception):
                 await held.execute("SELECT pg_advisory_unlock_all()")
@@ -195,10 +239,17 @@ class BoundaryRuns:
             await self._pool.putconn(held)
 
     async def _settled(
-        self, attempt_id: uuid.UUID, *, not_launched: str | None = None, call: str | None = None
+        self,
+        attempt_id: uuid.UUID,
+        *,
+        not_launched: str | None = None,
+        call: str | None = None,
+        verdict: SuiteResult | None = None,
     ) -> Attempt:
-        """Put on record what became of the call itself, beside whatever its verdict is."""
+        """Put on record what became of the call itself, with its verdict if it has one."""
         async with self._pool.connection() as connection, connection.transaction():
+            if verdict is not None:
+                await self._boundaries.record_in(connection, verdict)
             await connection.execute(
                 "UPDATE boundary_runs SET not_launched = %s, call = %s WHERE attempt_id = %s",
                 (not_launched, call, attempt_id),
@@ -224,13 +275,16 @@ class BoundaryRuns:
                     f"attempt {retry} was retried already, by attempt {again.attempt_id} "
                     f"(request {again.request_id}), which is {again.state}"
                 )
-            return
+        # And whatever it is, a run of these bounds is not made beside another: the
+        # bounds a retry runs are today's, which may be another boundary than the
+        # attempt's, with a run of its own being made or lost.
         others = await (
             await connection.execute(
-                "SELECT attempt_id FROM boundary_runs r WHERE digest = %s AND NOT EXISTS "
+                "SELECT attempt_id FROM boundary_runs r WHERE digest = %s "
+                "AND attempt_id IS DISTINCT FROM %s AND NOT EXISTS "
                 "(SELECT 1 FROM boundary_runs later WHERE later.retries = r.attempt_id) "
                 "ORDER BY started_at DESC",
-                (digest,),
+                (digest, retry),
             )
         ).fetchall()
         for other in others:
@@ -271,6 +325,8 @@ async def _attempt(
     ]
     if row["not_launched"] == FRESH:
         state, detail = "fresh", FRESH
+    elif row["not_launched"] is not None and str(row["not_launched"]).startswith(REFUSED):
+        state, detail = "refused", str(row["not_launched"])[len(REFUSED) :]
     elif row["not_launched"] is not None:
         state, detail = "not_launched", str(row["not_launched"])
     elif row["call"] == "uncertain":

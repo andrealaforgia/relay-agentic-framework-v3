@@ -31,24 +31,29 @@ class Boundaries:
         boundary did not hold. A failure is kept: it takes away an earlier pass. A run is
         recorded once however often it is handed over, as of when it was made."""
         async with self._pool.connection() as connection, connection.transaction():
-            await connection.execute(
-                "INSERT INTO boundary_passes (pass_id, digest, role, runtime, observations, "
-                "passed, observed_at, cost_usd) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (pass_id) DO NOTHING",
-                (
-                    result.run_id,
-                    result.digest,
-                    result.role,
-                    Jsonb(result.runtime),
-                    Jsonb(as_recorded(result)),
-                    result.passed,
-                    result.observed_at,
-                    result.cost_usd,
-                ),
-            )
+            await self.record_in(connection, result)
         if not result.passed:
             failed = [each.probe for each in result.observations if not each.passed]
             raise BoundaryNotShown(f"the bounds of a {result.role} did not hold: {failed}")
+
+    async def record_in(self, connection: Connection, result: SuiteResult) -> None:
+        """The same, in the caller's transaction: with whatever else is known of the run,
+        or not at all. Raises nothing for a failure: the caller reads the verdict."""
+        await connection.execute(
+            "INSERT INTO boundary_passes (pass_id, digest, role, runtime, observations, "
+            "passed, observed_at, cost_usd) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (pass_id) DO NOTHING",
+            (
+                result.run_id,
+                result.digest,
+                result.role,
+                Jsonb(result.runtime),
+                Jsonb(as_recorded(result)),
+                result.passed,
+                result.observed_at,
+                result.cost_usd,
+            ),
+        )
 
     async def holds(self, digest: str) -> bool:
         """Whether the latest run of the suite on this exact boundary passed, and not too

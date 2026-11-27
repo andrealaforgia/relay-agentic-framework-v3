@@ -140,3 +140,27 @@ async def test_a_request_that_changed_the_installation_is_repeated_by_its_handle
     )
     assert replayed.code == 0 and "as on record" in replayed.printed
     await authority.require(database, "a new one altogether")
+
+
+async def test_an_address_given_and_then_given_again_leaves_no_secret_in_the_journal(
+    database: AsyncConnectionPool, shell: dict[str, str], tmp_path: Path
+) -> None:
+    """3C-S1B-2.9: a wrapper supplied one address and the caller another. The last is the
+    one used and checked; the journal has what was understood, not the words as typed."""
+    here = checkout_of(tmp_path / "remote.git", tmp_path / "vat")
+    secret = "hunter2-in-the-first-address"
+    twice = [
+        *init(tmp_path),
+        "--repository",
+        f"https://someone:{secret}@example.invalid/vat.git",
+        "--repository",
+        str(tmp_path / "remote.git"),
+    ]
+
+    enrolled = at_a_terminal(twice, [PASSPHRASE, PASSPHRASE], shell, here)
+
+    assert enrolled.code == 0, enrolled.printed
+    file = Path(shell["RELAY_STATE_DIR"]) / "requests.jsonl"
+    assert secret not in file.read_text() and str(tmp_path / "remote.git") in file.read_text()
+    assert secret not in with_no_terminal(["requests"], shell, here).printed
+    assert secret not in enrolled.printed + enrolled.shown

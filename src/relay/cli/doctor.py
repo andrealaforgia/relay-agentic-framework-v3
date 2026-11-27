@@ -23,6 +23,7 @@ from relay.application.boundaries import Boundaries
 from relay.application.boundary_runs import Attempt, BoundaryRuns, RunRefused
 from relay.application.leadership import installation_of, lock_key
 from relay.application.workers import is_alive
+from relay.git.checkout import resolve_ref
 from relay.persistence.database import Pool, schema_state
 from relay.providers.boundary_suite import runtime_now
 from relay.providers.claude import _ALWAYS_PASSED, ClaudeAdapter, resolved
@@ -244,16 +245,22 @@ async def examine(pool: Pool, broker: redis.Redis) -> list[Finding]:
             )
         )
     for project in projects:
-        reached, saw = _runs(
-            "git", "ls-remote", "--heads", "--", str(project["repository"]), str(project["trunk"])
-        )
+        trunk = f"refs/heads/{project['trunk']}"
+        try:
+            # The lookup the workflow itself makes: the exact ref, and not whatever
+            # else in the repository has a name that ends the same way.
+            head = await resolve_ref(str(project["repository"]), trunk, timeout=20.0)
+            there, saw = (
+                head is not None,
+                (f"branch {project['trunk']} is there" if head else f"there is no {trunk}"),
+            )
+        except Exception as unreachable:  # noqa: BLE001 - whatever it is, it is said
+            there, saw = False, str(unreachable)[:200]
         found.append(
             Finding(
                 f"the repository of {project['project_id']}",
-                reached and bool(saw),
-                f"branch {project['trunk']} is there"
-                if reached and saw
-                else saw or "no such branch",
+                there,
+                saw,
                 "check the address, the branch, and that Git here has access to it",
             )
         )
@@ -416,9 +423,14 @@ async def run_boundaries(
     if buying and before_launching is not None:
         before_launching(buying)
     made: list[Attempt | RunRefused] = []
+    today = boundaries_of(settings, runtime)
     for role, digest in asked.items():
         try:
-            made.append(await runs.run(request_id, role, digest, runtime, retry=retry))
+            made.append(
+                await runs.run(
+                    request_id, role, digest, runtime, retry=retry, exercising=today.get(role)
+                )
+            )
         except RunRefused as refused:
             made.append(refused)
     return made

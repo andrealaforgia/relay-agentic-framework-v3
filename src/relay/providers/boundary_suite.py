@@ -524,7 +524,9 @@ async def run_suite(
             call=result.outcome.value,
         )
     except Exception as failed:
-        if not reached:
+        if not reached or isinstance(failed, ProviderUnavailable):
+            # ProviderUnavailable is what the adapter says when it established, before
+            # launching anything, that it could not: a flag the CLI does not offer.
             # The scene could not be made, or the CLI could not be asked what it is:
             # the provider was never called, and nothing was spent.
             raise NotLaunched(f"the run was not launched: {failed}") from failed

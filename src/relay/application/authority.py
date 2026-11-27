@@ -181,8 +181,9 @@ class Policy:
 
     statement: str
     revision: int
+    # Empty, and None: a statement put on record before who made it and when were kept.
     stated_by: str
-    stated_at: datetime
+    stated_at: datetime | None
 
 
 async def state_policy(
@@ -233,7 +234,7 @@ def _policy(said: dict[str, Any]) -> Policy:
         statement=str(said["statement"]),
         revision=int(said.get("revision", 0)),
         stated_by=str(said.get("stated_by", "")),
-        stated_at=datetime.fromisoformat(str(said["stated_at"])),
+        stated_at=datetime.fromisoformat(str(said["stated_at"])) if said.get("stated_at") else None,
     )
 
 

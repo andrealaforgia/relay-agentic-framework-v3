@@ -24,6 +24,7 @@ from relay.providers.confinement import confinement_for
 from relay.runtime import wake
 
 DEFAULT_IMAGE = "python:3.14-alpine"
+_PINNED = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
 
 
 class CannotEnrol(Exception):
@@ -115,7 +116,13 @@ async def enrol(
     repository, trunk = _source(asked, checkout)
     proposed = _places(asked, installation, at_first_look)
     if not at_first_look.get("image"):
-        proposed["image"] = pin(asked.image or DEFAULT_IMAGE)
+        image = pin(asked.image or DEFAULT_IMAGE)
+        if not _PINNED.fullmatch(image):
+            raise CannotEnrol(
+                f"the oracle's image is named by its whole digest, and {image!r} is not: "
+                "name@sha256: followed by 64 hexadecimal digits. Nothing was set up"
+            )
+        proposed["image"] = image
     first: str | None = None
     if not row["has"]:
         first = read_secret(

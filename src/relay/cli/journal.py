@@ -47,24 +47,25 @@ def note(
 ) -> Request:
     """Write a request down before anything is done for it. Given the identity of one
     already written, returns that one as it was written, and writes nothing."""
-    if request_id is not None:
-        for known in read(file):
-            if known.request_id == request_id:
-                return known
-    request = Request(
-        request_id=request_id or str(uuid.uuid7()),
-        at=datetime.now(UTC).isoformat(timespec="seconds"),
-        command=tuple(command),
-        installation=installation,
-        project=project,
-    )
     file.parent.mkdir(parents=True, exist_ok=True)
-    line = (json.dumps(asdict(request), sort_keys=True) + "\n").encode()
     descriptor = os.open(file, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     try:
-        # One command at a time: what is found at the end of the file is then the whole
-        # of what the last one left.
+        # One command at a time, from looking for the request to writing it: two that
+        # use one identity for the first time at once are one after the other, and the
+        # second finds what the first wrote.
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if request_id is not None:
+            for known in read(file):
+                if known.request_id == request_id:
+                    return known
+        request = Request(
+            request_id=request_id or str(uuid.uuid7()),
+            at=datetime.now(UTC).isoformat(timespec="seconds"),
+            command=tuple(command),
+            installation=installation,
+            project=project,
+        )
+        line = (json.dumps(asdict(request), sort_keys=True) + "\n").encode()
         size = os.fstat(descriptor).st_size
         if size and os.pread(descriptor, 1, size - 1) != b"\n":
             # A record cut short by a crash. It is ended here, as a line that is no

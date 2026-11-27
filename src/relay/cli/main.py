@@ -112,6 +112,39 @@ async def _worker(role: str) -> int:
     return 0
 
 
+async def _require_handle_is_for(
+    pool: Pool, request: journal.Request, installation: str, action: str
+) -> None:
+    """A handle names one request: of one installation, for one thing. Before a command
+    acts under a handle, the handle is held to both, by the journal and by whatever
+    either kind of receipt in the database says of it."""
+    if request.installation != installation:
+        raise authority.Refused(
+            f"request {request.request_id} was made of installation {request.installation}, "
+            f"and this is {installation}: nothing is done"
+        )
+    was = request.command[0] if request.command else ""
+    if was != ("doctor" if action == "doctor" else action) or (
+        action == "doctor" and "--boundary" not in request.command
+    ):
+        raise authority.Refused(
+            f"request {request.request_id} was `relay {' '.join(request.command[:2])}`: a "
+            "request's identity is used again only to ask for the same thing. Nothing is done"
+        )
+    kept = await authority.receipt_of(pool, request.request_id)
+    async with pool.connection() as connection:
+        probes = await (
+            await connection.execute(
+                "SELECT 1 FROM boundary_requests WHERE request_id = %s", (request.request_id,)
+            )
+        ).fetchone()
+    if (action == "doctor" and kept is not None) or (action != "doctor" and probes is not None):
+        raise authority.Refused(
+            f"request {request.request_id} is on record as a request for something else: "
+            "nothing is done"
+        )
+
+
 async def _installation(pool: Pool) -> str:
     async with pool.connection() as connection:
         return await installation_of(connection)
@@ -128,7 +161,16 @@ async def _init(asked: argparse.Namespace, command: Sequence[str]) -> int:
                 print(f"relay: the repository's address cannot be used: {refused}", file=sys.stderr)
                 return 1
         await migrate(pool)
-        request = journal.note(journal.journal_file(), command, await _installation(pool), None)
+        # What is written down is what was understood and checked, option by option:
+        # not the words as typed, in which an option given twice is there twice, with
+        # whatever the one that was not used held.
+        understood = ["init"]
+        for option in ("project", "repository", "trunk", "workspaces", "mirrors", "image"):
+            if getattr(asked, option):
+                understood += [f"--{option}", str(getattr(asked, option))]
+        for directory in asked.definitions or []:
+            understood += ["--definitions", directory]
+        request = journal.note(journal.journal_file(), understood, await _installation(pool), None)
         print(f"request {request.request_id}")
         try:
             said = await enrol(
@@ -161,11 +203,7 @@ async def _noted(
     something. A handle made of another installation is refused: it is answered there."""
     installation = await _installation(pool)
     request = journal.note(journal.journal_file(), command, installation, None, request_id)
-    if request.installation != installation:
-        raise authority.Refused(
-            f"request {request.request_id} was made of installation {request.installation}, "
-            f"and this is {installation}: nothing is done"
-        )
+    await _require_handle_is_for(pool, request, installation, action)
     print(f"request {request.request_id}", flush=True)
     done = await authority.receipt_of(pool, request.request_id)
     if done is None:
@@ -207,9 +245,16 @@ async def _policy(asked: argparse.Namespace, command: Sequence[str]) -> int:
             if policy is None:
                 print("no statement of policy has been made: workers launch nothing")
                 return 0
-            print(
-                f"revision {policy.revision}, stated by {policy.stated_by} at {policy.stated_at}:"
-            )
+            if policy.stated_at is None:
+                print(
+                    f"revision {policy.revision}, stated before who made it and when were "
+                    "kept (restate it with `relay policy state` to put that on record):"
+                )
+            else:
+                print(
+                    f"revision {policy.revision}, stated by {policy.stated_by} "
+                    f"at {policy.stated_at}:"
+                )
             print(policy.statement)
             return 0
         try:
@@ -280,14 +325,12 @@ async def _doctor(asked: argparse.Namespace, command: Sequence[str]) -> int:
         request = journal.note(
             journal.journal_file(), command, installation, None, asked.request_id
         )
-        if request.installation != installation:
-            # The handle is of a request made of another installation. It is answered
-            # from that one, and buys nothing from this.
-            print(
-                f"relay: request {request.request_id} was made of installation "
-                f"{request.installation}, and this is {installation}: nothing is run",
-                file=sys.stderr,
-            )
+        try:
+            # The handle may be of another installation's request, or of a request for
+            # something else. It is answered where and as it was made, and buys nothing.
+            await _require_handle_is_for(pool, request, installation, "doctor")
+        except authority.Refused as refused:
+            print(f"relay: {refused}", file=sys.stderr)
             return 1
         print(f"request {request.request_id}", flush=True)
 

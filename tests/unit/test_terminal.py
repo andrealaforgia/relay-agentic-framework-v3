@@ -23,11 +23,21 @@ READS = (
 
 
 def shown_on(master: int, until: bytes, within: float = 10.0) -> bytes:
-    shown = b""
+    """What the terminal is shown, up to `until`. One deadline for the whole of it, and a
+    terminal that has ended is said to have ended: this never waits for ever."""
+    shown, deadline = b"", time.monotonic() + within
     while until not in shown:
-        ready, _, _ = select.select([master], [], [], within)
-        assert ready, f"the terminal showed only {shown!r}"
-        shown += os.read(master, 1024)
+        left = deadline - time.monotonic()
+        assert left > 0, f"the terminal showed only {shown!r} in {within} seconds"
+        ready, _, _ = select.select([master], [], [], left)
+        if not ready:
+            continue
+        try:
+            more = os.read(master, 1024)
+        except OSError:
+            more = b""
+        assert more, f"the terminal ended, having shown only {shown!r}"
+        shown += more
     return shown
 
 

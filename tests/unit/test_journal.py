@@ -72,3 +72,29 @@ def test_a_record_cut_short_with_no_line_end_does_not_take_the_next_request_with
     third = journal.note(file, ["policy", "state", "none"], "installation-a", None)
 
     assert journal.read(file) == [first, second, third]
+
+
+def test_two_commands_using_one_identity_for_the_first_time_at_once_write_one_request(
+    tmp_path: Path,
+) -> None:
+    """3C-S1B-2.7: each of another installation. The second to take the lock finds what
+    the first wrote, and is given that: it then knows the handle is not its own."""
+    import threading
+
+    file = tmp_path / "requests.jsonl"
+    together = threading.Barrier(8)
+    given: list[journal.Request] = []
+
+    def uses(installation: str) -> None:
+        together.wait()
+        given.append(journal.note(file, ["doctor", "--boundary"], installation, None, "one-handle"))
+
+    commands = [threading.Thread(target=uses, args=(f"installation-{n}",)) for n in range(8)]
+    for each in commands:
+        each.start()
+    for each in commands:
+        each.join()
+
+    written = journal.read(file)
+    assert len(written) == 1
+    assert given == written * 8  # every one of them was told the same installation

@@ -120,6 +120,11 @@ async def test_an_installation_made_by_the_last_build_keeps_what_it_is_across_th
                 await connection.execute(
                     "INSERT INTO projects (project_id, repository, trunk) VALUES ('vat', 'r', 'main')"
                 )
+                # As step 1a's processes had it: a statement, and nothing of who or when.
+                await connection.execute(
+                    "UPDATE installation SET policy = jsonb_build_object('statement', "
+                    "'none applies, said in 1a'::text)"
+                )
                 before = await (
                     await connection.execute("SELECT installation_id, term FROM installation")
                 ).fetchone()
@@ -139,6 +144,18 @@ async def test_an_installation_made_by_the_last_build_keeps_what_it_is_across_th
                 )  # and what is new is there
             assert after == before and before is not None and before["term"] == 1
             assert [each["project_id"] for each in projects] == ["vat"]
+            # 3C-S1B-2.8: the statement is kept and can be read, and what was never
+            # kept of it is said to be unknown, not made up and not a crash.
+            from relay.application import authority
+
+            carried = await authority.policy_of(pool)
+            assert carried is not None
+            assert (carried.statement, carried.revision, carried.stated_by, carried.stated_at) == (
+                "none applies, said in 1a",
+                0,
+                "",
+                None,
+            )
     finally:
         async with open_pool(DATABASE_URL) as admin, admin.connection() as connection:
             await connection.execute(f'DROP SCHEMA "{namespace}" CASCADE')

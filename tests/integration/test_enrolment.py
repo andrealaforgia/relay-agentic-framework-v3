@@ -308,3 +308,20 @@ async def test_init_sets_nothing_a_worker_would_then_refuse(
     await enrol(database, broker, here, relative, Person(PASSPHRASE, PASSPHRASE), pin=str)
 
     assert (await settings_of(database))["definitions"] == [str(root / "agents")]
+
+
+async def test_an_image_named_by_half_a_digest_is_refused_and_a_corrected_init_then_works(
+    database: AsyncConnectionPool, broker: redis.Redis, tmp_path: Path, places: Asked
+) -> None:
+    """3C-S1B-2.11: nothing is committed that the oracle would then refuse to run."""
+    here = checkout_of(tmp_path / "remote.git", tmp_path / "vat")
+    for mistyped in ("python@sha256:", "python@sha256:abc123", "@sha256:" + "0" * 64):
+        places.image = mistyped
+        with pytest.raises(CannotEnrol, match="whole digest"):
+            await enrol(database, broker, here, places, Person(PASSPHRASE, PASSPHRASE), pin=str)
+    assert await settings_of(database) == {} and not await authority.is_set(database)
+
+    places.image = IMAGE
+    await enrol(database, broker, here, places, Person(PASSPHRASE, PASSPHRASE), pin=str)
+
+    assert (await settings_of(database))["image"] == IMAGE
