@@ -486,6 +486,11 @@ class Integration:
                     "stale: that refusal is not this behaviour's latest. It has been tried "
                     "again since, and what the repository said then is another matter"
                 )
+            if why_not is None and behaviour.state is not BehaviourState.BLOCKED:
+                # Its latest intent is this refusal still, and a retry of it has been
+                # allowed already: the behaviour is back in review, waiting for the
+                # control plane to take the integration up. A second retry allows nothing.
+                why_not = "stale: a retry of this refusal has already been allowed"
             if why_not is not None:
                 if action is None:
                     raise IntegrationRefused(why_not)

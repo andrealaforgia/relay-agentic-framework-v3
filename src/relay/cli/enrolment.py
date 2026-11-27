@@ -165,7 +165,9 @@ async def enrol(
             said.append(f"installation {installation}: already set up")
         if held["passphrase"] is None and first is not None:
             await connection.execute(
-                "UPDATE installation SET passphrase = %s", (authority.hashed(first),)
+                "UPDATE installation SET passphrase = %s, passphrase_revision = "
+                "passphrase_revision + 1",
+                (authority.hashed(first),),
             )
             said.append("the passphrase: set")
         elif first is not None:

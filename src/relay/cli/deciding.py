@@ -23,8 +23,16 @@ from relay.application.inbox import (
     Inbox,
     Item,
 )
-from relay.application.stories import closure_in, standing_of
-from relay.domain.story import HumanAction, Principal, PrincipalKind, Receipt
+from relay.application.stories import closure_in, standing_of, transition_in
+from relay.cli.terminal import visible
+from relay.domain.story import (
+    HumanAction,
+    Principal,
+    PrincipalKind,
+    Receipt,
+    StoryState,
+    permits_behaviour_work,
+)
 from relay.runtime import Relay
 
 PRODUCT_OWNER = Principal(PrincipalKind.HUMAN, "product-owner")
@@ -61,10 +69,19 @@ class Decision:
     # A digest of the record as shown, for a decision prepared now and confirmed later.
     basis: str
     carry_out: Callable[[str], Awaitable[Receipt]]
+    # The whole identity of what it is about, however the person named it: what a
+    # prepared action keeps, so that it means the same thing when it is confirmed.
+    target_id: str = ""
+    # In Relay's own words and from identifiers only: what the passphrase is asked for.
+    to: str = ""
 
 
 def _evidence(item: Item) -> str:
-    return json.dumps(item.evidence, indent=2, sort_keys=True, default=str)
+    # JSON shows every control character below a space as an escape, and everything
+    # beyond ASCII too: what a model or a repository wrote cannot drive the terminal.
+    return json.dumps(item.evidence, indent=2, sort_keys=True, default=str).replace(
+        "\x7f", "\\u007f"
+    )
 
 
 async def resolve(
@@ -89,8 +106,9 @@ async def resolve(
             )
 
         return Decision(
-            verb, f"Start a feature in {project_id} from this problem:\n\n  {problem}\n",
+            verb, f"Start a feature in {project_id} from this problem:\n\n  {visible(problem)}\n",
             f"{project_id}:start:{problem}", f"start:{problem}", start,
+            "", f"start a feature in {project_id}",
         )  # fmt: skip
     if verb in ("pause", "resume", "cancel"):
         return await _on_a_feature(relay, project_id, verb, target, reason)
@@ -119,7 +137,7 @@ async def resolve(
     said = (text if verb == "answer" else reason) or ""
     shown = (
         f"In {project_id}, you are about to {verb}: {item.about}\n\n{_evidence(item)}\n"
-        + (f"\nYou say: {said.strip()}\n" if said.strip() else "")
+        + (f"\nYou say: {visible(said.strip())}\n" if said.strip() else "")
         + f"\n(item {item.item_id}, as shown: {item.basis})\n"
     )
 
@@ -133,7 +151,9 @@ async def resolve(
         if item.kind == QUESTION:
             return await relay.decisions.answer(by("answer", text=said))
         if item.kind == PARKED_CALL:
-            return await relay.invocations.decide(by(verb.replace("-", "_")))
+            # Held, where the retry is authorised, to all the person was shown of the
+            # work: a bill that arrives late for an earlier call changes what they saw.
+            return await relay.invocations.decide(by(verb.replace("-", "_"), as_seen=item.basis))
         assert item.kind == REFUSED_PUSH
         # The receipt is committed with the retry it allows: sent again, this request is
         # given it, though the item is by then no longer waiting.
@@ -149,8 +169,9 @@ async def resolve(
         return receipt
 
     return Decision(
-        verb, shown, f"{project_id}:{verb}:{item.item_id}:{said}", item.basis, carry_out
-    )
+        verb, shown, f"{project_id}:{verb}:{item.item_id}:{said}", item.basis, carry_out,
+        item.item_id, f"{verb} {item.kind.replace('_', ' ')} {item.handle} in {project_id}",
+    )  # fmt: skip
 
 
 async def _on_a_feature(
@@ -165,6 +186,7 @@ async def _on_a_feature(
             )
         ).fetchone()
         closure = await closure_in(connection, project_id, feature_id)
+        transition = await transition_in(connection, project_id, feature_id)
     if feature is None:
         raise CannotDecide(f"there is no feature {feature_id!r} in {project_id}")
     standing = feature["closed_by"] or feature["state"]
@@ -176,8 +198,8 @@ async def _on_a_feature(
         )
     shown = (
         f"In {project_id}, you are about to {verb} feature {feature_id} ({standing}):\n\n"
-        f"  {feature['problem']}\n"
-        + (f"\nYou say: {(reason or '').strip()}\n" if verb != "resume" else "")
+        f"  {visible(feature['problem'])}\n"
+        + (f"\nYou say: {visible((reason or '').strip())}\n" if verb != "resume" else "")
         + (
             f"\n(the pause this lifts is entry {closure} of the ledger)\n"
             if verb == "resume"
@@ -185,7 +207,9 @@ async def _on_a_feature(
         )
     )
 
-    basis = standing_of(feature, closure)
+    # Its state, whether it is closed, and the last time it was paused, resumed or
+    # cancelled: paused and resumed since, it is open as it was and not as it was shown.
+    basis = standing_of(feature, transition)
     # Held, in the transaction that decides, to the feature as the person is shown it
     # now: they may take their time over the passphrase, and it may move meanwhile.
     held_to = basis
@@ -197,7 +221,7 @@ async def _on_a_feature(
                 request_id,
                 feature_id,
                 "lift",
-                {"closure": held_to.rsplit("/", 1)[-1], "as_seen": held_to},
+                {"closure": str(closure), "as_seen": held_to},
             )
         else:
             action = HumanAction(
@@ -210,8 +234,9 @@ async def _on_a_feature(
         return await relay.features.close(project_id, action)
 
     return Decision(
-        verb, shown, f"{project_id}:{verb}:{feature_id}:{reason or ''}:{closure}", basis, carry_out
-    )
+        verb, shown, f"{project_id}:{verb}:{feature_id}:{reason or ''}:{closure}", basis, carry_out,
+        feature_id, f"{verb} feature {feature_id} in {project_id}",
+    )  # fmt: skip
 
 
 async def _on_a_decision(relay: Relay, project_id: str, target: str, text: str | None) -> Decision:
@@ -242,7 +267,8 @@ async def _on_a_decision(relay: Relay, project_id: str, target: str, text: str |
     said = (text or "").strip()
     shown = (
         f"In {project_id}, you are about to replace decision {decision['number']} of "
-        f"{decision['feature_id']}:\n\n  {decision['text']}\n\nwith:\n\n  {said}\n"
+        f"{decision['feature_id']}:\n\n  {visible(decision['text'])}\n\nwith:\n\n  "
+        f"{visible(said)}\n"
     )
 
     async def carry_out(request_id: str) -> Receipt:
@@ -254,7 +280,8 @@ async def _on_a_decision(relay: Relay, project_id: str, target: str, text: str |
 
     return Decision(
         "replace-decision", shown, f"{project_id}:replace:{decision['decision_id']}:{said}",
-        f"decision:{decision['decision_id']}", carry_out,
+        f"decision:{decision['decision_id']}", carry_out, str(decision["decision_id"]),
+        f"replace decision {decision['number']} of {decision['feature_id']} in {project_id}",
     )  # fmt: skip
 
 
@@ -280,12 +307,20 @@ async def _on_a_story_at_work(
             f"nothing waiting in {project_id} is {story_id!r}, and there is no story of that "
             "name: see `relay inbox` and `relay status`"
         )
+    if not permits_behaviour_work(StoryState(story["state"])):
+        # The service's own rule, applied here as well: a story that is not being worked
+        # on is not rejected this way, and is not prepared to be.
+        raise CannotDecide(
+            f"story {story_id} is {story['state'].replace('_', ' ')}, not being worked on: "
+            "there is nothing of it to reject this way (see `relay inbox` for what is "
+            "waiting at a gate)"
+        )
     said = (reason or "").strip()
     shown = (
         f"In {project_id}, you are about to reject story {story_id} of {story['feature_id']} "
-        f"({story['state']}), which is being worked on:\n\n  {story['title']}\n\n"
-        f"You say: {said}\n\n(as it stands at revision {story['revision']}, under decision "
-        f"basis {story['basis']})\n"
+        f"({story['state']}), which is being worked on:\n\n  {visible(story['title'])}\n\n"
+        f"You say: {visible(said)}\n\n(as it stands at revision {story['revision']}, under "
+        f"decision basis {story['basis']})\n"
     )
 
     async def carry_out(request_id: str) -> Receipt:
@@ -293,13 +328,15 @@ async def _on_a_story_at_work(
             project_id,
             HumanAction(
                 PRODUCT_OWNER, request_id, story_id, "reject",
-                {"reason": said, "revision": str(story["revision"]), "basis": str(story["basis"])},
+                {"reason": said, "revision": str(story["revision"]),
+                 "basis": str(story["basis"]), "state": str(story["state"])},
             ),
         )  # fmt: skip
 
     return Decision(
         "reject", shown, f"{project_id}:reject:{story_id}:{said}",
-        f"story:{story_id}:{story['revision']}:{story['basis']}", carry_out,
+        f"story:{story_id}:{story['revision']}:{story['basis']}:{story['state']}", carry_out,
+        story_id, f"reject story {story_id} in {project_id}",
     )  # fmt: skip
 
 

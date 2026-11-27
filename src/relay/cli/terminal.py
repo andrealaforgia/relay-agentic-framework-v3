@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import termios
+import unicodedata
 from contextlib import suppress
 
 TERMINAL = "/dev/tty"
@@ -55,6 +56,22 @@ def read_secret(prompt: str, terminal: str = TERMINAL) -> str:
         return typed.decode().rstrip("\r\n")
     finally:
         os.close(descriptor)
+
+
+def visible(text: str) -> str:
+    """Text from somewhere else, made safe to put in front of a person who is about to
+    confirm something: a model wrote it, or a repository said it. Every control character
+    is shown as what it is, and none is sent to the terminal: text that could move the
+    cursor, clear the screen or rewrite a line above could change what the person sees
+    of the action they are asked to authorise. A line break is one of them."""
+    return "".join(
+        character
+        if unicodedata.category(character)[0] != "C"
+        else f"\\x{ord(character):02x}"
+        if ord(character) < 256
+        else f"\\u{ord(character):04x}"
+        for character in text
+    )
 
 
 def say(what: str, terminal: str = TERMINAL) -> None:

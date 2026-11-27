@@ -20,7 +20,7 @@ from pathlib import Path
 import redis.asyncio as redis
 
 from relay import processes
-from relay.application import authority, prepared
+from relay.application import authority, confirmation, prepared
 from relay.application.boundaries import Boundaries
 from relay.application.boundary_runs import Attempt, BoundaryRuns, RunRefused
 from relay.application.inbox import Inbox
@@ -420,6 +420,20 @@ async def _project(pool: Pool, asked: argparse.Namespace) -> str:
     return await select_project(pool, asked.project, os.environ, Path.cwd())
 
 
+def _typed(project: str, asked: argparse.Namespace) -> str:
+    """What a deciding command asks, as it was typed: the project, the verb, what it names
+    and what it says. A request sent again is the same request only if it types the same."""
+    return ":".join(
+        [
+            project,
+            asked.verb,
+            getattr(asked, "target", "") or "",
+            getattr(asked, "text", None) or "",
+            getattr(asked, "reason", None) or "",
+        ]
+    )
+
+
 async def _decide(asked: argparse.Namespace, command: Sequence[str]) -> int:
     """One decision of the Product Owner's: resolved against the record, shown on the
     terminal, confirmed by the passphrase, carried out under a handle taken first, and
@@ -428,14 +442,19 @@ async def _decide(asked: argparse.Namespace, command: Sequence[str]) -> int:
     async with _opened() as (pool, broker):
         try:
             project = await _project(pool, asked)
-            if asked.request_id and (
-                done := await deciding.receipt_on_record(pool, asked.request_id)
-            ):
-                # Sent again: it decided what it decided, and decides nothing now. No
-                # passphrase is asked for, and what it was about need no longer be there.
-                print(f"request {asked.request_id}")
-                print(f"{done.disposition}: {done.outcome} (as on record)")
-                return 0
+            if asked.request_id:
+                # Sent again, a request is held to what it was first for: this command,
+                # naming this, saying this. Another command given the handle of a
+                # decision that took effect is refused, and is shown no receipt.
+                await authority.take_handle(
+                    pool, asked.request_id, command[0], _typed(project, asked)
+                )
+                if done := await deciding.receipt_on_record(pool, asked.request_id):
+                    # It decided what it decided, and decides nothing now. No passphrase
+                    # is asked for, and what it was about need no longer be there.
+                    print(f"request {asked.request_id}")
+                    print(f"{done.disposition}: {done.outcome} (as on record)")
+                    return 0 if done.disposition == "effective" else 1
             relay = await assemble(pool, broker)
             decision = await deciding.resolve(
                 relay,
@@ -446,12 +465,18 @@ async def _decide(asked: argparse.Namespace, command: Sequence[str]) -> int:
                 getattr(asked, "reason", None),
             )
             request = await _handle(
-                pool, command, asked.request_id, command[0], decision.asked, project
+                pool, command, asked.request_id, command[0], _typed(project, asked), project
             )
             print(f"request {request.request_id}", flush=True)
             # Shown where the passphrase is then read: what is confirmed is what is seen.
+            # The prompt itself says, in Relay's own words, what the passphrase is for.
             terminal.say(decision.shown)
-            await authority.require(pool, terminal.read_secret("The Product Owner's passphrase: "))
+            revision = await authority.require(
+                pool, terminal.read_secret(f"The Product Owner's passphrase, to {decision.to}: ")
+            )
+            # Recorded with the decision, and held to the passphrase as it is where the
+            # decision is made.
+            confirmation.by_passphrase(revision)
             receipt = await decision.carry_out(request.request_id)
             # Whatever the decision leaves for Relay to do by itself is the control
             # plane's: it is told, here, after the decision has committed.
@@ -484,9 +509,11 @@ async def _prepare(asked: argparse.Namespace) -> int:
             decision = await deciding.resolve(
                 relay, project, asked.verb, asked.target, asked.text, asked.reason
             )
+            # Kept by the whole identity of what it names, however it was typed: the same
+            # thing is meant when it is confirmed, whatever else is waiting by then.
             made = await prepared.prepare(
-                pool, project, asked.verb, asked.target, asked.text, asked.reason,
-                asked.why, decision.shown, decision.basis,
+                pool, project, asked.verb, decision.target_id or asked.target, asked.text,
+                asked.reason, asked.why, decision.shown, decision.basis,
             )  # fmt: skip
         except (deciding.CannotDecide, NoProject, NotConfigured, LookupError, ValueError) as no:
             print(f"relay: {no}", file=sys.stderr)
@@ -510,19 +537,20 @@ async def _confirm(asked: argparse.Namespace, command: Sequence[str]) -> int:
             made = await prepared.find(pool, code)
             if made is None:
                 raise deciding.CannotDecide(f"nothing was prepared under the code {code!r}")
-            if done := await deciding.receipt_on_record(pool, request_id):
-                print(f"{done.disposition}: {done.outcome} (as on record: this code was confirmed)")
-                return 0
-            if made.ended is not None:
-                raise deciding.CannotDecide(f"{made.ended}. Nothing was done under this code")
-            project = await select_project(
-                pool, asked.project or made.project_id, os.environ, Path.cwd()
-            )
+            # The project the person means, worked out as for any command and before
+            # anything of the code is used: a code does not choose its own project, and
+            # is not answered, the first time or again, to someone who means another.
+            project = await select_project(pool, asked.project, os.environ, Path.cwd())
             if project != made.project_id:
                 raise deciding.CannotDecide(
                     f"this was prepared for {made.project_id}, and the project meant here is "
                     f"{project}: nothing is done"
                 )
+            if done := await deciding.receipt_on_record(pool, request_id):
+                print(f"{done.disposition}: {done.outcome} (as on record: this code was confirmed)")
+                return 0 if done.disposition == "effective" else 1
+            if made.ended is not None:
+                raise deciding.CannotDecide(f"{made.ended}. Nothing was done under this code")
             if made.expired:
                 await prepared.end(pool, code, "this expired unused, an hour after it was prepared")
                 raise deciding.CannotDecide(
@@ -553,11 +581,28 @@ async def _confirm(asked: argparse.Namespace, command: Sequence[str]) -> int:
                 return 1
             await _handle(pool, command, request_id, "confirm", code, project)
             print(f"request {request_id}", flush=True)
+            # Why it is proposed is whoever prepared it speaking, a model as likely as
+            # not: shown with every control character made visible, and before the
+            # action itself, which is Relay's own account and is what stands above the
+            # prompt.
             terminal.say(
-                f"Prepared for you to confirm, and nothing of it has been done:\n\n"
-                f"{decision.shown}\nWhy it is proposed: {made.why}\n"
+                "Prepared for you to confirm, and nothing of it has been done.\n"
+                f"Why it is proposed, in the words of whoever prepared it:\n\n"
+                f"  {terminal.visible(made.why)}\n\n{decision.shown}"
             )
-            await authority.require(pool, terminal.read_secret("The Product Owner's passphrase: "))
+            revision = await authority.require(
+                pool,
+                terminal.read_secret(f"The Product Owner's passphrase, to {decision.to}: "),
+            )
+            confirmation.by_passphrase(revision)
+            # Taken now, by the database's clock: a person who took their time at the
+            # prompt finds here that the hour has passed, and of two terminals with one
+            # code only one goes on.
+            if not await prepared.consume(pool, code, request_id):
+                raise deciding.CannotDecide(
+                    "this code expired, or was taken at another terminal, while it was "
+                    "waiting to be confirmed. Nothing was done under it here"
+                )
             receipt = await decision.carry_out(request_id)
             await wake(pool, relay.installation, project)
         except (

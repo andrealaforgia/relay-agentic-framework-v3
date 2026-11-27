@@ -38,9 +38,18 @@ async def status(pool: Pool, project_id: str) -> dict[str, Any]:
         ).fetchall()
         owed = await (
             await connection.execute(
-                "SELECT kind, role, state, feature_id, story_id, behaviour_id, parked, "
-                "grant_id IS NOT NULL AS taken FROM assignments WHERE project_id = %s "
-                "AND state IN ('wanted', 'granted', 'asked') ORDER BY created_at",
+                # Who can act on each, read from what is open now and not from the state
+                # the work was left in: work that asked is waiting only while its
+                # question is open, and work stopped on a call is waiting for a person
+                # only while a person is still being asked about it.
+                "SELECT a.kind, a.role, a.state, a.feature_id, a.story_id, a.behaviour_id, "
+                "a.parked, a.grant_id IS NOT NULL AS taken, "
+                "EXISTS (SELECT 1 FROM questions q WHERE q.asked_for = a.assignment_id "
+                "AND q.state = 'open') AS asking, "
+                "EXISTS (SELECT 1 FROM inbox_items i JOIN invocations v USING (invocation_id) "
+                "WHERE v.assignment_id = a.assignment_id AND i.state = 'open') AS asked_about "
+                "FROM assignments a WHERE a.project_id = %s "
+                "AND a.state IN ('wanted', 'granted', 'asked') ORDER BY a.created_at",
                 (project_id,),
             )
         ).fetchall()
@@ -79,9 +88,11 @@ async def status(pool: Pool, project_id: str) -> dict[str, Any]:
                 "of": each["behaviour_id"] or each["story_id"] or each["feature_id"],
                 "to": each["role"],
                 "state": (
-                    "stopped, waiting for a person"
+                    "stopped, waiting for the Product Owner"
+                    if each["parked"] and each["asked_about"]
+                    else "stopped, and set aside by the Product Owner"
                     if each["parked"]
-                    else "waiting on a question"
+                    else "waiting on a question to the Product Owner"
                     if each["state"] == "asked"
                     else "taken up"
                     if each["taken"]
@@ -89,6 +100,9 @@ async def status(pool: Pool, project_id: str) -> dict[str, Any]:
                 ),
             }
             for each in owed
+            # Work that asked, and whose question has been answered, is done with: what
+            # the answer left owed is another piece of work, and is in this list itself.
+            if each["state"] != "asked" or each["asking"]
         ],
         "waiting_for_the_product_owner": len(waiting),
     }
@@ -125,10 +139,9 @@ def inbox_text(items: list[Item]) -> str:
         return "nothing is waiting for the Product Owner"
     lines = []
     for item in items:
-        lines.append(f"{item.item_id[:8]}  {item.kind:<12}  {item.about}")
-        lines.append(
-            f"          can be: {', '.join(item.actions)}   (`relay show {item.item_id[:8]}`)"
-        )
+        handle = item.handle or item.item_id
+        lines.append(f"{handle}  {item.kind:<12}  {item.about}")
+        lines.append(f"    can be: {', '.join(item.actions)}   (`relay show {handle}`)")
     return "\n".join(lines)
 
 
@@ -154,9 +167,15 @@ async def roadmap(pool: Pool, project_id: str, feature_id: str | None) -> dict[s
             )
         ).fetchall()
         if feature_id is None and len(features) > 1:
-            # The one being delivered, if there is one; else the latest.
-            live = [each for each in features if each["state"] not in ("completed", "cancelled")]
-            features = (live or features)[-1:]
+            # The one being delivered, if there is one: then one being checked or waiting
+            # on a decision, then one being planned. Otherwise the latest of them.
+            for state in ("delivering", "checking", "needs_decision", "planning", "discovery"):
+                standing = [each for each in features if each["state"] == state]
+                if standing:
+                    features = standing[:1]
+                    break
+            else:
+                features = features[-1:]
         if not features:
             raise LookupError(
                 f"there is no feature {feature_id!r} in {project_id}"
@@ -240,9 +259,14 @@ async def ledger(
 
 
 def ledger_text(events: list[dict[str, Any]]) -> str:
+    """One line an event, with what it recorded: the same facts as the JSON, on a line."""
+    import json
+
     if not events:
         return "no events"
     return "\n".join(
-        f"{each['sequence']:>6}  {each['at']}  {each['event']:<40}  {each['subject'] or ''}"
+        f"{each['sequence']:>6}  {each['at']}  {each['event']:<40}  {each['subject'] or '-'}  "
+        # As JSON: whatever a model or a repository wrote into an event is shown escaped.
+        f"{json.dumps(each['payload'], sort_keys=True, default=str)}"
         for each in events
     )

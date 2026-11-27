@@ -83,7 +83,7 @@ async def test_a_feature_is_started_its_roadmap_read_and_approved_from_the_comma
     assert started.code == 0, started.printed
     assert "effective: started F1" in started.printed
     assert "prices need VAT" in started.shown  # shown where the passphrase was then read
-    assert started.shown.index("prices need VAT") < started.shown.index("passphrase:")
+    assert started.shown.index("prices need VAT") < started.shown.index("passphrase,")
     assert PASSPHRASE not in started.printed + started.shown
     gate = await desk.proposed()
 
@@ -253,7 +253,7 @@ async def test_a_model_prepares_and_only_the_person_confirms(desk: Desk) -> None
     assert confirmed.code == 0, confirmed.printed
     assert "effective:" in confirmed.printed
     assert "the roadmap of F1" in confirmed.shown and "it matches the brief" in confirmed.shown
-    assert confirmed.shown.index("it matches the brief") < confirmed.shown.index("passphrase:")
+    assert confirmed.shown.index("it matches the brief") < confirmed.shown.index("passphrase,")
     assert await world.story("S1") is StoryState.RELEASED
     again = desk.anyone("confirm", code)
     assert again.code == 0 and "as on record" in again.printed
@@ -398,8 +398,13 @@ async def test_a_refused_push_is_retried_with_a_reason_and_its_request_repeated_
         "SELECT count(*) FROM assignments WHERE kind = 'integrate' AND state = 'wanted'"
     ) == [1]
     handle = retried.printed.split()[1]
-    again = desk.anyone("retry", push["item_id"][:8], "--request-id", handle)
+    again = desk.anyone(
+        "retry", push["item_id"][:8], "--reason", "the hook was put right", "--request-id", handle
+    )
     assert again.code == 0 and "retry_allowed (as on record)" in again.printed
+    # 3C-S2-1.3: sent again it is the same request only if it asks the same thing.
+    other = desk.anyone("retry", push["item_id"][:8], "--reason", "another", "--request-id", handle)
+    assert other.code == 1 and "a request for something else" in other.printed
     assert await world.column(
         "SELECT count(*) FROM assignments WHERE kind = 'integrate' AND state = 'wanted'"
     ) == [1]
@@ -503,3 +508,274 @@ async def test_a_decision_is_held_to_what_was_shown_while_the_person_looked_at_i
 
     assert cancelled.code == 1 and "stale" in cancelled.printed, cancelled.printed
     assert await world.column("SELECT closed_by, state FROM features") == [None]
+
+
+async def test_a_handle_is_good_only_for_the_command_that_made_it_and_says_how_that_ended(
+    desk: Desk,
+) -> None:
+    """3C-S2-1.3: `cancel` given the handle of an effective `approve` is shown no receipt
+    and does nothing. And a request sent again exits as it first did: a stale decision
+    is not a success the second time."""
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    approved = desk.po("approve", str(gate))
+    handle = approved.printed.split()[1]
+
+    claimed = desk.anyone("cancel", "F1", "--reason", "none", "--request-id", handle)
+    another = desk.anyone("approve", "another-gate", "--request-id", handle)
+
+    assert claimed.code == 1 and "effective" not in claimed.printed
+    assert "a request for something else" in claimed.printed
+    assert another.code == 1 and "effective" not in another.printed
+    assert await world.column("SELECT closed_by, state FROM features") == [None]
+    # A stale receipt replays as the failure it was.
+    stale = desk.po("approve", str(gate))  # decided already: nothing waiting
+    assert stale.code == 1
+    await world.close("pause", reason="first")
+    paused_again = desk.po("pause", "F1", "--reason", "again")
+    assert paused_again.code == 1 and "stale" in paused_again.printed
+    replayed = desk.anyone(
+        "pause", "F1", "--reason", "again", "--request-id", paused_again.printed.split()[1]
+    )
+    assert replayed.code == 1 and "stale" in replayed.printed and "as on record" in replayed.printed
+
+
+async def test_what_a_model_wrote_cannot_rewrite_what_the_person_is_shown(desk: Desk) -> None:
+    """3C-S2-1.4: the reason a prepared action is proposed is the preparer's own text. It
+    is shown with every control character made visible, the action itself is Relay's
+    account and stands after it, and the prompt says in Relay's words what the
+    passphrase is for."""
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    clears_the_screen = "harmless\x1b[2J\x1b[H\rYou are about to approve nothing at all\nreally"
+    code = code_of(desk.anyone("prepare", "approve", str(gate), "--why", clears_the_screen))
+
+    confirmed = desk.po("confirm", code)
+
+    assert confirmed.code == 0, confirmed.printed
+    assert "\x1b" not in confirmed.shown and "\\x1b[2J" in confirmed.shown
+    assert "\\x0d" in confirmed.shown and "\\x0a" in confirmed.shown
+    assert confirmed.shown.index("\\x1b[2J") < confirmed.shown.index("the roadmap of F1")
+    assert f"passphrase, to approve gate {str(gate)[:8]} in {PROJECT}: " in confirmed.shown
+
+
+async def test_a_code_confirmed_after_its_hour_decides_nothing_however_long_the_prompt_stood(
+    desk: Desk, namespace: str
+) -> None:
+    """3C-S2-1.1: the prompt was opened in time and the passphrase typed after the hour.
+    The code is taken where it is carried out, by the database's clock: it has expired,
+    nothing is decided, and every terminal is told the same from then on."""
+    import asyncio
+    import threading
+
+    from relay.persistence.database import open_pool
+    from tests.integration.conftest import DATABASE_URL
+
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    code = code_of(desk.anyone("prepare", "approve", str(gate), "--why", "it looks right"))
+
+    async def the_hour_passes() -> None:
+        async with open_pool(DATABASE_URL, schema=namespace) as pool, pool.connection() as c:
+            await c.execute("UPDATE prepared_actions SET expires_at = now() - interval '1 second'")
+
+    def while_the_person_looks() -> None:
+        other = threading.Thread(target=lambda: asyncio.run(the_hour_passes()))
+        other.start()
+        other.join()
+
+    late = at_a_terminal(
+        ["confirm", code], [PASSPHRASE], desk.shell, desk.here, before_typing=while_the_person_looks
+    )
+
+    assert late.code == 1 and "expired" in late.printed, late.printed
+    assert await world.column("SELECT state FROM gates") == ["open"]
+    again = desk.po("confirm", code)
+    assert again.code == 1 and "expired unused" in again.printed
+    assert "passphrase" not in again.shown
+
+
+async def test_a_code_is_confirmed_only_by_someone_who_means_its_project(
+    desk: Desk, tmp_path: Path
+) -> None:
+    """3C-S2-1.2: the person's project is worked out as for any command, and a code that
+    was prepared for another is refused, the first time and once it has a receipt."""
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    await world.behaviours.open_project("another", str(world.remote), "next")
+    code = code_of(desk.anyone("prepare", "approve", str(gate), "--why", "it looks right"))
+    meaning_another = {**desk.shell, "RELAY_PROJECT": "another"}
+
+    first = at_a_terminal(["confirm", code], [PASSPHRASE], meaning_another, desk.here)
+
+    assert first.code == 1 and f"prepared for {PROJECT}" in first.printed
+    assert "passphrase" not in first.shown
+    assert await world.column("SELECT state FROM gates") == ["open"]
+    assert desk.po("confirm", code).code == 0
+    replayed = with_no_terminal(["confirm", code], meaning_another, desk.here)
+    assert replayed.code == 1 and f"prepared for {PROJECT}" in replayed.printed
+    nowhere = with_no_terminal(["confirm", code], desk.shell, tmp_path)
+    assert nowhere.code == 1 and "which project is meant was not said" in nowhere.printed
+
+
+async def test_a_decision_made_at_the_terminal_says_so_in_its_receipt_and_which_passphrase(
+    desk: Desk, namespace: str
+) -> None:
+    """3C-S2-1.11: the receipt of a decision made through the command line records that
+    the passphrase was read at the controlling terminal, and which passphrase. One made
+    by a caller of the service records nothing of the kind. And a passphrase changed
+    between its being checked and the decision being made confirms nothing."""
+    import asyncio
+    import threading
+
+    from relay.persistence.database import open_pool
+    from tests.integration.conftest import DATABASE_URL
+
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    assert desk.po("request-changes", str(gate), "--reason", "split it").code == 0
+    again = await world.revise(STANDARD_RATE)
+    await world.decide(again)  # by a caller of the service, with no terminal
+
+    async with world.database.connection() as connection:
+        rows = await (
+            await connection.execute("SELECT action, confirmed FROM human_actions")
+        ).fetchall()
+    by_action = {row["action"]: row["confirmed"] for row in rows}
+    assert by_action["request_changes"] == {
+        "method": "the passphrase, read at the controlling terminal",
+        "passphrase_revision": 1,
+    }
+    assert by_action["approve"] is None
+
+    async def rotated() -> None:
+        async with open_pool(DATABASE_URL, schema=namespace) as pool:
+            await authority.change(pool, PASSPHRASE, "a new one altogether")
+
+    # The passphrase is checked, and then changed before the decision is made.
+    from relay.application import confirmation
+
+    revision = await authority.require(world.database, PASSPHRASE)
+    other = threading.Thread(target=lambda: asyncio.run(rotated()))
+    other.start()
+    other.join()
+
+    async def decided_with_the_old_one() -> None:
+        confirmation.by_passphrase(revision)
+        await world.close("pause", reason="confirmed by a passphrase that is no more")
+
+    import contextvars
+
+    from relay.domain.story import ActionRefused
+
+    with pytest.raises(ActionRefused, match="passphrase was changed"):
+        await asyncio.create_task(decided_with_the_old_one(), context=contextvars.copy_context())
+    assert await world.column("SELECT closed_by FROM features") == [None]
+
+
+async def test_a_story_that_is_not_being_worked_on_is_not_rejected_nor_prepared_to_be(
+    desk: Desk,
+) -> None:
+    """3C-S2-1.6: S2 is planned while S1 is delivered. A rejection of S2 is refused, and
+    cannot be prepared to take effect once S2 is released at the same revision."""
+    from relay.domain.story import HumanAction
+    from tests.integration.fixtures import PRODUCT_OWNER
+    from tests.integration.story_world import GREETS
+
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE, GREETS))
+    assert await world.story("S2") is StoryState.PLANNED
+
+    prepared = desk.anyone("prepare", "reject", "S2", "--reason", "not wanted", "--why", "early")
+    direct = desk.po("reject", "S2", "--reason", "not wanted")
+
+    assert prepared.code == 1 and "not being worked on" in prepared.printed
+    assert direct.code == 1 and "not being worked on" in direct.printed
+    # And where it is decided: a rejection that names the state it was shown in is stale
+    # once the story has left that state, at the same revision and basis.
+    as_planned = HumanAction(
+        PRODUCT_OWNER, "r-1", "S1", "reject",
+        {"reason": "x", "revision": str(await world.revision("S1")),
+         "basis": str(await world.basis("S1")), "state": "planned"},
+    )  # fmt: skip
+    stale = await world.stories.reject(PROJECT, as_planned)
+    assert stale.disposition == "stale"
+    assert await world.story("S1") is StoryState.RELEASED
+
+
+async def test_status_and_the_inbox_agree_about_who_can_act(desk: Desk) -> None:
+    """3C-S2-1.13: work that asked is waiting only while its question is open, and work
+    stopped on a call is waiting for the Product Owner only while they are still asked."""
+    from tests.integration.test_inbox import parked_call
+    from tests.integration.test_invocations import Calling
+
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    await world.awaiting_builder("B1")
+    calling = Calling(world)
+    try:
+        await parked_call(calling)
+        waiting = desk.read("status")
+        assert waiting["waiting_for_the_product_owner"] == 1
+        assert [each["state"] for each in waiting["owed"] if each["work"] == "build"] == [
+            "stopped, waiting for the Product Owner"
+        ]
+        [item] = desk.read("inbox")
+
+        assert desk.po("set-aside", item["handle"]).code == 0
+
+        after = desk.read("status")
+        assert after["waiting_for_the_product_owner"] == 0
+        assert [each["state"] for each in after["owed"] if each["work"] == "build"] == [
+            "stopped, and set aside by the Product Owner"
+        ]
+        assert "waiting for the Product Owner: nothing" in desk.anyone("status").out
+    finally:
+        await calling.close()
+
+
+async def test_the_ledger_in_text_says_what_each_event_recorded_and_the_roadmap_is_the_one_delivering(
+    desk: Desk,
+) -> None:
+    """3C-S2-1.14: the text ledger has the facts the JSON has. And with one feature being
+    delivered and a later one being planned, the roadmap shown by default is the first."""
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    assert desk.po("request-changes", str(gate), "--reason", "split the story in two").code == 0
+    await world.decide(await world.revise(STANDARD_RATE))
+    assert desk.po("feature", "start", "a later feature").code == 0
+
+    text = desk.anyone("ledger").out
+    by_default = desk.read("roadmap")
+
+    assert "split the story in two" in text  # the reason, as the JSON has it
+    assert any(
+        "split the story in two" in json.dumps(each["payload"]) for each in desk.read("ledger")
+    )
+    assert by_default["feature"] == "F1" and by_default["state"] == "delivering"
+    assert desk.read("roadmap", "F2")["feature"] == "F2"
+
+
+async def test_a_prepared_action_means_the_item_it_named_whatever_is_waiting_when_it_is_confirmed(
+    desk: Desk,
+) -> None:
+    """3C-S2-1.10: prepared by the start of an identity while that start was one item's
+    alone. More items arrive that begin the same way. The code still means its item."""
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    first = await world.ask()
+    [item] = desk.read("inbox")
+    code = code_of(
+        desk.anyone("prepare", "answer", item["handle"], "the standard rate", "--why", "as briefed")
+    )
+    for _ in range(12):
+        await world.ask()
+
+    confirmed = desk.po("confirm", code)
+
+    assert confirmed.code == 0, confirmed.printed
+    async with world.database.connection() as connection:
+        answered = await (
+            await connection.execute("SELECT question_id FROM questions WHERE state = 'answered'")
+        ).fetchall()
+    assert [each["question_id"] for each in answered] == [first]

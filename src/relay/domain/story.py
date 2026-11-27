@@ -283,6 +283,8 @@ AT_A_GATE = {
 # Setting aside a story that is being worked on. A gate is one fixed thing to decide on;
 # a story at work is not, so the person says which revision, under which decisions.
 ON_A_STORY = {"reject": frozenset({"reason", "revision", "basis"})}
+# The same, as a command makes it: with the state the story was in when it was shown.
+ON_A_STORY_AS_SEEN = {"reject": frozenset({"reason", "revision", "basis", "state"})}
 ON_A_QUESTION = {"answer": frozenset({"text"})}
 ON_A_DECISION = {"replace": frozenset({"text"})}
 ON_A_FEATURE = {

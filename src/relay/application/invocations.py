@@ -40,6 +40,7 @@ from relay.application.closure import (
     require_startable,
     story_basis,
 )
+from relay.application.inbox import parked_basis, parked_evidence
 from relay.application.leadership import current_term, require_term, term, term_is_over
 from relay.application.stories import _record as record_receipt
 from relay.application.stories import _recorded as recorded_receipt
@@ -65,6 +66,8 @@ ATTEMPTS_BEFORE_ASKING = 3
 # The role of the control plane's own session, and whose an effect is when it is its.
 CONTROL_PLANE = "control-plane"
 ON_A_PARKED_CALL = {"retry": frozenset[str](), "set_aside": frozenset[str]()}
+# The same, as a command makes them: with a digest of all the person was shown of the work.
+ON_A_PARKED_CALL_AS_SEEN = {"retry": frozenset({"as_seen"}), "set_aside": frozenset({"as_seen"})}
 _UNCERTAIN = "a paid call may have completed and its result was not received"
 
 
@@ -774,7 +777,9 @@ class Invocations:
         more call, once, however often the request is sent; `set_aside` leaves the work
         parked and takes it out of the inbox."""
         require_human(action.principal)
-        require_well_formed(action, ON_A_PARKED_CALL)
+        require_well_formed(
+            action, ON_A_PARKED_CALL_AS_SEEN if "as_seen" in action.payload else ON_A_PARKED_CALL
+        )
         try:
             invocation_id = uuid.UUID(action.target)
         except ValueError:
@@ -806,6 +811,15 @@ class Invocations:
                 or assignment["state"] not in ("wanted", "granted")
             ):
                 receipt = Receipt("stale", "nothing changed: this work is not parked on that call")
+            elif "as_seen" in action.payload and action.payload["as_seen"] != parked_basis(
+                invocation_id, await parked_evidence(connection, invocation_id) or {}
+            ):
+                # What the person was shown of this work has changed since: a bill that
+                # arrived late for an earlier call, say. They decided on other evidence.
+                receipt = Receipt(
+                    "stale",
+                    "nothing changed: what is known of this work has changed since it was shown",
+                )
             elif not await _asked_about(connection, invocation_id):
                 # Set aside already: the question about this call was answered, and it
                 # is no longer one. The work stays parked, and nothing here allows a

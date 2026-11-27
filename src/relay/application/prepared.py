@@ -76,3 +76,27 @@ async def end(pool: Pool, code: str, why: str) -> None:
             "UPDATE prepared_actions SET ended = %s WHERE code = %s AND ended IS NULL",
             (why, code),
         )
+
+
+async def consume(pool: Pool, code: str, request_id: str) -> bool:
+    """Take a code for the confirmation about to carry it out: once, and only while it is
+    neither ended nor expired, as the database's clock has it at this moment. True if
+    this request has it. A person who took their time at the prompt finds here that the
+    hour has passed, and two terminals with one code are one after the other."""
+    async with pool.connection() as connection, connection.transaction():
+        taken = await (
+            await connection.execute(
+                "UPDATE prepared_actions SET consumed_by = %s WHERE code = %s AND ended IS NULL "
+                "AND expires_at > now() AND (consumed_by IS NULL OR consumed_by = %s) "
+                "RETURNING code",
+                (request_id, code, request_id),
+            )
+        ).fetchone()
+        if taken is None:
+            # Expired while the person was looking at it: said once, for whoever asks.
+            await connection.execute(
+                "UPDATE prepared_actions SET ended = %s WHERE code = %s AND ended IS NULL "
+                "AND consumed_by IS NULL AND expires_at <= now()",
+                ("this expired unused, an hour after it was prepared", code),
+            )
+    return taken is not None

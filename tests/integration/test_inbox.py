@@ -119,7 +119,7 @@ async def test_a_parked_call_set_aside_is_no_longer_a_question_and_a_retry_of_it
 
     [item] = await inbox.items(PROJECT)
     assert item.kind == PARKED_CALL and item.actions == ("retry", "set-aside")
-    assert item.evidence["calls_made"] == 3 and item.evidence["role"] == "builder"
+    assert item.evidence["calls_launched"] == 3 and item.evidence["role"] == "builder"
     assert item.evidence["why_parked"] == "3 calls gave nothing that could be used"
     assert item.evidence["work"] == "build of B1"
 
@@ -290,3 +290,178 @@ async def test_a_feature_is_paused_or_cancelled_only_as_it_was_when_the_person_w
     assert await world.close(
         "cancel", reason="as it is now", as_seen=standing_of(now, closure)
     ) == Receipt("effective", "cancelled")
+
+
+async def test_a_cancellation_is_of_the_feature_as_it_was_shown_and_not_of_one_that_looks_the_same(
+    world: DecisionWorld,
+) -> None:
+    """3C-S2-1.5: shown open. Paused and resumed since, with its state unchanged: open as
+    it was, and not as it was shown. A cancellation of what was shown is stale."""
+    from relay.application.stories import standing_of, transition_in
+
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    async with world.database.connection() as connection:
+        feature = await (
+            await connection.execute("SELECT state, closed_by FROM features")
+        ).fetchone()
+        assert feature is not None
+        shown = standing_of(feature, await transition_in(connection, PROJECT, "F1"))
+    await world.close("pause", reason="someone else's reason")
+    await world.close("resume")
+    async with world.database.connection() as connection:
+        again = await (await connection.execute("SELECT state, closed_by FROM features")).fetchone()
+        assert again == feature  # it looks the same
+        now = standing_of(again, await transition_in(connection, PROJECT, "F1"))
+
+    old = await world.close("cancel", reason="as I saw it", as_seen=shown)
+
+    assert shown != now
+    assert old.disposition == "stale" and "no longer as it was" in old.outcome
+    assert await world.column("SELECT closed_by FROM features") == [None]
+    assert await world.close("cancel", reason="as it is", as_seen=now) == Receipt(
+        "effective", "cancelled"
+    )
+
+
+async def test_a_second_retry_of_one_refused_push_allows_nothing_and_has_a_receipt_saying_so(
+    world: DecisionWorld,
+) -> None:
+    """3C-S2-1.7: two people saw the same refusal. The first retry puts the behaviour
+    back in review; the second finds it is no longer blocked on that refusal."""
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    base = await world.awaiting_builder("B1")
+    await world.reviewed("B1", on=base)
+    world.hook_flag("refuse").touch()
+    await world.integrate("B1")
+    [push] = await Inbox(world.database).items(PROJECT)
+    intent = uuid.UUID(push.item_id)
+
+    first = await world.integration.retry_integration(
+        PROJECT,
+        "B1",
+        "put right",
+        "r-1",
+        intent,
+        by("r-1", push.item_id, "retry", reason="put right"),
+    )
+    second = await world.integration.retry_integration(
+        PROJECT, "B1", "me too", "r-2", intent, by("r-2", push.item_id, "retry", reason="me too")
+    )
+
+    assert first == Receipt("effective", "retry_allowed")
+    assert second is not None and second.disposition == "stale"
+    assert "already been allowed" in second.outcome
+    assert await world.column(
+        "SELECT count(*) FROM assignments WHERE kind = 'integrate' AND state = 'wanted'"
+    ) == [1]
+    assert (
+        await world.integration.retry_integration(
+            PROJECT,
+            "B1",
+            "me too",
+            "r-2",
+            intent,
+            by("r-2", push.item_id, "retry", reason="me too"),
+        )
+        == second
+    )  # durable: sent again, the same receipt
+
+
+async def test_a_parked_call_shows_what_was_charged_estimated_and_not_known_and_is_held_to_it(
+    calling: Calling,
+) -> None:
+    """3C-S2-1.8: calls that never started are not calls made; a charge is not an estimate;
+    what is not known is counted, not left out of a sum. And a decision about the work is
+    held to all of that as it was shown: a bill that turns up late for an earlier call
+    changes the evidence, and a retry confirmed on the old evidence is stale."""
+    world = calling.world
+    await parked_call(calling)
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "UPDATE invocations SET provider_cost_usd = 0.02, estimated_cost_usd = 0.03 "
+            "WHERE attempt = 1"
+        )
+        await connection.execute(
+            "UPDATE invocations SET provider_cost_usd = NULL, estimated_cost_usd = 0.05 "
+            "WHERE attempt = 2"
+        )
+        await connection.execute(
+            "UPDATE invocations SET provider_cost_usd = NULL, estimated_cost_usd = NULL "
+            "WHERE attempt = 3"
+        )
+    inbox = Inbox(world.database)
+
+    [item] = await inbox.items(PROJECT)
+
+    assert item.evidence["calls_launched"] == 3
+    assert item.evidence["calls_that_never_started"] == 0
+    assert item.evidence["charged_usd"] == "0.02"
+    assert item.evidence["estimated_usd_where_no_charge_was_reported"] == "0.05"
+    assert item.evidence["calls_whose_cost_is_not_known"] == 1
+    # A bill arrives late for the third call.
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "UPDATE invocations SET provider_cost_usd = 0.40 WHERE attempt = 3"
+        )
+
+    late = await calling.invocations.decide(by("r-1", item.item_id, "retry", as_seen=item.basis))
+
+    assert late.disposition == "stale" and "changed since it was shown" in late.outcome
+    [now] = await inbox.items(PROJECT)
+    assert now.basis != item.basis and now.evidence["charged_usd"] == "0.42"
+    assert await calling.invocations.decide(
+        by("r-2", item.item_id, "retry", as_seen=now.basis)
+    ) == Receipt("effective", "retry_authorised")
+
+
+async def test_a_failed_final_check_shows_what_was_expected_and_what_was_observed(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    """3C-S2-1.9: what a person weighs between checking again and changing the roadmap."""
+    world = CompletionWorld(database, tmp_path, runner_image)
+    world.base = await world.open()
+    await failed_on_trunk(world)
+
+    [item] = await Inbox(world.database).items(PROJECT)
+
+    failed = [each for each in item.evidence["observed"] if not each["satisfied"]]
+    passed = [each for each in item.evidence["observed"] if each["satisfied"]]
+    assert len(failed) == 1 and len(passed) == 1
+    assert failed[0]["expected"] and failed[0]["ran"]  # what it was to produce, and how
+    assert {"exit_code", "stdout", "stderr"} <= set(failed[0])
+    assert passed[0]["stdout"].strip() == "120"  # what the oracle saw the other produce
+
+
+async def test_items_made_in_the_same_moment_each_have_a_handle_of_their_own(
+    world: DecisionWorld,
+) -> None:
+    """3C-S2-1.10: identities made together begin alike. Each item is shown with the
+    shortest start that is its alone, and that start finds it."""
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    for _ in range(12):
+        await world.ask()
+    inbox = Inbox(world.database)
+
+    items = await inbox.items(PROJECT)
+
+    handles = [each.handle for each in items]
+    assert len(items) == 12 and len(set(handles)) == 12
+    for each in items:
+        assert each.item_id.startswith(each.handle) and len(each.handle) >= 8
+        assert await inbox.item(PROJECT, each.handle) == each
+    # A start that two share finds neither.
+    shared = items[0].item_id[:8]
+    if sum(1 for each in items if each.item_id.startswith(shared)) > 1:
+        assert await inbox.item(PROJECT, shared) is None
+
+
+async def test_a_feature_is_given_a_name_nobody_has(world: DecisionWorld) -> None:
+    """3C-S2-1.12: features opened by other means chose their own names."""
+    from tests.integration.fixtures import PRODUCT_OWNER as PO
+
+    await world.stories.open_feature(PO, PROJECT, "F2", "named by its caller")
+
+    started = await world.stories.start_feature(PROJECT, by("r-1", "", "start", problem="a third"))
+    again = await world.stories.start_feature(PROJECT, by("r-2", "", "start", problem="a fourth"))
+
+    assert (started.outcome, again.outcome) == ("started F3", "started F4")

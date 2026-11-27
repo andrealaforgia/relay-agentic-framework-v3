@@ -60,14 +60,18 @@ async def is_set(pool: Pool) -> bool:
     return row is not None and row["passphrase"] is not None
 
 
-async def require(pool: Pool, passphrase: str) -> None:
-    """Refuse unless this is the Product Owner's passphrase."""
+async def require(pool: Pool, passphrase: str) -> int:
+    """Refuse unless this is the Product Owner's passphrase. Says which passphrase it is:
+    a decision confirmed by it is held to that where it is decided."""
     async with pool.connection() as connection:
-        row = await (await connection.execute("SELECT passphrase FROM installation")).fetchone()
+        row = await (
+            await connection.execute("SELECT passphrase, passphrase_revision FROM installation")
+        ).fetchone()
     if row is None or row["passphrase"] is None:
         raise Refused("no passphrase has been set: run `relay init`")
     if not matches(passphrase, row["passphrase"]):
         raise Refused("that is not the passphrase")
+    return int(row["passphrase_revision"])
 
 
 async def set_first(pool: Pool, passphrase: str) -> bool:
@@ -76,7 +80,8 @@ async def set_first(pool: Pool, passphrase: str) -> bool:
     require_usable(passphrase)
     async with pool.connection() as connection:
         cursor = await connection.execute(
-            "UPDATE installation SET passphrase = %s WHERE passphrase IS NULL",
+            "UPDATE installation SET passphrase = %s, passphrase_revision = "
+            "passphrase_revision + 1 WHERE passphrase IS NULL",
             (hashed(passphrase),),
         )
     return cursor.rowcount == 1
@@ -93,7 +98,11 @@ async def change(pool: Pool, current: str, new: str, request_id: str | None = No
         if done is not None:
             return "changed, as on record"
         _require_matches(current, row["passphrase"])
-        await connection.execute("UPDATE installation SET passphrase = %s", (hashed(new),))
+        await connection.execute(
+            "UPDATE installation SET passphrase = %s, passphrase_revision = "
+            "passphrase_revision + 1",
+            (hashed(new),),
+        )
         await _keep_receipt(connection, row, request_id, "passphrase", "", {"changed": True})
     return "changed"
 

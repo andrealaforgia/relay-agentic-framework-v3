@@ -46,6 +46,7 @@ from relay.application.closure import (
 from relay.application.completion import end_request as end_completion_request
 from relay.application.completion import evaluate_completion, roadmap_changed
 from relay.application.completion import settle_gate as settle_completion_gate
+from relay.application.confirmation import confirmation_in
 from relay.application.owed import owe_what_is_needed
 from relay.domain.evidence import ProcessContract
 from relay.domain.identifiers import require_identifier
@@ -55,6 +56,7 @@ from relay.domain.story import (
     ON_A_FEATURE,
     ON_A_FEATURE_AS_SEEN,
     ON_A_STORY,
+    ON_A_STORY_AS_SEEN,
     ActionRefused,
     Candidate,
     Entry,
@@ -196,7 +198,17 @@ class Stories:
                 )
             ).fetchone()
             assert row is not None
-            feature_id = f"F{int(row['n']) + 1}"
+            # A name nobody has: features opened by other means chose their own names,
+            # and the next number may be one of them.
+            number = int(row["n"]) + 1
+            while await (
+                await connection.execute(
+                    "SELECT 1 FROM features WHERE project_id = %s AND feature_id = %s",
+                    (project_id, f"F{number}"),
+                )
+            ).fetchone():
+                number += 1
+            feature_id = f"F{number}"
             if not action.payload["problem"].strip():
                 raise ActionRefused("a feature starts from a stated problem")
             await _open_feature_in(
@@ -452,7 +464,7 @@ class Stories:
         revision and decision basis as the person saw them: if either has moved, or the
         story is no longer being worked on, nothing changes and the receipt says so."""
         require_human(action.principal)
-        require_well_formed(action, ON_A_STORY)
+        require_well_formed(action, ON_A_STORY_AS_SEEN if "state" in action.payload else ON_A_STORY)
         story_id = action.target
         try:
             revision, basis = int(action.payload["revision"]), int(action.payload["basis"])
@@ -470,6 +482,10 @@ class Stories:
                 story["revision"],
                 await story_basis(connection, project_id, story_id),
             )
+            # From a command: also the state the person was shown it in. A story that
+            # was planned when a rejection was prepared, and has been released since at
+            # the same revision, is not the story that was shown.
+            as_seen = as_seen and action.payload.get("state", story["state"]) == story["state"]
             if not as_seen or not permits_behaviour_work(StoryState(story["state"])):
                 receipt = Receipt(
                     "stale",
@@ -700,10 +716,23 @@ async def _open_feature_in(
     )
 
 
-def standing_of(feature: Mapping[str, Any], closure: int | None) -> str:
+def standing_of(feature: Mapping[str, Any], transition: int | None) -> str:
     """How a feature stands, as one thing a decision can be held to: its state, whether
-    it is closed, and by which pause."""
-    return f"{feature['state']}/{feature['closed_by'] or 'open'}/{closure or '-'}"
+    it is closed, and the last time it was paused, resumed or cancelled. Paused and
+    resumed since, a feature is open as it was and is not as it was shown."""
+    return f"{feature['state']}/{feature['closed_by'] or 'open'}/{transition or '-'}"
+
+
+async def transition_in(connection: Connection, project_id: str, feature_id: str) -> int | None:
+    """The place in the ledger of the last pause, resume or cancellation of a feature."""
+    row = await (
+        await connection.execute(
+            "SELECT max(sequence) AS last FROM events WHERE project_id = %s AND subject_id = %s "
+            "AND event_type IN ('feature.paused', 'feature.resumed', 'feature.cancelled')",
+            (project_id, feature_id),
+        )
+    ).fetchone()
+    return int(row["last"]) if row and row["last"] is not None else None
 
 
 async def closure_in(connection: Connection, project_id: str, feature_id: str) -> int | None:
@@ -742,7 +771,7 @@ async def close_feature(pool: Pool, project_id: str, action: HumanAction) -> Rec
             return seen
         closed_by = feature["closed_by"]
         if "as_seen" in action.payload:
-            now = standing_of(feature, await closure_in(connection, project_id, feature_id))
+            now = standing_of(feature, await transition_in(connection, project_id, feature_id))
             if now != action.payload["as_seen"]:
                 # Decided on what a person was shown, which is no longer how it is:
                 # paused, resumed, moved on or cancelled since.
@@ -1696,7 +1725,7 @@ async def _record(connection: Connection, action: HumanAction, receipt: Receipt)
     stored = await (
         await connection.execute(
             "INSERT INTO human_actions (principal, request_id, target, action, payload, digest, "
-            "disposition, outcome) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+            "disposition, outcome, confirmed) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (principal, request_id) DO NOTHING RETURNING request_id",
             (
                 action.principal.identity,
@@ -1707,6 +1736,9 @@ async def _record(connection: Connection, action: HumanAction, receipt: Receipt)
                 action.digest,
                 receipt.disposition,
                 receipt.outcome,
+                # How the person was known to be the Product Owner, read here, in the
+                # transaction that decides: it refuses a passphrase changed since.
+                Jsonb(confirmed) if (confirmed := await confirmation_in(connection)) else None,
             ),
         )
     ).fetchone()
