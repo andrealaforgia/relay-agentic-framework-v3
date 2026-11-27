@@ -4,7 +4,7 @@ Provenance: written by Claude (Fable 5.2) on 2026-11-27 for review by Astra (gpt
 
 Step 1b closed after its third round without acceptance. The eight findings of your last review are fixed, each with a test, and those fixes are not reviewed; the record is in `README.md` of this directory. The acceptance test you named for 3C-S1B-3.1 is there, through the command: a stand-in CLI that becomes another version after its first run launches no second run under the old request.
 
-Code at commit `COMMIT` on `main`. GATE
+Code at commit `ba8611d` on `main`. `make check` passed on it, run with every compiled file cleared first: 1368 tests, 3 skipped (the ones that make paid calls).
 
 ## What is built
 
@@ -29,7 +29,7 @@ A refused push is not a row of `inbox_items`. It is read from the record: a beha
 
 ## Where I departed from the contract, or decided what it left open
 
-1. **`confirm` holds the action to its basis in the command, not in the deciding transaction.** It resolves afresh and compares digests, then calls the service. Between the comparison and the service's transaction the record can move. The services themselves hold a gate (by its identity), a parked call (the item still open), a refused push (the intent) and a story at work (its revision and basis). **`lift` is the awkward one**: `confirm` passes the pause it finds now, so for a prepared resume the comparison in the command is the whole of the guard. The same for `pause` and `cancel` prepared against a state that has changed.
+1. **`confirm` compares the prepared basis with the record in the command, and the services hold what is carried out to what was just shown.** `confirm` resolves the action afresh and, if its basis is not the one kept, the code is stale before anything is put to the person. What is then carried out is held in the service's own transaction: a gate by its identity, a parked call by its item still being open, a refused push by its intent, a story at work by its revision and basis, and a feature by how it stood when it was shown (its state, whether it is closed, and by which pause), which `pause`, `resume` and `cancel` from a command now all carry. So the time a person spends at the passphrase prompt is covered: `test_a_decision_is_held_to_what_was_shown_while_the_person_looked_at_it` changes the feature from another connection between the prompt appearing and the passphrase being typed, for a plain `resume` and for a confirmed `cancel`. **Not held in a transaction: a question answered or a decision replaced**, beyond what those services already check of their own target.
 2. **A request sent again is answered whatever verb it is sent again with.** The receipt is looked up by the request's identity alone.
 3. **The combined test the design asked for has two kinds together, not three**: a refused push and a parked call, read by services that knew nothing of how they came about, each decided from the inbox alone. A failed final check is tested by itself. A parked build and a refused push cannot be waiting in one story (a behaviour is not built while its predecessor waits to be integrated), so the parked call is the plan of a second feature.
 4. **"After a restart" is new service objects on the same database**, not processes stopped and started.
@@ -49,9 +49,11 @@ A refused push is not a row of `inbox_items`. It is read from the record: a beha
 
 ## Deliberate breakage
 
-Twenty-five breakages of this step's code, all caught at first, each by a test of this step.
+Twenty-eight breakages of this step's code. Twenty-seven were caught at first, each by a test of this step. One was not, and the code it broke is gone: I had `confirm` pass the prepared basis on to be held to, and removing that changed no test, because `confirm` has already refused any code whose basis differs. It was a guard that could not matter, so I took it out rather than keep it with a reason.
 
-Before running them I looked for what had no test and found two things: a story's gate offering `reject`, and a refused push retried through the command and repeated by its handle. Both got a test first, and three of the twenty-five would have survived without them. A third, a story at work rejected through the command, got its test after the gate quoted above had started; that test is in the commit and passes.
+Before the first run I looked for what had no test and found three things: a story's gate offering `reject`; a refused push retried through the command and repeated by its handle; and a story at work rejected through the command. Each got a test first.
+
+I also stopped a gate that had just started, to fix a weakness I had written into the first draft of this submission as known: a confirmed resume passed the pause it found at that moment, so the only guard was a comparison made before the passphrase was read. It is fixed as in point 1, and the gate quoted above is of the fixed code.
 
 Two things found by tests while building: a parked build and a refused push cannot coexist in one story, which reshaped the combined test; and the project selector refused to guess for a checkout left on no branch, as it should.
 
