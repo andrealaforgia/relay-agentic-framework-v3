@@ -1327,6 +1327,13 @@ async def test_a_planned_story_a_decision_changed_is_reworded_by_the_analyst(
 
     [asked] = briefings(roles["analyst"], "You propose the roadmap")
     assert "story S2 no longer stands under the decisions now in force" in asked
+    # 3B-S4-2.5: the verdict was offered because S2 is planned.
+    [offered] = [
+        each.schema["properties"]["delivered"]["properties"]["verdict"]["enum"]
+        for each in roles["analyst"].asked
+        if "You are asked whether" in each.briefing
+    ]
+    assert offered == ["stands", "to_be_replaced"]
     [proposal] = [each for each in await world.stories.inbox(PROJECT) if each.kind == "roadmap"]
     await world.decide(proposal.gate_id)
     assert await world.column("SELECT title FROM stories WHERE story_id = 'S2'") == [
@@ -1477,3 +1484,24 @@ async def test_a_reconfirmation_is_offered_only_the_verdicts_its_behaviour_can_t
     ]
     assert (before["verdict"]["enum"], "contract" in before) == (["stands", "amended"], True)
     assert (after["verdict"]["enum"], "contract" in after) == (["stands", "to_be_replaced"], False)
+
+
+async def test_a_story_being_worked_on_is_offered_no_verdict_it_cannot_take(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S4-2.5: only a planned story is reworded. For one that is released the Analyst
+    says it stands, or asks."""
+    at = delivering_world
+    roles = await released(at)
+    at.workers.pop("verifier")
+    at.workers.pop("builder")
+
+    await at.world.answer(await at.world.ask(), "zero-rated")
+    await at.work()
+
+    [offered] = [
+        each.schema["properties"]["delivered"]["properties"]
+        for each in roles["analyst"].asked
+        if "You are asked whether" in each.briefing
+    ]
+    assert offered == {"verdict": {"enum": ["stands"]}}

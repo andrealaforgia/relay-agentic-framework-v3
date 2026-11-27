@@ -361,6 +361,29 @@ async def test_a_result_already_known_is_applied_and_nothing_is_called(bench: Be
     assert bench.applied == [{"sum": 5}]
 
 
+async def test_a_run_that_starts_on_another_cli_than_its_pass_was_for_is_not_carried_through(
+    bench: Bench, tmp_path: Path
+) -> None:
+    """3B-S4-2.2: the worker says which CLI the admitting pass was of, and the run's own
+    start event is held to it."""
+    adapter = ClaudeAdapter(
+        str(RECORDED / "stub_claude.py"),
+        {
+            "PATH": os.environ["PATH"],
+            "STUB_STREAM": str(RECORDED / "success.jsonl"),
+            "STUB_HANG": "1",
+        },
+    )
+    bench.stated["cli"] = "2.2.0 (Claude Code)"  # and the recorded run says 2.1.330
+    worker = await bench.worker(adapter)
+
+    assert await worker.carry_out(await bench.owed()) == "uncertain"
+
+    assert bench.applied == []
+    [reason] = await bench.world.column("SELECT reason FROM invocations")
+    assert "is of CLI 2.1.330" in str(reason)
+
+
 async def test_with_the_cli_itself_standing_in_a_recorded_run_is_carried_through(
     bench: Bench, tmp_path: Path
 ) -> None:
