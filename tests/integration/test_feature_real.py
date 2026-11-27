@@ -93,8 +93,10 @@ async def test_a_small_feature_is_delivered_by_the_real_provider(
             await world.decide(item.gate_id)
 
     said = await world.column(
-        "SELECT a.kind || ' ' || v.state || coalesce(': ' || v.reason, '') FROM invocations v "
-        "JOIN assignments a USING (assignment_id) ORDER BY v.started_at"
+        "SELECT a.kind || ' ' || v.state || coalesce(': ' || v.reason, '') || ' [' || v.role "
+        "|| ' attempt ' || v.attempt || ' of ' || left(a.assignment_id::text, 13) || ' ' "
+        "|| a.state || coalesce(' after ' || left(a.succeeds::text, 13), '') || ']' "
+        "FROM invocations v JOIN assignments a USING (assignment_id) ORDER BY v.started_at"
     )
     assert await world.feature() == "completed", "\n".join(str(each) for each in said)
     summary = await world.summary()
@@ -119,5 +121,8 @@ async def test_a_small_feature_is_delivered_by_the_real_provider(
     ) == [0]
     spent = {role: use["provider_cost_usd"] for role, use in summary["usage"]["by_role"].items()}
     print("calls:", len(provider.made), "spent by role:", spent)
+    print("\n".join(provider.made))
+    # Every call on record is one the provider was asked for, and the other way about.
+    assert len(said) == len(provider.made), (said, provider.made)
     print("\n".join(str(each) for each in said))
     assert all(cost != "unknown" for cost in spent.values()), spent

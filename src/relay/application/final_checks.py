@@ -714,7 +714,13 @@ def totals_of(calls: Sequence[Mapping[str, Any]]) -> Any:
             role[counted] = "unknown" if None in each else sum(each)
         for cost in ("provider_cost_usd", "estimated_cost_usd"):
             each = parts[name][cost]
-            role[cost] = "unknown" if None in each else str(sum(each, Decimal(0)).normalize())
+            # To a hundred-millionth of a dollar: what a provider reports as a binary
+            # fraction is not shown with the noise of one.
+            role[cost] = (
+                "unknown"
+                if None in each
+                else f"{sum(each, Decimal(0)).quantize(Decimal('0.00000001')).normalize():f}"
+            )
     return {"by_role": by_role, "calls_not_known": not_known}
 
 
