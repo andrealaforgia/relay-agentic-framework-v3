@@ -34,7 +34,8 @@ from relay.providers.definitions import AgentDefinition
 from relay.providers.stream import Event, Started, Terminal, read_line
 
 # The tool the CLI adds for itself when a reply has to satisfy a schema.
-_STRUCTURED_OUTPUT = "StructuredOutput"
+STRUCTURED_OUTPUT = "StructuredOutput"
+_STRUCTURED_OUTPUT = STRUCTURED_OUTPUT
 _ALWAYS_PASSED = (
     "--print",
     "--output-format",
@@ -159,8 +160,11 @@ class ClaudeAdapter:
             request.definition.name: {
                 "description": request.definition.description,
                 "prompt": request.definition.prompt,
-                # The role's tools, whatever the definition's own file asked for.
-                "tools": tools,
+                # The role's tools, whatever the definition's own file asked for, and the
+                # one by which a reply is given in the form its schema asks for. An agent
+                # whose own list leaves that one out cannot give a structured answer at
+                # all: the real CLI then returns prose, and every reply is refused.
+                "tools": [*tools, _STRUCTURED_OUTPUT],
             }
         }
         return [

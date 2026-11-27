@@ -91,14 +91,20 @@ def builds(files: dict[str, str]) -> Any:
 
 
 class Delivering:
-    def __init__(self, world: CompletionWorld, tmp_path: Path) -> None:
+    def __init__(
+        self, world: CompletionWorld, tmp_path: Path, profile: Profile | None = None
+    ) -> None:
+        # What a worker is shown to run within, and on what: stand-ins unless a test
+        # that makes real calls puts the real ones here.
+        self.boundaries: Any = SeenToHold()
+        self.runtime: Any = lambda: RUNTIME
         self.world = world
         agents = tmp_path / "agents"
         agents.mkdir()
         for name in AGENTS:
             (agents / f"{name}.md").write_text(f"---\nname: {name}\n---\nDo the work.\n")
         self.invocations = Invocations(world.database)
-        profile = Profile("claude-sonnet-5-5")
+        profile = profile or Profile("claude-sonnet-5-5")
         workspaces = Workspaces(tmp_path.resolve() / "workspaces")
         common = (world.database, self.invocations, workspaces, world.mirrors, [agents], profile)
         roadmap = RoadmapTask(*common)
@@ -158,8 +164,8 @@ class Delivering:
                 self.invocations,
                 provider,
                 self.by_role[role],
-                SeenToHold(),
-                lambda: RUNTIME,
+                self.boundaries,
+                self.runtime,
                 then=self.world.features.reconcile,
             )
 

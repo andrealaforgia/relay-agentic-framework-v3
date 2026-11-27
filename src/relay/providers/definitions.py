@@ -64,7 +64,10 @@ def find_definition(name: str, directories: Sequence[Path]) -> AgentDefinition:
                 sha256=hashlib.sha256(content).hexdigest(),
                 revision=revision,
                 dirty=dirty,
-                description=description,
+                # The provider refuses to launch an agent that is described by nothing,
+                # and says so only after the launch. One that gives no description is
+                # handed over under its name: that is recorded with the call, as given.
+                description=description or f"The {name} agent.",
                 prompt=prompt,
             )
     raise LookupError(f"no definition of {name} is installed in any of the places searched")

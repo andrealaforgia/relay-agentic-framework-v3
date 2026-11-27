@@ -68,29 +68,14 @@ def plain(reply: Any) -> Any:
 
 
 def _shape_problem(reply: Any, flat: Mapping[str, Any]) -> str | None:
-    """What is wrong with how a reply says which of the two it is, or with what it then
-    says, or None. A reply is in one form or the other and never a mixture, and what it
-    delivers is held to the whole of the schema in either: `flat` is that schema."""
+    """What is wrong with a reply as its schema has it, or with what the schema cannot
+    say, or None. A build or a review replies in its own form and no other: the whole
+    of the reply is held to the whole of the schema, here as where it is recorded."""
     if not isinstance(reply, dict):
         return "the reply is an object"
-    if "delivered" in reply:
-        inside = reply["delivered"]
-        if not isinstance(inside, dict):
-            return "what a reply delivers is an object"
-        beside = sorted(set(reply) - {"outcome", "delivered", "assumptions", "question"})
-        if beside:
-            return f"a reply that says what it delivers under delivered has no {beside} beside it"
-        within = sorted(set(inside) & {"outcome", "delivered", "assumptions", "question"})
-        if within:
-            return f"what a reply delivers has no {within} within it"
-    said = schema_problem(plain(reply), dict(flat))
+    said = schema_problem(reply, dict(flat))
     if said:
         return said
-    outcome = reply.get("outcome")
-    if outcome == "question" and (reply.get("question") is None or "delivered" in reply):
-        return "a reply that asks has a question and delivers nothing"
-    if outcome == "delivered" and reply.get("question") is not None:
-        return "a reply that delivers has no question"
     if not all(str(text).strip() for text in reply.get("assumptions") or ()):
         return "an assumption says nothing"
     return None
@@ -200,10 +185,10 @@ REVIEW_REPLY = {
         },
         "question": QUESTION,
         "assumptions": _ASSUMPTIONS,
-        "outcome": {"enum": ["delivered", "question"]},
-        "delivered": {"type": "object"},
     },
-    # A review, with its findings and how the earlier ones stand; or a question.
+    # A review, with its findings and how the earlier ones stand; or a question. One
+    # form only: offered this and the form other kinds of work reply in, a real model
+    # filled in both at once, and each such reply was a paid call refused.
     "required": [],
     "additionalProperties": False,
 }
@@ -507,8 +492,6 @@ BUILD_REPLY = {
         "note": {"type": "string"},
         "question": QUESTION,
         "assumptions": _ASSUMPTIONS,
-        "outcome": {"enum": ["delivered", "question"]},
-        "delivered": {"type": "object"},
     },
     # A note of what was built; or a question, and then nothing that was left is kept.
     "required": [],

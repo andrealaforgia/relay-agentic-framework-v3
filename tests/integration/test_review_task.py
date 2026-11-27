@@ -499,13 +499,8 @@ async def test_one_reviewer_asking_while_the_other_reviews_does_not_stop_either(
 async def test_what_a_reviewer_assumed_is_on_record_with_the_review_it_delivered(
     reviewing: Reviewing,
 ) -> None:
-    """3B-S3-2.7 and 3B-S3-2.12: in the transaction that accepts the review, and in the
-    form every other kind of work replies in."""
-    reply = {
-        "outcome": "delivered",
-        "assumptions": ["amounts are whole numbers"],
-        "delivered": NOTHING_FOUND,
-    }
+    """3B-S3-2.7: in the transaction that accepts the review."""
+    reply = {**NOTHING_FOUND, "assumptions": ["amounts are whole numbers"]}
     worker = await reviewing.worker("qa", Reviewer(reply))
 
     assert await worker.carry_out(await reviewing.owed("qa")) == "applied"

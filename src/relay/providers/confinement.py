@@ -20,7 +20,7 @@ import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from relay.providers.claude import Confinement
+from relay.providers.claude import STRUCTURED_OUTPUT, Confinement
 from relay.providers.definitions import AgentDefinition
 
 _READS = ("Read", "Grep", "Glob")
@@ -114,12 +114,13 @@ def environment_for_a_run(
 
 def effective_agent_sha256(definition: AgentDefinition, tools: Sequence[str]) -> str:
     """The hash of the definition as it is handed to the provider: what the file says
-    of the agent, with the role's tools in place of whatever the file asked for."""
+    of the agent, with the role's tools in place of whatever the file asked for, and the
+    tool by which a structured answer is given."""
     handed_over = {
         "name": definition.name,
         "description": definition.description,
         "prompt": definition.prompt,
-        "tools": list(tools),
+        "tools": [*tools, STRUCTURED_OUTPUT],
     }
     return hashlib.sha256(json.dumps(handed_over, sort_keys=True).encode()).hexdigest()
 

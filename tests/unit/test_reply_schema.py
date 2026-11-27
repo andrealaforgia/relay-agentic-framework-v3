@@ -93,16 +93,18 @@ QUESTION = {"text": "Refuse negatives?", "why": "no criterion says", "options": 
         (BuildTask, BUILD_REPLY, {"note": "done"}),
     ],
 )
-def test_a_build_or_a_review_may_reply_in_the_form_every_other_kind_of_work_does(
+def test_a_build_or_a_review_replies_in_one_form_and_the_schema_offers_no_other(
     task: Any, schema: dict[str, Any], delivered: dict[str, Any]
 ) -> None:
-    """3B-S3-2.12: the common shape is not a paid attempt lost."""
-    asks = {"outcome": "question", "question": QUESTION, "assumptions": []}
-    delivers = {"outcome": "delivered", "assumptions": ["x"], "delivered": delivered}
-
-    for reply in (asks, delivers, delivered, {"question": QUESTION}):
+    """Offered two forms, a real model filled in both at once (the smoke against the
+    provider, three paid builds refused). The schema it is given now has the one."""
+    for reply in (delivered, {**delivered, "assumptions": ["x"]}, {"question": QUESTION}):
         assert problem_with(reply, schema) is None
         assert task.problem_with(None, reply) is None
+    wrapped = {"outcome": "delivered", "assumptions": [], "delivered": delivered}
+    for reply in (wrapped, {**wrapped, **delivered}, {"outcome": "question", "question": QUESTION}):
+        assert "which was not asked for" in str(problem_with(reply, schema))
+        assert task.problem_with(None, reply) is not None
 
 
 @pytest.mark.parametrize(
@@ -110,9 +112,6 @@ def test_a_build_or_a_review_may_reply_in_the_form_every_other_kind_of_work_does
     [
         ({"note": "done", "assumptions": [" "]}, "an assumption says nothing"),
         ({"note": "done", "question": QUESTION}, "no note of work done"),
-        ({"outcome": "question", "delivered": {"note": "x"}, "question": QUESTION}, "delivers"),
-        ({"outcome": "delivered", "question": QUESTION}, "has no question"),
-        ({"outcome": "question"}, "has a question"),
     ],
 )
 def test_what_a_schema_cannot_say_of_a_build_reply_its_task_says(
@@ -153,22 +152,23 @@ def test_a_reply_its_task_would_not_take_is_applied_as_a_refusal_whoever_recorde
                 "assumptions": [],
                 "delivered": {"findings": "", "carried": {}},
             },
-            "is not a array",
+            "not asked for",
         ),
         (
             BuildTask,
             {"outcome": "delivered", "delivered": {"note": "done", "question": QUESTION}},
-            "within it",
+            "not asked for",
         ),
-        (BuildTask, {"delivered": {"note": "done"}, "note": "also"}, "beside it"),
-        (BuildTask, {"outcome": "delivered", "delivered": "done"}, "is an object"),
+        (BuildTask, {"delivered": {"note": "done"}, "note": "also"}, "not asked for"),
+        (BuildTask, {"outcome": "delivered", "delivered": "done"}, "not asked for"),
         (ReviewTask, {"delivered": {"findings": [], "carried": [], "extra": 1}}, "not asked for"),
     ],
 )
-def test_what_a_reply_delivers_is_held_to_its_whole_schema_in_either_form(
+def test_a_reply_in_the_other_form_or_in_both_has_no_effect_of_the_work(
     task: Any, reply: dict[str, Any], says: str
 ) -> None:
-    """3B-S3-3.1: neither a review of nothing nor a build that also asks."""
+    """3B-S3-3.1: neither a review of nothing nor a build that also asks. The one form
+    is the whole of what is accepted."""
     found = task.problem_with(None, reply)
 
     assert found is not None and says in found

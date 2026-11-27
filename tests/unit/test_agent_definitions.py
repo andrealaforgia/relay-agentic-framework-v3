@@ -114,7 +114,9 @@ def test_a_file_with_no_front_matter_is_all_prompt(tmp_path: Path) -> None:
 
     found = find_definition("plain", [tmp_path])
 
-    assert (found.description, found.prompt) == ("", "Just do the work.\n")
+    # Under its name: the real CLI refuses an agent with an empty description, and only
+    # after it has been launched (found by the first smoke against the real provider).
+    assert (found.description, found.prompt) == ("The plain agent.", "Just do the work.\n")
 
 
 def test_the_search_goes_from_what_was_configured_to_the_project_to_the_home(

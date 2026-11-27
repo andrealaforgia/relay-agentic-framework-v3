@@ -139,7 +139,9 @@ async def test_the_definition_that_runs_is_the_content_that_was_recorded(tmp_pat
         "alf-test-design-reviewer": {
             "description": "Evaluates test code quality.",
             "prompt": "You review tests.\n",
-            "tools": ["Read"],
+            # With the tool a structured answer is given by: left out of the agent's own
+            # list, the real CLI gives prose (found by the smoke against the provider).
+            "tools": ["Read", "StructuredOutput"],
         }
     }
 
