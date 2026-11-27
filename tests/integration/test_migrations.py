@@ -41,9 +41,10 @@ async def test_an_applied_migration_missing_from_this_build_is_an_error(
         await migrate(database)
 
 
-# What `relay up` of slice 3c step 1a applied, by content. An installation made by that
-# build records these, and refuses a build in which any of them reads differently: what
-# comes after is a new migration, never an addition to one of these.
+# Every migration that has been pushed, by content. A build that has been pushed may have
+# been run, and an installation made by it records these and refuses a build in which
+# any of them reads differently. What comes after is a new migration, never an addition
+# to one of these: a migration is added to this list in the commit that first pushes it.
 SHIPPED = {
     "0001_foundation.sql": "09329c490ba244d5c797870679eaecbb8fd06c768614465f678c5968f1c5f3cf",
     "0002_executions.sql": "5eee91cb96afffead89a524e2a37b1a1a43045ad347bcaadc56fed424823ff1f",
@@ -61,6 +62,8 @@ SHIPPED = {
     "0014_completion.sql": "78daa16d7862c9f07e6e637c3c1a67edfdd8a30ac5c09eb101e889bcce30d834",
     "0015_invocations.sql": "34cf81d4ffef9ced6a9bb51948f0c5d621564951b76a77f214e6a5c247654721",
     "0016_installation.sql": "11e9895fb1d31021ff63c82f5b413fa98264d5eba2f1b3aff9c2191409a0c389",
+    "0017_enrolment.sql": "b69abf31a36f0792569da7ff3c0e6f2490b29076479e792c2a708221c6f75231",
+    "0018_prepared.sql": "c45e8b0533564ba622bc13245be79bc42d0944b4af4194e495a2870679c8c79b",
 }
 
 
@@ -120,6 +123,19 @@ async def test_an_installation_made_by_the_last_build_keeps_what_it_is_across_th
                 await connection.execute(
                     "INSERT INTO projects (project_id, repository, trunk) VALUES ('vat', 'r', 'main')"
                 )
+                # What the last build left of the Product Owner's work: a passphrase, an
+                # action prepared and not yet confirmed, and a decision with its receipt.
+                await connection.execute("UPDATE installation SET passphrase = 'scrypt$kept'")
+                await connection.execute(
+                    "INSERT INTO prepared_actions (code, project_id, verb, target, why, shown, "
+                    "basis, expires_at) VALUES ('c0de0001', 'vat', 'approve', 'a-gate', "
+                    "'it looks right', 'shown', 'sha256:b', now() + interval '1 hour')"
+                )
+                await connection.execute(
+                    "INSERT INTO human_actions (principal, request_id, target, action, payload, "
+                    "digest, disposition, outcome) VALUES ('product-owner', 'r-1', 'vat', "
+                    "'start', '{\"problem\": \"p\"}', 'd', 'effective', 'started F1')"
+                )
                 # As step 1a's processes had it: a statement, and nothing of who or when.
                 await connection.execute(
                     "UPDATE installation SET policy = jsonb_build_object('statement', "
@@ -144,6 +160,23 @@ async def test_an_installation_made_by_the_last_build_keeps_what_it_is_across_th
                 )  # and what is new is there
             assert after == before and before is not None and before["term"] == 1
             assert [each["project_id"] for each in projects] == ["vat"]
+            # 3C-S2-2.1: what the last build left is there and can be used by this one.
+            from relay.application import prepared
+            from relay.cli.deciding import receipt_on_record
+
+            kept = await prepared.find(pool, "c0de0001")
+            assert kept is not None and (kept.consumed_by, kept.expired, kept.ended) == (
+                None,
+                False,
+                None,
+            )
+            receipt = await receipt_on_record(pool, "r-1", "vat", "start", "", "p", None)
+            assert receipt is not None and receipt.outcome == "started F1"
+            async with pool.connection() as connection:
+                which = await (
+                    await connection.execute("SELECT passphrase_revision FROM installation")
+                ).fetchone()
+            assert which is not None and which["passphrase_revision"] == 1
             # 3C-S1B-2.8: the statement is kept and can be read, and what was never
             # kept of it is said to be unknown, not made up and not a crash.
             from relay.application import authority

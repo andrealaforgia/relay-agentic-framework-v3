@@ -716,23 +716,30 @@ async def _open_feature_in(
     )
 
 
-def standing_of(feature: Mapping[str, Any], transition: int | None) -> str:
+def standing_of(feature: Mapping[str, Any], transition: str | int | None) -> str:
     """How a feature stands, as one thing a decision can be held to: its state, whether
-    it is closed, and the last time it was paused, resumed or cancelled. Paused and
-    resumed since, a feature is open as it was and is not as it was shown."""
+    it is closed, and how far it has come (`transition_in`). Paused and resumed since,
+    or checked again and failed again, a feature may read as it did and is not as it
+    was shown."""
     return f"{feature['state']}/{feature['closed_by'] or 'open'}/{transition or '-'}"
 
 
-async def transition_in(connection: Connection, project_id: str, feature_id: str) -> int | None:
-    """The place in the ledger of the last pause, resume or cancellation of a feature."""
+async def transition_in(connection: Connection, project_id: str, feature_id: str) -> str:
+    """How far a feature has come: the place in the ledger of the last time it was
+    paused, resumed or cancelled, and the last thing that was put to a person about it.
+    A final check retried and failed again leaves the feature in the state it was in,
+    with another gate: this is what tells the two apart."""
     row = await (
         await connection.execute(
-            "SELECT max(sequence) AS last FROM events WHERE project_id = %s AND subject_id = %s "
-            "AND event_type IN ('feature.paused', 'feature.resumed', 'feature.cancelled')",
-            (project_id, feature_id),
+            "SELECT (SELECT max(sequence) FROM events WHERE project_id = %s AND subject_id = %s "
+            "AND event_type IN ('feature.paused', 'feature.resumed', 'feature.cancelled')) "
+            "AS closure, (SELECT gate_id FROM gates WHERE project_id = %s AND feature_id = %s "
+            "ORDER BY opened_at DESC, gate_id DESC LIMIT 1) AS gate",
+            (project_id, feature_id, project_id, feature_id),
         )
     ).fetchone()
-    return int(row["last"]) if row and row["last"] is not None else None
+    assert row is not None
+    return f"{row['closure'] or '-'}.{row['gate'] or '-'}"
 
 
 async def closure_in(connection: Connection, project_id: str, feature_id: str) -> int | None:

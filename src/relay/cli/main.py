@@ -29,7 +29,7 @@ from relay.application.leadership import AlreadyLed, installation_of
 from relay.cli import deciding, doctor, journal, reading, terminal
 from relay.cli.enrolment import DEFAULT_IMAGE, Asked, CannotEnrol, enrol
 from relay.cli.selection import NoProject, select_project
-from relay.domain.story import ActionRefused
+from relay.domain.story import ActionRefused, Receipt
 from relay.git.checkout import require_credential_free
 from relay.persistence.database import Pool, migrate, open_pool, schema_state
 from relay.providers.boundary_suite import SuiteResult, run_suite, runtime_now
@@ -434,6 +434,17 @@ def _typed(project: str, asked: argparse.Namespace) -> str:
     )
 
 
+async def _require_made_here(pool: Pool, request_id: str) -> None:
+    """Refuse a request the journal says was made of another installation."""
+    installation = await _installation(pool)
+    for known in journal.read(journal.journal_file()):
+        if known.request_id == request_id and known.installation != installation:
+            raise authority.Refused(
+                f"request {request_id} was made of installation {known.installation}, and "
+                f"this is {installation}: nothing is done, and nothing of it is answered here"
+            )
+
+
 async def _decide(asked: argparse.Namespace, command: Sequence[str]) -> int:
     """One decision of the Product Owner's: resolved against the record, shown on the
     terminal, confirmed by the passphrase, carried out under a handle taken first, and
@@ -443,13 +454,28 @@ async def _decide(asked: argparse.Namespace, command: Sequence[str]) -> int:
         try:
             project = await _project(pool, asked)
             if asked.request_id:
-                # Sent again, a request is held to what it was first for: this command,
-                # naming this, saying this. Another command given the handle of a
-                # decision that took effect is refused, and is shown no receipt.
-                await authority.take_handle(
-                    pool, asked.request_id, command[0], _typed(project, asked)
-                )
-                if done := await deciding.receipt_on_record(pool, asked.request_id):
+                if asked.request_id.startswith("confirm:"):
+                    # The name a confirmation gives its own request. Nobody else's.
+                    raise deciding.CannotDecide(
+                        "a request's identity does not begin with `confirm:`: that is how "
+                        "a prepared action names its confirmation"
+                    )
+                # Of this installation: the journal says which one a request was made
+                # of, and another installation may have a project and a request of the
+                # same names. Asked before anything here is looked at or claimed.
+                await _require_made_here(pool, asked.request_id)
+                # Sent again, a request is answered by its own receipt, which says what
+                # it was for: another command given the handle of a decision that took
+                # effect is refused, and is shown nothing.
+                if done := await deciding.receipt_on_record(
+                    pool,
+                    asked.request_id,
+                    project,
+                    verb,
+                    getattr(asked, "target", "") or "",
+                    getattr(asked, "text", None),
+                    getattr(asked, "reason", None),
+                ):
                     # It decided what it decided, and decides nothing now. No passphrase
                     # is asked for, and what it was about need no longer be there.
                     print(f"request {asked.request_id}")
@@ -546,12 +572,28 @@ async def _confirm(asked: argparse.Namespace, command: Sequence[str]) -> int:
                     f"this was prepared for {made.project_id}, and the project meant here is "
                     f"{project}: nothing is done"
                 )
-            if done := await deciding.receipt_on_record(pool, request_id):
+            # The handle first: `confirm:<code>` is this code's request and nobody
+            # else's. One that some other command used under that name is refused here,
+            # before any receipt of its is looked at.
+            await authority.take_handle(pool, request_id, "confirm", code)
+
+            async def answered() -> Receipt | None:
+                # The receipt on record under this code's request, if it is the receipt
+                # of the action that was prepared and of no other.
+                return await deciding.receipt_on_record(
+                    pool, request_id, project, made.verb, made.target, made.said, made.reason
+                )
+
+            if done := await answered():
                 print(f"{done.disposition}: {done.outcome} (as on record: this code was confirmed)")
                 return 0 if done.disposition == "effective" else 1
             if made.ended is not None:
                 raise deciding.CannotDecide(f"{made.ended}. Nothing was done under this code")
             if made.expired:
+                # Unused and past its hour. A code a confirmation has taken is not
+                # expired, however long ago: it is settled by what that confirmation
+                # decides, and a second terminal, or the same one after a crash,
+                # carries that same confirmation on.
                 await prepared.end(pool, code, "this expired unused, an hour after it was prepared")
                 raise deciding.CannotDecide(
                     "this expired unused, an hour after it was prepared. Nothing was done"
@@ -568,6 +610,12 @@ async def _confirm(asked: argparse.Namespace, command: Sequence[str]) -> int:
                 moved = decision.basis != made.basis
             except deciding.CannotDecide:
                 moved = True
+            if moved and (done := await answered()):
+                # It has moved because this very code was confirmed at another terminal
+                # a moment ago: the item closes in the transaction that writes the
+                # receipt. Both terminals are given that one answer.
+                print(f"{done.disposition}: {done.outcome} (as on record: this code was confirmed)")
+                return 0 if done.disposition == "effective" else 1
             if moved:
                 # What it was prepared against is closed, or is no longer what was
                 # shown. That is this code's answer, for good.
@@ -579,7 +627,9 @@ async def _confirm(asked: argparse.Namespace, command: Sequence[str]) -> int:
                     "decided, or has changed, since it was prepared"
                 )
                 return 1
-            await _handle(pool, command, request_id, "confirm", code, project)
+            journal.note(
+                journal.journal_file(), command, await _installation(pool), project, request_id
+            )
             print(f"request {request_id}", flush=True)
             # Why it is proposed is whoever prepared it speaking, a model as likely as
             # not: shown with every control character made visible, and before the

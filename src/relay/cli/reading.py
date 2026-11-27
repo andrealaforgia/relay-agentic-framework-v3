@@ -8,6 +8,7 @@ import dataclasses
 from typing import Any
 
 from relay.application.inbox import Inbox, Item
+from relay.cli.terminal import visible
 from relay.persistence.database import Pool
 
 
@@ -113,11 +114,13 @@ def status_text(facts: dict[str, Any]) -> str:
     if not facts["features"]:
         lines.append('  no feature yet: start one with `relay feature start "<the problem>"`')
     for feature in facts["features"]:
-        lines.append(f"  {feature['feature']}  {feature['state']}  {feature['problem']}")
+        lines.append(f"  {feature['feature']}  {feature['state']}  {visible(feature['problem'])}")
         for story in feature["stories"]:
-            lines.append(f"    {story['story']}  {story['state']}  {story['title']}")
+            lines.append(f"    {story['story']}  {story['state']}  {visible(story['title'])}")
             for each in story["behaviours"]:
-                lines.append(f"      {each['behaviour']}  {each['state']}  {each['summary']}")
+                lines.append(
+                    f"      {each['behaviour']}  {each['state']}  {visible(each['summary'])}"
+                )
     lines.append("owed:" if facts["owed"] else "owed: nothing")
     for each in facts["owed"]:
         lines.append(f"  {each['work']} of {each['of']}, to the {each['to']}: {each['state']}")
@@ -169,13 +172,29 @@ async def roadmap(pool: Pool, project_id: str, feature_id: str | None) -> dict[s
         if feature_id is None and len(features) > 1:
             # The one being delivered, if there is one: then one being checked or waiting
             # on a decision, then one being planned. Otherwise the latest of them.
-            for state in ("delivering", "checking", "needs_decision", "planning", "discovery"):
-                standing = [each for each in features if each["state"] == state]
-                if standing:
-                    features = standing[:1]
-                    break
+            # The feature whose story holds the project's one place in delivery, if a
+            # story does: two features can both read `delivering` while only one of them
+            # is being worked on.
+            holding = await (
+                await connection.execute(
+                    "SELECT feature_id FROM stories WHERE project_id = %s AND state IN "
+                    "('released', 'changes_requested', 'awaiting_approval') "
+                    "ORDER BY position LIMIT 1",
+                    (project_id,),
+                )
+            ).fetchone()
+            if holding is not None:
+                features = [
+                    each for each in features if each["feature_id"] == holding["feature_id"]
+                ]
             else:
-                features = features[-1:]
+                for state in ("checking", "needs_decision", "delivering", "planning", "discovery"):
+                    standing = [each for each in features if each["state"] == state]
+                    if standing:
+                        features = standing[:1]
+                        break
+                else:
+                    features = features[-1:]
         if not features:
             raise LookupError(
                 f"there is no feature {feature_id!r} in {project_id}"
@@ -217,18 +236,18 @@ async def roadmap(pool: Pool, project_id: str, feature_id: str | None) -> dict[s
 
 
 def roadmap_text(facts: dict[str, Any]) -> str:
-    lines = [f"{facts['feature']}  {facts['state']}  {facts['problem']}"]
+    lines = [f"{facts['feature']}  {facts['state']}  {visible(facts['problem'])}"]
     if not facts["stories"]:
         lines.append("  no story yet")
     for story in facts["stories"]:
-        lines.append(f"  {story['story']}  {story['state']}  {story['title']}")
-        lines.append(f"      so that: {story['outcome']}")
+        lines.append(f"  {story['story']}  {story['state']}  {visible(story['title'])}")
+        lines.append(f"      so that: {visible(story['outcome'])}")
         for name, text in story["criteria"].items():
-            lines.append(f"      {name}: {text}")
+            lines.append(f"      {visible(name)}: {visible(text)}")
     if facts["proposal_waiting"]:
         lines.append(
-            f"a proposal is waiting for the Product Owner: `relay show "
-            f"{facts['proposal_waiting'][:8]}`"
+            # By its whole identity: a start of it may be another item's too.
+            f"a proposal is waiting for the Product Owner: `relay show {facts['proposal_waiting']}`"
         )
     return "\n".join(lines)
 

@@ -134,6 +134,15 @@ async def resolve(
         raise CannotDecide(f"to {verb} this, say why with --reason")
     if verb == "answer" and not (text or "").strip():
         raise CannotDecide("an answer says something")
+    # Every word that is taken reaches the decision and its receipt, and no word is
+    # taken that the decision has no place for: nothing is shown to the person as part
+    # of what they confirm and then dropped, or refused after the passphrase was asked.
+    if (reason or "").strip() and not needs_reason:
+        raise CannotDecide(
+            f"to {verb} {item.about} carries no reason: say it again without --reason"
+        )
+    if (text or "").strip() and verb != "answer":
+        raise CannotDecide(f"to {verb} this carries no text: say it again without {text!r}")
     said = (text if verb == "answer" else reason) or ""
     shown = (
         f"In {project_id}, you are about to {verb}: {item.about}\n\n{_evidence(item)}\n"
@@ -340,15 +349,65 @@ async def _on_a_story_at_work(
     )  # fmt: skip
 
 
-async def receipt_on_record(pool: Any, request_id: str) -> Receipt | None:
-    """The receipt the Product Owner's request was given, if it has one: asked before a
-    passphrase is asked for, since a request sent again decides nothing."""
+# The service's word for each verb, as its receipt records it.
+_ACTION = {
+    "approve": "approve",
+    "request-changes": "request_changes",
+    "reject": "reject",
+    "retry": "retry",
+    "set-aside": "set_aside",
+    "answer": "answer",
+    "replace-decision": "replace",
+    "pause": "pause",
+    "resume": "lift",
+    "cancel": "cancel",
+    "start": "start",
+}
+
+
+async def receipt_on_record(
+    pool: Any,
+    request_id: str,
+    project_id: str,
+    verb: str,
+    target: str,
+    text: str | None,
+    reason: str | None,
+) -> Receipt | None:
+    """The receipt the Product Owner's request was given, if it has one and it is this
+    request's: asked before a passphrase is asked for, since a request sent again decides
+    nothing. The receipt on record says what it was for (the action, what it was done
+    to, what was said), and a command is given it only if that is what the command
+    asks: so `cancel` is not answered with the receipt of an `approve`, and a receipt
+    made by any build of Relay is still its request's own."""
     async with pool.connection() as connection:
         row = await (
             await connection.execute(
-                "SELECT disposition, outcome FROM human_actions "
+                "SELECT action, target, payload, disposition, outcome FROM human_actions "
                 "WHERE principal = %s AND request_id = %s",
                 (PRODUCT_OWNER.identity, request_id),
             )
         ).fetchone()
-    return Receipt(row["disposition"], row["outcome"]) if row else None
+    if row is None:
+        return None
+    # A feature and a story are recorded under their project; an item by its identity,
+    # which the person may have named by its start; a feature started, by the project.
+    named = str(row["target"]).rsplit("/", 1)[-1]
+    same_target = (
+        row["target"] == project_id
+        if verb == "start"
+        else bool(target) and (named == target or (len(target) >= 6 and named.startswith(target)))
+    )
+    said = dict(row["payload"])
+    same_words = (
+        said.get("problem", "") == (text or "").strip()
+        if verb == "start"
+        else said.get("text", "") == (text or "").strip()
+        and said.get("reason", "") == (reason or "").strip()
+    )
+    if row["action"] != _ACTION.get(verb) or not same_target or not same_words:
+        raise CannotDecide(
+            f"request {request_id} is a request for something else: a request's identity is "
+            "used again only to ask for the same thing. Nothing is done"
+        )
+    return Receipt(row["disposition"], row["outcome"])

@@ -17,6 +17,7 @@ from relay.cli import journal
 from relay.domain.story import StoryState
 from relay.git.checkout import name_attempts_under
 from relay.runtime import channel, configure
+from tests.integration.completion_world import CompletionWorld
 from tests.integration.decision_world import DecisionWorld
 from tests.integration.fixtures import ANALYST
 from tests.integration.person import Ran, at_a_terminal, with_no_terminal
@@ -55,7 +56,7 @@ class Desk:
 async def desk(
     database: AsyncConnectionPool, shell: dict[str, str], tmp_path: Path, runner_image: str
 ) -> Any:
-    world = DecisionWorld(database, tmp_path, runner_image)
+    world = CompletionWorld(database, tmp_path, runner_image)
     world.base = await world.open()
     await configure(
         database,
@@ -828,3 +829,179 @@ async def test_a_retry_of_a_parked_call_is_held_to_what_the_person_was_shown_of_
         assert again.code == 0 and '"charged_usd": "0.4' in again.shown
     finally:
         await calling.close()
+
+
+async def test_a_code_taken_in_time_is_settled_by_its_confirmation_and_by_nothing_else(
+    desk: Desk,
+) -> None:
+    """3C-S2-2.2: one durable answer. A confirmation took the code before its hour and
+    has not yet decided: it is waiting for a lock, or its process died. The hour passes.
+    Nobody is told the code expired; a second terminal, or the same one again, carries
+    the same confirmation on and is given the same receipt."""
+    from relay.application import prepared
+
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    code = code_of(desk.anyone("prepare", "approve", str(gate), "--why", "it looks right"))
+    request = f"confirm:{code}"
+    assert await prepared.consume(world.database, code, request)  # taken, and then: nothing
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "UPDATE prepared_actions SET expires_at = now() - interval '1 minute'"
+        )
+
+    made = await prepared.find(world.database, code)
+    await prepared.end(world.database, code, "this expired unused")
+    assert made is not None and not made.expired
+    assert (await prepared.find(world.database, code)).ended is None  # type: ignore[union-attr]
+    assert not await prepared.consume(world.database, code, "confirm:another")
+    carried_on = desk.po("confirm", code)
+
+    assert carried_on.code == 0 and "effective" in carried_on.printed, carried_on.printed
+    assert await world.column("SELECT state FROM gates") == ["decided"]
+    again = desk.anyone("confirm", code)
+    assert again.code == 0 and "as on record" in again.printed
+
+
+async def test_a_confirmation_is_answered_only_by_the_receipt_of_what_was_prepared(
+    desk: Desk,
+) -> None:
+    """3C-S2-2.3: `confirm:<code>` is the name of a code's own request. No command may
+    choose it, and a receipt already on record under it for something else is not this
+    code's: the prepared gate stays open and nothing reports success."""
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    code = code_of(desk.anyone("prepare", "approve", str(gate), "--why", "it looks right"))
+
+    chosen = desk.po("pause", "F1", "--reason", "mine", "--request-id", f"confirm:{code}")
+
+    assert chosen.code == 1 and "does not begin with `confirm:`" in chosen.printed
+    async with world.database.connection() as connection:
+        # As a record left by an earlier build, or by a caller of the service, would be.
+        await connection.execute(
+            "INSERT INTO human_actions (principal, request_id, target, action, payload, digest, "
+            "disposition, outcome) VALUES ('product-owner', %s, %s, 'pause', %s::jsonb, 'd', "
+            "'effective', 'paused')",
+            (f"confirm:{code}", f"{PROJECT}/F1", json.dumps({"reason": "mine"})),
+        )
+    claimed = desk.po("confirm", code)
+
+    assert claimed.code == 1 and "a request for something else" in claimed.printed
+    assert "effective" not in claimed.printed and "passphrase" not in claimed.shown
+    assert await world.column("SELECT state FROM gates") == ["open"]
+
+
+async def test_a_request_made_by_an_earlier_build_is_still_answered_by_its_receipt(
+    desk: Desk,
+) -> None:
+    """3C-S2-2.4: the handle was bound, then, to a digest worked out another way. The
+    receipt says what the request was for, and the same words are answered by it."""
+    import hashlib
+
+    world = desk.world
+    started = desk.po("feature", "start", "prices need VAT")
+    handle = started.printed.split()[1]
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "UPDATE request_handles SET asked = %s WHERE request_id = %s",
+            (hashlib.sha256(f"{PROJECT}:start:prices need VAT".encode()).hexdigest(), handle),
+        )
+
+    again = desk.anyone("feature", "start", "prices need VAT", "--request-id", handle)
+    other = desk.anyone("feature", "start", "something else", "--request-id", handle)
+
+    assert again.code == 0 and "started F1 (as on record)" in again.printed
+    assert other.code == 1 and "a request for something else" in other.printed
+    assert await world.column("SELECT count(*) FROM features") == [1]
+
+
+async def test_a_request_of_another_installation_is_not_answered_from_this_one(
+    desk: Desk,
+) -> None:
+    """3C-S2-2.5: two installations may each have a project and a request of the same
+    names. The journal says which installation a request was made of."""
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    approved = desk.po("approve", str(gate))
+    handle = approved.printed.split()[1]
+    file = Path(desk.shell["RELAY_STATE_DIR"]) / "requests.jsonl"
+    elsewhere = "01a20000-0000-7000-8000-00000000000b"
+    file.write_text(
+        "\n".join(
+            line.replace(json.loads(line)["installation"], elsewhere)
+            for line in file.read_text().splitlines()
+        )
+        + "\n"
+    )
+
+    replayed = desk.anyone("approve", str(gate), "--request-id", handle)
+
+    assert replayed.code == 1 and f"made of installation {elsewhere}" in replayed.printed
+    assert "effective" not in replayed.printed
+
+
+async def test_no_word_is_taken_that_the_decision_has_no_place_for(desk: Desk) -> None:
+    """3C-S2-2.7: refused before a code is given or a passphrase asked, not after."""
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+
+    texted = desk.anyone("prepare", "approve", str(gate), "some text", "--why", "because")
+    reasoned = desk.po("approve", str(gate))  # the plain form is taken
+    assert texted.code == 1 and "carries no text" in texted.printed
+    assert reasoned.code == 0
+
+    from tests.integration.test_inbox import parked_call
+    from tests.integration.test_invocations import Calling
+
+    await world.awaiting_builder("B1")
+    calling = Calling(world)
+    try:
+        await parked_call(calling)
+        [item] = desk.read("inbox")
+        with_a_reason = desk.po("retry", item["handle"], "--reason", "worth another")
+        assert with_a_reason.code == 1 and "carries no reason" in with_a_reason.printed
+        assert "passphrase" not in with_a_reason.shown
+        assert desk.po("retry", item["handle"]).code == 0
+    finally:
+        await calling.close()
+
+
+async def test_what_a_model_wrote_is_shown_safely_by_the_reading_commands_and_whole_in_json(
+    desk: Desk,
+) -> None:
+    """3C-S2-2.11: a worker-authored roadmap cannot alter the terminal of the person
+    inspecting it. The values themselves are whole in `--json`. And a proposal is named
+    by its whole identity (3C-S2-2.10)."""
+    from relay.application.stories import StoryDraft
+
+    world = desk.world
+    hostile = StoryDraft(
+        "S1", "VAT\x1b[2J\x1b[Hat standard rate", "the shopper\rsees gross", {"AC1": "120\x07"}
+    )
+    proposal = await world.roadmap(hostile)
+    assert f"relay show {proposal}`" in desk.anyone("roadmap").out
+    await world.decide(proposal)
+
+    status, roadmap = desk.anyone("status").out, desk.anyone("roadmap").out
+
+    for text in (status, roadmap):
+        assert "\x1b" not in text and "\r" not in text and "\x07" not in text
+    assert "VAT\\x1b[2J\\x1b[Hat standard rate" in status
+    assert "the shopper\\x0dsees gross" in roadmap and "120\\x07" in roadmap
+    assert desk.read("roadmap")["stories"][0]["title"] == hostile.title  # whole, in JSON
+
+
+async def test_the_roadmap_shown_by_default_is_of_the_feature_that_holds_the_place_in_delivery(
+    desk: Desk,
+) -> None:
+    """3C-S2-2.10: two features both read `delivering`, and only one of them has a story
+    being worked on."""
+    from tests.integration.test_completion_histories import two_features_at_work
+
+    world = desk.world
+    assert isinstance(world, CompletionWorld)
+    desk.shell["RELAY_PROJECT"] = PROJECT  # the Builder's work leaves the checkout on no branch
+    await two_features_at_work(world)
+
+    assert desk.read("roadmap")["feature"] == "F2"
+    assert desk.read("roadmap", "F1")["feature"] == "F1"

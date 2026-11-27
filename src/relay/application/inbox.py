@@ -100,7 +100,12 @@ async def parked_evidence(connection: Connection, invocation_id: Any) -> dict[st
             # A call that never started was not made, and cost nothing. A charge the
             # provider reported is a charge; an estimate is Relay's own and is said to
             # be one; a call launched with neither is not known, and is counted so.
-            "SELECT count(*) FILTER (WHERE state <> 'not_started') AS launched, "
+            # Launched: the provider said so, or a result came of it. A call still on
+            # record as intended, or one nobody can say the end of, may never have been
+            # launched at all: a worker can die after a call is admitted and before the
+            # provider is started. Those are counted apart.
+            "SELECT count(*) FILTER (WHERE state NOT IN ('not_started', 'uncertain', 'intended')) "
+            "AS launched, count(*) FILTER (WHERE state IN ('uncertain', 'intended')) AS unsure, "
             "count(*) FILTER (WHERE state = 'not_started') AS never_started, "
             "sum(provider_cost_usd) AS charged, "
             "sum(estimated_cost_usd) FILTER (WHERE provider_cost_usd IS NULL) AS estimated, "
@@ -116,6 +121,7 @@ async def parked_evidence(connection: Connection, invocation_id: Any) -> dict[st
         "role": call["role"],
         "feature": call["feature_id"],
         "calls_launched": int(account["launched"]),
+        "calls_that_may_or_may_not_have_been_launched": int(account["unsure"]),
         "calls_that_never_started": int(account["never_started"]),
         "why_parked": call["parked"],
         "how_the_call_ended": call["state"],
@@ -171,7 +177,7 @@ class Inbox:
                     runs = await (
                         await connection.execute(
                             "SELECT o.name, o.contract, r.satisfied, e.exit_code, e.stdout, "
-                            "e.stderr FROM completion_receipts r JOIN obligations o "
+                            "e.stderr, e.ineligibility FROM completion_receipts r JOIN obligations o "
                             "USING (obligation_id) JOIN executions e USING (execution_id) "
                             "WHERE r.batch_id = %s ORDER BY o.name",
                             (gate["manifest"].get("batch_id"),),
@@ -184,6 +190,10 @@ class Inbox:
                                 "satisfied": run["satisfied"],
                                 "expected": run["contract"].get("expect"),
                                 "ran": run["contract"].get("launch"),
+                                # Why the run does not count, where the oracle said so:
+                                # a run that timed out has no exit status and may have
+                                # printed nothing, and that is the whole explanation.
+                                "why_the_run_does_not_count": run["ineligibility"],
                                 "exit_code": run["exit_code"],
                                 "stdout": _text(run["stdout"]),
                                 "stderr": _text(run["stderr"]),

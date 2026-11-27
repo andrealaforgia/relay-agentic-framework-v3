@@ -264,17 +264,20 @@ async def test_a_feature_is_paused_or_cancelled_only_as_it_was_when_the_person_w
 ) -> None:
     """3C-2.7, where it is decided: the command sends how the feature stood when it was
     shown, and the service compares that under the feature's lock. This is what holds a
-    prepared action in the moment between its being looked at again and its being
-    carried out."""
-    from relay.application.stories import standing_of
+    decision in the time a person takes over the passphrase."""
+    from relay.application.stories import standing_of, transition_in
 
     await world.decide(await world.roadmap(STANDARD_RATE))
-    async with world.database.connection() as connection:
-        feature = await (
-            await connection.execute("SELECT state, closed_by FROM features")
-        ).fetchone()
-    assert feature is not None
-    shown = standing_of(feature, None)
+
+    async def standing() -> str:
+        async with world.database.connection() as connection:
+            feature = await (
+                await connection.execute("SELECT state, closed_by FROM features")
+            ).fetchone()
+            assert feature is not None
+            return standing_of(feature, await transition_in(connection, PROJECT, "F1"))
+
+    shown = await standing()
     await world.close("pause", reason="paused by someone else meanwhile")
 
     cancelled = await world.close("cancel", reason="as I saw it", as_seen=shown)
@@ -283,13 +286,9 @@ async def test_a_feature_is_paused_or_cancelled_only_as_it_was_when_the_person_w
     assert cancelled.disposition == "stale" and "no longer as it was" in cancelled.outcome
     assert paused.disposition == "stale"
     assert await world.column("SELECT closed_by FROM features") == ["paused"]
-    async with world.database.connection() as connection:
-        now = await (await connection.execute("SELECT state, closed_by FROM features")).fetchone()
-        closure = await closure_in(connection, PROJECT, "F1")
-    assert now is not None
-    assert await world.close(
-        "cancel", reason="as it is now", as_seen=standing_of(now, closure)
-    ) == Receipt("effective", "cancelled")
+    assert await world.close("cancel", reason="as it is now", as_seen=await standing()) == Receipt(
+        "effective", "cancelled"
+    )
 
 
 async def test_a_cancellation_is_of_the_feature_as_it_was_shown_and_not_of_one_that_looks_the_same(
@@ -475,3 +474,76 @@ async def test_a_feature_is_given_a_name_nobody_has(world: DecisionWorld) -> Non
     again = await world.stories.start_feature(PROJECT, by("r-2", "", "start", problem="a fourth"))
 
     assert (started.outcome, again.outcome) == ("started F3", "started F4")
+
+
+async def test_a_cancellation_does_not_survive_a_final_check_retried_and_failed_again(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    """3C-S2-2.6: the feature needs a decision, the check is retried, and it fails again.
+    It reads as it did, with another batch and another gate. A cancellation of the
+    feature as it was first shown is stale."""
+    from relay.application.stories import standing_of, transition_in
+
+    world = CompletionWorld(database, tmp_path, runner_image)
+    world.base = await world.open()
+    failed = await failed_on_trunk(world)
+
+    async def standing() -> str:
+        async with world.database.connection() as connection:
+            feature = await (
+                await connection.execute("SELECT state, closed_by FROM features")
+            ).fetchone()
+            assert feature is not None
+            return standing_of(feature, await transition_in(connection, PROJECT, "F1"))
+
+    shown = await standing()
+    await world.decide(failed.gate_id, "retry")
+    assert await world.feature() == "needs_decision"  # the same state, by another failure
+
+    old = await world.features.close(
+        PROJECT, by("r-1", "F1", "cancel", reason="as I saw it", as_seen=shown)
+    )
+
+    assert shown != await standing()
+    assert old.disposition == "stale"
+    assert await world.column("SELECT closed_by FROM features") == [None]
+
+
+async def test_a_call_whose_launch_nobody_can_vouch_for_is_not_shown_as_a_call_launched(
+    calling: Calling,
+) -> None:
+    """3C-S2-2.8: a worker can die after a call is admitted and before the provider is
+    started. Recovery records the call as uncertain. A person deciding whether to pay
+    for another is told that, and not that a call was made."""
+    world = calling.world
+    await parked_call(calling)
+    async with world.database.connection() as connection:
+        await connection.execute("UPDATE invocations SET state = 'uncertain' WHERE attempt = 3")
+
+    [item] = await Inbox(world.database).items(PROJECT)
+
+    assert item.evidence["calls_launched"] == 2
+    assert item.evidence["calls_that_may_or_may_not_have_been_launched"] == 1
+    assert item.evidence["calls_that_never_started"] == 0
+
+
+async def test_a_final_check_that_timed_out_says_so(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> None:
+    """3C-S2-2.9: no exit status and nothing printed, and Relay knows why."""
+    world = CompletionWorld(database, tmp_path, runner_image)
+    world.base = await world.open()
+    await failed_on_trunk(world)
+    async with world.database.connection() as connection:
+        await connection.execute("ALTER TABLE executions DISABLE TRIGGER USER")
+        await connection.execute(
+            "UPDATE executions SET ineligibility = 'timed_out', exit_code = NULL "
+            "WHERE execution_id IN (SELECT execution_id FROM completion_receipts "
+            "WHERE NOT satisfied)"
+        )
+        await connection.execute("ALTER TABLE executions ENABLE TRIGGER USER")
+
+    [item] = await Inbox(world.database).items(PROJECT)
+
+    [failed] = [each for each in item.evidence["observed"] if not each["satisfied"]]
+    assert failed["why_the_run_does_not_count"] == "timed_out" and failed["exit_code"] is None
