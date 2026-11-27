@@ -54,23 +54,29 @@ def test_what_is_typed_at_the_terminal_is_read_and_not_shown_and_standard_input_
 
         os.write(master, b"typed by the person\n")
 
-        assert child.stdout.read().decode().strip() == "READ 'typed by the person'"
-        # What the terminal was shown is read before the child is waited for: a process
-        # closing its terminal waits for what it wrote there to be taken.
+        # What the child prints and what the terminal is shown are both taken as they
+        # come: a process closing its terminal waits for what it wrote there to be read.
         os.set_blocking(master, False)
-        after, quiet_since = b"", time.monotonic()
+        os.set_blocking(child.stdout.fileno(), False)
+        after, printed, quiet_since = b"", b"", time.monotonic()
         while child.poll() is None or time.monotonic() - quiet_since < 0.3:
             assert time.monotonic() - quiet_since < 20, "the child did not end"
-            try:
-                more = os.read(master, 1024)
-            except BlockingIOError, OSError:
-                more = b""
-            if more:
-                after, quiet_since = after + more, time.monotonic()
+            heard = b""
+            for descriptor in (master, child.stdout.fileno()):
+                try:
+                    more = os.read(descriptor, 1024)
+                except BlockingIOError, OSError:
+                    more = b""
+                if descriptor == master:
+                    after += more
+                else:
+                    printed += more
+                heard += more
+            if heard:
+                quiet_since = time.monotonic()
             else:
                 time.sleep(0.02)
-                if child.poll() is None:
-                    continue
+        assert printed.decode().strip() == "READ 'typed by the person'"
         assert child.wait(timeout=10) == 0
         assert b"typed by the person" not in after  # nothing typed was echoed
     finally:

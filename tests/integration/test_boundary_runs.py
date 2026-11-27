@@ -31,7 +31,9 @@ class Suite:
     async def __call__(self, role: str, runtime: Mapping[str, str]) -> SuiteResult:
         self.launched += 1
         self.started.set()
-        if self.hold is not None:
+        if self.hold is not None and self.launched == 1:
+            # Only the first is held: a second that should never have been launched
+            # returns, and the test that forbids it fails there and then.
             await self.hold.wait()
         if self.fails_with is not None:
             raise self.fails_with
