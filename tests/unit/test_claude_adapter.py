@@ -5,6 +5,7 @@ a paid call may ever be made again without asking a person."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -22,6 +23,7 @@ from relay.providers.claude import (
     ProviderUnavailable,
     Request,
 )
+from relay.providers.confinement import effective_agent_sha256
 from relay.providers.definitions import AgentDefinition
 
 RECORDED = Path(__file__).parent.parent / "fixtures" / "claude"
@@ -144,6 +146,15 @@ async def test_the_definition_that_runs_is_the_content_that_was_recorded(tmp_pat
             "tools": ["Read", "StructuredOutput"],
         }
     }
+    # And what is recorded as the hash of the definition as handed over is the hash of
+    # exactly this: the name, and what was passed under it.
+    [(name, passed)] = json.loads(following(argv, "--agents")).items()
+    handed_over = json.dumps({"name": name, **passed}, sort_keys=True).encode()
+    asked = request(tmp_path)
+    assert (
+        effective_agent_sha256(asked.definition, ("Read",))
+        == hashlib.sha256(handed_over).hexdigest()
+    )
 
 
 async def test_no_effort_and_no_budget_are_passed_unless_asked_for(tmp_path: Path) -> None:
