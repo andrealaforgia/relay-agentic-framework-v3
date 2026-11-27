@@ -132,6 +132,9 @@ def test_a_build_or_a_review_is_offered_the_one_form_every_kind_of_work_replies_
         (BuildTask, {"outcome": "question", "assumptions": []}, "has a question"),
         (BuildTask, {"outcome": "delivered", "assumptions": []}, "has what was asked for"),
         (BuildTask, delivering({"note": "done"}, assumptions=[" "]), "an assumption says nothing"),
+        # The earlier form, held to the whole of what it was.
+        (BuildTask, {"note": "done", "commit": "abc"}, "not asked for"),
+        (ReviewTask, {"findings": "none", "carried": []}, "is not a array"),
         # The earlier form, mixed or blank.
         (BuildTask, {"note": "done", "question": QUESTION}, "no note of work done"),
         (BuildTask, {"note": "done", "assumptions": [" "]}, "an assumption says nothing"),

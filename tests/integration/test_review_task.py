@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -592,3 +593,21 @@ async def test_a_review_that_says_nothing_of_a_finding_its_reviewer_was_asked_ab
     ]
     [now] = await reviewing.world.column("SELECT count(*) FROM review_submissions")
     assert now == submitted[0] + 1  # the one that answered, and not the one that did not
+
+
+async def test_a_reviews_call_may_cost_no_more_than_its_roles_profile_allows(
+    reviewing: Reviewing,
+) -> None:
+    """3B-S4-1.10."""
+    reviewing.task._profile = Profile("claude-haiku-5-5", budget_usd=Decimal("0.25"))
+    session = await WorkerSession.start(reviewing.world.database, "qa")
+    reviewing.sessions.append(session)
+    owed = await reviewing.owed("qa")
+    grant = await reviewing.world.claims.claim(
+        session.principal, owed["assignment_id"], session.worker_id
+    )
+
+    call = await reviewing.task.prepare(owed, grant, None)
+    reviewing.task.discard(call)
+
+    assert call.budget_usd == Decimal("0.25")

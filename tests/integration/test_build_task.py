@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from collections.abc import AsyncIterator
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -726,3 +727,21 @@ async def test_a_builder_that_asks_keeps_and_publishes_nothing_and_builds_after_
     ) == ["asked", "done"]
     assert "The Product Owner answered: yes" in builder.asked[1].briefing
     assert await world.state("B1") is BehaviourState.REVIEW
+
+
+async def test_a_builds_call_may_cost_no_more_than_its_roles_profile_allows(
+    building: Building,
+) -> None:
+    """3B-S4-1.10."""
+    building.task._profile = Profile("claude-sonnet-5-5", budget_usd=Decimal(2))
+    session = await WorkerSession.start(building.world.database, "builder")
+    building.sessions.append(session)
+    owed = await building.owed()
+    grant = await building.world.claims.claim(
+        session.principal, owed["assignment_id"], session.worker_id
+    )
+
+    call = await building.task.prepare(owed, grant, None)
+    building.task.discard(call)
+
+    assert call.budget_usd == Decimal(2)

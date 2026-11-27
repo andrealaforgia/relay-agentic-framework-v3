@@ -514,3 +514,28 @@ def test_the_runtime_is_of_the_cli_that_is_installed_now_and_not_of_one_that_was
     assert (before["cli"], after["cli"]) == ("2.1.330 (Claude Code)", "2.2.0 (Claude Code)")
     assert before != after
     assert gone["cli"] == "unavailable"
+
+
+async def test_a_run_made_while_the_cli_was_replaced_is_a_pass_of_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S4-1.9: the version is read again after the run, as the policy files are."""
+    from relay.providers import boundary_suite
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(boundary_suite, "_LOCAL_POLICY", (tmp_path / "no-policy.json",))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(
+        boundary_suite, "evaluate", lambda *_: [Observation("every probe", True, "")]
+    )
+
+    async def another_version(self: object) -> str:
+        return "9.9.9 (another)"
+
+    monkeypatch.setattr(boundary_suite.ClaudeAdapter, "version", another_version)
+
+    result = await boundary_suite.run_suite("qa", tmp_path / "ws", binary=STUB)
+
+    [stable] = [each for each in result.observations if "did not change" in each.probe]
+    assert not stable.passed and not result.passed
