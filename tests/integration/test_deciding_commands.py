@@ -1055,11 +1055,21 @@ async def test_a_receipt_is_its_projects_and_a_feature_is_named_in_full(desk: De
     from relay.cli import deciding
 
     world = desk.world
-    await world.decide(await world.roadmap(STANDARD_RATE))
+    gate = await world.roadmap(STANDARD_RATE)
     await world.behaviours.open_project("another", str(world.remote), "next")
+    approved = desk.po("approve", str(gate))
     cancelled = desk.po("cancel", "F1", "--reason", "no longer wanted")
     handle = cancelled.printed.split()[1]
     pool = world.database
+    # An item's receipt is its project's too, though it is recorded by identity alone.
+    of_the_gate = approved.printed.split()[1]
+    assert await deciding.receipt_on_record(
+        pool, of_the_gate, PROJECT, "approve", str(gate), None, None
+    )
+    with pytest.raises(deciding.CannotDecide, match="a request for something else"):
+        await deciding.receipt_on_record(
+            pool, of_the_gate, "another", "approve", str(gate), None, None
+        )
 
     mine = await deciding.receipt_on_record(
         pool, handle, PROJECT, "cancel", "F1", None, "no longer wanted"
@@ -1277,19 +1287,15 @@ async def test_status_says_who_takes_up_work_that_is_the_control_planes(desk: De
     """3C-S2-3.10: a red, an integration and a final check are not a worker's to claim.
     With the control plane stopped, starting another worker moves none of them on."""
     world = desk.world
+    desk.shell["RELAY_PROJECT"] = PROJECT  # the Builder's work leaves the checkout on no branch
     await world.decide(await world.roadmap(STANDARD_RATE))
-    async with world.database.connection() as connection:
-        kinds = await (
-            await connection.execute(
-                "SELECT kind FROM assignments WHERE state = 'wanted' AND grant_id IS NULL"
-            )
-        ).fetchall()
+    base = await world.awaiting_builder("B1")
+    await world.reviewed("B1", on=base)  # reviewed: its integration is owed, and not taken up
+    assert await world.column(
+        "SELECT kind FROM assignments WHERE state = 'wanted' AND kind = 'integrate'"
+    ) == ["integrate"]
 
     owed = {each["work"]: each["state"] for each in desk.read("status")["owed"]}
 
-    assert {each["kind"] for each in kinds} & {"red", "integrate", "complete"} or owed
-    for work, state in owed.items():
-        if work in ("red", "integrate", "complete"):
-            assert state == "waiting for the control plane (`relay up`)"
-        elif state.startswith("waiting for a"):
-            assert state == "waiting for a worker"
+    assert owed["integrate"] == "waiting for the control plane (`relay up`)"
+    assert "waiting for the control plane (`relay up`)" in desk.anyone("status").out
