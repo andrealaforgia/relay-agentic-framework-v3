@@ -94,3 +94,23 @@ async def delivering_world(
     await delivering.invocations.close()
     for session in delivering.sessions:
         await session.stop()
+
+
+@pytest.fixture
+async def building(
+    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
+) -> AsyncIterator[Any]:
+    """A behaviour with a verified red, waiting for its Builder: see `test_build_task`."""
+    from tests.integration.decision_world import DecisionWorld
+    from tests.integration.story_world import STANDARD_RATE
+    from tests.integration.test_build_task import Building
+
+    world = DecisionWorld(database, tmp_path, runner_image)
+    world.base = await world.open()
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    await world.awaiting_builder("B1")
+    building = Building(world, tmp_path)
+    yield building
+    await building.invocations.close()
+    for session in building.sessions:
+        await session.stop()

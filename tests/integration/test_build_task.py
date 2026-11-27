@@ -7,13 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
-from collections.abc import AsyncIterator
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
-from psycopg_pool import AsyncConnectionPool
 
 from relay.application import behaviours as behaviours_module
 from relay.application.invocations import Invocations
@@ -34,7 +32,6 @@ from tests.integration.fixtures import (
     VAT_RETURNS_NET,
     VERIFIER,
 )
-from tests.integration.story_world import STANDARD_RATE
 from tests.integration.test_review_task import replying
 from tests.integration.test_worker import RUNTIME, SeenToHold
 from tests.integration.trunk_world import PROJECT
@@ -156,21 +153,6 @@ class Building:
 
     async def states(self) -> list[object]:
         return await self.world.column("SELECT state FROM invocations ORDER BY started_at")
-
-
-@pytest.fixture
-async def building(
-    database: AsyncConnectionPool, tmp_path: Path, runner_image: str
-) -> AsyncIterator[Building]:
-    world = DecisionWorld(database, tmp_path, runner_image)
-    world.base = await world.open()
-    await world.decide(await world.roadmap(STANDARD_RATE))
-    await world.awaiting_builder("B1")
-    building = Building(world, tmp_path)
-    yield building
-    await building.invocations.close()
-    for session in building.sessions:
-        await session.stop()
 
 
 async def test_what_the_builder_left_is_published_as_an_attempt_and_found_green(
@@ -775,3 +757,34 @@ async def test_a_builds_call_may_cost_no_more_than_its_roles_profile_allows(
     building.task.discard(call)
 
     assert call.budget_usd == Decimal(2)
+
+
+async def test_a_candidate_the_control_plane_finds_not_green_is_handed_back_with_its_builder_idle(
+    building: Building,
+) -> None:
+    """3C-2.2: the Builder's worker dealt with its delivery and went on, alive. The
+    control plane refuses the green. The work is given back and announced again there,
+    and the next delivery buys exactly one call, briefed with what was observed."""
+    provider = Builder(WRONG, RIGHT)
+    worker = await building.worker(provider)
+    assert await worker.carry_out(await building.owed()) == "handed_on"
+    await building.world.column("UPDATE outbox SET published_at = now() RETURNING 1")
+
+    await building.invocations.recover(PROJECT)
+
+    assert await building.states() == ["rejected"]
+    [build] = await building.world.column(
+        "SELECT state || ':' || (grant_id IS NULL) FROM assignments WHERE kind = 'build'"
+    )
+    assert build == "wanted:true"
+    assert await building.world.column(
+        "SELECT count(*) FROM outbox o JOIN assignments a ON a.command_message_id = o.message_id "
+        "WHERE a.kind = 'build' AND o.published_at IS NULL"
+    ) == [1]
+    assert len(provider.asked) == 1
+
+    assert await worker.carry_out(await building.owed()) == "handed_on"
+    await building.invocations.recover(PROJECT)
+
+    assert len(provider.asked) == 2 and "not green" in provider.asked[1].briefing
+    assert await building.states() == ["rejected", "applied"]

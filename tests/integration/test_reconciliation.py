@@ -787,21 +787,31 @@ async def test_one_projects_silent_repository_does_not_keep_the_pass_from_anothe
     assert (await run_green(silent.behaviours, "alpha", "B1", 1)).is_valid
     real = reviews_module.resolve_ref
 
+    asked_of_alpha: list[str] = []
+
     async def alpha_never_answers(
         repository: str, wanted: str, *, timeout: float | None = None
     ) -> str | None:
         if "silent" not in repository:
             return await real(repository, wanted, timeout=timeout)
+        asked_of_alpha.append(wanted)
         await asyncio.sleep(3600 if timeout is None else timeout)
         raise RemoteUnavailable("no answer in time")
 
     monkeypatch.setattr(reviews_module, "resolve_ref", alpha_never_answers)
     impatient = Reviews(world.database, world.mirrors, remote_timeout=0.2)
+    features = Features(world.database, impatient, world.integration)
 
     async with asyncio.timeout(90):
-        await Features(world.database, impatient, world.integration).reconcile(PROJECT)
+        await features.reconcile(PROJECT)
 
+    # 3C-1.3: a pass for one project does nothing for another, and so does not wait on
+    # the other's repository at all.
     assert world.trunk() == candidate
+    assert asked_of_alpha == []
+    async with asyncio.timeout(90):
+        await features.reconcile("alpha")  # whose own pass asks, gives up, and goes on
+    assert asked_of_alpha != []
     assert await world.column(
         "SELECT publication FROM review_cycles WHERE project_id = 'alpha'"
     ) == ["pending"]
