@@ -24,11 +24,15 @@ from relay.persistence.database import Connection, Pool
 _TERM: ContextVar[int | None] = ContextVar("relay_control_plane_term", default=None)
 
 
+def lock_key(installation: str) -> int:
+    """The first of the two keys of the installation's lock: of this installation, since
+    advisory locks are a database's and several installations may share one. Not
+    negative, so that it reads the same in `pg_locks`, where it is `classid`."""
+    return int.from_bytes(uuid.UUID(installation).bytes[8:12], "big") & 0x7FFFFFFF
+
+
 async def _lock_key(connection: Connection) -> int:
-    """One lock for the installation's control plane: of this installation, since
-    advisory locks are a database's and several installations may share one."""
-    installation = uuid.UUID(await installation_of(connection))
-    return int.from_bytes(installation.bytes[8:], "big", signed=True)
+    return lock_key(await installation_of(connection))
 
 
 class NotLeader(Exception):
@@ -85,7 +89,7 @@ class Leadership:
         await held.set_autocommit(True)
         took = await (
             await held.execute(
-                "SELECT pg_try_advisory_lock(%s, 1) AS took", (await _lock_key(held) >> 32,)
+                "SELECT pg_try_advisory_lock(%s, 1) AS took", (await _lock_key(held),)
             )
         ).fetchone()
         if took is None or not took["took"]:
@@ -123,7 +127,7 @@ class Leadership:
             return
         held, self._held = self._held, None
         try:
-            await held.execute("SELECT pg_advisory_unlock(%s, 1)", (await _lock_key(held) >> 32,))
+            await held.execute("SELECT pg_advisory_unlock(%s, 1)", (await _lock_key(held),))
             await held.set_autocommit(False)
         except Exception:  # noqa: BLE001 - a connection that is gone holds no lock to give up
             with contextlib.suppress(Exception):

@@ -109,7 +109,16 @@ class Worker:
         boundaries: Shown,
         runtime: Callable[[], Mapping[str, str]],
         then: Callable[[str], Awaitable[None]] | None = None,
+        may_launch: Callable[[], Awaitable[str | None]] | None = None,
+        stated: Callable[[Connection], Awaitable[str | None]] | None = None,
     ) -> None:
+        # Asked before every call this worker would make, a retry included: why nothing
+        # may be launched now, if anything. The process is stopping; the Redis it reads
+        # is no longer the control plane's.
+        self._may_launch = may_launch
+        # What the operator has stated of this host's remote policy, as the installation
+        # has it in the transaction that admits a call.
+        self._stated = stated
         # What the control plane does by itself once something has been applied: the
         # pass, which publishes a candidate, observes a red, takes up an integration.
         self._then = then
@@ -146,6 +155,11 @@ class Worker:
         ]
         left = []
         for delivery in deliveries:
+            if self._may_launch is not None and await self._may_launch() is not None:
+                # Read, and not dealt with: left unacknowledged, for whichever worker
+                # reads next after it has lain long enough. What it announces is owed
+                # in PostgreSQL whatever becomes of the delivery.
+                break
             left.append(await self._serve(delivery.envelope))
             await streams.acknowledge(stream, group, delivery)
         return left
@@ -194,6 +208,9 @@ class Worker:
         prepared: list[Call] = []
         try:
             while True:
+                if self._may_launch is not None and (held_back := await self._may_launch()):
+                    await self._claims.give_back(assignment_id, grant)
+                    return f"refused: {held_back}"
                 try:
                     call = await task.prepare(assignment, grant, problem)
                 except BaseException as failed:
@@ -225,8 +242,14 @@ class Worker:
                 boundary = boundary_digest(call.confinement, runtime)
 
                 async def authorised(
-                    connection: Connection, boundary: str = boundary
+                    connection: Connection,
+                    boundary: str = boundary,
+                    policy: str | None = runtime.get("remote_policy"),
                 ) -> uuid.UUID | None:
+                    if self._stated is not None and await self._stated(connection) != policy:
+                        # The statement was changed after this call's bounds were worked
+                        # out from it. A pass of those bounds says nothing of these.
+                        return None
                     # No call is made within bounds nobody has seen hold here: not on a
                     # new version of the CLI, not under changed settings, not after a
                     # pass has gone stale or a later run of the suite has failed. Asked

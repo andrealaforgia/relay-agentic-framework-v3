@@ -8,6 +8,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from relay.application.leadership import require_term
 from relay.persistence.database import Connection, Pool
 from relay.transport.envelope import Envelope
 from relay.transport.streams import Streams
@@ -62,6 +63,10 @@ class OutboxPublisher:
 
     async def _publish_next(self) -> bool:
         async with self._pool.connection() as connection, connection.transaction():
+            # A control plane that has been replaced may be on another Redis than its
+            # successor. It appends nothing and marks nothing published: the share lock
+            # this takes holds a new term off until the mark has committed.
+            await require_term(connection)
             row = await (
                 await connection.execute(
                     "SELECT position, message_id, stream, envelope FROM outbox o "

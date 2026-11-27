@@ -156,6 +156,7 @@ class Integration:
         self.completion = Completion(pool, oracle, push_timeout)
         # Batches being given up for callers that were cancelled as they were made.
         self.giving_up: set[asyncio.Future[None]] = set()
+        self._hearing: set[asyncio.Task[None]] = set()
 
     def _mirror(self, project_id: str) -> Mirror:
         return Mirror(self._mirrors / f"{require_identifier('project', project_id)}.git")
@@ -892,6 +893,18 @@ class Integration:
                 # intent, or been refused, since this one decided to send.
                 if current["state"] != "outstanding" or current["refusal"] is not None:
                     return False
+                refused = await (
+                    await connection.execute(
+                        "SELECT 1 FROM integration_sends WHERE intent_id = %s "
+                        "AND heard = 'refused' LIMIT 1",
+                        (intent_id,),
+                    )
+                ).fetchone()
+                if refused is not None:
+                    # Git has refused a send of this intent, and whoever heard could not
+                    # act on it: it is on record and not yet counted. Nothing more is
+                    # sent on an intent that has been refused. The pass counts it.
+                    return False
                 await connection.execute(
                     "UPDATE integration_intents SET sends_started = sends_started + 1 "
                     "WHERE intent_id = %s",
@@ -939,12 +952,27 @@ class Integration:
         no lock of the workflow's: whoever sent it is the only one who will ever hear,
         and may by now be a control plane that has been replaced. Nothing is decided
         here. The control plane of the day counts it (`_count_what_was_heard`)."""
-        async with self._pool.connection() as connection:
-            await connection.execute(
-                "UPDATE integration_sends SET heard = %s, reason = %s "
-                "WHERE send_id = %s AND heard IS NULL",
-                (heard, reason, send_id),
-            )
+
+        async def write() -> None:
+            async with self._pool.connection() as connection:
+                await connection.execute(
+                    "UPDATE integration_sends SET heard = %s, reason = %s "
+                    "WHERE send_id = %s AND heard IS NULL",
+                    (heard, reason, send_id),
+                )
+
+        # Git has answered, and this is the only place that answer exists. A process
+        # told to stop now still writes it down: the write goes on when its caller is
+        # cancelled, and `drain` waits for it before the pool is closed.
+        writing = asyncio.create_task(write())
+        self._hearing.add(writing)
+        writing.add_done_callback(self._hearing.discard)
+        await asyncio.shield(writing)
+
+    async def drain(self) -> None:
+        """Wait for every answer that is being written down. Called as a process stops."""
+        while self._hearing:
+            await asyncio.gather(*self._hearing, return_exceptions=True)
 
     async def _count_what_was_heard(self, intent_id: uuid.UUID) -> IntegrationReceipt | None:
         """Answers on record that nobody has acted on: heard by a control plane that was

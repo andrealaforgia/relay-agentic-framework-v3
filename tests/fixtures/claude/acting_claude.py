@@ -57,6 +57,8 @@ print(
 )
 with open(HERE / "script.lock", "w") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
+    with open(HERE / "launched.jsonl", "a") as launched:  # what each run was launched with
+        launched.write(json.dumps(sys.argv[1:]) + "\n")
     script = json.loads((HERE / "script.json").read_text())
     state_file = HERE / "script.state.json"
     given = json.loads(state_file.read_text()) if state_file.exists() else {}

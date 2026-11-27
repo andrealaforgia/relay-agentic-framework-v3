@@ -98,18 +98,35 @@ async def configure(pool: Pool, **settings: Any) -> None:
         )
 
 
+# The most one call may cost when the installation's settings do not say: no call is
+# ever launched without a cap.
+DEFAULT_BUDGET_USD = Decimal("2.00")
+
+
 def profile_of(settings: Mapping[str, Any], role: str) -> Profile:
-    said = {
-        **settings.get("profiles", {}).get("default", {}),
-        **settings.get("profiles", {}).get(role, {}),
-    }
-    budget = said.get("budget_usd")
+    profiles = settings.get("profiles", {})
+    said = {**profiles.get("default", {}), **profiles.get(role, {})}
+    budget = Decimal(str(said.get("budget_usd", DEFAULT_BUDGET_USD)))
+    if not budget.is_finite() or budget <= 0:
+        raise NotConfigured(
+            f"the most one call of the {role} may cost is set to {said.get('budget_usd')!r}: "
+            "it must be an amount above nothing"
+        )
     return Profile(
         model=str(said.get("model", "claude-sonnet-5-5")),
         effort=said.get("effort"),
         timeout=float(said.get("timeout", 1800.0)),
-        budget_usd=Decimal(str(budget)) if budget is not None else None,
+        budget_usd=budget,
     )
+
+
+async def stated_policy(connection: Any) -> str | None:
+    """What the operator has stated of this host's remote policy (D-10), as the
+    installation has it in this transaction."""
+    row = await (
+        await connection.execute("SELECT policy->>'statement' AS statement FROM installation")
+    ).fetchone()
+    return row["statement"] if row else None
 
 
 def channel(installation: str) -> str:

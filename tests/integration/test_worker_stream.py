@@ -266,3 +266,23 @@ async def test_a_reviewer_that_asks_is_answered_and_reviews_afresh_under_a_succe
     ) == [2]
     assert provider.asked[0].workdir != provider.asked[1].workdir
     assert await world.column("SELECT count(*) FROM review_submissions") == [1]
+
+
+async def test_a_delivery_read_by_a_worker_that_may_launch_nothing_is_left_for_another(
+    served: Served,
+) -> None:
+    """3C-S1A-1.5: read already, and the worker is then told to stop. It is not dealt with
+    and not acknowledged; another worker finds it."""
+    provider = Reviewer(NOTHING_FOUND)
+    worker = await served.worker("qa", provider)
+
+    async def stopping() -> str | None:
+        return "this worker is stopping"
+
+    worker._may_launch = stopping
+
+    assert await worker.serve_once(served.streams, PROJECT) == []
+
+    assert provider.asked == []
+    another = await served.worker("qa", Reviewer(NOTHING_FOUND))
+    assert await another.serve_once(served.streams, PROJECT, abandoned_after_ms=0) == ["applied"]

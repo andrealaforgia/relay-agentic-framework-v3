@@ -40,7 +40,7 @@ from relay.application.closure import (
     require_startable,
     story_basis,
 )
-from relay.application.leadership import current_term, term
+from relay.application.leadership import current_term, require_term, term
 from relay.application.stories import _record as record_receipt
 from relay.application.stories import _recorded as recorded_receipt
 from relay.application.workers import WorkerSession, is_alive
@@ -528,6 +528,7 @@ class Invocations:
                         giving_up.add_done_callback(self._giving_up.discard)
                         await asyncio.shield(giving_up)
         async with self._pool.connection() as connection, connection.transaction():
+            await require_term(connection)
             await connection.execute(
                 "UPDATE invocations SET state = 'applied' WHERE invocation_id = %s "
                 "AND state = 'returned'",
@@ -549,6 +550,12 @@ class Invocations:
         it in between would have its own try set free by this."""
         try:
             async with self._pool.connection() as connection, connection.transaction():
+                if (mine_term := term()) is not None and mine_term != await current_term(
+                    connection
+                ):
+                    # A control plane that has been replaced lets nothing go: an effect
+                    # of an earlier term is free to its successor as it stands.
+                    return
                 await connection.execute(
                     "UPDATE invocation_effects SET state = 'pending' WHERE invocation_id = %s "
                     "AND name = %s AND state = 'started' AND worker_id = %s",

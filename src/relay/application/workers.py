@@ -8,6 +8,7 @@ clock or from another worker having started.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
 import uuid
@@ -47,13 +48,28 @@ class WorkerSession:
     def principal(self) -> Principal:
         return Principal(PrincipalKind.WORKER, f"{self.role}@{self.worker_id}", role=self.role)
 
+    async def held(self) -> bool:
+        """Whether the connection this worker's lock is on still answers. Without it the
+        worker is, to everyone else, gone, whatever else of it still works."""
+        if self._held is None or self._held.closed:
+            return False
+        try:
+            await self._held.execute("SELECT 1")
+        except Exception:  # noqa: BLE001 - whatever is wrong with it, the lock is not held
+            return False
+        return True
+
     async def stop(self) -> None:
         """The worker ends. From here on it is, to everyone else, gone."""
         if self._held is None:
             return
         held, self._held = self._held, None
-        await held.execute("SELECT pg_advisory_unlock(%s)", (_lock_key(self.worker_id),))
-        await held.set_autocommit(False)
+        try:
+            await held.execute("SELECT pg_advisory_unlock(%s)", (_lock_key(self.worker_id),))
+            await held.set_autocommit(False)
+        except Exception:  # noqa: BLE001 - a connection that is gone holds no lock
+            with contextlib.suppress(Exception):
+                await held.close()
         await self._pool.putconn(held)
 
 

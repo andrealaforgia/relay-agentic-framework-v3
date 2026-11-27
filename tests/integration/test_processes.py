@@ -22,11 +22,12 @@ import redis.asyncio as redis
 from psycopg_pool import AsyncConnectionPool
 
 from relay.application.boundaries import Boundaries
+from relay.application.leadership import lock_key
 from relay.application.stories import Stories
 from relay.domain.story import HumanAction
 from relay.providers.boundary_suite import Observation, SuiteResult, runtime_now
 from relay.providers.confinement import boundary_digest, confinement_for
-from relay.runtime import ROLES, configure, wake
+from relay.runtime import DEFAULT_BUDGET_USD, ROLES, configure, wake
 from tests.integration.completion_world import CompletionWorld
 from tests.integration.conftest import DATABASE_URL, REDIS_URL
 from tests.integration.fixtures import PRODUCT_OWNER, VAT_APPLIES_STANDARD_RATE
@@ -78,6 +79,7 @@ class Running:
         self.stories = Stories(world.database)
         self.requests = 0
         self.installation = ""
+        self.cli = tmp_path
 
     def start(self, *command: str) -> subprocess.Popen[bytes]:
         log = open(self.tmp / f"{'-'.join(command)}-{len(self.started)}.log", "wb")  # noqa: SIM115
@@ -174,6 +176,7 @@ async def running(
             )
         )
     running = Running(world, namespace, tmp_path, broker)
+    running.cli = cli.parent
     running.installation = row["id"]
     yield running
     running.stop_all()
@@ -192,6 +195,7 @@ async def test_a_feature_is_delivered_between_processes_and_through_a_change_of_
     world = running.world
     # A timer far longer than the test: every step that needs the control plane is
     # taken up because it was woken, by a worker or by a person's command.
+    key = lock_key(running.installation)
     first = running.start("up", "--every", "600")
     for role in ROLES:
         running.start("worker", "start", "--role", role)
@@ -207,10 +211,18 @@ async def test_a_feature_is_delivered_between_processes_and_through_a_change_of_
     # The first control plane loses its hold: the connection its lock is on is ended
     # under it, as a network fault would. The process is alive and its pool works.
     await running.until("a term is open", "SELECT term FROM installation", 1)
-    await world.column(
-        "SELECT pg_terminate_backend(l.pid) FROM pg_locks l WHERE l.locktype = 'advisory' "
-        "AND l.objsubid = 2 AND l.granted AND l.pid <> pg_backend_pid()"
+    # Exactly that connection: the one holding this installation's lock, in this
+    # database. Another holder of an advisory lock beside it is left alone.
+    bystander = await world.database.getconn()
+    await bystander.execute("SELECT pg_advisory_lock(%s, 1)", (key ^ 1,))
+    await bystander.commit()
+    holder = (
+        "FROM pg_locks l JOIN pg_database d ON d.oid = l.database "
+        "WHERE d.datname = current_database() AND l.locktype = 'advisory' AND l.granted "
+        f"AND l.objsubid = 2 AND l.classid = {key} AND l.objid = 1"
     )
+    assert await world.column(f"SELECT count(*) {holder}") == [1]
+    await world.column(f"SELECT pg_terminate_backend(l.pid) {holder}")
     second = running.start("up", "--every", "600")
 
     await running.until("a new term is open", "SELECT term FROM installation", 2)
@@ -247,6 +259,18 @@ async def test_a_feature_is_delivered_between_processes_and_through_a_change_of_
         "SELECT count(*) FROM invocation_effects WHERE name IN ('publish', 'green') "
         "AND term IS NULL"
     ) == [0]
+    # The bystander's connection was not touched.
+    await bystander.execute("SELECT pg_advisory_unlock(%s, 1)", (key ^ 1,))
+    await bystander.commit()
+    await world.database.putconn(bystander)
+    # 3C-S1A-1.9: every run was launched with a cap on what it may cost, the default
+    # here, since the settings of this installation say none.
+    launched = [
+        json.loads(line) for line in (running.cli / "launched.jsonl").read_text().splitlines()
+    ]
+    runs = [each for each in launched if "--session-id" in each]
+    assert [len(runs)] == await world.column("SELECT count(*) FROM invocations")
+    assert all(each[each.index("--max-budget-usd") + 1] == str(DEFAULT_BUDGET_USD) for each in runs)
     # And commands travelled on streams named under the installation.
     streams = [
         key async for key in running.broker.scan_iter(f"{running.installation}:*", _type="stream")

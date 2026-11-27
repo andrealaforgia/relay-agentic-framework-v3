@@ -159,7 +159,7 @@ class Bench:
 
         return [Effect("use", use)]
 
-    async def worker(self, provider: Any) -> Worker:
+    async def worker(self, provider: Any, **asked: Any) -> Worker:
         self.session = self.session or await WorkerSession.start(self.world.database, "builder")
         return Worker(
             self.session,
@@ -169,6 +169,7 @@ class Bench:
             {"build": self.task},
             self.boundaries,
             self.runtime,
+            **asked,
         )
 
     async def owed(self) -> dict[str, Any]:
@@ -898,3 +899,65 @@ async def test_a_host_whose_policy_cannot_be_read_launches_nothing_and_keeps_no_
     assert await bench.world.column(
         "SELECT state || ':' || (grant_id IS NULL) FROM assignments WHERE kind = 'build'"
     ) == ["wanted:true"]
+
+
+async def test_a_worker_told_it_may_launch_nothing_makes_no_call_and_keeps_no_grant(
+    bench: Bench,
+) -> None:
+    """3C-S1A-1.5: the process is stopping, or the Redis it reads is no longer the control
+    plane's. Asked before the call."""
+    provider = Scripted(said())
+
+    async def not_now() -> str | None:
+        return "this worker is stopping"
+
+    worker = await bench.worker(provider, may_launch=not_now)
+
+    assert await worker.carry_out(await bench.owed()) == "refused: this worker is stopping"
+
+    assert provider.asked == []
+    assert (await bench.owed())["state"] == "wanted"
+
+
+async def test_a_worker_is_asked_again_before_the_call_that_follows_a_reply_it_could_not_use(
+    bench: Bench,
+) -> None:
+    """3C-S1A-1.5: a retry is a call like any other. What changed while the first call ran
+    stops the second."""
+    unusable = said()
+    assert unusable.terminal is not None
+    unusable.terminal.envelope["structured_output"] = {"total": 5}
+    provider = Scripted(unusable, said())
+
+    async def until_the_first_call_is_made() -> str | None:
+        return "this worker is stopping" if provider.asked else None
+
+    worker = await bench.worker(provider, may_launch=until_the_first_call_is_made)
+
+    assert await worker.carry_out(await bench.owed()) == "refused: this worker is stopping"
+
+    assert len(provider.asked) == 1
+    assert await bench.states() == ["rejected"]
+    assert (await bench.owed())["state"] == "wanted"
+
+
+async def test_a_call_worked_out_from_a_statement_that_has_since_changed_is_not_launched(
+    bench: Bench,
+) -> None:
+    """3C-S1A-1.7: the statement of policy is read again in the transaction that admits
+    the call. A pass of bounds worked out from another statement admits nothing."""
+    provider = Scripted(said(), said())
+    now = ["restated since"]
+
+    async def stated(connection: Any) -> str | None:
+        assert connection is not None  # asked within admission's own transaction
+        return now[0]
+
+    worker = await bench.worker(provider, stated=stated)
+
+    left = await worker.carry_out(await bench.owed())
+
+    assert left.startswith("refused:")
+    assert provider.asked == [] and await bench.states() == []
+    now[0] = RUNTIME["remote_policy"]
+    assert await worker.carry_out(await bench.owed()) == "applied"

@@ -1410,3 +1410,120 @@ async def test_a_refusal_counted_late_while_another_send_is_unanswered_settles_a
         "FROM integration_intents"
     ) == ["outstanding:2:1:pre-receive hook declined"]
     assert (await world.events()).count("integration.refusal_left_unsettled") == 1
+
+
+async def test_a_refusal_put_on_record_after_the_pass_looked_stops_the_send_it_was_about_to_make(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S1A-1.1: the successor's pass has looked for answers and found none. The former
+    control plane then records that Git refused, and is refused the rest. The successor
+    is about to send. The send is authorised under the intent's lock, and there the
+    refusal is on record: nothing leaves. The next pass counts it: one refused push."""
+    base, _ = await ready_to_integrate(world)
+
+    async def dies(*_: Any, **__: Any) -> None:
+        raise Crash
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Mirror, "advance", dies)
+        with pytest.raises(Crash):
+            await world.integrate()
+    [intent_id] = await world.column("SELECT intent_id FROM integration_intents")
+    send = uuid.uuid4()
+    async with world.database.connection() as connection:
+        await connection.execute("UPDATE integration_intents SET sends_started = 1")
+        await connection.execute(
+            "INSERT INTO integration_sends (send_id, intent_id) VALUES (%s, %s)", (send, intent_id)
+        )
+    looked = world.integration._count_what_was_heard
+
+    async def looks_and_then_the_refusal_is_recorded(intent: uuid.UUID) -> Any:
+        found = await looked(intent)
+        await world.integration._heard(send, "refused", "pre-receive hook declined")
+        return found
+
+    pushes: list[object] = []
+    push = Mirror._push
+
+    async def counted_push(self: Mirror, *arguments: Any, **more: Any) -> Any:
+        pushes.append(arguments)
+        return await push(self, *arguments, **more)
+
+    monkeypatch.setattr(Mirror, "_push", counted_push)
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            world.integration, "_count_what_was_heard", looks_and_then_the_refusal_is_recorded
+        )
+        assert await world.integration.reconcile() == 0
+
+    assert pushes == [] and world.trunk() == base
+    assert await world.column("SELECT sends_started FROM integration_intents") == [1]
+
+    await world.integration.reconcile()
+
+    assert pushes == [] and world.trunk() == base
+    assert await world.column("SELECT state FROM integration_intents") == ["rejected"]
+    assert await world.state() is BehaviourState.BLOCKED
+    assert (await world.events()).count("integration.rejected") == 1
+
+
+async def test_what_git_said_is_written_down_though_its_hearer_is_stopped_as_it_writes(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S1A-1.2: Git has refused, and the process is told to stop before that is on
+    record. The write goes on, and stopping waits for it."""
+    await ready_to_integrate(world)
+    world.hook_flag("refuse").touch()
+    integration = world.integration_with()
+    writing, may_write = asyncio.Event(), asyncio.Event()
+
+    class Slow:
+        """The pool, with every connection after the hook's refusal held until told."""
+
+        def __init__(self, pool: Any) -> None:
+            self._pool, self.holding = pool, False
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._pool, name)
+
+        def connection(self) -> Any:
+            pool, slow = self._pool, self
+
+            class Opening:
+                async def __aenter__(self) -> Any:
+                    if slow.holding:
+                        writing.set()
+                        await may_write.wait()
+                    self._inner = pool.connection()
+                    return await self._inner.__aenter__()
+
+                async def __aexit__(self, *raised: object) -> Any:
+                    return await self._inner.__aexit__(*raised)
+
+            return Opening()
+
+    slow = Slow(world.database)
+    integration._pool = slow  # type: ignore[assignment]
+    advance = Mirror.advance
+
+    async def refused_and_then_slow(self: Mirror, *arguments: Any, **more: Any) -> Any:
+        try:
+            return await advance(self, *arguments, **more)
+        finally:
+            slow.holding = True
+
+    monkeypatch.setattr(Mirror, "advance", refused_and_then_slow)
+    sending = asyncio.create_task(integration.integrate(PROJECT, "B1", "once"))
+    await writing.wait()
+
+    sending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sending
+    assert await world.column("SELECT heard FROM integration_sends") == [None]
+    draining = asyncio.create_task(integration.drain())
+    await asyncio.sleep(0.1)
+    assert not draining.done()
+    may_write.set()
+    await draining
+
+    assert await world.column("SELECT heard FROM integration_sends") == ["refused"]

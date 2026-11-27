@@ -18,7 +18,7 @@ from relay.application.leadership import AlreadyLed
 from relay.persistence.database import Pool, migrate, open_pool
 from relay.providers.boundary_suite import runtime_now
 from relay.providers.claude import ClaudeAdapter
-from relay.runtime import ROLES, NotConfigured, assemble, bootstrap
+from relay.runtime import ROLES, NotConfigured, assemble, bootstrap, stated_policy
 
 
 @asynccontextmanager
@@ -46,8 +46,8 @@ async def _up(every: float) -> int:
         relay = await assemble(pool, broker, control_plane=True)
         try:
             await processes.control_plane(relay, broker, _until_told_to_stop(), every=every)
-        except AlreadyLed as led:
-            print(f"relay: {led}", file=sys.stderr)
+        except (AlreadyLed, processes.CannotListen) as cannot:
+            print(f"relay: {cannot}", file=sys.stderr)
             return 1
     return 0
 
@@ -63,13 +63,11 @@ async def _worker(role: str) -> int:
             installation has it now: read again and again, since it can be stated or
             restated while this worker runs."""
             while True:
-                async with pool.connection() as connection:
-                    row = await (
-                        await connection.execute(
-                            "SELECT policy->>'statement' AS statement FROM installation"
-                        )
-                    ).fetchone()
-                stated["policy"] = row["statement"] if row else None
+                try:
+                    async with pool.connection() as connection:
+                        stated["policy"] = await stated_policy(connection)
+                except Exception:  # noqa: BLE001 - nothing is launched on a statement not read
+                    stated["policy"] = None
                 await asyncio.sleep(1.0)
 
         reading = asyncio.create_task(reading_the_statement())
@@ -81,7 +79,14 @@ async def _worker(role: str) -> int:
                 ClaudeAdapter(binary),
                 lambda: runtime_now(stated["policy"], binary),
                 _until_told_to_stop(),
+                # And where a call is admitted, the statement is read again, in that
+                # transaction: a call worked out from one that has since changed is not
+                # launched.
+                stated=stated_policy,
             )
+        except processes.LostIdentity as lost:
+            print(f"relay: {lost}", file=sys.stderr)
+            return 1
         finally:
             reading.cancel()
             with contextlib.suppress(asyncio.CancelledError):

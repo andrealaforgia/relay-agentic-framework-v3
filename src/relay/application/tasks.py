@@ -28,6 +28,7 @@ from relay.application.invocations import (
     Overtaken,
     Prepared,
 )
+from relay.application.leadership import require_term
 from relay.application.reviews import NewFinding, Review, Reviews
 from relay.application.worker import Call
 from relay.domain.review import Carried, Severity, SubmissionRefused
@@ -677,6 +678,7 @@ class BuildTask:
         had, across builds and remediations, and the same however often it is asked."""
         about = await self._about(invocation["assignment_id"])
         async with self._pool.connection() as connection, connection.transaction():
+            await require_term(connection)
             await connection.execute(
                 "SELECT 1 FROM behaviours WHERE project_id = %s AND behaviour_id = %s FOR UPDATE",
                 (about["project_id"], about["behaviour_id"]),

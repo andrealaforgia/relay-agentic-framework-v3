@@ -217,6 +217,8 @@ class Passes:
 
     def __init__(self) -> None:
         self.run: list[str] = []
+        self.starting: list[tuple[str, bool]] = []
+        self.failing: set[str] = set()
         self.again = asyncio.Event()
 
     async def start(self) -> None:
@@ -224,7 +226,17 @@ class Passes:
 
     async def reconcile(self, project_id: str, *, starting: bool = False) -> None:
         self.run.append(project_id)
+        self.starting.append((project_id, starting))
         self.again.set()
+        if project_id in self.failing:
+            raise RuntimeError(f"the repository of {project_id} cannot be reached")
+
+
+DRAINED: list[str] = []
+
+
+async def nothing_to_wait_for() -> None:
+    DRAINED.append("drained")
 
 
 async def serving(database: AsyncConnectionPool, broker: Any, every: float) -> Any:
@@ -241,6 +253,7 @@ async def serving(database: AsyncConnectionPool, broker: Any, every: float) -> A
     return SimpleNamespace(
         pool=database,
         installation=installation,
+        integration=SimpleNamespace(drain=nothing_to_wait_for),
         features=Passes(),
         streams=Streams(broker, prefix=installation),
         invocations=Invocations(database),
@@ -271,10 +284,13 @@ async def test_the_control_plane_runs_a_projects_pass_when_woken_and_on_its_time
                 await wake(database, relay.installation, "alpha")
             await relay.features.again.wait()
         assert relay.features.run == ["alpha", "alpha"]
+        DRAINED.clear()
     finally:
         stop.set()
         await running
         await broker.delete(processes._marker(relay.installation))
+    # As it stops, it waits for whatever Git has said that is still being written down.
+    assert DRAINED == ["drained"]
 
 
 async def test_only_the_control_plane_is_assembled_with_a_pass_that_runs(
@@ -303,3 +319,287 @@ async def test_only_the_control_plane_is_assembled_with_a_pass_that_runs(
         from relay.git.checkout import name_attempts_under
 
         name_attempts_under("")
+
+
+async def test_one_projects_start_that_fails_holds_up_no_other_project_and_is_tried_again(
+    database: AsyncConnectionPool, broker: Any
+) -> None:
+    """3C-S1A-1.4: start-up cleanup is each project's own first pass. One whose repository
+    cannot be reached is tried again as a start, and the others are served meanwhile."""
+    from relay import processes
+
+    relay = await serving(database, broker, 0.2)
+    async with database.connection() as connection:
+        await connection.execute(
+            "INSERT INTO projects (project_id, repository, trunk) VALUES ('beta', 'r2', 'main')"
+        )
+    passes = relay.features
+    passes.failing.add("alpha")
+    stop = asyncio.Event()
+
+    async def the_control_plane() -> None:
+        await processes.control_plane(relay, broker, stop, every=0.2)
+
+    running = asyncio.create_task(the_control_plane(), context=contextvars.copy_context())
+    try:
+        async with asyncio.timeout(20):
+            while passes.starting.count(("alpha", True)) < 2 or (
+                ("beta", False) not in passes.starting
+            ):
+                await asyncio.sleep(0.05)
+            assert ("alpha", False) not in passes.starting
+            passes.failing.clear()
+            while ("alpha", False) not in passes.starting:
+                await asyncio.sleep(0.05)
+        assert passes.starting.count(("beta", True)) == 1
+        assert await broker.get(processes._marker(relay.installation)) is not None
+    finally:
+        stop.set()
+        await running
+        await broker.delete(processes._marker(relay.installation))
+
+
+@pytest.mark.parametrize("fails", ["once", "always"])
+async def test_a_control_plane_that_cannot_listen_tries_again_and_does_not_sit_on_the_installation(
+    database: AsyncConnectionPool, broker: Any, monkeypatch: pytest.MonkeyPatch, fails: str
+) -> None:
+    """3C-S1A-1.8: a listener that fails is started again, and wakes are heard after. One
+    that never starts does not leave the process holding the installation and deaf to
+    being told to stop: it gives the installation up and says why."""
+    from relay import processes
+    from relay.runtime import wake
+
+    relay = await serving(database, broker, 600.0)
+    real, asked = processes.channel, 0
+
+    def channel(installation: str) -> str:
+        nonlocal asked
+        asked += 1
+        if fails == "always" or asked == 1:
+            raise OSError("no connection to listen on")
+        return real(installation)
+
+    monkeypatch.setattr(processes, "channel", channel)
+    stop = asyncio.Event()
+
+    async def the_control_plane() -> None:
+        await processes.control_plane(
+            relay, broker, stop, every=600.0, listening_within=1.0, listening_again_after=0.05
+        )
+
+    running = asyncio.create_task(the_control_plane(), context=contextvars.copy_context())
+    try:
+        if fails == "always":
+            with pytest.raises(processes.CannotListen):
+                async with asyncio.timeout(20):
+                    await running
+            assert relay.features.run == []
+
+            async def another() -> None:
+                await (await Leadership.take(database)).release()
+
+            await as_a_process(another)  # the installation was given up
+        else:
+            async with asyncio.timeout(20):
+                await relay.features.again.wait()
+                relay.features.again.clear()
+                await wake(database, relay.installation, "alpha")
+                await relay.features.again.wait()
+            assert relay.features.run == ["alpha", "alpha"]
+    finally:
+        stop.set()
+        await asyncio.gather(running, return_exceptions=True)
+        await broker.delete(processes._marker(relay.installation))
+
+
+async def test_a_control_plane_whose_term_is_over_publishes_nothing_and_marks_nothing_published(
+    database: AsyncConnectionPool, broker: Any, namespace: str
+) -> None:
+    """3C-S1A-1.3: it may be on another Redis than its successor. A message it appended
+    there and marked published would never be published where it is read."""
+    from relay.persistence.outbox import OutboxPublisher
+    from relay.transport.streams import Streams
+
+    await serving(database, broker, 1.0)
+    async with database.connection() as connection:
+        await connection.execute(
+            "INSERT INTO outbox (message_id, project_id, stream, envelope) "
+            "VALUES (gen_random_uuid(), 'alpha', 'relay:alpha:cmd:qa', '{}')"
+        )
+    its_redis = Streams(broker, prefix=namespace)
+    refused: list[object] = []
+
+    async def the_old_one() -> None:
+        mine = await Leadership.take(database)
+        await mine.drop_connection()
+
+        async def the_new_one() -> None:
+            await (await Leadership.take(database)).release()
+
+        await as_a_process(the_new_one)
+        try:
+            await OutboxPublisher(database, its_redis).publish_pending()
+        except NotLeader as over:
+            refused.append(over)
+
+    await as_a_process(the_old_one)
+
+    assert len(refused) == 1
+    async with database.connection() as connection:
+        row = await (await connection.execute("SELECT published_at FROM outbox")).fetchone()
+    assert row is not None and row["published_at"] is None
+    assert [key async for key in broker.scan_iter(f"{namespace}:*")] == []
+    assert await OutboxPublisher(database, its_redis).publish_pending() == 1  # one with no term
+
+
+async def test_a_worker_that_lost_the_connection_its_lock_is_on_stops_and_says_so(
+    database: AsyncConnectionPool, broker: Any
+) -> None:
+    """3C-S1A-1.6: its pool and its Redis still work, and to everyone else it is gone: it
+    would be refused every claim and acknowledge every command, for ever. It stops."""
+    from types import SimpleNamespace
+
+    from relay import processes
+    from relay.application.leadership import installation_of
+
+    async with database.connection() as connection:
+        installation = await installation_of(connection)
+    relay: Any = SimpleNamespace(
+        pool=database, installation=installation, claims=None, invocations=None,
+        tasks={"qa": {}}, boundaries=None, streams=None,
+    )  # fmt: skip
+    stop = asyncio.Event()
+    serving_qa = asyncio.create_task(
+        processes.worker(relay, broker, "qa", None, dict, stop, idle=0.05)  # type: ignore[arg-type]
+    )
+    try:
+        async with asyncio.timeout(20):
+            while not (
+                keys := await column_of(database, "SELECT lock_key FROM workers WHERE role = 'qa'")
+            ):
+                await asyncio.sleep(0.05)
+            key = int(keys[0]) & 0xFFFFFFFFFFFFFFFF
+            ended = await column_of(
+                database,
+                "SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype = 'advisory' "
+                f"AND granted AND objsubid = 1 AND classid = {key >> 32} "
+                f"AND objid = {key & 0xFFFFFFFF}",
+            )
+            assert ended == [True]
+            with pytest.raises(processes.LostIdentity, match="Start it again"):
+                await serving_qa
+    finally:
+        stop.set()
+        await asyncio.gather(serving_qa, return_exceptions=True)
+
+
+async def column_of(database: AsyncConnectionPool, query: str) -> list[Any]:
+    async with database.connection() as connection:
+        rows = await (await connection.execute(query)).fetchall()  # type: ignore[arg-type]
+    return [next(iter(row.values())) for row in rows]
+
+
+async def test_a_worker_process_asks_before_every_call_whether_it_is_stopping_and_whose_redis_it_is_on(
+    database: AsyncConnectionPool, broker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S1A-1.5: what the process hands its worker to ask before each call. Whose Redis
+    this is is asked each time, not remembered from thirty seconds ago."""
+    from types import SimpleNamespace
+
+    from relay import processes
+    from relay.application.leadership import installation_of
+
+    async with database.connection() as connection:
+        installation = await installation_of(connection)
+    relay: Any = SimpleNamespace(
+        pool=database, installation=installation, claims=None, invocations=None,
+        tasks={"qa": {}}, boundaries=None, streams=None,
+    )  # fmt: skip
+    handed: dict[str, Any] = {}
+
+    class Recorded:
+        def __init__(self, *_: Any, **asked: Any) -> None:
+            handed.update(asked)
+
+        async def serve_once(self, *_: Any) -> list[str]:
+            return []
+
+    monkeypatch.setattr(processes, "Worker", Recorded)
+    stop = asyncio.Event()
+    serving_qa = asyncio.create_task(
+        processes.worker(relay, broker, "qa", None, dict, stop, idle=0.05)  # type: ignore[arg-type]
+    )
+    try:
+        async with asyncio.timeout(20):
+            while "may_launch" not in handed:
+                await asyncio.sleep(0.02)
+        may_launch = handed["may_launch"]
+        assert "none has been started" in await may_launch()
+
+        async def led() -> int:
+            mine = await Leadership.take(database)
+            await mine.release()
+            return mine.term
+
+        first = await as_a_process(led)
+        await broker.set(processes._marker(installation), first)
+        assert await may_launch() is None
+        await as_a_process(led)  # a control plane started since, on another Redis
+        assert "another Redis" in await may_launch()
+        stop.set()
+        assert await may_launch() == "this worker is stopping"
+    finally:
+        stop.set()
+        await serving_qa
+        await broker.delete(processes._marker(installation))
+
+
+async def test_a_control_plane_whose_term_is_over_numbers_no_attempt(building: Building) -> None:
+    """3C-S1A-1.3: one of the writes a gate check in an earlier transaction cannot fence."""
+    world = building.world
+    worker = await building.worker(Builder(RIGHT))
+    assert await worker.carry_out(await building.owed()) == "handed_on"
+    async with world.database.connection() as connection:
+        invocation = await (await connection.execute("SELECT * FROM invocations")).fetchone()
+    assert invocation is not None
+
+    async def the_old_one() -> None:
+        mine = await Leadership.take(world.database)
+        await mine.drop_connection()
+
+        async def the_new_one() -> None:
+            await (await Leadership.take(world.database)).release()
+
+        await as_a_process(the_new_one)
+        with pytest.raises(NotLeader):
+            await building.task._attempt(invocation)
+
+    await as_a_process(the_old_one)
+
+    assert await world.column("SELECT count(*) FROM build_attempts") == [0]
+
+
+async def test_a_control_plane_told_to_stop_before_it_can_listen_stops(
+    database: AsyncConnectionPool, broker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S1A-1.8: as Astra found it, the process stayed blocked with its stop set."""
+    from relay import processes
+
+    relay = await serving(database, broker, 600.0)
+
+    def channel(installation: str) -> str:
+        raise OSError("no connection to listen on")
+
+    monkeypatch.setattr(processes, "channel", channel)
+    stop = asyncio.Event()
+
+    async def the_control_plane() -> None:
+        await processes.control_plane(relay, broker, stop, every=600.0, listening_within=600.0)
+
+    running = asyncio.create_task(the_control_plane(), context=contextvars.copy_context())
+    await asyncio.sleep(0.3)
+    stop.set()
+
+    async with asyncio.timeout(10):
+        await running  # and no complaint that it could not listen: it was told to stop
+    assert relay.features.run == []

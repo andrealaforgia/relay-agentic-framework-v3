@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from relay.runtime import NotConfigured, bootstrap, profile_of
+from relay.runtime import DEFAULT_BUDGET_USD, NotConfigured, bootstrap, profile_of
 
 
 def test_the_environment_says_where_the_database_and_redis_are(tmp_path: Path) -> None:
@@ -71,4 +71,11 @@ def test_a_roles_profile_is_the_default_with_what_is_said_of_the_role_over_it() 
     assert (builder.model, builder.effort, builder.timeout) == ("claude-opus-5-5", "high", 60.0)
     assert str(builder.budget_usd) == "0.5"
     assert (qa.model, qa.effort) == ("claude-haiku-5-5", None)
-    assert profile_of({}, "qa").budget_usd is None
+
+
+def test_no_profile_is_without_a_cap_on_what_one_call_may_cost() -> None:
+    """3C-S1A-1.9: said or not, every call has one, and it is an amount above nothing."""
+    assert profile_of({}, "qa").budget_usd == DEFAULT_BUDGET_USD > 0
+    for nothing in ("0", "-1", "NaN", "Infinity"):
+        with pytest.raises(NotConfigured, match="may cost"):
+            profile_of({"profiles": {"qa": {"budget_usd": nothing}}}, "qa")
