@@ -1680,3 +1680,77 @@ async def test_what_git_said_is_kept_and_written_again_when_the_database_would_n
     hearing.cancel()
     with pytest.raises(AnswersNotRecorded, match=str(second)):
         await integration.drain(within=0.3)
+
+
+async def test_a_send_whose_authorisation_committed_and_was_not_heard_to_is_one_that_never_left(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S1A-3.2: the send is on record and the connection is lost before the commit is
+    answered. Git is not started. The send's identity is kept across the failure and it
+    is put on record as never having left."""
+    base, _ = await ready_to_integrate(world)
+    integration = world.integration_with()
+    pool = Pool(world.database)
+    integration._pool = pool  # type: ignore[assignment]
+    lost = [False]
+
+    async def the_answer_is_lost() -> None:
+        if not lost[0] and await world.column("SELECT count(*) FROM integration_sends") == [1]:
+            lost[0] = True
+            raise OSError("the connection was lost as the commit was answered")
+
+    pool.after = the_answer_is_lost
+    pushes: list[object] = []
+
+    async def no_push(self: Mirror, *arguments: Any, **__: Any) -> None:
+        pushes.append(arguments)
+
+    monkeypatch.setattr(Mirror, "_push", no_push)
+
+    with pytest.raises(OSError, match="as the commit was answered"):
+        await integration.integrate(PROJECT, "B1", "once")
+    await integration.drain()
+
+    assert pushes == [] and world.trunk() == base
+    assert await world.column("SELECT heard FROM integration_sends") == ["never_left"]
+
+
+async def test_a_caller_stopped_while_authorising_stops_though_nothing_can_be_written_down(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S1A-3.3: the caller does not wait for the writing. It ends, and the answer is
+    the integration service's to write: the drain has the deadline, and names the send
+    it could not put on record."""
+    await ready_to_integrate(world)
+    integration = world.integration_with()
+    integration.writing_again_after = 0.05
+    pool = Pool(world.database)
+    integration._pool = pool  # type: ignore[assignment]
+    committed, may_return = asyncio.Event(), asyncio.Event()
+
+    async def once_the_send_is_on_record() -> None:
+        if not committed.is_set() and await world.column(
+            "SELECT count(*) FROM integration_sends"
+        ) == [1]:
+            committed.set()
+            await may_return.wait()
+
+    pool.after = once_the_send_is_on_record
+
+    async def no_push(self: Mirror, *_: Any, **__: Any) -> None:
+        raise AssertionError("nothing is sent")
+
+    monkeypatch.setattr(Mirror, "_push", no_push)
+    sending = asyncio.create_task(integration.integrate(PROJECT, "B1", "once"))
+    await committed.wait()
+    pool.after = None
+    pool.failing = 10_000  # the database takes nothing from here on
+
+    sending.cancel()
+    await asyncio.sleep(0.05)
+    may_return.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(sending, 5)
+    [send] = await world.column("SELECT send_id FROM integration_sends")
+    with pytest.raises(AnswersNotRecorded, match=str(send)):
+        await integration.drain(within=0.3)

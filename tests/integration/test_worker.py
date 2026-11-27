@@ -992,3 +992,124 @@ async def test_a_worker_told_to_stop_while_it_prepares_a_call_does_not_make_it(
     assert provider.asked == [] and await bench.states() == []
     assert asked_with[0] is None and asked_with[-1] is not None
     assert (await bench.owed())["state"] == "wanted"
+
+
+async def test_a_reply_the_database_would_not_take_is_kept_and_recorded_by_the_same_worker(
+    bench: Bench,
+) -> None:
+    """3C-S1A-3.1: the provider has answered and been paid, and the record of it fails on
+    its way to the database. The worker is alive, so nobody takes the call for lost and
+    nobody will ask again. It keeps the reply and records it: one call, applied once."""
+    import psycopg
+
+    provider = Scripted(said(), said())
+    worker = await bench.worker(provider)
+    worker.recording_again_after = 0.01
+    record, failures = bench.invocations.record, [2]
+
+    async def fails_and_then_takes_it(*arguments: Any, **more: Any) -> str:
+        if failures[0]:
+            failures[0] -= 1
+            raise psycopg.OperationalError("the connection is closed")
+        return await record(*arguments, **more)
+
+    bench.invocations.record = fails_and_then_takes_it  # type: ignore[method-assign]
+
+    assert await worker.carry_out(await bench.owed()) == "applied"
+
+    assert len(provider.asked) == 1 and failures == [0]
+    assert await bench.states() == ["applied"]
+    assert bench.applied == [{"sum": 5}]
+
+
+async def test_a_worker_told_to_stop_as_its_call_is_admitted_calls_nothing_and_says_so(
+    bench: Bench,
+) -> None:
+    """3C-S1A-3.4: the last check before a call waits on PostgreSQL and on Redis, and the
+    stop can arrive during that wait. Asked once more, waiting on nothing, where the
+    provider would be called. The call on record is one that never started."""
+    provider = Scripted(said(), said())
+    told: list[bool] = []
+
+    async def may_launch(admitting: Any = None) -> str | None:
+        if admitting is not None:
+            told.append(True)  # told to stop while this was being asked
+        return None
+
+    worker = await bench.worker(provider, may_launch=may_launch, stopping=lambda: bool(told))
+    owed = await bench.owed()
+
+    assert await worker.carry_out(owed) == "not_started"
+
+    assert provider.asked == []
+    assert await bench.states() == ["not_started"]
+    told.clear()
+    assert await (await bench.worker(provider)).carry_out(owed) == "applied"  # the next worker
+    assert len(provider.asked) == 1
+
+
+async def test_a_control_plane_started_on_another_redis_while_a_call_is_prepared_stops_the_call(
+    bench: Bench,
+) -> None:
+    """3C-3.2 and 3C-S1A-2.3, with two Redis databases: the worker reads one, where the
+    first control plane left its term. While the worker prepares its call a second
+    control plane takes the installation and publishes to the other. Asked where the
+    call is admitted, this Redis is no longer the control plane's: nothing is launched."""
+    import contextvars
+    from types import SimpleNamespace
+
+    import redis.asyncio as redis
+
+    from relay import processes
+    from relay.application.leadership import Leadership, installation_of
+    from tests.integration.conftest import REDIS_URL
+
+    database = bench.world.database
+    async with database.connection() as connection:
+        installation = await installation_of(connection)
+    relay: Any = SimpleNamespace(pool=database, installation=installation)
+    server = REDIS_URL.rsplit("/", 1)[0]
+    the_workers = redis.from_url(f"{server}/14", decode_responses=True)
+    the_successors = redis.from_url(f"{server}/15", decode_responses=True)
+    await the_workers.set("which", "the worker's")
+    assert await the_successors.get("which") is None  # two databases, not one twice
+    await the_workers.delete("which")
+
+    async def led_on(broker: Any) -> None:
+        mine = await Leadership.take(database)
+        assert await processes.mark(broker, installation, mine.term, 60)
+        await mine.release()
+
+    async def as_another_process(broker: Any) -> None:
+        await asyncio.create_task(led_on(broker), context=contextvars.copy_context())
+
+    provider = Scripted(said(), said())
+    prepare = bench.task.prepare
+
+    async def prepared_across_the_switch(*arguments: Any) -> Any:
+        call = await prepare(*arguments)
+        await as_another_process(the_successors)
+        return call
+
+    async def may_launch(admitting: Any = None) -> str | None:
+        return (
+            await processes.transport_is_the_control_planes(relay, the_workers, admitting) or None
+        )
+
+    try:
+        await as_another_process(the_workers)
+        assert await may_launch() is None
+        bench.task.prepare = prepared_across_the_switch  # type: ignore[method-assign]
+        worker = await bench.worker(provider, may_launch=may_launch)
+
+        left = await worker.carry_out(await bench.owed())
+
+        assert left.startswith("refused:")
+        assert provider.asked == [] and await bench.states() == []
+        assert "another Redis" in str(await may_launch())
+        # On the Redis the control plane now uses, the same check lets a call through.
+        assert await processes.transport_is_the_control_planes(relay, the_successors) == ""
+    finally:
+        for broker in (the_workers, the_successors):
+            await broker.delete(processes._marker(installation))
+            await broker.aclose()

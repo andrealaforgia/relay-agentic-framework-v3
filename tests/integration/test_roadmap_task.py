@@ -423,3 +423,42 @@ async def test_a_roles_profile_caps_what_one_call_may_cost(planning: Planning) -
     planning.task.discard(call)
 
     assert call.budget_usd == Decimal("0.25")
+
+
+async def test_a_call_that_could_not_be_prepared_leaves_no_workspace_behind(
+    planning: Planning, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S1A-3.5: the repository cannot be reached, or the role's definition is missing
+    once the trunk has been exported. No call comes of it, so nobody else knows of the
+    workspace: it is cleared where it was made, each time the work is announced again."""
+    from relay.application import authoring
+    from relay.git.checkout import RemoteUnavailable
+
+    root = tmp_path.resolve() / "workspaces"
+    owed = await planning.owed()
+    grant = uuid.uuid4()
+    real = authoring.resolve_ref
+
+    async def unreachable(*_: Any, **__: Any) -> str | None:
+        raise RemoteUnavailable("no route to host")
+
+    monkeypatch.setattr(authoring, "resolve_ref", unreachable)
+    for _ in range(2):
+        with pytest.raises(RemoteUnavailable):
+            await planning.task.prepare(owed, grant, None)
+    assert not root.exists() or list(root.iterdir()) == []
+
+    monkeypatch.setattr(authoring, "resolve_ref", real)
+    monkeypatch.setattr(planning.task, "_definitions", [tmp_path / "no-definitions-here"])
+    monkeypatch.setattr(authoring, "find_definition", _missing)
+    with pytest.raises(LookupError):
+        await planning.task.prepare(owed, grant, None)
+    assert list(root.iterdir()) == []
+
+    monkeypatch.undo()
+    call = await planning.task.prepare(owed, grant, None)
+    assert [each.name for each in root.iterdir()] == [call.workdir.parent.name]
+
+
+def _missing(*_: Any, **__: Any) -> Any:
+    raise LookupError("no definition for this role")

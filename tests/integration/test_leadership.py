@@ -235,7 +235,7 @@ class Passes:
 DRAINED: list[str] = []
 
 
-async def nothing_to_wait_for() -> None:
+async def nothing_to_wait_for(within: float = 30.0) -> None:
     DRAINED.append("drained")
 
 
@@ -802,3 +802,103 @@ async def test_a_call_is_admitted_against_the_term_as_it_is_held_through_admissi
                 await taking.execute("RESET lock_timeout")
     finally:
         await broker.delete(_marker(relay.installation))
+
+
+async def test_a_control_plane_that_cannot_write_an_answer_down_still_gives_up_the_installation(
+    database: AsyncConnectionPool, broker: Any
+) -> None:
+    """3C-S1A-3.3: the drain's deadline passes, it is said which send, and the stop goes
+    on: the installation is another's to take."""
+    from relay import processes
+    from relay.application.integration import AnswersNotRecorded
+
+    relay = await serving(database, broker, 0.2)
+    waited: list[float] = []
+
+    async def cannot(within: float) -> None:
+        waited.append(within)
+        raise AnswersNotRecorded("could not be put on record before stopping: heard for send X")
+
+    relay.integration.drain = cannot
+    stop = asyncio.Event()
+
+    async def the_control_plane() -> None:
+        await processes.control_plane(relay, broker, stop, every=0.2, draining_within=0.4)
+
+    running = asyncio.create_task(the_control_plane(), context=contextvars.copy_context())
+    try:
+        async with asyncio.timeout(20):
+            await relay.features.again.wait()
+    finally:
+        stop.set()
+        await running  # and it ends without raising
+        await broker.delete(processes._marker(relay.installation))
+
+    assert waited == [0.4]
+
+    async def another() -> None:
+        await (await Leadership.take(database)).release()
+
+    await as_a_process(another)
+
+
+async def test_a_worker_told_to_stop_while_it_asks_whose_redis_it_is_on_may_launch_nothing(
+    database: AsyncConnectionPool, broker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S1A-3.4: the stop is read last, after everything that waits."""
+    from types import SimpleNamespace
+
+    from relay import processes
+    from relay.application.leadership import installation_of
+
+    async with database.connection() as connection:
+        installation = await installation_of(connection)
+    relay: Any = SimpleNamespace(
+        pool=database, installation=installation, claims=None, invocations=None,
+        tasks={"qa": {}}, boundaries=None, streams=None,
+    )  # fmt: skip
+    handed: dict[str, Any] = {}
+
+    class Recorded:
+        def __init__(self, *_: Any, **asked: Any) -> None:
+            handed.update(asked)
+
+        async def serve_once(self, *_: Any) -> list[str]:
+            return []
+
+    monkeypatch.setattr(processes, "Worker", Recorded)
+    stop = asyncio.Event()
+    told_during_the_read = [False]
+
+    class ToldToStopAsItReads:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(broker, name)
+
+        async def get(self, key: str) -> Any:
+            marked = await broker.get(key)
+            if told_during_the_read[0]:
+                stop.set()
+            return marked
+
+    async def led() -> int:
+        mine = await Leadership.take(database)
+        await mine.release()
+        return mine.term
+
+    await broker.set(processes._marker(installation), await as_a_process(led))
+    serving_qa = asyncio.create_task(
+        processes.worker(relay, ToldToStopAsItReads(), "qa", None, dict, stop, idle=0.05)  # type: ignore[arg-type]
+    )
+    try:
+        async with asyncio.timeout(20):
+            while "may_launch" not in handed:
+                await asyncio.sleep(0.02)
+        assert await handed["may_launch"]() is None
+        assert handed["stopping"]() is False
+        told_during_the_read[0] = True
+        assert await handed["may_launch"]() == "this worker is stopping"
+        assert handed["stopping"]() is True
+    finally:
+        stop.set()
+        await serving_qa
+        await broker.delete(processes._marker(installation))

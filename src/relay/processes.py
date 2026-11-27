@@ -62,6 +62,7 @@ async def control_plane(
     started: Callable[[Leadership], None] | None = None,
     listening_within: float = 30.0,
     listening_again_after: float = 1.0,
+    draining_within: float = 30.0,
 ) -> None:
     """Take the installation and serve it until told to stop or replaced. Raises
     `AlreadyLed` if another control plane holds it."""
@@ -184,7 +185,7 @@ async def control_plane(
         await asyncio.gather(listening, *tasks.values(), return_exceptions=True)
         # What Git has said to a send, and is being written down, is written down.
         try:
-            await relay.integration.drain()
+            await relay.integration.drain(draining_within)
         except Exception as unwritten:  # noqa: BLE001 - said, and the stop goes on
             _say(f"relay: {unwritten}")
         await relay.invocations.close()
@@ -277,11 +278,13 @@ async def worker(
         if trouble[0] and trouble[0] != said[0]:
             _say(f"relay: {role} launches nothing: {trouble[0]}")
         said[0] = trouble[0]
+        if stop.is_set():  # told to stop while those were being asked
+            return "this worker is stopping"
         return trouble[0] or None
 
     serving: Any = Worker(
         session, relay.claims, relay.invocations, provider, relay.tasks[role], relay.boundaries,
-        runtime, then=then, may_launch=may_launch, stated=stated,
+        runtime, then=then, may_launch=may_launch, stated=stated, stopping=stop.is_set,
     )  # fmt: skip
     try:
         while not stop.is_set():

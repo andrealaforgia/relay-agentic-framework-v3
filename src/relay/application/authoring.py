@@ -42,6 +42,7 @@ from relay.application.tasks import (
     Profile,
     Workspaces,
     caller_of,
+    clearing_up_if_it_fails,
     put_question,
     question_problem,
     record_assumptions,
@@ -130,6 +131,7 @@ class Authoring:
 
     # What they all do.
 
+    @clearing_up_if_it_fails
     async def prepare(
         self, assignment: Mapping[str, Any], grant: uuid.UUID, last_problem: str | None
     ) -> Call:

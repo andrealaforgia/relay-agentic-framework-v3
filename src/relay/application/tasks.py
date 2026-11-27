@@ -8,10 +8,12 @@ its run has no tool that could change one.
 
 from __future__ import annotations
 
+import functools
 import json
 import shutil
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -257,6 +259,37 @@ class Profile:
     budget_usd: Decimal | None = None
 
 
+# The workspaces allocated while one call is being prepared.
+_ALLOCATING: ContextVar[list[Path] | None] = ContextVar("allocating", default=None)
+
+
+def clearing_up_if_it_fails[**P, R](
+    prepare: Callable[P, Awaitable[R]],
+) -> Callable[P, Awaitable[R]]:
+    """A preparation that fails returns no call, so nobody else knows of the workspace it
+    had made: a repository that could not be reached, a definition that is missing. It
+    is cleared here, by the code that allocated it. Work announced again and failing
+    again leaves nothing behind each time."""
+
+    @functools.wraps(prepare)
+    async def prepared(*arguments: P.args, **more: P.kwargs) -> R:
+        allocated: list[Path] = []
+        token = _ALLOCATING.set(allocated)
+        try:
+            return await prepare(*arguments, **more)
+        except BaseException:
+            bases = getattr(arguments[0], "_bases", None) if arguments else None
+            for workspace in allocated:
+                if isinstance(bases, dict):
+                    bases.pop(workspace, None)
+                shutil.rmtree(workspace.parent, ignore_errors=True)
+            raise
+        finally:
+            _ALLOCATING.reset(token)
+
+    return prepared
+
+
 class Workspaces:
     """Where runs work: one fresh directory each, under a root of Relay's own that is
     neither in the home directory nor in the directory every sandboxed shell shares."""
@@ -265,7 +298,11 @@ class Workspaces:
         self._root = root
 
     def fresh(self) -> Path:
-        return self._root / str(uuid.uuid7()) / "tree"
+        workspace = self._root / str(uuid.uuid7()) / "tree"
+        allocating = _ALLOCATING.get()
+        if allocating is not None:
+            allocating.append(workspace)
+        return workspace
 
 
 def review_from(reply: Any) -> Review:
@@ -324,6 +361,7 @@ class ReviewTask:
         self._definitions = definitions
         self._profile = profile
 
+    @clearing_up_if_it_fails
     async def prepare(
         self, assignment: Mapping[str, Any], grant: uuid.UUID, last_problem: str | None
     ) -> Call:
@@ -595,6 +633,7 @@ class BuildTask:
     def _mirror(self, project_id: str) -> Mirror:
         return Mirror(self._mirrors / f"{project_id}.git")
 
+    @clearing_up_if_it_fails
     async def prepare(
         self, assignment: Mapping[str, Any], grant: uuid.UUID, last_problem: str | None
     ) -> Call:

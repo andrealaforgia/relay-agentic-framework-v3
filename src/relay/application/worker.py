@@ -16,6 +16,9 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
+import psycopg
+from psycopg_pool import PoolTimeout
+
 from relay.application.assignments import Assignments
 from relay.application.invocations import Invocations, Prepared, reply_problem
 from relay.application.workers import WorkerSession
@@ -111,7 +114,12 @@ class Worker:
         then: Callable[[str], Awaitable[None]] | None = None,
         may_launch: Callable[[Connection | None], Awaitable[str | None]] | None = None,
         stated: Callable[[Connection], Awaitable[str | None]] | None = None,
+        stopping: Callable[[], bool] | None = None,
     ) -> None:
+        # Asked, without waiting on anything, at the moment the provider would be
+        # called: every other check has waited on something, and a process told to stop
+        # during the last of those waits makes no call.
+        self._stopping = stopping
         # Asked before every call this worker would make, a retry included: why nothing
         # may be launched now, if anything. The process is stopping; the Redis it reads
         # is no longer the control plane's. Asked before the call is prepared, to spare
@@ -136,6 +144,7 @@ class Worker:
         # another runtime, with no pass.
         self._runtime = runtime
         self._recording: set[asyncio.Task[str]] = set()
+        self.recording_again_after = 0.5
 
     async def serve_once(
         self, streams: Streams, project_id: str, *, abandoned_after_ms: int = 300_000
@@ -327,6 +336,18 @@ class Worker:
         Returns the state the call was recorded in."""
         heard: list[ProviderResult] = []
         launched: list[int] = []
+        if self._stopping is not None and self._stopping():
+            # Admitted, and then told to stop before anything was launched. Nothing was
+            # spent, and that is what is recorded: the work is free for the next worker.
+            return await self._recorded(
+                invocation_id,
+                task,
+                assignment,
+                call,
+                ProviderResult(
+                    Outcome.NOT_STARTED, reason="the worker was told to stop before the call"
+                ),
+            )
         try:
             result = await self._provider.invoke(
                 Request(
@@ -413,9 +434,18 @@ class Worker:
                 # The reply arrived and what it left could not be kept. That is known,
                 # and is recorded with what the call used.
                 problem = f"what the call left could not be kept: {failure}"
-        return await self._invocations.record(
-            invocation_id, result, problem=problem, retained=retained
-        )
+        while True:
+            try:
+                return await self._invocations.record(
+                    invocation_id, result, problem=problem, retained=retained
+                )
+            except psycopg.OperationalError, psycopg.InterfaceError, PoolTimeout, OSError:
+                # The database would not take it. This worker is the only place the
+                # result exists, and it is alive: to everyone else the call is still
+                # being made, and nobody will ask again. The result is kept, with what
+                # was retained of it, and recorded again until it is on record.
+                # Recording is by the call's own identity, so twice is once.
+                await asyncio.sleep(self.recording_again_after)
 
 
 def _problem(task: Task, result: ProviderResult, schema: Mapping[str, Any]) -> str | None:

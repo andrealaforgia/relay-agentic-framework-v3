@@ -932,8 +932,20 @@ class Integration:
                 return await asyncio.shield(counting)
             except asyncio.CancelledError:
                 await asyncio.wait([counting])
-                if not counting.cancelled() and counting.exception() is None and sent:
-                    await self._heard(send_id, "never_left", "stopped before the send was launched")
+                if counting.cancelled() or counting.exception() is not None or sent:
+                    # Authorised, or nobody heard whether it was. Handed over to be
+                    # written down, and not waited for here: a caller told to stop
+                    # stops, and the process's drain has a deadline for the writing.
+                    self._to_be_heard(send_id, "never_left", "stopped before the send was launched")
+                raise
+            except Exception:
+                # The authorisation failed where its outcome cannot be known: it may
+                # have committed with the answer lost on the way back. Git was not
+                # started. If the send is on record, it is one that never left; if it is
+                # not, there is no send, and writing this changes nothing.
+                self._to_be_heard(
+                    send_id, "never_left", "the send was not launched: its authorisation failed"
+                )
                 raise
 
         try:
@@ -967,6 +979,10 @@ class Integration:
         return await self._converged(intent_id)
 
     async def _heard(self, send_id: uuid.UUID, heard: str, reason: str) -> None:
+        """Put on record what Git said to one send, and wait until it is."""
+        await asyncio.shield(self._to_be_heard(send_id, heard, reason))
+
+    def _to_be_heard(self, send_id: uuid.UUID, heard: str, reason: str) -> asyncio.Task[None]:
         """Put on record what Git said to one send. Not fenced by the term, and taking
         no lock of the workflow's: whoever sent it is the only one who will ever hear,
         and may by now be a control plane that has been replaced. Nothing is decided
@@ -996,12 +1012,12 @@ class Integration:
                     # again, until it is on record or the process is made to give up.
                     await asyncio.sleep(self.writing_again_after)
 
-        # Git has answered. A process told to stop now still writes it down: the write
-        # goes on when its caller is cancelled, and `drain` waits for it.
+        # A process told to stop now still writes it down: the write goes on when its
+        # caller is cancelled, and `drain` waits for it.
         writing = asyncio.create_task(write(), name=f"heard {heard} for send {send_id}")
         self._hearing.add(writing)
         writing.add_done_callback(self._hearing.discard)
-        await asyncio.shield(writing)
+        return writing
 
     async def drain(self, within: float = 30.0) -> None:
         """Wait for every answer that is being written down. Called as a process stops.
