@@ -357,6 +357,18 @@ What the slice set out to do, it does: workers and the Claude adapter drive the 
 
 What it does not do is in the reservations of each step. The ones that bear most on using it: the worker processes, the pass and the control plane are one process here, and wiring them across processes is 3c's; nothing runs on a timer; and a project's admissions and marks are serialised behind one lock whose cost has not been measured.
 
+## Slice 3c, design (the processes, the command line and the Product Owner's part)
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 57 | CHALLENGE, 11 | A build's worker unable to finish its own apply once it has no Docker and no push credentials; a control plane that lost its lock still acting; a pass for one project doing another's work; a second project governed by the first one's file; the operator's statement an editable field; a prepared retry confirmed against a later refusal; no handle to replay the first command; two human decisions missing from the inbox; live usage already aggregated away; no stated way to bound the session's tools; a final smoke that never starts the session |
+| 58 | CHALLENGE, 9 | A known result whose worker is gone or idle, owned by nobody; a rejected green with its Builder alive and nothing to announce; start-up cleanup under an old term; transport not bound to the installation; a paid probe bought again after a lost reply; no rule for which project a command means; a prepared resume confirmed against a later pause; a session inventory check with no channel; analyses and Interpreter questions lost with the conversation |
+| 59 | CHALLENGE, 8 | A push's outcome lost across a change of term; a running worker left on another Redis; attempt refs shared by two installations; a running probe taken for an uncertain one; a prepared decision on a parked call decided otherwise; a conversation treated as one invocation; a note's answer not recorded; "not delivered" where recovery from the record would serve |
+
+Twenty-eight findings. **The design was not accepted.** Round 59's eight are folded into the build contract (`round-60`), which Astra did not review; Astra asked for exactly that, and said the build should begin. Astra accepted along the way: the installation as a row in the database; the lossy wake with a periodic pass; a retry bound to the particular refused push; the typed inbox; the usage calculation; and the passphrase read from the person's own terminal as reasonable for the stated single-host model.
+
+Three things the review changed in the design's shape. A worker cannot finish a build once the processes are split, so effects say whose they are and the control plane takes a returned build. Holding a lock does not stop a former control plane, so a control plane has a term and every transaction of its that changes workflow state is fenced by it. And Relay hosts the Product Owner's conversation itself, a turn at a time, because the provider's interactive launch gives no account of what tools a session has.
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.
