@@ -267,6 +267,46 @@ Reservations:
 - **The overlapping-oracle histories are tested with two real oracle runs in one process**, not two worker processes.
 - **Whether a discarded tree is really gone** is checked by looking at the workspace root after the call, not under a failing filesystem; `rmtree` errors are ignored.
 
+### Step 3 as built: the owed work that was missing
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 51 | CHALLENGE, 4 blocking of 13 | A first integration nobody carries on when its checks are discarded or cut short; an invalid red observed again, and by two passes at once; a proposal sent back between two commits owing no successor; a successor refused by the proposal it is to replace; "demonstrated" accepted with a criterion unshown; refusals of paid replies escaping as errors; story-wide work started while a contract waits to be reconfirmed; a proposal reconfirmed without its new stories; no worker route to replace what is on trunk; no question from a Builder or a reviewer; a late take-up starting another cycle's checks; an assumption outliving a refused reply; the Analyst asked to repair without the evidence |
+| 52 | CHALLENGE, 2 blocking of 12 | A stale reply withdrawing a proposal under a later decision; two reviewers deadlocked when one asks; a red observed twice across a pause and a resume; a seal or assessment owed again when it is no longer the step; a replacement voided by a decision with no worker to propose it again; a roadmap in force that no longer stands with nobody owed its revision; assumptions accepted blank, or lost beside accepted work; a refused push a person allows again owed to nobody; a pass cancelled as its first batch commits; two missing wake-ups; validation that depended on who recorded; the common reply shape refused for a build or a review |
+| 53 | CHALLENGE, 2 blocking of 11 | A malformed wrapped reply accepted as an empty review; a red launched with none owed, and decided by a caller that no longer held it; a reply to an invalid red that rewrote nothing; a story-scoped decision with nobody owed the rewording; no way to decline a voided replacement past its red; a retry replayed allowing a further push; a stream loop while a gate waits for a person; binary output breaking a briefing; two briefings that said what was not so; a second cancellation during batch creation; a withdrawal's wake-up neither required nor repeatable |
+
+Thirty-six findings, every one reachable through a real entry point. **Step 3 was not accepted.** Round 53 was the third and last round (D-8). All eleven of its findings are fixed, each with a test that fails without the fix, at commit `8196107`; **Astra has not seen those fixes.**
+
+Deliberate breakage, since every test of this step was written with its code: 50 breakages of the step as first built, then 31, 28 and 16 against the three rounds of fixes. Of the last 16, 15 were caught and 1 survived: nothing showed that an amended contract's red is owed in the amendment's own transaction, because the pass that follows owed it anyway; it has a test now and is caught. The last full run was 1183 passed and 3 failed, before the last source change: two of the three were the missing red named below, the third an expectation that a repeated withdrawal is refused. All three pass now with their files, and the files of everything changed since were run; **the whole suite has not been run on the last commit.**
+
+Three things breaking the code showed, beyond missing tests. A test of mine passed for the wrong reason twice: once because the two refusals it exercised had come to be caught earlier by other checks, so nothing reached the code under test; and once because the test's own loop offers each piece of work once per round, so a build I claimed was held back by a check had simply not been offered again. And a rule made strict in the last round (a red needs a current assignment to launch) found two transitions that had been owing no red in their own transaction, a trunk that moved under a reviewed candidate and a contract amended after a decision, both until then put right only by the next pass.
+
+Decided during the build:
+
+- **Every kind of work has a worker**, and every reply may be one question for the Product Owner in its place, with what was assumed.
+- **An assignment is one occasion.** A reply that asks ends it (`asked`); the answer owes a successor, except for a reconfirmation, a seal or an assessment, where the answer undoes what they were of and what is owed next is derived.
+- **The gate is taken exclusively for every admission, effect take and mark.** Any reply may be a question, and a question needs it so. No paid call and no oracle run is made under it.
+- **One rule says what a story needs next** (`owed.py`), asked in the transactions that move a story and by the pass. It owes only what is not owed.
+- **One red per behaviour and red cycle**, the control plane's, taken before it is launched and decided only by the grant that took it. After a red that showed nothing, the Verifier writes the contract again, as it was if it was right.
+- **An integration is never left to a caller to ask for again**: a first generation that is discarded or cut short stays owed like any later one, and a retry a person allows owes it.
+- **Nothing is built for a behaviour whose replacement of something on trunk is undecided**, and its red waits. This narrows what 3a-ii allowed: a replacement can still be proposed after its candidate was built, by hand.
+- **A step that is not due is refused at the claim**, before any call: a seal with nothing said to be demonstrated, an assessment with no seal, story-wide work while a contract waits to be reconfirmed.
+- **The pass runs after a gate decision and after work is applied or found done**, not after a refusal for a reason that still holds.
+- **A reply is read where it is applied**, whoever recorded it.
+
+Reservations:
+
+- **Astra has not reviewed the round 53 fixes.**
+- **The exclusive gate serialises a project's admissions and marks.** What that costs with several workers has not been measured. Two applies are not raced in any test; the gate is relied on by construction.
+- **The Verifier's worker cannot declare a behaviour replaced from a story other than through reconfirmation**, and a roadmap or story that no longer stands is revised only if it is the roadmap in force, a waiting proposal, or a planned story. A story being worked on that no longer stands is the Product Owner's to be asked about.
+- **`Supersessions` and `Integration.retry_integration` wake the pass only if they are given it** (`then`, or through `Features`). Wiring every public route to it is 3c's composition.
+- **A build's or a review's reply keeps its own flat form** beside the common one; both are accepted.
+- **What a build that was not green assumed is not kept.**
+- **A red refused because the oracle's isolation is not gate-bearing stays owed** and is refused again each pass.
+- **The feature test's workers are driven from PostgreSQL in the order work became wanted**, not from the streams, and its loop offers each piece of work once per round.
+- **Briefings are tested for the facts in them, not as prose.** Whether a real model does good work from them is step 4's smoke.
+- **The pass run by a worker is the control plane's own object in the same process.** Across processes it is 3c's.
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.
