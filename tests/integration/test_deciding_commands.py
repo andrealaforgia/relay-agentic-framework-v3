@@ -845,6 +845,9 @@ async def test_a_code_taken_in_time_is_settled_by_its_confirmation_and_by_nothin
     code = code_of(desk.anyone("prepare", "approve", str(gate), "--why", "it looks right"))
     request = f"confirm:{code}"
     assert await prepared.consume(world.database, code, request)  # taken, and then: nothing
+    # In its hour still, and another request cannot take it: it is the first one's.
+    assert not await prepared.consume(world.database, code, "confirm:another")
+    assert await prepared.consume(world.database, code, request)  # and the first may again
     async with world.database.connection() as connection:
         await connection.execute(
             "UPDATE prepared_actions SET expires_at = now() - interval '1 minute'"
@@ -1005,3 +1008,41 @@ async def test_the_roadmap_shown_by_default_is_of_the_feature_that_holds_the_pla
 
     assert desk.read("roadmap")["feature"] == "F2"
     assert desk.read("roadmap", "F1")["feature"] == "F1"
+
+
+async def test_two_terminals_confirming_one_code_are_given_one_answer(
+    desk: Desk, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """3C-S2-2.2, the live overlap: the second terminal looked for a receipt and found
+    none, and by the time it looks at the record the first has confirmed. What it finds
+    has moved because this very code was carried out. It is given that receipt, and the
+    code is not marked stale."""
+    import argparse
+
+    from relay.application import prepared
+    from relay.cli import deciding, main
+
+    world = desk.world
+    gate = await world.roadmap(STANDARD_RATE)
+    code = code_of(desk.anyone("prepare", "approve", str(gate), "--why", "it looks right"))
+    assert desk.po("confirm", code).code == 0  # the first terminal
+    for name, value in desk.shell.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.chdir(desk.here)
+    looked, real = [0], deciding.receipt_on_record
+
+    async def not_there_the_first_time(*arguments: Any) -> Any:
+        # As the second terminal saw it: nothing on record when it first looked.
+        looked[0] += 1
+        return None if looked[0] == 1 else await real(*arguments)
+
+    monkeypatch.setattr(deciding, "receipt_on_record", not_there_the_first_time)
+    capsys.readouterr()
+
+    code_exit = await main._confirm(argparse.Namespace(code=code, project=None), ["confirm", code])
+
+    said = capsys.readouterr().out
+    assert code_exit == 0 and "effective" in said and "as on record" in said, said
+    assert "stale" not in said
+    kept = await prepared.find(world.database, code)
+    assert kept is not None and kept.ended is None
