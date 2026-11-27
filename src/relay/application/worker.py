@@ -109,12 +109,15 @@ class Worker:
         boundaries: Shown,
         runtime: Callable[[], Mapping[str, str]],
         then: Callable[[str], Awaitable[None]] | None = None,
-        may_launch: Callable[[], Awaitable[str | None]] | None = None,
+        may_launch: Callable[[Connection | None], Awaitable[str | None]] | None = None,
         stated: Callable[[Connection], Awaitable[str | None]] | None = None,
     ) -> None:
         # Asked before every call this worker would make, a retry included: why nothing
         # may be launched now, if anything. The process is stopping; the Redis it reads
-        # is no longer the control plane's.
+        # is no longer the control plane's. Asked before the call is prepared, to spare
+        # the preparing, and asked again in the transaction that admits the call, with
+        # that transaction's connection: preparing can take long, and what is true
+        # where the call becomes one is what counts.
         self._may_launch = may_launch
         # What the operator has stated of this host's remote policy, as the installation
         # has it in the transaction that admits a call.
@@ -155,7 +158,7 @@ class Worker:
         ]
         left = []
         for delivery in deliveries:
-            if self._may_launch is not None and await self._may_launch() is not None:
+            if self._may_launch is not None and await self._may_launch(None) is not None:
                 # Read, and not dealt with: left unacknowledged, for whichever worker
                 # reads next after it has lain long enough. What it announces is owed
                 # in PostgreSQL whatever becomes of the delivery.
@@ -208,7 +211,7 @@ class Worker:
         prepared: list[Call] = []
         try:
             while True:
-                if self._may_launch is not None and (held_back := await self._may_launch()):
+                if self._may_launch is not None and (held_back := await self._may_launch(None)):
                     await self._claims.give_back(assignment_id, grant)
                     return f"refused: {held_back}"
                 try:
@@ -246,6 +249,8 @@ class Worker:
                     boundary: str = boundary,
                     policy: str | None = runtime.get("remote_policy"),
                 ) -> uuid.UUID | None:
+                    if self._may_launch is not None and await self._may_launch(connection):
+                        return None
                     if self._stated is not None and await self._stated(connection) != policy:
                         # The statement was changed after this call's bounds were worked
                         # out from it. A pass of those bounds says nothing of these.

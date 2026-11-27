@@ -276,7 +276,7 @@ async def test_a_delivery_read_by_a_worker_that_may_launch_nothing_is_left_for_a
     provider = Reviewer(NOTHING_FOUND)
     worker = await served.worker("qa", provider)
 
-    async def stopping() -> str | None:
+    async def stopping(admitting: Any = None) -> str | None:
         return "this worker is stopping"
 
     worker._may_launch = stopping

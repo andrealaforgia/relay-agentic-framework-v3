@@ -16,7 +16,7 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from relay.application import integration as integration_module
-from relay.application.integration import IntegrationRefused, Outcome
+from relay.application.integration import AnswersNotRecorded, IntegrationRefused, Outcome
 from relay.domain.behaviour import BehaviourState
 from relay.domain.evidence import Launch, RedRejection
 from relay.git import checkout as checkout_module
@@ -1527,3 +1527,156 @@ async def test_what_git_said_is_written_down_though_its_hearer_is_stopped_as_it_
     await draining
 
     assert await world.column("SELECT heard FROM integration_sends") == ["refused"]
+
+
+async def test_what_git_said_waits_for_a_send_being_authorised_and_is_not_missed_by_it(
+    world: TrunkWorld,
+) -> None:
+    """3C-S1A-2.1: authorising a send holds the intent's lock from before it looks for a
+    refusal until it commits. Recording a refusal takes the same lock. So the refusal is
+    on record before the look, or after the send: never between."""
+    await ready_to_integrate(world)
+    world.hook_flag("refuse").touch()
+    await world.integrate()
+    [intent] = await world.column("SELECT intent_id FROM integration_intents")
+    send = uuid.uuid4()
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "INSERT INTO integration_sends (send_id, intent_id) VALUES (%s, %s)", (send, intent)
+        )
+    async with world.database.connection() as authorising, authorising.transaction():
+        # As the authorisation of another send does: the intent's lock, then its look.
+        await authorising.execute(
+            "SELECT 1 FROM integration_intents WHERE intent_id = %s FOR UPDATE", (intent,)
+        )
+        looked = await (
+            await authorising.execute(
+                "SELECT count(*) AS refused FROM integration_sends WHERE heard = 'refused' "
+                "AND send_id = %s",
+                (send,),
+            )
+        ).fetchone()
+        recording = asyncio.create_task(world.integration._heard(send, "refused", "declined"))
+        await asyncio.sleep(0.5)
+        assert looked is not None and looked["refused"] == 0
+        assert not recording.done()  # it waits for the authorisation to end
+    await asyncio.wait_for(recording, 10)
+
+    assert await world.column(f"SELECT heard FROM integration_sends WHERE send_id = '{send}'") == [
+        "refused"
+    ]
+
+
+class Pool:
+    """The pool, with what a test asks of the connections it hands out."""
+
+    def __init__(self, pool: Any) -> None:
+        self._pool = pool
+        self.failing = 0
+        self.after: Any = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._pool, name)
+
+    def connection(self) -> Any:
+        pool, mine = self._pool, self
+
+        class Opening:
+            async def __aenter__(self) -> Any:
+                if mine.failing:
+                    mine.failing -= 1
+                    raise OSError("the database cannot be reached")
+                self._inner = pool.connection()
+                return await self._inner.__aenter__()
+
+            async def __aexit__(self, *raised: object) -> Any:
+                left = await self._inner.__aexit__(*raised)
+                if mine.after is not None:
+                    await mine.after()
+                return left
+
+        return Opening()
+
+
+async def test_a_send_authorised_and_then_stopped_before_git_is_on_record_as_never_having_left(
+    world: TrunkWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S1A-2.2: the authorisation has committed, and its caller is stopped before it
+    hears so. Git is never started. Left unanswered, that send would be waited for by
+    every refusal after it, for an answer that cannot come."""
+    base, _ = await ready_to_integrate(world)
+    integration = world.integration_with()
+    pool = Pool(world.database)
+    integration._pool = pool  # type: ignore[assignment]
+    committed, may_return = asyncio.Event(), asyncio.Event()
+
+    async def once_the_send_is_on_record() -> None:
+        if not committed.is_set() and await world.column(
+            "SELECT count(*) FROM integration_sends"
+        ) == [1]:
+            committed.set()
+            await may_return.wait()
+
+    pool.after = once_the_send_is_on_record
+    pushes: list[object] = []
+
+    async def no_push(self: Mirror, *arguments: Any, **__: Any) -> None:
+        pushes.append(arguments)
+
+    monkeypatch.setattr(Mirror, "_push", no_push)
+    sending = asyncio.create_task(integration.integrate(PROJECT, "B1", "once"))
+    await committed.wait()
+
+    sending.cancel()
+    await asyncio.sleep(0.1)
+    may_return.set()
+    with pytest.raises(asyncio.CancelledError):
+        await sending
+    await integration.drain()
+
+    assert pushes == [] and world.trunk() == base
+    assert await world.column("SELECT heard FROM integration_sends") == ["never_left"]
+    pool.after = None
+    monkeypatch.undo()
+    assert await world.integration.reconcile() == 1  # counted, and then sent for the first time
+    assert await world.column(
+        "SELECT sends_started || ':' || sends_resolved FROM integration_intents"
+    ) == ["2:1"]
+
+
+async def test_what_git_said_is_kept_and_written_again_when_the_database_would_not_take_it(
+    world: TrunkWorld,
+) -> None:
+    """3C-S1A-2.4: the only place the answer exists is the process that heard it. A write
+    that fails is made again; a stop waits for it; and one that cannot be made before
+    the process must go is said by name, not passed over."""
+    await ready_to_integrate(world)
+    world.hook_flag("refuse").touch()
+    await world.integrate()
+    [intent] = await world.column("SELECT intent_id FROM integration_intents")
+    first, second = uuid.uuid4(), uuid.uuid4()
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "INSERT INTO integration_sends (send_id, intent_id) VALUES (%s, %s), (%s, %s)",
+            (first, intent, second, intent),
+        )
+    integration = world.integration_with()
+    pool = Pool(world.database)
+    integration._pool = pool  # type: ignore[assignment]
+    integration.writing_again_after = 0.05
+
+    pool.failing = 2
+    hearing = asyncio.create_task(integration._heard(first, "refused", "declined"))
+    await asyncio.sleep(0)
+    hearing.cancel()
+    await integration.drain()
+    assert await world.column(f"SELECT heard FROM integration_sends WHERE send_id = '{first}'") == [
+        "refused"
+    ]
+
+    pool.failing = 10_000
+    hearing = asyncio.create_task(integration._heard(second, "refused", "declined"))
+    await asyncio.sleep(0)
+    hearing.cancel()
+    with pytest.raises(AnswersNotRecorded, match=str(second)):
+        await integration.drain(within=0.3)

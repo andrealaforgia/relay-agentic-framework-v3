@@ -40,7 +40,7 @@ from relay.application.closure import (
     require_startable,
     story_basis,
 )
-from relay.application.leadership import current_term, require_term, term
+from relay.application.leadership import current_term, require_term, term, term_is_over
 from relay.application.stories import _record as record_receipt
 from relay.application.stories import _recorded as recorded_receipt
 from relay.application.workers import WorkerSession, is_alive
@@ -550,9 +550,7 @@ class Invocations:
         it in between would have its own try set free by this."""
         try:
             async with self._pool.connection() as connection, connection.transaction():
-                if (mine_term := term()) is not None and mine_term != await current_term(
-                    connection
-                ):
+                if await term_is_over(connection):
                     # A control plane that has been replaced lets nothing go: an effect
                     # of an earlier term is free to its successor as it stands.
                     return

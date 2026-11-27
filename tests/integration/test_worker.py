@@ -908,7 +908,7 @@ async def test_a_worker_told_it_may_launch_nothing_makes_no_call_and_keeps_no_gr
     plane's. Asked before the call."""
     provider = Scripted(said())
 
-    async def not_now() -> str | None:
+    async def not_now(admitting: Any = None) -> str | None:
         return "this worker is stopping"
 
     worker = await bench.worker(provider, may_launch=not_now)
@@ -929,7 +929,7 @@ async def test_a_worker_is_asked_again_before_the_call_that_follows_a_reply_it_c
     unusable.terminal.envelope["structured_output"] = {"total": 5}
     provider = Scripted(unusable, said())
 
-    async def until_the_first_call_is_made() -> str | None:
+    async def until_the_first_call_is_made(admitting: Any = None) -> str | None:
         return "this worker is stopping" if provider.asked else None
 
     worker = await bench.worker(provider, may_launch=until_the_first_call_is_made)
@@ -961,3 +961,34 @@ async def test_a_call_worked_out_from_a_statement_that_has_since_changed_is_not_
     assert provider.asked == [] and await bench.states() == []
     now[0] = RUNTIME["remote_policy"]
     assert await worker.carry_out(await bench.owed()) == "applied"
+
+
+async def test_a_worker_told_to_stop_while_it_prepares_a_call_does_not_make_it(
+    bench: Bench,
+) -> None:
+    """3C-S1A-2.3: preparing can wait on Git, and admission on PostgreSQL. What counts is
+    what is true where the call becomes one: asked there, in admission's transaction."""
+    provider = Scripted(said())
+    stopping: list[bool] = []
+    asked_with: list[object] = []
+    prepare = bench.task.prepare
+
+    async def prepared_slowly(*arguments: Any) -> Any:
+        call = await prepare(*arguments)
+        stopping.append(True)  # told to stop while it was preparing
+        return call
+
+    bench.task.prepare = prepared_slowly  # type: ignore[method-assign]
+
+    async def may_launch(admitting: Any = None) -> str | None:
+        asked_with.append(admitting)
+        return "this worker is stopping" if stopping else None
+
+    worker = await bench.worker(provider, may_launch=may_launch)
+
+    left = await worker.carry_out(await bench.owed())
+
+    assert left.startswith("refused:")
+    assert provider.asked == [] and await bench.states() == []
+    assert asked_with[0] is None and asked_with[-1] is not None
+    assert (await bench.owed())["state"] == "wanted"

@@ -73,6 +73,10 @@ from relay.testing.oracle import ProcessOracle
 from relay.transport.envelope import Envelope, MessageKind
 
 
+class AnswersNotRecorded(Exception):
+    """What Git said to a send could not be written down before the process stopped."""
+
+
 class IntegrationRefused(Exception):
     """The request cannot be acted on as things stand. Nothing was run or changed."""
 
@@ -157,6 +161,7 @@ class Integration:
         # Batches being given up for callers that were cancelled as they were made.
         self.giving_up: set[asyncio.Future[None]] = set()
         self._hearing: set[asyncio.Task[None]] = set()
+        self.writing_again_after = 0.5
 
     def _mirror(self, project_id: str) -> Mirror:
         return Mirror(self._mirrors / f"{require_identifier('project', project_id)}.git")
@@ -917,6 +922,20 @@ class Integration:
             sent = True
             return True
 
+        async def about_to_send() -> bool:
+            # Nothing is awaited between this returning and Git being started. So a
+            # caller stopped here is one whose send, if it was authorised, never left:
+            # the authorisation is seen through, and that is put on record. Left as it
+            # was, the send would be waited for by every refusal that came after it.
+            counting = asyncio.create_task(count_the_send())
+            try:
+                return await asyncio.shield(counting)
+            except asyncio.CancelledError:
+                await asyncio.wait([counting])
+                if not counting.cancelled() and counting.exception() is None and sent:
+                    await self._heard(send_id, "never_left", "stopped before the send was launched")
+                raise
+
         try:
             await self._recover_the_pin(intent)
             await self._mirror(intent["project_id"]).advance(
@@ -925,7 +944,7 @@ class Integration:
                 f"refs/heads/{intent['trunk']}",
                 expected=intent["expected_trunk"],
                 timeout=self._push_timeout,
-                about_to_send=count_the_send,
+                about_to_send=about_to_send,
             )
         except NotFastForward as never_sendable:
             return await self._refused(intent_id, str(never_sendable), sent=False)
@@ -954,25 +973,50 @@ class Integration:
         here. The control plane of the day counts it (`_count_what_was_heard`)."""
 
         async def write() -> None:
-            async with self._pool.connection() as connection:
-                await connection.execute(
-                    "UPDATE integration_sends SET heard = %s, reason = %s "
-                    "WHERE send_id = %s AND heard IS NULL",
-                    (heard, reason, send_id),
-                )
+            # Under the intent's own lock, which the authorisation of a send holds from
+            # before it looks for a refusal until it has committed: a refusal is on
+            # record before that look, or after that send is. No gate is taken and no
+            # term asked: a control plane that has been replaced may still write this.
+            while True:
+                try:
+                    async with self._pool.connection() as connection, connection.transaction():
+                        await connection.execute(
+                            "SELECT 1 FROM integration_intents WHERE intent_id = (SELECT "
+                            "intent_id FROM integration_sends WHERE send_id = %s) FOR UPDATE",
+                            (send_id,),
+                        )
+                        await connection.execute(
+                            "UPDATE integration_sends SET heard = %s, reason = %s "
+                            "WHERE send_id = %s AND heard IS NULL",
+                            (heard, reason, send_id),
+                        )
+                    return
+                except Exception:  # noqa: BLE001 - whatever stopped it, the answer is kept
+                    # This is the only place the answer exists. It is kept, and written
+                    # again, until it is on record or the process is made to give up.
+                    await asyncio.sleep(self.writing_again_after)
 
-        # Git has answered, and this is the only place that answer exists. A process
-        # told to stop now still writes it down: the write goes on when its caller is
-        # cancelled, and `drain` waits for it before the pool is closed.
-        writing = asyncio.create_task(write())
+        # Git has answered. A process told to stop now still writes it down: the write
+        # goes on when its caller is cancelled, and `drain` waits for it.
+        writing = asyncio.create_task(write(), name=f"heard {heard} for send {send_id}")
         self._hearing.add(writing)
         writing.add_done_callback(self._hearing.discard)
         await asyncio.shield(writing)
 
-    async def drain(self) -> None:
-        """Wait for every answer that is being written down. Called as a process stops."""
-        while self._hearing:
-            await asyncio.gather(*self._hearing, return_exceptions=True)
+    async def drain(self, within: float = 30.0) -> None:
+        """Wait for every answer that is being written down. Called as a process stops.
+        One that cannot be written in the time given is said, by name: its send will be
+        on record as never answered, though it was."""
+        if not self._hearing:
+            return
+        _, unwritten = await asyncio.wait(set(self._hearing), timeout=within)
+        if unwritten:
+            for each in unwritten:
+                each.cancel()
+            raise AnswersNotRecorded(
+                "could not be put on record before stopping: "
+                + "; ".join(sorted(each.get_name() for each in unwritten))
+            )
 
     async def _count_what_was_heard(self, intent_id: uuid.UUID) -> IntegrationReceipt | None:
         """Answers on record that nobody has acted on: heard by a control plane that was

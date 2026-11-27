@@ -61,6 +61,23 @@ async def require_term(connection: Connection) -> None:
         raise NotLeader(f"term {mine} is over: the installation is at term {row['term']}")
 
 
+async def term_is_over(connection: Connection) -> bool:
+    """Whether this task acts under a term that has ended: read as `require_term` reads
+    it, so that what follows in this transaction is done under the term or not at all."""
+    try:
+        await require_term(connection)
+    except NotLeader:
+        return True
+    return False
+
+
+async def term_for_share(connection: Connection) -> int:
+    """The installation's term, held as it is until this transaction ends."""
+    row = await (await connection.execute("SELECT term FROM installation FOR SHARE")).fetchone()
+    assert row is not None
+    return int(row["term"])
+
+
 async def current_term(connection: Connection) -> int:
     row = await (await connection.execute("SELECT term FROM installation")).fetchone()
     assert row is not None

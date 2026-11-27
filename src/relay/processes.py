@@ -20,7 +20,12 @@ from typing import Any
 
 import redis.asyncio as redis
 
-from relay.application.leadership import Leadership, NotLeader, current_term
+from relay.application.leadership import (
+    Leadership,
+    NotLeader,
+    current_term,
+    term_for_share,
+)
 from relay.application.worker import Provider, Worker
 from relay.application.workers import WorkerSession
 from relay.persistence.outbox import OutboxPublisher
@@ -126,6 +131,7 @@ async def control_plane(
             await asyncio.sleep(listening_again_after)
 
     woken_for_all, listening_now = asyncio.Event(), asyncio.Event()
+    reached = True
     listening = asyncio.create_task(listen())
     try:
         # Before the first pass: a wake sent while that pass runs is then heard, and
@@ -146,7 +152,15 @@ async def control_plane(
                 _say("relay: the lock on the installation is lost. This control plane stops.")
                 return
             # So that a worker can tell this Redis is the one the control plane uses.
-            await broker.set(_marker(relay.installation), leadership.term, ex=int(every * 6))
+            try:
+                await mark(broker, relay.installation, leadership.term, int(every * 6))
+                reached = True
+            except (redis.RedisError, OSError) as unreachable:
+                # Said once, and tried again each turn: Redis coming back finds this
+                # control plane serving, and its workers waiting for the marker.
+                if reached:
+                    _say(f"relay: Redis cannot be reached, and is tried again: {unreachable}")
+                reached = False
             async with relay.pool.connection() as connection:
                 projects = await (
                     await connection.execute("SELECT project_id FROM projects ORDER BY project_id")
@@ -156,7 +170,7 @@ async def control_plane(
                 if project_id not in tasks or tasks[project_id].done():
                     woken.setdefault(project_id, asyncio.Event())
                     tasks[project_id] = asyncio.create_task(one_project(project_id))
-            with contextlib.suppress(NotLeader):
+            with contextlib.suppress(NotLeader, redis.RedisError, OSError):
                 await publisher.publish_pending()
             woken_for_all.clear()
             waiting = [asyncio.create_task(each.wait()) for each in (stop, replaced, woken_for_all)]
@@ -169,19 +183,48 @@ async def control_plane(
             task.cancel()
         await asyncio.gather(listening, *tasks.values(), return_exceptions=True)
         # What Git has said to a send, and is being written down, is written down.
-        await relay.integration.drain()
+        try:
+            await relay.integration.drain()
+        except Exception as unwritten:  # noqa: BLE001 - said, and the stop goes on
+            _say(f"relay: {unwritten}")
         await relay.invocations.close()
         await leadership.release()
 
 
-async def transport_is_the_control_planes(relay: Relay, broker: redis.Redis) -> str:
+# Set the marker, unless one of a later term is there: a control plane that has been
+# replaced, and whose write arrives late, neither puts its term back nor keeps it alive.
+_MARK = """
+local there = tonumber(redis.call('GET', KEYS[1]))
+if there and there > tonumber(ARGV[1]) then return 0 end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return 1
+"""
+
+
+async def mark(broker: redis.Redis, installation: str, term: int, lasting: int) -> bool:
+    """Leave this control plane's term in the Redis it publishes to. False if a later
+    term's is there already."""
+    return bool(await broker.eval(_MARK, 1, _marker(installation), term, lasting))
+
+
+async def transport_is_the_control_planes(
+    relay: Relay, broker: redis.Redis, connection: Any = None
+) -> str:
     """Empty if the Redis this process was given is the one the control plane is using;
     otherwise why not. The control plane leaves its term there, and the term is on
     record in PostgreSQL: a marker that is missing, or of an earlier term, is another
     Redis than the one commands are being published to."""
-    marked = await broker.get(_marker(relay.installation))
-    async with relay.pool.connection() as connection:
-        term = await current_term(connection)
+    if connection is None:
+        async with relay.pool.connection() as asking:
+            term = await current_term(asking)
+    else:
+        # Where a call is admitted: the term is held as it is until that transaction
+        # ends, so no control plane starts, on this Redis or another, in between.
+        term = await term_for_share(connection)
+    try:
+        marked = await broker.get(_marker(relay.installation))
+    except (redis.RedisError, OSError) as unreachable:
+        return f"this Redis cannot be reached, and nothing is read from it: {unreachable}"
     if term == 0:
         return "waiting for the control plane: none has been started yet"
     if marked is None:
@@ -217,8 +260,9 @@ async def worker(
 
     trouble: list[str] = ["not checked yet"]
     said: list[str] = [""]
+    said_of: dict[str, str] = {}
 
-    async def may_launch() -> str | None:
+    async def may_launch(admitting: Any = None) -> str | None:
         """Asked before every call, and before every delivery is taken up. Whose Redis
         this is is asked again each time: a call costs far more than the asking, and a
         control plane may have been started against another Redis at any moment."""
@@ -229,7 +273,7 @@ async def worker(
                 f"worker {session.worker_id} has lost the connection its lock is on, and "
                 "is gone to everyone else: it stops. Start it again."
             )
-        trouble[0] = await transport_is_the_control_planes(relay, broker)
+        trouble[0] = await transport_is_the_control_planes(relay, broker, admitting)
         if trouble[0] and trouble[0] != said[0]:
             _say(f"relay: {role} launches nothing: {trouble[0]}")
         said[0] = trouble[0]
@@ -250,7 +294,22 @@ async def worker(
                         )
                     ).fetchall()
                 for project in projects:
-                    did += len(await serving.serve_once(relay.streams, project["project_id"]))
+                    try:
+                        did += len(await serving.serve_once(relay.streams, project["project_id"]))
+                    except LostIdentity:
+                        raise
+                    except Exception as failure:  # noqa: BLE001 - one project's trouble is its own
+                        # A repository that cannot be reached, a Redis that has gone:
+                        # what was owed is owed still, and is announced again. The
+                        # other projects are served, and this one again next turn.
+                        where = project["project_id"]
+                        if said_of.get(where) != repr(failure):
+                            _say(
+                                f"relay: {role} could not serve {where}, and will again: {failure!r}"
+                            )
+                        said_of[where] = repr(failure)
+                    else:
+                        said_of.pop(project["project_id"], None)
             if not did:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(stop.wait(), idle)

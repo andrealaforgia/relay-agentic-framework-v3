@@ -124,7 +124,11 @@ async def stated_policy(connection: Any) -> str | None:
     """What the operator has stated of this host's remote policy (D-10), as the
     installation has it in this transaction."""
     row = await (
-        await connection.execute("SELECT policy->>'statement' AS statement FROM installation")
+        # For share: whoever restates the policy waits for a call being admitted under
+        # the statement as it is, and a call admitted after sees the new one.
+        await connection.execute(
+            "SELECT policy->>'statement' AS statement FROM installation FOR SHARE"
+        )
     ).fetchone()
     return row["statement"] if row else None
 

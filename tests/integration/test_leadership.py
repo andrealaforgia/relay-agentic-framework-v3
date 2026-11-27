@@ -603,3 +603,202 @@ async def test_a_control_plane_told_to_stop_before_it_can_listen_stops(
     async with asyncio.timeout(10):
         await running  # and no complaint that it could not listen: it was told to stop
     assert relay.features.run == []
+
+
+async def test_a_control_plane_whose_write_arrives_late_does_not_put_its_term_back_in_redis(
+    broker: Any, namespace: str
+) -> None:
+    """3C-S1A-2.7: its successor's term is there. Every worker would refuse the right
+    Redis until the successor wrote again."""
+    from relay import processes
+
+    try:
+        assert await processes.mark(broker, namespace, 1, 60)
+        assert await processes.mark(broker, namespace, 2, 60)
+        await broker.expire(processes._marker(namespace), 5)
+
+        assert not await processes.mark(broker, namespace, 1, 60)
+
+        assert await broker.get(processes._marker(namespace)) == "2"
+        assert await broker.ttl(processes._marker(namespace)) <= 5  # nor kept alive by it
+        assert await processes.mark(broker, namespace, 2, 60)  # its own, renewed
+        assert await broker.ttl(processes._marker(namespace)) > 5
+    finally:
+        await broker.delete(processes._marker(namespace))
+
+
+class Unreachable:
+    """Redis, gone for as long as the test says."""
+
+    def __init__(self, broker: Any) -> None:
+        self._broker, self.gone = broker, True
+
+    def __getattr__(self, name: str) -> Any:
+        import redis.exceptions
+
+        real = getattr(self._broker, name)
+        if not callable(real):
+            return real
+
+        async def asked(*arguments: Any, **more: Any) -> Any:
+            if self.gone:
+                raise redis.exceptions.ConnectionError("connection refused")
+            return await real(*arguments, **more)
+
+        return asked
+
+
+async def test_processes_outlast_a_redis_that_goes_away_and_find_it_when_it_is_back(
+    database: AsyncConnectionPool, broker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S1A-2.6: neither process ends because Redis cannot be reached. The control plane
+    writes its marker when it can again; the worker launches nothing until it has read
+    it, and says why."""
+    from relay import processes
+
+    relay = await serving(database, broker, 0.2)
+    relay.tasks, relay.claims, relay.boundaries = {"qa": {}}, None, None
+    redis_now = Unreachable(broker)
+    handed: dict[str, Any] = {}
+
+    class Recorded:
+        def __init__(self, *_: Any, **asked: Any) -> None:
+            handed.update(asked)
+
+        async def serve_once(self, *_: Any) -> list[str]:
+            handed["served"] = handed.get("served", 0) + 1
+            return []
+
+    monkeypatch.setattr(processes, "Worker", Recorded)
+    stop = asyncio.Event()
+
+    async def the_control_plane() -> None:
+        await processes.control_plane(relay, redis_now, stop, every=0.2)
+
+    leading = asyncio.create_task(the_control_plane(), context=contextvars.copy_context())
+    serving_qa = asyncio.create_task(
+        processes.worker(relay, redis_now, "qa", None, dict, stop, idle=0.05)  # type: ignore[arg-type]
+    )
+    try:
+        async with asyncio.timeout(20):
+            while "may_launch" not in handed or len(relay.features.run) < 3:
+                await asyncio.sleep(0.05)
+            assert "cannot be reached" in await handed["may_launch"]()
+            assert "served" not in handed
+            assert not leading.done() and not serving_qa.done()
+            redis_now.gone = False
+            while "served" not in handed:
+                await asyncio.sleep(0.05)
+        assert await handed["may_launch"]() is None
+    finally:
+        stop.set()
+        await asyncio.gather(leading, serving_qa, return_exceptions=True)
+        await broker.delete(processes._marker(relay.installation))
+    assert leading.exception() is None and serving_qa.exception() is None
+
+
+async def test_a_project_a_worker_cannot_serve_does_not_take_the_worker_from_another(
+    database: AsyncConnectionPool, broker: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S1A-2.5: the repository of one project cannot be reached while its call is being
+    prepared. The same process serves the other, and comes back to the first."""
+    from relay import processes
+    from relay.git.checkout import RemoteUnavailable
+
+    relay = await serving(database, broker, 1.0)
+    relay.tasks, relay.claims, relay.boundaries = {"analyst": {}}, None, None
+    async with database.connection() as connection:
+        await connection.execute(
+            "INSERT INTO projects (project_id, repository, trunk) VALUES ('beta', 'r2', 'main')"
+        )
+    served: list[str] = []
+
+    class OneRepositoryGone:
+        def __init__(self, *_: Any, **__: Any) -> None:
+            pass
+
+        async def serve_once(self, _: Any, project_id: str) -> list[str]:
+            served.append(project_id)
+            if project_id == "alpha":
+                raise RemoteUnavailable("no route to host")
+            return ["applied"]
+
+    monkeypatch.setattr(processes, "Worker", OneRepositoryGone)
+
+    async def led() -> int:
+        mine = await Leadership.take(database)
+        await mine.release()
+        return mine.term
+
+    await broker.set(processes._marker(relay.installation), await as_a_process(led))
+    stop = asyncio.Event()
+    serving_analyst = asyncio.create_task(
+        processes.worker(relay, broker, "analyst", None, dict, stop, idle=0.05)  # type: ignore[arg-type]
+    )
+    try:
+        async with asyncio.timeout(20):
+            while served.count("alpha") < 2 or served.count("beta") < 2:
+                await asyncio.sleep(0.05)
+        assert not serving_analyst.done()
+    finally:
+        stop.set()
+        await serving_analyst
+        await broker.delete(processes._marker(relay.installation))
+
+
+async def test_a_statement_of_policy_cannot_be_changed_under_a_call_being_admitted(
+    database: AsyncConnectionPool,
+) -> None:
+    """3C-S1A-2.8: admission reads the statement for share, and holds it until the call is
+    on record. Whoever restates the policy waits for that; a call admitted after reads
+    the new statement."""
+    import psycopg
+
+    from relay.runtime import stated_policy
+
+    async with database.connection() as admitting, admitting.transaction():
+        assert await stated_policy(admitting) is None
+        async with database.connection() as restating:
+            await restating.execute("SET lock_timeout = '300ms'")
+            with pytest.raises(psycopg.errors.LockNotAvailable):
+                await restating.execute(
+                    "UPDATE installation SET policy = jsonb_build_object('statement', 'new')"
+                )
+            await restating.rollback()
+            await restating.execute("RESET lock_timeout")
+    async with database.connection() as restating:
+        await restating.execute(
+            "UPDATE installation SET policy = jsonb_build_object('statement', 'new')"
+        )
+    async with database.connection() as admitting:
+        assert await stated_policy(admitting) == "new"
+
+
+async def test_a_call_is_admitted_against_the_term_as_it_is_held_through_admission(
+    database: AsyncConnectionPool, broker: Any
+) -> None:
+    """3C-S1A-2.3: asked with admission's connection, whose Redis this is is settled
+    against a term no control plane can open past until that transaction ends."""
+    import psycopg
+
+    from relay.processes import _marker, transport_is_the_control_planes
+
+    relay = await serving(database, broker, 1.0)
+
+    async def led() -> int:
+        mine = await Leadership.take(database)
+        await mine.release()
+        return mine.term
+
+    try:
+        await broker.set(_marker(relay.installation), await as_a_process(led))
+        async with database.connection() as admitting, admitting.transaction():
+            assert await transport_is_the_control_planes(relay, broker, admitting) == ""
+            async with database.connection() as taking:
+                await taking.execute("SET lock_timeout = '300ms'")
+                with pytest.raises(psycopg.errors.LockNotAvailable):
+                    await taking.execute("UPDATE installation SET term = term + 1")
+                await taking.rollback()
+                await taking.execute("RESET lock_timeout")
+    finally:
+        await broker.delete(_marker(relay.installation))
