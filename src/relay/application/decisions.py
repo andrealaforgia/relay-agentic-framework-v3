@@ -44,6 +44,7 @@ from relay.application.closure import (
 )
 from relay.application.completion import evaluate_completion
 from relay.application.features import Features
+from relay.application.owed import owe_red
 from relay.application.stories import (
     _close_gate,
     _locked_project,
@@ -573,6 +574,9 @@ class Decisions:
                     connection, project_id, principal, grant, "behaviour", behaviour_id, basis,
                     statement, announce=False,
                 )  # fmt: skip
+                # The amended contract's red is owed with it, by the behaviour's own
+                # identity: not left for a pass to notice.
+                await owe_red(connection, project_id, behaviour_id)
         await self._features.reconcile(project_id)
 
     async def context_for(

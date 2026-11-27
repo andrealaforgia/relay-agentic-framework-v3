@@ -44,6 +44,7 @@ from relay.application.closure import (
     what_ended,
 )
 from relay.application.final_checks import Completion
+from relay.application.owed import owe_red
 from relay.application.reviews import gate_of
 from relay.application.stories import evaluate_story_gate, lock_story, require_story_at_work
 from relay.application.supersessions import (
@@ -628,6 +629,8 @@ class Integration:
             subject_id=behaviour_id,
             payload={"cycle_id": str(cycle["cycle_id"]), "reason": reason, **details},
         )
+        # A new red cycle, and its red is owed here: nobody else will ask for it.
+        await owe_red(connection, project_id, behaviour_id)
 
     async def _run_checks(self, batch: dict[str, Any]) -> list[tuple[CheckContract, Execution]]:
         mirror = self._mirror(batch["project_id"])

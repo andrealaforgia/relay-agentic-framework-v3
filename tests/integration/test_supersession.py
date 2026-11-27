@@ -231,8 +231,8 @@ async def test_the_verifier_can_withdraw_a_proposal_nobody_has_decided(
 
     assert await world.stories.inbox(PROJECT) == []
     assert (await world.decide(gate)).disposition == "stale"
-    with pytest.raises(ActionRefused, match="no such proposal waiting"):
-        await world.supersessions.withdraw(VERIFIER, PROJECT, gate)
+    # Sent again after a lost reply, it is the same withdrawal, and withdraws nothing more.
+    await world.supersessions.withdraw(VERIFIER, PROJECT, gate)
     decided = await world.propose()
     await world.decide(decided)
     with pytest.raises(ActionRefused, match="no such proposal waiting"):
