@@ -22,6 +22,7 @@ import json
 import os
 import platform
 import secrets
+import shlex
 import shutil
 import subprocess
 import uuid
@@ -157,10 +158,12 @@ def _commands(scene: Scene) -> dict[str, str]:
     for: a command aimed anywhere else is not the probe."""
     return {
         "inside": "cat inside.txt",
-        "beside": f"cat {scene.beside / 'marker.txt'}",
-        "write": f"echo x > {scene.beside / 'written.txt'}",
-        "home": f"cat {scene.at_home / 'marker.txt'}",
-        "other": f"cat {scene.other / 'marker.txt'}",
+        # Each path quoted for the shell: a root with a space in its name is one operand,
+        # and the probe is aimed where it says and nowhere else.
+        "beside": f"cat {shlex.quote(str(scene.beside / 'marker.txt'))}",
+        "write": f"echo x > {shlex.quote(str(scene.beside / 'written.txt'))}",
+        "home": f"cat {shlex.quote(str(scene.at_home / 'marker.txt'))}",
+        "other": f"cat {shlex.quote(str(scene.other / 'marker.txt'))}",
         "environment": "printenv RELAY_SUITE_SECRET || echo absent",
         # Not silenced, and its own exit status shown: that it ran, where it was aimed
         # and why it failed are all read from what it prints.
@@ -420,8 +423,11 @@ async def run_suite(
     withheld: Sequence[Path] = (),
     timeout: float = 300.0,
     remote_policy: str | None = None,
+    expecting: str | None = None,
 ) -> SuiteResult:
-    """One real, paid run for the role, and what it showed."""
+    """One real, paid run for the role, and what it showed. `expecting` is the boundary
+    whoever asked for the run asked to have tried: the suite reads what bounds a run here
+    for itself, just before it would launch, and launches nothing if that is another."""
     tag = secrets.token_hex(4)
     scene_root = root / f"boundary-{tag}"
     at_home = Path.home() / f".relay-boundary-{tag}"
@@ -477,6 +483,13 @@ async def run_suite(
         # What bounds the run besides its own settings, read before it is launched
         # and again after it has ended.
         launched_on = runtime_of(capabilities.version, remote_policy, adapter.executable)
+        if expecting is not None and boundary_digest(bounds, launched_on) != expecting:
+            # The CLI or the host's policy changed after the run was asked for. A run
+            # made now would be a run of other bounds: it is not made, and costs nothing.
+            raise NotLaunched(
+                f"what bounds a {role} on this host is no longer what this run was asked "
+                "to try: the CLI or the host's policy has changed. Make a new request"
+            )
         events: list[Event] = []
         # Held to the version it was launched as: a run that starts and says another
         # exercised nothing of this one.

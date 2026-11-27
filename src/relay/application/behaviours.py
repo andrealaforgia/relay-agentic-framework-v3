@@ -52,6 +52,7 @@ from relay.git.checkout import (
     attempt_ref,
     canonical_repository,
     pristine_checkout,
+    require_branch_name,
     trunk_head,
 )
 from relay.git.mirror import Mirror
@@ -80,6 +81,13 @@ async def open_project_in(
     """Register a project in the caller's transaction: with whatever else the caller is
     deciding, or not at all."""
     require_identifier("project", project_id)
+    try:
+        require_branch_name(trunk)
+    except CheckoutFailed as refused:
+        raise ValueError(
+            f"{refused}: Relay delivers to branches named with letters, digits, dots, "
+            "underscores, hyphens and slashes"
+        ) from refused
     address = canonical_repository(repository)
     managed = await (
         await connection.execute(

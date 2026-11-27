@@ -325,3 +325,19 @@ async def test_an_image_named_by_half_a_digest_is_refused_and_a_corrected_init_t
     await enrol(database, broker, here, places, Person(PASSPHRASE, PASSPHRASE), pin=str)
 
     assert (await settings_of(database))["image"] == IMAGE
+
+
+async def test_a_branch_the_workflow_would_refuse_to_deliver_to_is_refused_at_enrolment(
+    database: AsyncConnectionPool, broker: redis.Redis, tmp_path: Path, places: Asked
+) -> None:
+    """3C-S1B-3.7: Git accepts the name, and Relay's own reading of a trunk does not. The
+    project is not registered on it, and nothing else of the enrolment is done."""
+    here = checkout_of(tmp_path / "remote.git", tmp_path / "vat", branch="release+vat")
+
+    with pytest.raises(CannotEnrol, match="not a branch name"):
+        await enrol(database, broker, here, places, Person(PASSPHRASE, PASSPHRASE), pin=str)
+
+    assert await settings_of(database) == {} and not await authority.is_set(database)
+    async with database.connection() as connection:
+        projects = await (await connection.execute("SELECT project_id FROM projects")).fetchall()
+    assert projects == []

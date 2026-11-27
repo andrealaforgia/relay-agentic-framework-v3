@@ -119,11 +119,18 @@ def _local_identity(written: str) -> str:
     return os.fspath(Path(os.fsdecode(found.stdout.removesuffix(b"\n"))).resolve())
 
 
+def require_branch_name(trunk: str) -> str:
+    """The branch names the workflow will read a trunk by. Git accepts others; a project
+    is not registered on one that its own delivery would then refuse."""
+    if not _BRANCH_NAME.fullmatch(trunk):
+        raise CheckoutFailed(f"not a branch name: {trunk!r}")
+    return trunk
+
+
 async def trunk_head(repository: str, trunk: str, *, timeout: float | None = None) -> str:
     """The commit the project's trunk points at now, read from the project's own
     repository. With a timeout, a repository that does not answer is given up on."""
-    if not _BRANCH_NAME.fullmatch(trunk):
-        raise CheckoutFailed(f"not a branch name: {trunk!r}")
+    require_branch_name(trunk)
     return await _resolve(repository, f"refs/heads/{trunk}", f"branch {trunk!r}", timeout)
 
 

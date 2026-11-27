@@ -68,7 +68,7 @@ async def examined(database: AsyncConnectionPool, broker: redis.Redis) -> dict[s
 
 
 def passing(settings: Mapping[str, Any], launched: list[str]) -> Any:
-    async def suite(role: str, runtime: Mapping[str, str]) -> SuiteResult:
+    async def suite(role: str, runtime: Mapping[str, str], expecting: str = "") -> SuiteResult:
         launched.append(role)
         digest = doctor.boundaries_of(settings, runtime)[role]
         return SuiteResult(role, digest, dict(runtime), (Observation("held", True, ""),), None)
@@ -261,7 +261,7 @@ async def test_a_retry_is_a_run_of_the_bounds_as_they_are_on_the_runtime_it_will
     launched: list[str] = []
     said: list[list[str]] = []
 
-    async def lost(role: str, runtime: Mapping[str, str]) -> SuiteResult:
+    async def lost(role: str, runtime: Mapping[str, str], expecting: str) -> SuiteResult:
         raise RuntimeError("the terminal went away")
 
     losing = BoundaryRuns(enrolled, Boundaries(enrolled), lost)
@@ -431,3 +431,73 @@ async def test_the_command_refuses_a_request_made_for_the_bounds_of_another_runt
     assert len(made) == len(asked) > 0
     assert all("make a new request" in str(each) for each in made)
     assert launched == []
+
+
+def test_doctor_says_in_the_form_asked_for_that_it_has_not_been_told_where_anything_is(
+    shell: dict[str, str], tmp_path: Path
+) -> None:
+    """3C-S1B-3.8: the first thing wrong on a first use. A finding with what to do, as
+    JSON when JSON was asked for, and exit 1."""
+    untold = {
+        name: value
+        for name, value in shell.items()
+        if name not in ("RELAY_DATABASE_URL", "RELAY_REDIS_URL")
+    }
+    untold["RELAY_CONFIG"] = str(tmp_path / "no-such-file.toml")
+
+    as_json = with_no_terminal(["doctor", "--json"], untold, tmp_path)
+    as_text = with_no_terminal(["doctor"], untold, tmp_path)
+
+    [finding] = json.loads(as_json.out)
+    assert as_json.code == 1 and not finding["ok"]
+    assert "not there" in finding["saw"] and "RELAY_DATABASE_URL" in finding["do"]
+    assert as_text.code == 1 and "NOT  where the database and Redis are" in as_text.out
+
+
+async def test_a_handle_given_to_the_wrong_command_by_mistake_is_still_good_for_the_right_one(
+    enrolled: AsyncConnectionPool, shell: dict[str, str], tmp_path: Path
+) -> None:
+    """3C-S1B-3.4: at another terminal with a journal of its own, the handle of a
+    boundary request is given to `policy state` by mistake. It is refused from the
+    database before anything is written on that machine, so the proper replay there is
+    answered and not refused for what the mistake left behind."""
+    from relay.cli import journal
+
+    await authority.state_policy(enrolled, PASSPHRASE, "none applies here", "andrea")
+    here = tmp_path / "vat"
+    handle = with_no_terminal(["doctor", "--boundary"], shell, here).out.split()[1]
+    another = {**shell, "RELAY_STATE_DIR": str(tmp_path / "another-terminal")}
+
+    mistaken = with_no_terminal(
+        ["policy", "state", "whatever suits", "--request-id", handle], another, here
+    )
+
+    assert mistaken.code == 1 and "a request for something else" in mistaken.printed
+    assert journal.read(Path(another["RELAY_STATE_DIR"]) / "requests.jsonl") == []
+    proper = with_no_terminal(["doctor", "--boundary", "--request-id", handle], another, here)
+    assert "a request for something else" not in proper.printed
+    assert "as on record" in proper.out and "run now" not in proper.out
+
+
+def test_the_suite_launches_nothing_when_what_bounds_a_run_is_not_what_it_was_asked_to_try(
+    tmp_path: Path,
+) -> None:
+    """3C-S1B-3.1, in the suite itself: it reads the runtime for itself, just before it
+    would launch, and holds it to the boundary it was given."""
+    import asyncio
+
+    from relay.providers.boundary_suite import NotLaunched, run_suite
+
+    cli = tmp_path / "cli" / "claude"
+    cli.parent.mkdir()
+    shutil.copy(ACTING, cli)
+    root = tmp_path.resolve() / "w"
+    root.mkdir()
+
+    with pytest.raises(NotLaunched, match="no longer what this run was asked to try"):
+        asyncio.run(
+            run_suite("qa", root, binary=str(cli), remote_policy="none", expecting="0" * 64)
+        )
+
+    assert not (cli.parent / "launched.jsonl").exists()
+    assert list(root.iterdir()) == []  # and what it had set up is cleared away

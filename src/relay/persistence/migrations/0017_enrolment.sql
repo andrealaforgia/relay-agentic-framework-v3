@@ -54,3 +54,15 @@ CREATE TABLE installation_receipts (
     outcome      jsonb NOT NULL,
     at           timestamptz NOT NULL DEFAULT now()
 );
+
+-- A handle names one request: for one action, asking one thing. It is taken here, once,
+-- before the command that uses it does anything or asks anybody anything: whichever
+-- command takes a handle first has it, and another command given the same handle, on
+-- this machine or any other, is refused before it acts.
+CREATE TABLE request_handles (
+    request_id text PRIMARY KEY,
+    action     text NOT NULL,
+    -- A digest of what was asked: the statement of policy, the attempt retried.
+    asked      text NOT NULL,
+    at         timestamptz NOT NULL DEFAULT now()
+);

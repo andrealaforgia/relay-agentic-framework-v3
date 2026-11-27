@@ -98,6 +98,37 @@ async def change(pool: Pool, current: str, new: str, request_id: str | None = No
     return "changed"
 
 
+async def take_handle(pool: Pool, request_id: str, action: str, asked: str) -> bool:
+    """Take a handle for one action asking one thing, or find that it is taken for just
+    that. Refused if it is taken for anything else. True if this call is the one that
+    took it. Done before a command acts or asks anybody anything, in the database: two
+    commands given one handle, from two machines, cannot both go on."""
+    async with pool.connection() as connection, connection.transaction():
+        taken = await (
+            await connection.execute(
+                "INSERT INTO request_handles (request_id, action, asked) VALUES (%s, %s, %s) "
+                "ON CONFLICT (request_id) DO NOTHING RETURNING 1",
+                (request_id, action, _digest(asked)),
+            )
+        ).fetchone()
+        if taken is not None:
+            return True
+        held = await (
+            await connection.execute(
+                "SELECT action, asked FROM request_handles WHERE request_id = %s", (request_id,)
+            )
+        ).fetchone()
+    assert held is not None
+    if held["action"] != action or held["asked"] != _digest(asked):
+        raise Refused(
+            f"request {request_id} is a request for something else"
+            + (f" (`relay {held['action']}`)" if held["action"] != action else "")
+            + ": a request's identity is used again only to ask for the same thing. "
+            "Nothing is done"
+        )
+    return False
+
+
 async def receipt_of(pool: Pool, request_id: str) -> dict[str, Any] | None:
     """What a request did, if it did anything: asked before a passphrase is asked for."""
     async with pool.connection() as connection:
@@ -252,4 +283,5 @@ __all__ = [
     "require_usable",
     "set_first",
     "state_policy",
+    "take_handle",
 ]

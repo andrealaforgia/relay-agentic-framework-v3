@@ -21,11 +21,13 @@ from relay.application.workers import _lock_key, is_alive
 from relay.persistence.database import Connection, Pool
 from relay.providers.boundary_suite import NotLaunched, SuiteResult
 
-Suite = Callable[[str, Mapping[str, str]], Awaitable[SuiteResult]]
+# Given the role, the runtime and the boundary it is asked to try.
+Suite = Callable[[str, Mapping[str, str], str], Awaitable[SuiteResult]]
 
 
 FRESH = "these bounds had lately been seen to hold: nothing was run"
 REFUSED = "refused: "
+OTHER_BOUNDS = "other_bounds"
 
 
 class RunRefused(Exception):
@@ -203,7 +205,7 @@ class BoundaryRuns:
             if refusal is not None:
                 raise refusal
             try:
-                result = await self._suite(role, runtime)
+                result = await self._suite(role, runtime, digest)
             except NotLaunched as never:
                 # Established before the provider was called: nothing was spent, and
                 # nobody needs asking before these bounds are tried again.
@@ -248,7 +250,39 @@ class BoundaryRuns:
     ) -> Attempt:
         """Put on record what became of the call itself, with its verdict if it has one."""
         async with self._pool.connection() as connection, connection.transaction():
+            # With the boundary's own lock, as admission has it: a retry is admitted
+            # before this or after it, and what is settled here knows which.
+            about = await (
+                await connection.execute(
+                    "SELECT digest, started_at FROM boundary_runs WHERE attempt_id = %s",
+                    (attempt_id,),
+                )
+            ).fetchone()
+            assert about is not None
+            await connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (about["digest"],)
+            )
+            if verdict is not None and verdict.digest != about["digest"]:
+                # The run was of other bounds than this attempt's: the runtime changed
+                # under it. What it showed is true of those bounds and is kept as a run
+                # of them, under an identity of its own. It is no verdict of this
+                # attempt, which is said to have been made elsewhere.
+                await self._boundaries.record_in(
+                    connection, dataclasses.replace(verdict, run_id=uuid.uuid7())
+                )
+                verdict, call = None, OTHER_BOUNDS
             if verdict is not None:
+                succeeded = await (
+                    await connection.execute(
+                        "SELECT 1 FROM boundary_runs WHERE retries = %s", (attempt_id,)
+                    )
+                ).fetchone()
+                if succeeded is not None:
+                    # A retry of this attempt has been admitted: it was taken for lost,
+                    # and what stands for these bounds is its successor's to say. What
+                    # this one showed and cost is kept, as of when it was started: a
+                    # result that turns up late does not outrank what replaced it.
+                    verdict = dataclasses.replace(verdict, observed_at=about["started_at"])
                 await self._boundaries.record_in(connection, verdict)
             await connection.execute(
                 "UPDATE boundary_runs SET not_launched = %s, call = %s WHERE attempt_id = %s",
@@ -329,6 +363,12 @@ async def _attempt(
         state, detail = "refused", str(row["not_launched"])[len(REFUSED) :]
     elif row["not_launched"] is not None:
         state, detail = "not_launched", str(row["not_launched"])
+    elif row["call"] == OTHER_BOUNDS:
+        state = "failed"
+        detail = (
+            "the run was made on another runtime than the one this request was for: what "
+            "it showed is on record for those bounds, and is no verdict of these"
+        )
     elif row["call"] == "uncertain":
         # Launched, and it ended with no result: whatever verdict is beside it, the
         # call may have been paid for, and only a person buys another.

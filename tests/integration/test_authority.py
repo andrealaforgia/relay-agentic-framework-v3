@@ -149,3 +149,19 @@ async def test_a_request_that_stated_the_policy_or_changed_the_passphrase_does_i
     assert kept == {"action": "passphrase", "changed": True}  # and nothing of either secret
     with pytest.raises(Refused, match="for something else"):
         await authority.state_policy(database, "a new one altogether", "x", "y", "r-3")
+
+
+async def test_a_handle_is_taken_once_for_one_action_asking_one_thing(
+    database: AsyncConnectionPool,
+) -> None:
+    """3C-S1B-3.3 and 3.4: in the database, before a command acts or asks anybody
+    anything. Whichever command takes it first has it; any other use of it is refused,
+    from whatever machine, and a statement cannot be swapped under a handle already
+    taken for another."""
+    assert await authority.take_handle(database, "h-1", "policy", "none applies")
+    assert not await authority.take_handle(database, "h-1", "policy", "none applies")
+
+    with pytest.raises(Refused, match=r"something else \(`relay policy`\)"):
+        await authority.take_handle(database, "h-1", "doctor", "boundary runs, retrying none")
+    with pytest.raises(Refused, match="a request for something else:"):
+        await authority.take_handle(database, "h-1", "policy", "another statement")

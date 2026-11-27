@@ -41,6 +41,14 @@ async def migrate(pool: Pool) -> list[str]:
     whose file has since changed is an error, never a silent skip."""
     applied: list[str] = []
     async with pool.connection() as connection, connection.transaction():
+        # Before the first statement that makes anything: two commands on a database
+        # nothing has been made in would otherwise both set about making its first table,
+        # and PostgreSQL may refuse one of them. Of this schema's, so that installations
+        # in other schemas of one database do not wait on each other.
+        await connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended('relay migrations of ' || "
+            "current_schema(), 0))"
+        )
         await connection.execute(
             "CREATE TABLE IF NOT EXISTS schema_migrations "
             "(version text PRIMARY KEY, checksum text NOT NULL)"

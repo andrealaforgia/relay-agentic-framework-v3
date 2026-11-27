@@ -47,8 +47,13 @@ class Suite:
         self.started = asyncio.Event()
         self.fails_with: Exception | None = None
         self.call = "returned"
+        self.expected: list[str] = []
+        self.of = ""  # the boundary a run turns out to be of, if not the one asked for
 
-    async def __call__(self, role: str, runtime: Mapping[str, str]) -> SuiteResult:
+    async def __call__(
+        self, role: str, runtime: Mapping[str, str], expecting: str = DIGEST
+    ) -> SuiteResult:
+        self.expected.append(expecting)
         self.launched += 1
         self.started.set()
         if self.hold is not None and self.launched == 1:
@@ -59,7 +64,7 @@ class Suite:
             raise self.fails_with
         return SuiteResult(
             role,
-            DIGEST,
+            self.of or expecting,
             dict(runtime),
             (Observation("writes stay inside", self.holds, ""),),
             None,
@@ -400,3 +405,64 @@ async def test_a_request_is_not_spent_on_other_bounds_than_the_ones_it_asked_for
     replayed = await runs.run("request-2", "qa", DIGEST, RUNTIME, exercising=today)
     assert (replayed.attempt_id, replayed.state) == (done.attempt_id, "passed")
     assert suite.launched == 1
+
+
+async def test_a_run_that_turns_out_to_be_of_other_bounds_is_no_verdict_of_the_ones_asked_for(
+    database: AsyncConnectionPool, runs: BoundaryRuns, suite: Suite
+) -> None:
+    """3C-S1B-3.1: the CLI changed between two probes of one request. The suite is told
+    which boundary it is asked to try, and what it returns is held to that at
+    settlement: a run of other bounds is kept as a run of those, and the request is not
+    said to have passed."""
+    elsewhere = "e" * 64
+    suite.of = elsewhere
+
+    made = await asked(runs, "request-1")
+
+    assert suite.expected == [DIGEST]  # the suite was told what it was asked to try
+    assert made.state == "failed" and "another runtime" in made.detail
+    assert not await Boundaries(database).holds(DIGEST)
+    assert await Boundaries(database).holds(elsewhere)  # true of those bounds, and kept
+    assert (await asked(runs, "request-1")).state == "failed"
+
+
+async def test_a_result_that_turns_up_after_its_retry_was_admitted_authorises_nothing(
+    database: AsyncConnectionPool,
+) -> None:
+    """3C-S1B-3.2: the first run lost its lock and was taken for lost. Its retry ran and
+    showed the bounds not to hold. The first then finishes, with a pass. What it showed
+    and cost is kept, as of when it was started: it does not outrank what replaced it,
+    and a worker still cannot launch."""
+    first_may_end, first_started = asyncio.Event(), asyncio.Event()
+    launched = 0
+
+    async def suite(role: str, runtime: Mapping[str, str], expecting: str) -> SuiteResult:
+        nonlocal launched
+        launched += 1
+        mine = launched
+        if mine == 1:
+            first_started.set()
+            await first_may_end.wait()
+        return SuiteResult(
+            role, expecting, dict(runtime), (Observation("held", mine == 1, ""),), None
+        )
+
+    runs = BoundaryRuns(database, Boundaries(database), suite)
+    first = asyncio.create_task(asked(runs, "request-1"))
+    await first_started.wait()
+    running = await runs.of_request("request-1", "qa")
+    assert running is not None
+    await end_the_process_of(database, running.attempt_id)  # its lock is gone; it goes on
+    lost = await runs.of_request("request-1", "qa")
+    assert lost is not None and lost.state == "uncertain"
+
+    retried = await asked(runs, "request-2", retry=lost.attempt_id)
+    assert retried.state == "failed" and not await Boundaries(database).holds(DIGEST)
+
+    first_may_end.set()
+    late = await first
+
+    assert late.state == "passed"  # what it showed is kept, and said
+    assert not await Boundaries(database).holds(DIGEST)
+    async with database.connection() as connection:
+        assert await Boundaries(database).authorising(connection, DIGEST) is None

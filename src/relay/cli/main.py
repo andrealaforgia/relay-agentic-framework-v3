@@ -112,37 +112,30 @@ async def _worker(role: str) -> int:
     return 0
 
 
-async def _require_handle_is_for(
-    pool: Pool, request: journal.Request, installation: str, action: str
-) -> None:
-    """A handle names one request: of one installation, for one thing. Before a command
-    acts under a handle, the handle is held to both, by the journal and by whatever
-    either kind of receipt in the database says of it."""
+async def _handle(
+    pool: Pool, command: Sequence[str], given: str | None, action: str, asked: str
+) -> journal.Request:
+    """The handle this command acts under: the one it was given, or a new one. It is
+    taken in the database first, for this action asking this thing: a handle that is
+    another request's is refused there, before anything is written on this machine, so a
+    mistaken use of it leaves no local entry to stand in the way of its proper one. Only
+    then is it written in the journal, where a handle of another installation, or of
+    another command, is refused in its turn."""
+    installation = await _installation(pool)
+    request_id = given or str(uuid.uuid7())
+    await authority.take_handle(pool, request_id, action, asked)
+    request = journal.note(journal.journal_file(), command, installation, None, request_id)
     if request.installation != installation:
         raise authority.Refused(
             f"request {request.request_id} was made of installation {request.installation}, "
             f"and this is {installation}: nothing is done"
         )
-    was = request.command[0] if request.command else ""
-    if was != ("doctor" if action == "doctor" else action) or (
-        action == "doctor" and "--boundary" not in request.command
-    ):
+    if (request.command[0] if request.command else "") != action.split()[0]:
         raise authority.Refused(
             f"request {request.request_id} was `relay {' '.join(request.command[:2])}`: a "
             "request's identity is used again only to ask for the same thing. Nothing is done"
         )
-    kept = await authority.receipt_of(pool, request.request_id)
-    async with pool.connection() as connection:
-        probes = await (
-            await connection.execute(
-                "SELECT 1 FROM boundary_requests WHERE request_id = %s", (request.request_id,)
-            )
-        ).fetchone()
-    if (action == "doctor" and kept is not None) or (action != "doctor" and probes is not None):
-        raise authority.Refused(
-            f"request {request.request_id} is on record as a request for something else: "
-            "nothing is done"
-        )
+    return request
 
 
 async def _installation(pool: Pool) -> str:
@@ -197,19 +190,15 @@ async def _init(asked: argparse.Namespace, command: Sequence[str]) -> int:
 
 
 async def _noted(
-    pool: Pool, command: Sequence[str], request_id: str | None, action: str
+    pool: Pool, command: Sequence[str], request_id: str | None, action: str, asked: str = ""
 ) -> tuple[journal.Request, str | None]:
-    """Write the request down, and say what it did if it is one sent again and it did
-    something. A handle made of another installation is refused: it is answered there."""
-    installation = await _installation(pool)
-    request = journal.note(journal.journal_file(), command, installation, None, request_id)
-    await _require_handle_is_for(pool, request, installation, action)
+    """Take the handle and write the request down, and say what it did if it is one sent
+    again and it did something."""
+    request = await _handle(pool, command, request_id, action, asked)
     print(f"request {request.request_id}", flush=True)
     done = await authority.receipt_of(pool, request.request_id)
     if done is None:
         return request, None
-    if done["action"] != action:
-        raise authority.Refused(f"request {request.request_id} was for something else")
     if action == "policy":
         return request, "on record"
     return request, "the passphrase: changed (as on record: this request changed it)"
@@ -258,7 +247,9 @@ async def _policy(asked: argparse.Namespace, command: Sequence[str]) -> int:
             print(policy.statement)
             return 0
         try:
-            request, done = await _noted(pool, command, asked.request_id, "policy")
+            request, done = await _noted(
+                pool, command, asked.request_id, "policy", asked.statement.strip()
+            )
             if done is not None:
                 # Answered from its receipt, which is of one statement: the same handle
                 # with another statement is refused there. No passphrase is asked for,
@@ -291,6 +282,26 @@ async def _policy(asked: argparse.Namespace, command: Sequence[str]) -> int:
 
 
 async def _doctor(asked: argparse.Namespace, command: Sequence[str]) -> int:
+    try:
+        bootstrap()
+    except NotConfigured as missing:
+        # The first thing that can be wrong on a first use, and what doctor is for: said
+        # as a finding, in the form asked for, with what to do.
+        found = [
+            doctor.Finding(
+                "where the database and Redis are",
+                False,
+                str(missing),
+                "set RELAY_DATABASE_URL and RELAY_REDIS_URL, or write them under [relay] in "
+                "the file RELAY_CONFIG names or in ~/.config/relay/relay.toml",
+            )
+        ]
+        print(
+            json.dumps([dataclasses.asdict(each) for each in found], indent=2)
+            if asked.json
+            else doctor.report(found)
+        )
+        return 1
     async with _opened() as (pool, broker):
         if not asked.boundary:
             # Reads, and changes nothing: no migration is applied to find out what is wrong.
@@ -322,13 +333,16 @@ async def _doctor(asked: argparse.Namespace, command: Sequence[str]) -> int:
             return 1
         binary = str(settings.get("cli", "claude"))
         runtime = runtime_now(policy.statement, binary)
-        request = journal.note(
-            journal.journal_file(), command, installation, None, asked.request_id
-        )
         try:
-            # The handle may be of another installation's request, or of a request for
-            # something else. It is answered where and as it was made, and buys nothing.
-            await _require_handle_is_for(pool, request, installation, "doctor")
+            # The handle may be another installation's, or a request for something else.
+            # It is answered where and as it was made, and buys nothing here.
+            request = await _handle(
+                pool,
+                command,
+                asked.request_id,
+                "doctor",
+                f"boundary runs, retrying {asked.retry or 'none'}",
+            )
         except authority.Refused as refused:
             print(f"relay: {refused}", file=sys.stderr)
             return 1
@@ -343,7 +357,7 @@ async def _doctor(asked: argparse.Namespace, command: Sequence[str]) -> int:
                 flush=True,
             )
 
-        async def suite(role: str, on: Mapping[str, str]) -> SuiteResult:
+        async def suite(role: str, on: Mapping[str, str], expecting: str) -> SuiteResult:
             return await run_suite(
                 role,
                 Path(settings["workspaces"]),
@@ -351,6 +365,9 @@ async def _doctor(asked: argparse.Namespace, command: Sequence[str]) -> int:
                 model=doctor.SUITE_MODEL,
                 withheld=[Path(settings["mirrors"])] if role == "builder" else [],
                 remote_policy=policy.statement,
+                # The suite reads the runtime for itself before each launch, and holds
+                # it to this: a CLI updated between two roles launches no second run.
+                expecting=expecting,
             )
 
         made = await doctor.run_boundaries(

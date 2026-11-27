@@ -159,3 +159,32 @@ async def test_an_installation_made_by_the_last_build_keeps_what_it_is_across_th
     finally:
         async with open_pool(DATABASE_URL) as admin, admin.connection() as connection:
             await connection.execute(f'DROP SCHEMA "{namespace}" CASCADE')
+
+
+async def test_two_commands_setting_up_one_empty_database_at_once_both_succeed(
+    namespace: str,
+) -> None:
+    """3C-S1B-3.5: nothing has been made in it, not even the table that records what has
+    been. The first migration is one at a time from before its first statement."""
+    from relay.persistence.database import open_pool
+    from tests.integration.conftest import DATABASE_URL
+
+    async with open_pool(DATABASE_URL) as admin, admin.connection() as connection:
+        await connection.execute(f'CREATE SCHEMA "{namespace}"')
+    try:
+        async with (
+            open_pool(DATABASE_URL, schema=namespace) as one,
+            open_pool(DATABASE_URL, schema=namespace) as other,
+        ):
+            applied = await asyncio.gather(*(migrate(each) for each in (one, other, one, other)))
+
+            assert sorted(len(each) for each in applied)[:3] == [0, 0, 0]
+            assert max(len(each) for each in applied) > len(SHIPPED)
+            async with one.connection() as connection:
+                installations = await (
+                    await connection.execute("SELECT count(*) AS n FROM installation")
+                ).fetchone()
+            assert installations is not None and installations["n"] == 1
+    finally:
+        async with open_pool(DATABASE_URL) as admin, admin.connection() as connection:
+            await connection.execute(f'DROP SCHEMA "{namespace}" CASCADE')
