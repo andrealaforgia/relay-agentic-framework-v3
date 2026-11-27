@@ -11,6 +11,9 @@ dependencies = [
     "redis>=5.2",
 ]
 
+[project.scripts]
+relay = "relay.cli.main:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",
