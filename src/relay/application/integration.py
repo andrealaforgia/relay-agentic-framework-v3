@@ -416,14 +416,24 @@ class Integration:
         return settled
 
     async def retry_integration(
-        self, project_id: str, behaviour_id: str, reason: str, request_id: str | None = None
+        self,
+        project_id: str,
+        behaviour_id: str,
+        reason: str,
+        request_id: str | None = None,
+        refusal: uuid.UUID | None = None,
     ) -> None:
         """Put a behaviour whose integration the repository refused back where it can be
         integrated again. A person decides this, once the cause has been dealt with.
 
         `request_id` names the person's request. Sent again after a lost reply, it is
         the same request and allows nothing more: the retry it allowed has been owed,
-        and whatever the repository said to that is not another refusal to answer."""
+        and whatever the repository said to that is not another refusal to answer.
+
+        `refusal` names the refused intent the person was shown. If the behaviour has
+        been retried and refused again since, that is another refusal, for whatever
+        reason the repository had then, and this retry answers the old one: it is
+        refused as stale."""
         if not reason.strip():
             raise ValueError("retrying an integration needs a stated reason")
         async with self._pool.connection() as connection, connection.transaction():
@@ -441,7 +451,8 @@ class Integration:
             require_open(await closure_of_behaviour(connection, project_id, behaviour_id))
             last = await (
                 await connection.execute(
-                    "SELECT i.state, c.state AS cycle_state, c.cycle_id FROM integration_intents i "
+                    "SELECT i.intent_id, i.state, c.state AS cycle_state, c.cycle_id "
+                    "FROM integration_intents i "
                     "JOIN review_cycles c USING (cycle_id) WHERE i.project_id = %s "
                     "AND i.behaviour_id = %s ORDER BY i.created_at DESC LIMIT 1",
                     (project_id, behaviour_id),
@@ -449,6 +460,11 @@ class Integration:
             ).fetchone()
             if last is None or last["state"] != "rejected" or last["cycle_state"] != "satisfied":
                 raise IntegrationRefused("this behaviour has no failed integration to retry")
+            if refusal is not None and last["intent_id"] != refusal:
+                raise IntegrationRefused(
+                    "stale: that refusal is not this behaviour's latest. It has been tried "
+                    "again since, and what the repository said then is another matter"
+                )
             behaviour.retry_integration()
             await save_behaviour(connection, project_id, behaviour)
             await append_event(

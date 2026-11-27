@@ -806,6 +806,13 @@ class Invocations:
                 or assignment["state"] not in ("wanted", "granted")
             ):
                 receipt = Receipt("stale", "nothing changed: this work is not parked on that call")
+            elif not await _asked_about(connection, invocation_id):
+                # Set aside already: the question about this call was answered, and it
+                # is no longer one. The work stays parked, and nothing here allows a
+                # call under an answer given to a question that is closed.
+                receipt = Receipt(
+                    "stale", "nothing changed: a person has already decided about this call"
+                )
             elif action.action == "retry":
                 await connection.execute(
                     "UPDATE invocations SET retry_authorised_by = %s WHERE invocation_id = %s",
@@ -1234,6 +1241,17 @@ async def _unpark(connection: Connection, assignment: dict[str, Any]) -> None:
         (assignment["assignment_id"],),
     )
     await _close_inbox(connection, assignment["assignment_id"])
+
+
+async def _asked_about(connection: Connection, invocation_id: uuid.UUID) -> bool:
+    """Whether a person is still being asked about this call."""
+    row = await (
+        await connection.execute(
+            "SELECT 1 FROM inbox_items WHERE invocation_id = %s AND state = 'open'",
+            (invocation_id,),
+        )
+    ).fetchone()
+    return row is not None
 
 
 async def _close_inbox(connection: Connection, assignment_id: uuid.UUID) -> None:

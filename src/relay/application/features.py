@@ -72,13 +72,20 @@ class Features:
         return receipt
 
     async def retry_integration(
-        self, project_id: str, behaviour_id: str, reason: str, request_id: str | None = None
+        self,
+        project_id: str,
+        behaviour_id: str,
+        reason: str,
+        request_id: str | None = None,
+        refusal: uuid.UUID | None = None,
     ) -> None:
         """A person allows an integration the repository refused to be tried again, and
         Relay tries it: the retry owes the integration, and the pass takes it up. The
         same request sent again allows no further push; the pass is run again, which
         changes nothing if there is nothing owed."""
-        await self._integration.retry_integration(project_id, behaviour_id, reason, request_id)
+        await self._integration.retry_integration(
+            project_id, behaviour_id, reason, request_id, refusal
+        )
         await self.reconcile(project_id)
 
     async def usage_of(self, project_id: str, feature_id: str) -> Any:
@@ -98,7 +105,7 @@ class Features:
         that changed nothing or is being repeated, is followed by the pass that takes up
         what a pause held: the pass is safe to run again."""
         receipt = await close_feature(self._pool, project_id, action)
-        if action.action == "resume":
+        if action.action in ("resume", "lift"):
             await self.reconcile(project_id)
         return receipt
 

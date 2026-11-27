@@ -288,8 +288,13 @@ ON_A_DECISION = {"replace": frozenset({"text"})}
 ON_A_FEATURE = {
     "pause": frozenset({"reason"}),
     "resume": frozenset[str](),
+    # A resume that names the pause it lifts, as the person was shown it. Paused again
+    # since, the feature is closed by another pause, and this one lifts nothing.
+    "lift": frozenset({"closure"}),
     "cancel": frozenset({"reason"}),
 }
+# Starting a feature: the problem it starts from, said by the Product Owner.
+IN_A_PROJECT = {"start": frozenset({"problem"})}
 
 
 def require_well_formed(

@@ -51,6 +51,7 @@ from relay.domain.evidence import ProcessContract
 from relay.domain.identifiers import require_identifier
 from relay.domain.story import (
     HOLDING_THE_SLOT,
+    IN_A_PROJECT,
     ON_A_FEATURE,
     ON_A_STORY,
     ActionRefused,
@@ -175,33 +176,34 @@ class Stories:
             raise ValueError("a feature starts from a stated problem")
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id)
-            await connection.execute(
-                "INSERT INTO features (project_id, feature_id, problem) VALUES (%s, %s, %s)",
-                (project_id, require_identifier("feature", feature_id), problem),
+            await _open_feature_in(connection, principal, project_id, feature_id, problem)
+
+    async def start_feature(self, project_id: str, action: HumanAction) -> Receipt:
+        """The Product Owner starts a feature from a stated problem. Relay names it, and
+        the receipt says the name. The receipt is committed with the feature: the same
+        request sent again is given it again, and starts nothing more."""
+        require_human(action.principal)
+        require_well_formed(action, IN_A_PROJECT)
+        action = replace(action, target=project_id)
+        async with self._pool.connection() as connection, connection.transaction():
+            await lock_gate(connection, project_id, exclusive=True)
+            if (seen := answer_again(action, await _recorded(connection, action))) is not None:
+                return seen
+            row = await (
+                await connection.execute(
+                    "SELECT count(*) AS n FROM features WHERE project_id = %s", (project_id,)
+                )
+            ).fetchone()
+            assert row is not None
+            feature_id = f"F{int(row['n']) + 1}"
+            if not action.payload["problem"].strip():
+                raise ActionRefused("a feature starts from a stated problem")
+            await _open_feature_in(
+                connection, action.principal, project_id, feature_id, action.payload["problem"]
             )
-            await append_event(
-                connection,
-                project_id,
-                "feature.opened",
-                subject_id=feature_id,
-                payload={"problem": problem, "by": principal.identity},
-            )
-            await owe(
-                connection,
-                PLAN,
-                Envelope(
-                    message_kind=MessageKind.COMMAND,
-                    event_type="roadmap.requested",
-                    project_id=project_id,
-                    sender=CONTROL_PLANE,
-                    recipient="analyst",
-                    idempotency_key=f"plan:{project_id}:{feature_id}",
-                    correlation_id=uuid.uuid7(),
-                    payload={"feature_id": feature_id},
-                ),
-                issued_on={"feature_id": feature_id},
-                feature_id=feature_id,
-            )
+            receipt = Receipt("effective", f"started {feature_id}")
+            await _record(connection, action, receipt)
+        return receipt
 
     async def publish_roadmap(
         self,
@@ -664,6 +666,54 @@ async def _evaluate_story_gate(connection: Connection, project_id: str, story_id
     )
 
 
+async def _open_feature_in(
+    connection: Connection, principal: Principal, project_id: str, feature_id: str, problem: str
+) -> None:
+    """Open a feature and owe its plan, in the caller's transaction."""
+    await connection.execute(
+        "INSERT INTO features (project_id, feature_id, problem) VALUES (%s, %s, %s)",
+        (project_id, require_identifier("feature", feature_id), problem),
+    )
+    await append_event(
+        connection,
+        project_id,
+        "feature.opened",
+        subject_id=feature_id,
+        payload={"problem": problem, "by": principal.identity},
+    )
+    await owe(
+        connection,
+        PLAN,
+        Envelope(
+            message_kind=MessageKind.COMMAND,
+            event_type="roadmap.requested",
+            project_id=project_id,
+            sender=CONTROL_PLANE,
+            recipient="analyst",
+            idempotency_key=f"plan:{project_id}:{feature_id}",
+            correlation_id=uuid.uuid7(),
+            payload={"feature_id": feature_id},
+        ),
+        issued_on={"feature_id": feature_id},
+        feature_id=feature_id,
+    )
+
+
+async def closure_in(connection: Connection, project_id: str, feature_id: str) -> int | None:
+    """Which pause a paused feature is closed by: the place in the ledger of the event
+    that paused it. None if it is not paused. Two pauses are two closures."""
+    row = await (
+        await connection.execute(
+            "SELECT e.sequence FROM features f JOIN events e ON e.project_id = f.project_id "
+            "AND e.subject_id = f.feature_id AND e.event_type = 'feature.paused' "
+            "WHERE f.project_id = %s AND f.feature_id = %s AND f.closed_by = 'paused' "
+            "ORDER BY e.sequence DESC LIMIT 1",
+            (project_id, feature_id),
+        )
+    ).fetchone()
+    return int(row["sequence"]) if row else None
+
+
 async def close_feature(pool: Pool, project_id: str, action: HumanAction) -> Receipt:
     """Pause, resume or cancel the feature the action names: the transaction only. The
     entry point is `Features.close`, which also does what a resume leaves owed. The transaction holds
@@ -682,8 +732,21 @@ async def close_feature(pool: Pool, project_id: str, action: HumanAction) -> Rec
         if (seen := answer_again(action, await _recorded(connection, action))) is not None:
             return seen
         closed_by = feature["closed_by"]
-        pointless = (action.action == "pause" and closed_by == PAUSED) or (
-            action.action == "resume" and closed_by != PAUSED
+        lifting = action.action == "lift"
+        if lifting and closed_by == PAUSED:
+            closure = await closure_in(connection, project_id, feature_id)
+            if str(closure) != action.payload["closure"]:
+                # Resumed and paused again since this was prepared or shown: that is
+                # another pause, by someone who may have had another reason.
+                receipt = Receipt(
+                    "stale",
+                    "nothing changed: the feature has been paused again since the pause this names",
+                )
+                await _record(connection, action, receipt)
+                return receipt
+        doing = "resume" if lifting else action.action
+        pointless = (doing == "pause" and closed_by == PAUSED) or (
+            doing == "resume" and closed_by != PAUSED
         )
         finished = feature["state"] == "completed"
         if closed_by == CANCELLED or finished or pointless:
@@ -693,27 +756,27 @@ async def close_feature(pool: Pool, project_id: str, action: HumanAction) -> Rec
             receipt = Receipt("stale", f"nothing changed: the feature is {standing}")
             await _record(connection, action, receipt)
             return receipt
-        if action.action == "cancel":
+        if doing == "cancel":
             await _cancel(connection, project_id, feature_id)
             await retire_all_of_feature(connection, project_id, feature_id)
-        if action.action == "pause":
+        if doing == "pause":
             await revoke_unstarted_grants(connection, project_id, feature_id)
         await connection.execute(
             "UPDATE features SET closed_by = %s, state = %s "
             "WHERE project_id = %s AND feature_id = %s",
             (
-                {"pause": PAUSED, "cancel": CANCELLED, "resume": None}[action.action],
-                CANCELLED if action.action == "cancel" else feature["state"],
+                {"pause": PAUSED, "cancel": CANCELLED, "resume": None}[doing],
+                CANCELLED if doing == "cancel" else feature["state"],
                 project_id,
                 feature_id,
             ),
         )
-        if action.action == "cancel":
+        if doing == "cancel":
             await _end_replacements_that_lost_their_ground(connection, project_id)
             await end_completion_request(
                 connection, project_id, feature_id, "abandoned", "the feature was cancelled"
             )
-        outcome = {"pause": "paused", "cancel": "cancelled", "resume": "resumed"}[action.action]
+        outcome = {"pause": "paused", "cancel": "cancelled", "resume": "resumed"}[doing]
         await append_event(
             connection,
             project_id,
@@ -725,7 +788,7 @@ async def close_feature(pool: Pool, project_id: str, action: HumanAction) -> Rec
                 "said": dict(action.payload),
             },
         )
-        if action.action == "resume":
+        if doing == "resume":
             # Whatever became ready while the feature was closed is owed now, with
             # no event left to cause it.
             working = await (
