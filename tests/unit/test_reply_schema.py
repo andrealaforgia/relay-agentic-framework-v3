@@ -176,3 +176,15 @@ def test_a_reply_in_the_other_form_or_in_both_has_no_effect_of_the_work(
         {"kind": "work", "role": "any", "reply": reply}
     )
     assert effect.name == "read"  # and so no effect of the work itself
+
+
+def test_what_a_real_model_leaves_out_or_fills_in_harmlessly_is_not_a_paid_call_refused() -> None:
+    """Each of these came back from the real provider and was refused, until it was
+    plain that nothing in them was in doubt."""
+    from relay.application.authoring import SpecifyTask
+
+    # A reviewer with nothing to carry leaves the list out.
+    assert ReviewTask.problem_with(None, {"findings": []}) is None  # type: ignore[arg-type]
+    # "Demonstrated", with the other fields of the schema filled in beside it.
+    demonstrated = {"demonstrated": True, "summary": "", "demonstrates": []}
+    assert SpecifyTask._problem_with_delivered(None, demonstrated) is None  # type: ignore[arg-type]

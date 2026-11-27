@@ -1364,3 +1364,52 @@ async def test_a_withdrawal_sent_again_wakes_the_control_plane_again_and_withdra
 
     assert await at.world.state("B2") is BehaviourState.IMPLEMENTING
     assert await at.world.column("SELECT state FROM supersessions") == ["withdrawn"]
+
+
+async def test_a_contract_restated_beside_stands_is_the_one_that_stands_or_the_reply_is_refused(
+    delivering_world: Delivering,
+) -> None:
+    """What the real provider does: it fills in the contract when it says "stands". The
+    same contract is no amendment; a different one is not what "stands" says."""
+    at = delivering_world
+    another = {**STANDARD_RATE_CONTRACT, "contract_id": "B1-another"}
+    roles = await released(
+        at,
+        verifier__You_are_asked_whether=[
+            delivering(verdict="stands", contract=another),
+            delivering(verdict="stands", contract=STANDARD_RATE_CONTRACT),
+        ],
+    )
+    at.workers.pop("builder")
+    await at.work()
+
+    await at.world.answer(await at.world.ask(), "zero-rated")
+    await at.work()
+
+    asked = briefings(roles["verifier"], "You are asked whether")
+    assert 'if it is to change, the verdict is "amended"' in asked[1]
+    assert await at.world.column("SELECT contract->>'contract_id', red_cycle FROM behaviours") == [
+        "B1-standard-rate"
+    ]
+    assert await at.world.column(
+        "SELECT v.state FROM invocations v JOIN assignments a USING (assignment_id) "
+        "WHERE a.kind = 'reconfirm' AND v.role = 'verifier' ORDER BY v.attempt"
+    ) == ["rejected", "applied"]
+
+
+async def test_a_roadmap_or_a_story_is_reconfirmed_on_a_schema_that_offers_no_contract(
+    delivering_world: Delivering,
+) -> None:
+    at = delivering_world
+    roles = staffed()
+    await at.staff(analyst=roles["analyst"])
+    await at.world.stories.open_feature(PRODUCT_OWNER, PROJECT, "F1", "prices need VAT")
+    await at.work()
+    await at.world.answer(await at.world.ask(story=None), "prices are in euros")
+    await at.work()
+
+    [request] = [
+        each for each in roles["analyst"].asked if "You are asked whether" in each.briefing
+    ]
+    offered = request.schema["properties"]["delivered"]["properties"]
+    assert sorted(offered) == ["because", "verdict"]

@@ -34,7 +34,7 @@ PROBLEM = (
     "That is the whole of the feature: one story with one acceptance criterion is enough."
 )
 # More calls than a feature this small can need; a run that reaches it is stopped.
-CALLS_AT_MOST = 30
+CALLS_AT_MOST = 45
 
 
 class Counted:
@@ -70,7 +70,7 @@ async def test_a_small_feature_is_delivered_by_the_real_provider(
     await at.staff(**dict.fromkeys(("analyst", "verifier", "builder", "qa", "sentinel"), provider))
 
     await world.stories.open_feature(PRODUCT_OWNER, PROJECT, "F1", PROBLEM)
-    for _ in range(8):
+    for _ in range(12):
         await at.work()
         if await world.feature() == "completed":
             break

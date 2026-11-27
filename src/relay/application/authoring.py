@@ -134,6 +134,11 @@ class Authoring:
         """What of that the reply will be applied against, recorded with the call."""
         return {}
 
+    def _asked_for(self, about: Mapping[str, Any]) -> Mapping[str, Any]:
+        """The schema of what this call is to deliver. A field that this call could not
+        use is not offered: a real model fills in what it is offered."""
+        return self.delivered
+
     def _problem_with_delivered(self, delivered: Any) -> str | None:
         raise NotImplementedError
 
@@ -193,7 +198,7 @@ class Authoring:
                 definition=definition,
                 effective_agent_sha256=effective_agent_sha256(definition, bounds.tools),
                 briefing="\n".join(lines) + "\n",
-                schema=reply_schema(self.delivered),
+                schema=reply_schema(self._asked_for(about)),
                 read_on=read_on,
                 evidence={**self._evidence(about), "trunk": trunk},
             ),
@@ -851,8 +856,9 @@ class SpecifyTask(Authoring):
 
     def _problem_with_delivered(self, delivered: Any) -> str | None:
         if delivered.get("demonstrated"):
-            if set(delivered) != {"demonstrated"}:
-                return "a story that is demonstrated needs nothing else said"
+            # Said outright. Whatever else a model filled in beside it is not read: it
+            # is what the schema offered, and refusing it would be a paid call wasted on
+            # a reply whose meaning is plain.
             return None
         if "contract" not in delivered:
             # Only what a behaviour there already is may say: that it still replaces
@@ -1122,6 +1128,20 @@ class ReconfirmTask(Authoring):
         "additionalProperties": False,
     }
 
+    def _asked_for(self, about: Mapping[str, Any]) -> Mapping[str, Any]:
+        if about["subject"] == "behaviour":
+            return self.delivered
+        # A roadmap or a story has no contract to give.
+        return {
+            "type": "object",
+            "properties": {
+                "verdict": {"enum": ["stands", "to_be_replaced"]},
+                "because": {"type": "string"},
+            },
+            "required": ["verdict"],
+            "additionalProperties": False,
+        }
+
     def __init__(self, role: str, decisions: Decisions, *arguments: Any, **named: Any) -> None:
         super().__init__(*arguments, **named)
         self.role = role
@@ -1265,7 +1285,9 @@ class ReconfirmTask(Authoring):
         if delivered.get("verdict") not in ("stands", "amended", "to_be_replaced"):
             return "a verdict is stands, amended or to_be_replaced"
         if delivered.get("verdict") != "amended":
-            return None if "contract" not in delivered else "a contract that stands is not given"
+            # A contract given beside "stands" is held to be the one that stands, where
+            # the verdict is applied: a different one is refused there.
+            return None
         try:
             contract_from(delivered["contract"])
         except (KeyError, TypeError, ValueError) as malformed:
@@ -1394,6 +1416,16 @@ class ReconfirmTask(Authoring):
                 revision=run.invocation["expects"]["story_revision"],
             )
         elif delivered["verdict"] == "stands":
+            if "contract" in delivered:
+                try:
+                    same = contract_from(delivered["contract"]).digest == read["contract_digest"]
+                except KeyError, TypeError, ValueError:
+                    same = False
+                if not same:
+                    raise ActionRefused(
+                        "you say the contract stands and give a different one: if it is to "
+                        'change, the verdict is "amended"'
+                    )
             await self._decisions.reconfirm_contract(
                 caller,
                 project_id,

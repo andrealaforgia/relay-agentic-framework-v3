@@ -239,10 +239,14 @@ def review_from(reply: Any) -> Review:
             )
             for each in reply["findings"]
         )
-        carried = {str(each["finding_id"]): Carried(each["verdict"]) for each in reply["carried"]}
+        # Left out, it is none: a reviewer with no earlier findings has none to carry, and
+        # a real model asked for "no carried ones" leaves the list out as often as empty.
+        # One with earlier findings and no verdicts on them is refused where it is submitted.
+        earlier = reply.get("carried", [])
+        carried = {str(each["finding_id"]): Carried(each["verdict"]) for each in earlier}
         reasons = {
             str(each["finding_id"]): str(each.get("reason", ""))
-            for each in reply["carried"]
+            for each in earlier
             if each["verdict"] == Carried.WITHDRAWN.value
         }
     except (KeyError, TypeError, ValueError) as malformed:
