@@ -372,6 +372,9 @@ async def test_with_the_cli_itself_standing_in_a_recorded_run_is_carried_through
             "STUB_RECORD": str(tmp_path / "call.json"),
         },
     )
+    # The recorded run says it is of this CLI, and that is the one the pass was for:
+    # a run that started and said another would be ended (3B-S4-2.2).
+    bench.stated["cli"] = "2.1.330 (Claude Code)"
     worker = await bench.worker(adapter)
 
     assert await worker.carry_out(await bench.owed()) == "applied"

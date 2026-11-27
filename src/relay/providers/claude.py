@@ -90,6 +90,9 @@ class Request:
     timeout: float
     effort: str | None = None
     budget_usd: Decimal | None = None
+    # The CLI the run's bounds were shown to hold for, as that CLI says of itself. A run
+    # that starts and reports another is not the run that was admitted.
+    cli_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -315,6 +318,13 @@ def _beyond(started: Started, request: Request) -> str:
     This is a check on a run that has already been handed its briefing: what bounds the
     run is what it was launched with, and this verifies that it took."""
     confinement = request.confinement
+    if request.cli_version is not None and started.version not in request.cli_version.split():
+        # Replaced between the pass being asked for and the launch: the bounds were
+        # shown to hold on another CLI than the one that is running.
+        return (
+            f"the run is of CLI {started.version}, and its bounds were shown to hold for "
+            f"{request.cli_version}"
+        )
     if started.session_id != str(request.invocation_id):
         return "the run was not confined as asked: it is not the session Relay started"
     if started.tools is None or started.mcp_servers is None:

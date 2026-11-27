@@ -60,3 +60,16 @@ def test_a_zero_that_was_reported_is_a_zero_and_everything_reported_is_summed() 
         "provider_cost_usd": "0.02",
         "estimated_cost_usd": "0.02",
     }
+
+
+def test_a_report_with_no_counter_in_it_is_no_report_of_use() -> None:
+    """3B-S4-2.6: the provider's event had `usage: {}`. One model billed, nothing said."""
+    empty = {name: None for name in WHOLE}
+    zero = dict.fromkeys(WHOLE, 0)
+
+    said_nothing = totals_of([call("qa", empty)])["by_role"]["qa"]
+    said_zero = totals_of([call("qa", zero)])["by_role"]["qa"]
+
+    assert said_nothing["calls_with_no_use_reported"] == 1
+    assert said_nothing["input_tokens"] == "unknown"
+    assert (said_zero["calls_with_no_use_reported"], said_zero["input_tokens"]) == (0, 0)

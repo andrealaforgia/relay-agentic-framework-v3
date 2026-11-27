@@ -266,6 +266,28 @@ async def test_a_run_that_has_a_tool_or_a_server_it_was_not_given_is_ended(
     assert "not confined" in result.reason and named in result.reason
 
 
+async def test_a_run_of_another_cli_than_its_bounds_were_shown_to_hold_for_is_ended(
+    tmp_path: Path,
+) -> None:
+    """3B-S4-2.2: replaced between the pass being asked for and the launch. The run says
+    what it is when it starts, and that is checked against what was authorised."""
+    another = ClaudeAdapter(
+        STUB,
+        {
+            "PATH": os.environ["PATH"],
+            "STUB_STREAM": str(RECORDED / "success.jsonl"),
+            "STUB_HANG": "1",
+        },
+    )
+
+    result = await another.invoke(request(tmp_path, cli_version="2.2.0 (Claude Code)"))
+    same = await adapter(tmp_path).invoke(request(tmp_path, cli_version="2.1.330 (Claude Code)"))
+
+    assert result.outcome is Outcome.UNCERTAIN
+    assert "is of CLI 2.1.330, and its bounds were shown to hold for 2.2.0" in result.reason
+    assert same.outcome is Outcome.RETURNED
+
+
 async def test_the_tools_a_run_was_given_are_not_a_breach(tmp_path: Path) -> None:
     result = await adapter(tmp_path).invoke(
         request(tmp_path, confinement=Confinement(tools=("Read",), settings={}))

@@ -32,7 +32,13 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from relay.providers.claude import ClaudeAdapter, Confinement, Outcome, Request
+from relay.providers.claude import (
+    ClaudeAdapter,
+    Confinement,
+    Outcome,
+    ProviderUnavailable,
+    Request,
+)
 from relay.providers.confinement import (
     ROLE_TOOLS,
     boundary_digest,
@@ -377,7 +383,13 @@ def runtime_now(remote_policy: str | None = None, binary: str = "claude") -> dic
     another has been installed. A CLI that cannot be asked is a runtime with no pass."""
     try:
         asked = subprocess.run(
-            [binary, "--version"], capture_output=True, text=True, timeout=30, check=False
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            # What any run of the CLI is given, and nothing else of the supervisor's.
+            env=environment_for_a_run(os.environ),
         )
         version = asked.stdout.strip() if asked.returncode == 0 else "unavailable"
     except OSError, subprocess.TimeoutExpired:
@@ -459,7 +471,13 @@ async def run_suite(
         )
         # The version too is read again: a CLI replaced while the run was being made is
         # another runtime, and nobody can say which of the two the run was of.
-        runtime = runtime_of(await adapter.version(), remote_policy)
+        try:
+            now = await adapter.version()
+        except ProviderUnavailable:
+            # It answered before the run and does not now. The probes were made and
+            # paid for: what they showed is kept, as a run of a runtime nobody can name.
+            now = "unavailable"
+        runtime = runtime_of(now, remote_policy)
         # A policy file that changed while the run was being made leaves nobody able to
         # say which policy the run was made under. What it showed is then a pass of
         # neither: not of what was there before, and not of what is there now.

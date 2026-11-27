@@ -539,3 +539,44 @@ async def test_a_run_made_while_the_cli_was_replaced_is_a_pass_of_nothing(
 
     [stable] = [each for each in result.observations if "did not change" in each.probe]
     assert not stable.passed and not result.passed
+
+
+async def test_a_run_after_which_the_cli_cannot_be_asked_its_version_is_kept_as_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S4-2.4: the probes were made and paid for. What they showed is a result, of a
+    runtime nobody can name, and not an error with nothing to record."""
+    from relay.providers import boundary_suite
+    from relay.providers.claude import ProviderUnavailable
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(boundary_suite, "_LOCAL_POLICY", (tmp_path / "no-policy.json",))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(
+        boundary_suite, "evaluate", lambda *_: [Observation("every probe", True, "")]
+    )
+
+    async def gone(self: object) -> str:
+        raise ProviderUnavailable("the Claude CLI did not answer --version")
+
+    monkeypatch.setattr(boundary_suite.ClaudeAdapter, "version", gone)
+
+    result = await boundary_suite.run_suite("qa", tmp_path / "ws", binary=STUB)
+
+    assert not result.passed
+    assert result.runtime["cli"] == "unavailable"
+
+
+def test_the_version_is_asked_in_the_environment_any_run_is_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3B-S4-2.3: nothing of the supervisor's that a run would not get."""
+    from relay.providers.boundary_suite import runtime_now
+
+    cli = tmp_path / "claude"
+    cli.write_text('#!/bin/sh\necho "2.1.330 ${RELAY_ONLY_THE_SUPERVISORS:-absent}"\n')
+    cli.chmod(0o755)
+    monkeypatch.setenv("RELAY_ONLY_THE_SUPERVISORS", "leaked")
+
+    assert runtime_now("stated", str(cli))["cli"] == "2.1.330 absent"

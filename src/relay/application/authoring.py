@@ -1133,6 +1133,15 @@ class ReconfirmTask(Authoring):
                 "required": ["verdict"],
                 "additionalProperties": False,
             }
+        if about["subject"] == "story" and about["story"]["state"] != "planned":
+            # Only a planned story is reworded. One that is being worked on stands, or
+            # the Product Owner is asked: that is a question, not a verdict.
+            return {
+                "type": "object",
+                "properties": {"verdict": {"enum": ["stands"]}},
+                "required": ["verdict"],
+                "additionalProperties": False,
+            }
         # A behaviour on the trunk stands or is to be replaced: what is there cannot be
         # amended, so no contract is asked for. A roadmap or a story has none to give.
         return {

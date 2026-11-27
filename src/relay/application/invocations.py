@@ -331,12 +331,17 @@ class Invocations:
                 # What a build returns is a tree. Without the tree kept there is nothing
                 # to apply, whatever the model said about it.
                 state, reason = "rejected", "nothing was kept of what the build made"
+            # Another call was admitted in its place. Whatever this one turns out to have
+            # been, the work is that call's now: this one settles its own record and
+            # nothing of the assignment, its grant, its park or what a person was asked.
+            succeeded = late and await _has_a_successor(connection, invocation)
+            live = live and not succeeded
             if state == "not_started":
                 # Known now: nothing was launched and nothing was paid. That is what it
                 # is on record as, whatever was admitted in its place meanwhile: a call
                 # that never happened is not counted among those that ended.
                 pass
-            elif late and await _has_a_successor(connection, invocation):
+            elif succeeded:
                 # Another call was admitted in its place. What this one returned is kept
                 # as evidence, with what it used, and applied to nothing.
                 state, reason = "overtaken", "its result arrived after another call was admitted"

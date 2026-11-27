@@ -702,7 +702,12 @@ def totals_of(calls: Sequence[Mapping[str, Any]]) -> Any:
             {name: [] for name in (*_COUNTED, "provider_cost_usd", "estimated_cost_usd")},
         )
         role["calls"] += 1
-        if not call["usage"]:
+        if not any(
+            billed.get(counted) is not None
+            for billed in call["usage"] or ()
+            for counted in _COUNTED
+        ):
+            # Nothing of what it used: an empty report is no report, and a zero is one.
             role["calls_with_no_use_reported"] += 1
         for counted in _COUNTED:
             into[counted] += [billed.get(counted) for billed in call["usage"] or ()] or [None]

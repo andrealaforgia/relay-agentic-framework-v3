@@ -561,11 +561,42 @@ async def test_a_call_found_late_never_to_have_been_launched_is_not_one_that_end
     await calling.invocations.recover(PROJECT)
     await calling.invocations.decide(calling.person(invocation, "retry"))
     second = await calling.worker()
-    await calling.admitted(second)
+    successor = await calling.admitted(second)
 
     assert await calling.invocations.record(invocation, NOT_STARTED) == "not_started"
 
     assert await calling.states() == ["not_started", "intended"]
+    # 3B-S4-2.1: and it settles nothing but itself. The work is its successor's, whose
+    # grant stands and whose result is applied.
+    assert await calling.assignment() == ("granted", None, True)
+    assert await calling.invocations.record(successor, said(), retained=KEPT) == "returned"
+    assert await calling.invocations.apply(successor, second) == "applied"
+
+
+async def test_a_late_nothing_was_launched_does_not_clear_what_a_person_was_asked_of_its_successor(
+    calling: Calling,
+) -> None:
+    """3B-S4-2.1, the other order: the successor has itself become uncertain, and a
+    person is being asked about it. The first call's late report answers nothing of that:
+    no third call is bought without the person saying so."""
+    first = await calling.worker()
+    invocation = await calling.admitted(first)
+    await first.stop()
+    await calling.invocations.recover(PROJECT)
+    await calling.invocations.decide(calling.person(invocation, "retry"))
+    second = await calling.worker()
+    successor = await calling.admitted(second)
+    assert await calling.invocations.record(successor, UNCERTAIN) == "uncertain"
+    parked = await calling.assignment()
+    assert parked[1] is not None
+
+    assert await calling.invocations.record(invocation, NOT_STARTED) == "not_started"
+
+    assert await calling.assignment() == parked
+    assert len(await calling.invocations.parked(PROJECT)) == 1
+    third = await calling.worker()
+    with pytest.raises(ActionRefused, match="parked"):
+        await calling.claimed(third)
 
 
 async def test_a_result_that_arrives_after_its_retry_was_admitted_is_kept_and_not_used(

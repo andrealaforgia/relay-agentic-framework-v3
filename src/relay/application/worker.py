@@ -244,7 +244,9 @@ class Worker:
                 if admission.outcome == "apply":
                     # A result is already known for this work. Nothing is called.
                     return await self._invocations.apply(admission.invocation_id, self._session)
-                state = await self._call(admission.invocation_id, task, assignment, call)
+                state = await self._call(
+                    admission.invocation_id, task, assignment, call, runtime.get("cli")
+                )
                 if state == "returned":
                     state = await self._invocations.apply(admission.invocation_id, self._session)
                     if state != "rejected":
@@ -276,7 +278,12 @@ class Worker:
         discard()
 
     async def _call(
-        self, invocation_id: uuid.UUID, task: Task, assignment: Mapping[str, Any], call: Call
+        self,
+        invocation_id: uuid.UUID,
+        task: Task,
+        assignment: Mapping[str, Any],
+        call: Call,
+        cli_version: str | None = None,
     ) -> str:
         """Call the provider and record what came of it. Whatever happens from the call
         being made to its record being durable, what is known of the call is recorded:
@@ -297,6 +304,8 @@ class Worker:
                     confinement=call.confinement,
                     timeout=call.timeout,
                     budget_usd=call.budget_usd,
+                    # What the pass that admitted this call was a pass of.
+                    cli_version=cli_version,
                 ),
                 on_result=heard.append,
                 on_start=launched.append,

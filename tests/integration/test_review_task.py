@@ -506,16 +506,38 @@ async def test_one_reviewer_asking_while_the_other_reviews_does_not_stop_either(
     qa = await reviewing.worker("qa", Reviewer(asks))
     sentinel = await reviewing.worker("sentinel", Reviewer(NOTHING_FOUND))
 
-    for _ in range(5):  # whichever order their transactions fall in
-        left = await asyncio.gather(
-            qa.carry_out(await reviewing.owed("qa")),
-            sentinel.carry_out(await reviewing.owed("sentinel")),
-        )
-        if left[0] == "applied":
-            break
+    left = await asyncio.gather(
+        qa.carry_out(await reviewing.owed("qa")),
+        sentinel.carry_out(await reviewing.owed("sentinel")),
+    )
 
-    assert left[0] == "applied" and left[1] in ("applied", "held")
+    # Whichever order their transactions fell in, neither stopped the other. The
+    # question is put; the review is applied, or held by the question, or was refused
+    # because the question was there before it could start (3B-S4-2.7).
+    assert left[0] == "applied", left
+    assert left[1] in ("applied", "held") or left[1].startswith("refused"), left
     assert len(await reviewing.world.decisions.open_questions(PROJECT)) == 1
+
+
+async def test_a_review_whose_scope_was_stopped_by_a_question_first_launches_nothing(
+    reviewing: Reviewing,
+) -> None:
+    """3B-S4-2.7, the order in which the question comes first."""
+    asks = {
+        "question": {
+            "text": "Should a negative amount be refused?",
+            "why": "no criterion says",
+            "options": ["yes", "no"],
+        }
+    }
+    qa = await reviewing.worker("qa", Reviewer(asks))
+    other = Reviewer(NOTHING_FOUND)
+    sentinel = await reviewing.worker("sentinel", other)
+    assert await qa.carry_out(await reviewing.owed("qa")) == "applied"
+
+    left = await sentinel.carry_out(await reviewing.owed("sentinel"))
+
+    assert left.startswith("refused") and other.asked == []
 
 
 async def test_what_a_reviewer_assumed_is_on_record_with_the_review_it_delivered(
