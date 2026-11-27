@@ -63,7 +63,10 @@ def say(what: str, terminal: str = TERMINAL) -> None:
     try:
         descriptor = os.open(terminal, os.O_WRONLY | os.O_NOCTTY)
     except OSError as none:
-        raise NoTerminal("there is no controlling terminal to show this on") from none
+        raise NoTerminal(
+            "this needs a person at a terminal: there is no controlling terminal to show "
+            "what is being decided on, or to read the passphrase from"
+        ) from none
     try:
         os.write(descriptor, (what if what.endswith("\n") else what + "\n").encode())
     finally:
