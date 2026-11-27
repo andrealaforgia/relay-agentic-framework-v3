@@ -252,8 +252,20 @@ async def test_a_contract_is_amended_only_once_its_story_stands_and_the_old_red_
     assert (await world.decisions.evidence_of(PROJECT, "B1")).red is not None
     await world.reconfirm(await owed_for(world, "story"))
 
+    class NoPass:
+        """So that what the amendment owes is what its own transaction owed."""
+
+        async def reconcile(self, project_id: str) -> None:
+            return None
+
+    world.decisions._features = NoPass()  # type: ignore[assignment]
     await world.decisions.amend_contract(
         VERIFIER, PROJECT, "B1", amended, grant=grant, basis=1, replaces=CONTRACT.digest
     )
 
+    # The amended contract's red is owed with it, by the behaviour's own identity.
+    assert await world.column(
+        "SELECT state FROM assignments WHERE kind = 'red' AND behaviour_id = 'B1' "
+        "AND state = 'wanted'"
+    ) == ["wanted"]
     assert (await world.decisions.evidence_of(PROJECT, "B1")).red is None
