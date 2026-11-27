@@ -400,6 +400,38 @@ Reservations:
 
 `make check` on the commit that closes the step: 1277 tests, 3 skipped (the ones that make paid calls).
 
+## Slice 3c, step 1b as built: enrolment and its commands
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 64 | CHALLENGE, 12 | A replayed boundary request buying a run the original never needed; two operators paying for one pass; the verdict losing what became of the paid call; a database made by step 1a unable to open (a shipped migration added to); an old passphrase authorising a policy change during a rotation; a partial first enrolment, and two overwriting each other; a secret in a refused address kept by the journal; `doctor` migrating the database and unable to report its absence; a trailing space lost from Git's output; settings a worker would refuse; no way to repeat a policy or passphrase request; a torn journal line hiding the next request |
+| 65 | CHALLENGE, 11 | An uncertain call briefly an ordinary failure between two commits; a retry beside a run already live; a frozen request exercising another boundary; a refused request spending on replay; a refusal known before launch asking for a paid retry; one handle for a policy change and a paid request; one journal handle bound to two installations; a 1a policy breaking 1b's commands; an overridden address leaving its secret in the journal; `doctor` taking another branch for the trunk; half a digest accepted as an image |
+| 66 | CHALLENGE, 8 | The runtime changing between two probes of one request; a late result restoring permission after its retry failed; one handle spent on two actions from two machines; a mistaken replay hiding the correct receipt; two first enrolments racing on an empty database; a workspace path with a space changing what the paid probe tests; a branch the workflow refuses accepted at enrolment; `doctor --json` losing its format on a bootstrap failure |
+
+Thirty-one findings, every one reachable through a shipped command, every one fixed with a test. **The step was not accepted.** Round 66's eight were fixed without a further round (D-8) and those fixes are not reviewed. Astra accepted along the way: reusing a pass when the operator restates the policy in the same words; running an explicitly requested paid probe without the Product Owner's passphrase; the two writes left unfenced by the term in step 1a.
+
+What the step does. `relay init` gathers and checks everything, then in one transaction sets what the installation has not been told, sets the Product Owner's first passphrase and registers the checkout's project; run again it changes nothing. The passphrase is kept as a salted hash and read from the controlling terminal and nowhere else; a command with no terminal decides nothing. `relay passphrase` changes it; `relay policy state` records the operator's statement as a revision, shown on the terminal before the passphrase is read. A command's project is the one it names, or `RELAY_PROJECT`'s, or the one checkout it is run in, and is never guessed. Every acting command takes a handle in the database for one action before it acts, writes it in the user's journal, and prints it; sent again under its handle a request is answered from its receipt. `relay doctor` reads and changes nothing, and says each thing that stands in the way with the command that puts it right, as text or JSON. `relay doctor --boundary` runs the paid suite for boundaries nobody has lately seen hold: the request is on record with all it asks before anything is run, the cost is said first, one run is made for a boundary at a time, what became of the paid call is kept beside its verdict in one transaction, and nothing is bought twice by asking twice.
+
+Deliberate breakage across the step and its three rounds: 75 breakages, 65 caught at first. Of the 10 that were not: five showed a test missing or too weak, and each has a test that now catches it; three were not sound breakages (two could not run, one changed nothing) and were caught when made properly; two were aimed at text the formatter had rewrapped and were caught when aimed again. None survives.
+
+One gate in this step was invalid and was run again: a breakage run on a very fast unit test had restored a source file within the same second and at the same size, and Python kept the bytecode of the broken version. The breakage script now writes no bytecode and clears the file's compiled copy, and every gate since has been run with compiled files cleared first.
+
+Reservations:
+
+- **Round 66's fixes are not reviewed.**
+- **The passphrase is the whole of S3-1.8.** A pseudo-terminal is a controlling terminal; a model given one still needs the passphrase. A person who tells a model the passphrase has given their authority away, and nothing in Relay can tell.
+- **`relay doctor --boundary` to a pass with the real provider is run by no test.** The runs are tested with a stand-in for the suite; the pre-launch refusal and a CLI that changes between two roles are tested through the command with a stand-in CLI.
+- **The suite's own classification of a truncated provider stream** is not exercised by Relay's tests. Astra passed a recorded truncated stream through the adapter and the suite in round 66 and saw `uncertain` with a failed verdict.
+- **Two commands taking one handle** is tested at the statement that takes it, not with a command held at its passphrase prompt.
+- **Two first enrolments** are overlapped inside one process, and two migrations of an empty schema through two pools; not as two `relay init` processes.
+- **A refusal is a request's answer for good.** A person who retried a moment too early makes a new request.
+- **A result that turns up after its retry was admitted** is kept as of when its run started, which is what stops it authorising anything; its true time of observation is not kept.
+- **`relay init` has no receipt**: it is safe to run again by construction.
+- **Defaults Claude chose**: workspaces and mirrors under `/Users/Shared/relay/<installation>` on macOS and `/var/tmp/relay-<uid>/<installation>` elsewhere; the oracle's image `python:3.14-alpine`, pinned at enrolment; definitions looked for in `~/.claude/agents`; two US dollars as a call's cap when none is set.
+- **The journal is a local file**: handles do not follow a person to another machine, though a handle taken there is honoured here.
+
+`make check` on the commit that closes the step, run with compiled files cleared first: 1345 tests, 3 skipped (the ones that make paid calls).
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.
