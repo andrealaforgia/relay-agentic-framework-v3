@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -410,3 +411,15 @@ async def test_a_proposal_that_could_not_be_approved_as_it_stood_ends_and_can_be
     assert "could not be approved as it stood" in analyst.asked[1].briefing
     await world.decide(await planning.gate())
     assert (await world.stories.roadmap_of(PROJECT, "F1")).stories == ("S1", "S2", "S3")
+
+
+async def test_a_roles_profile_caps_what_one_call_may_cost(planning: Planning) -> None:
+    """3B-S4-1.10: carried from the profile to the call, which the adapter passes to the
+    CLI as its own budget."""
+    planning.task._profile = Profile("claude-haiku-5-5", budget_usd=Decimal("0.25"))
+    owed = await planning.owed()
+
+    call = await planning.task.prepare(owed, uuid.uuid7(), None)
+    planning.task.discard(call)
+
+    assert call.budget_usd == Decimal("0.25")

@@ -92,7 +92,11 @@ def builds(files: dict[str, str]) -> Any:
 
 class Delivering:
     def __init__(
-        self, world: CompletionWorld, tmp_path: Path, profile: Profile | None = None
+        self,
+        world: CompletionWorld,
+        tmp_path: Path,
+        profile: Profile | None = None,
+        definitions: Path | None = None,
     ) -> None:
         # What a worker is shown to run within, and on what: stand-ins unless a test
         # that makes real calls puts the real ones here.
@@ -103,6 +107,8 @@ class Delivering:
         agents.mkdir()
         for name in AGENTS:
             (agents / f"{name}.md").write_text(f"---\nname: {name}\n---\nDo the work.\n")
+        # One-line stand-ins, unless a test names where the real definitions are.
+        agents = definitions or agents
         self.invocations = Invocations(world.database)
         profile = profile or Profile("claude-sonnet-5-5")
         workspaces = Workspaces(tmp_path.resolve() / "workspaces")
@@ -324,6 +330,15 @@ async def test_a_features_summary_says_what_its_calls_used_by_role_as_known_when
     }
     assert usage["by_role"]["verifier"]["estimated_cost_usd"] != "unknown"
     assert usage["by_role"]["analyst"]["calls"] == 2
+    # 3B-S4-1.12: the call that was in flight reports afterwards. The summary keeps what
+    # was known when the feature completed; what is known now is read live.
+    [late] = await world.column("SELECT invocation_id FROM invocations WHERE state = 'uncertain'")
+    await at.invocations.record(late, metered(NOTHING_FOUND, cost=0.02))  # type: ignore[arg-type]
+    now = await world.features.usage_of(PROJECT, "F1")
+    assert (await world.summary()) == summary
+    assert now["calls_not_known"] == 0
+    assert (now["by_role"]["qa"]["calls"], now["by_role"]["qa"]["provider_cost_usd"]) == (2, "0.03")
+    assert usage["by_role"]["qa"]["calls"] == 1
     assert usage["by_role"]["sentinel"] == {
         "calls": 1,
         "input_tokens": "unknown",

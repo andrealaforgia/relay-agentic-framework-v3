@@ -188,6 +188,7 @@ class Authoring:
             workspace,
             bounds,
             self._profile.timeout,
+            self._profile.budget_usd,
         )
 
     async def _export_trunk(
@@ -839,9 +840,20 @@ class SpecifyTask(Authoring):
 
     def _problem_with_delivered(self, delivered: Any) -> str | None:
         if delivered.get("demonstrated"):
-            # Said outright. Whatever else a model filled in beside it is not read: it
-            # is what the schema offered, and refusing it would be a paid call wasted on
-            # a reply whose meaning is plain.
+            # Said outright. What a model filled in empty beside it is not read: it is
+            # what the schema offered, and refusing it would be a paid call wasted on a
+            # reply whose meaning is plain. But a reply that also specifies something
+            # says two things, and which was meant is not for Relay to choose.
+            also = sorted(
+                name
+                for name in ("behaviour_id", "contract", "replaces", "no_longer_replaces")
+                if delivered.get(name)
+            )
+            if also:
+                return (
+                    f"the reply says the story is demonstrated and also gives {also}: it "
+                    "is one or the other"
+                )
             return None
         if "contract" not in delivered:
             # Only what a behaviour there already is may say: that it still replaces
@@ -1112,9 +1124,17 @@ class ReconfirmTask(Authoring):
     }
 
     def _asked_for(self, about: Mapping[str, Any]) -> Mapping[str, Any]:
-        if about["subject"] == "behaviour":
-            return self.delivered
-        # A roadmap or a story has no contract to give.
+        if about["subject"] == "behaviour" and about["obligation"] is None:
+            # Not on the trunk yet: its contract stands or is amended. There is nothing
+            # on the trunk of it to declare replaced.
+            return {
+                "type": "object",
+                "properties": {"verdict": {"enum": ["stands", "amended"]}, "contract": _CONTRACT},
+                "required": ["verdict"],
+                "additionalProperties": False,
+            }
+        # A behaviour on the trunk stands or is to be replaced: what is there cannot be
+        # amended, so no contract is asked for. A roadmap or a story has none to give.
         return {
             "type": "object",
             "properties": {

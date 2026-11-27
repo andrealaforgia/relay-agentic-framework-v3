@@ -1413,3 +1413,67 @@ async def test_a_roadmap_or_a_story_is_reconfirmed_on_a_schema_that_offers_no_co
     ]
     offered = request.schema["properties"]["delivered"]["properties"]
     assert sorted(offered) == ["because", "verdict"]
+
+
+async def test_a_story_said_to_be_demonstrated_with_a_new_behaviour_beside_it_is_neither(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S4-1.5: with its criteria already shown, so that nothing else refuses it."""
+    at = delivering_world
+    another = {
+        **STANDARD_RATE_CONTRACT,
+        "contract_id": "B2-also",
+        "expect_stdout": "125\n",
+        "baseline_stdout": "120\n",
+    }
+    both = delivering(
+        demonstrated=True,
+        behaviour_id="B2",
+        summary="another",
+        demonstrates=["AC1"],
+        contract=another,
+    )
+    roles = await released(
+        at, verifier__You_decide_how_a_user_story_is_shown=[B1, both, DEMONSTRATED]
+    )
+
+    await at.work()
+
+    assert (
+        "says the story is demonstrated and also gives ['behaviour_id', 'contract']"
+        in (briefings(roles["verifier"], "You decide how")[2])
+    )
+    assert await at.world.column("SELECT behaviour_id FROM behaviours") == ["B1"]
+
+
+async def test_a_reconfirmation_is_offered_only_the_verdicts_its_behaviour_can_take(
+    delivering_world: Delivering,
+) -> None:
+    """3B-S4-1.8: amended, with a contract, before the trunk; to be replaced, with none,
+    once it is there."""
+    at = delivering_world
+    roles = await released(
+        at,
+        verifier__You_decide_how_a_user_story_is_shown=[B1, DEMONSTRATED, DEMONSTRATED],
+        verifier__You_are_asked_to_vouch=[VOUCHED, VOUCHED],
+        verifier__You_are_asked_whether=[STANDS, STANDS],
+        analyst__You_are_asked_to_assess=[VOUCHED, VOUCHED],
+    )
+    builder = at.workers.pop("builder")
+    await at.work()
+    await at.world.answer(await at.world.ask(), "zero-rated")
+    await at.work()
+    at.workers["builder"] = builder
+    await at.work()
+    verifier = at.workers.pop("verifier")
+    await at.world.answer(await at.world.ask(), "and rounded")
+    at.workers["verifier"] = verifier
+    await at.work()
+
+    before, after = [
+        each.schema["properties"]["delivered"]["properties"]
+        for each in roles["verifier"].asked
+        if "You are asked whether" in each.briefing
+    ]
+    assert (before["verdict"]["enum"], "contract" in before) == (["stands", "amended"], True)
+    assert (after["verdict"]["enum"], "contract" in after) == (["stands", "to_be_replaced"], False)

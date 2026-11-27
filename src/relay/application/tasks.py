@@ -13,6 +13,7 @@ import shutil
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -244,6 +245,8 @@ class Profile:
     model: str
     effort: str | None = None
     timeout: float = 1800.0
+    # The most one call may cost, enforced by the provider's own CLI. None: no cap.
+    budget_usd: Decimal | None = None
 
 
 class Workspaces:
@@ -276,6 +279,12 @@ def review_from(reply: Any) -> Review:
         # a real model asked for "no carried ones" leaves the list out as often as empty.
         # One with earlier findings and no verdicts on them is refused where it is submitted.
         earlier = reply.get("carried", [])
+        named = [str(each["finding_id"]) for each in earlier]
+        twice = sorted({each for each in named if named.count(each) > 1})
+        if twice:
+            # Two verdicts on one finding, of which the last would win: which of them
+            # was meant is not for the order of a list to decide.
+            raise SubmissionRefused(f"{twice} are given more than one verdict: one each")
         carried = {str(each["finding_id"]): Carried(each["verdict"]) for each in earlier}
         reasons = {
             str(each["finding_id"]): str(each.get("reason", ""))
@@ -330,11 +339,16 @@ class ReviewTask:
                 briefing=_review_briefing(role, about, last_problem),
                 schema=REVIEW_REPLY,
                 read_on=read_on,
-                evidence={"checkout": str(checkout.receipt)},
+                evidence={
+                    "checkout": str(checkout.receipt),
+                    # The findings it was asked for a verdict on: each has to get one.
+                    "earlier": [str(each["finding_id"]) for each in about["earlier"]],
+                },
             ),
             workspace,
             bounds,
             self._profile.timeout,
+            self._profile.budget_usd,
         )
 
     def problem_with(self, reply: Any) -> str | None:
@@ -383,6 +397,15 @@ class ReviewTask:
             raise Overtaken(
                 "the review was written from a checkout made under a grant that no longer "
                 "holds the work"
+            )
+        review = review_from(plain(run.invocation["reply"]))
+        silent = sorted(set(run.invocation["evidence"].get("earlier", ())) - set(review.carried))
+        if silent:
+            # Asked how each stands, and said nothing of these. Silence clears no
+            # finding, and is not a review of the candidate either.
+            raise ActionRefused(
+                f"the review says nothing of {silent}, which you raised before: say how "
+                "each stands in this candidate"
             )
         try:
             accepted = await self._reviews.submit_review(
@@ -601,6 +624,7 @@ class BuildTask:
             workspace,
             bounds,
             self._profile.timeout,
+            self._profile.budget_usd,
         )
 
     def problem_with(self, reply: Any) -> str | None:

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -652,6 +653,14 @@ async def _summary(
 _COUNTED = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
 
 
+async def usage_of(pool: Pool, project_id: str, feature_id: str) -> Any:
+    """What the feature's calls have used, as it is known now. A completed feature's
+    summary says what was known when it completed and is never changed; a call that
+    reports afterwards shows here."""
+    async with pool.connection() as connection:
+        return await _usage(connection, project_id, feature_id)
+
+
 async def _usage(connection: Connection, project_id: str, feature_id: str) -> Any:
     """What the feature's calls used, as it is known at this moment: totals by role over
     the calls that have ended, and beside them how many had not ended or had ended
@@ -669,34 +678,43 @@ async def _usage(connection: Connection, project_id: str, feature_id: str) -> An
             (project_id, feature_id),
         )
     ).fetchall()
+    return totals_of(calls)
+
+
+def totals_of(calls: Sequence[Mapping[str, Any]]) -> Any:
+    """The account of a feature's calls: see `_usage`. Each call has its role, its
+    state, what it reported using by model billed, and its two costs."""
     if not calls:
         return "unknown"
     by_role: dict[str, dict[str, Any]] = {}
-    costs: dict[str, dict[str, list[Any]]] = {}
+    # Per role, every value that goes into each total: one for each model billed by each
+    # call, and None for whatever was not reported. A total is a total only if nothing
+    # that goes into it is missing; a reported zero is a zero.
+    parts: dict[str, dict[str, list[Any]]] = {}
     not_known = 0
     for call in calls:
         if call["state"] in ("intended", "uncertain"):
             not_known += 1
             continue
-        role = by_role.setdefault(
+        role = by_role.setdefault(call["role"], {"calls": 0, "calls_with_no_use_reported": 0})
+        into = parts.setdefault(
             call["role"],
-            {"calls": 0, **dict.fromkeys(_COUNTED, 0), "calls_with_no_use_reported": 0},
+            {name: [] for name in (*_COUNTED, "provider_cost_usd", "estimated_cost_usd")},
         )
         role["calls"] += 1
         if not call["usage"]:
             role["calls_with_no_use_reported"] += 1
-        for billed in call["usage"] or ():
-            for counted in _COUNTED:
-                role[counted] += billed.get(counted) or 0
-        cost = costs.setdefault(call["role"], {"provider_cost_usd": [], "estimated_cost_usd": []})
-        for kind in cost:
-            cost[kind].append(call[kind])
+        for counted in _COUNTED:
+            into[counted] += [billed.get(counted) for billed in call["usage"] or ()] or [None]
+        for cost in ("provider_cost_usd", "estimated_cost_usd"):
+            into[cost].append(call[cost])
     for name, role in by_role.items():
-        if role["calls"] == role["calls_with_no_use_reported"]:
-            # Nothing was reported for any of them: that is not a use of nothing.
-            role.update(dict.fromkeys(_COUNTED, "unknown"))
-        for kind, each in costs[name].items():
-            role[kind] = "unknown" if None in each else str(sum(each, Decimal(0)).normalize())
+        for counted in _COUNTED:
+            each = parts[name][counted]
+            role[counted] = "unknown" if None in each else sum(each)
+        for cost in ("provider_cost_usd", "estimated_cost_usd"):
+            each = parts[name][cost]
+            role[cost] = "unknown" if None in each else str(sum(each, Decimal(0)).normalize())
     return {"by_role": by_role, "calls_not_known": not_known}
 
 

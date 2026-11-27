@@ -23,6 +23,7 @@ import os
 import platform
 import secrets
 import shutil
+import subprocess
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -370,6 +371,20 @@ def runtime_of(cli_version: str, remote_policy: str | None = None) -> dict[str, 
     }
 
 
+def runtime_now(remote_policy: str | None = None, binary: str = "claude") -> dict[str, str]:
+    """The runtime as it is at this moment, the installed CLI's version asked afresh: a
+    pass for the version that was there when the worker started allows nothing once
+    another has been installed. A CLI that cannot be asked is a runtime with no pass."""
+    try:
+        asked = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=30, check=False
+        )
+        version = asked.stdout.strip() if asked.returncode == 0 else "unavailable"
+    except OSError, subprocess.TimeoutExpired:
+        version = "unavailable"
+    return runtime_of(version or "unavailable", remote_policy)
+
+
 async def run_suite(
     role: str,
     root: Path,
@@ -442,7 +457,9 @@ async def run_suite(
                 "the run ended with a result", result.outcome is Outcome.RETURNED, result.reason
             )
         )
-        runtime = runtime_of(capabilities.version, remote_policy)
+        # The version too is read again: a CLI replaced while the run was being made is
+        # another runtime, and nobody can say which of the two the run was of.
+        runtime = runtime_of(await adapter.version(), remote_policy)
         # A policy file that changed while the run was being made leaves nobody able to
         # say which policy the run was made under. What it showed is then a pass of
         # neither: not of what was there before, and not of what is there now.

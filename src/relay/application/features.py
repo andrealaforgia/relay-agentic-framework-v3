@@ -14,7 +14,7 @@ from relay.application.assignments import announce_again, revoke_every_grant
 from relay.application.behaviours import Behaviours
 from relay.application.closure import lock_gate, lock_project
 from relay.application.completion import evaluate_completion
-from relay.application.final_checks import Completion, end_batches_left_running
+from relay.application.final_checks import Completion, end_batches_left_running, usage_of
 from relay.application.integration import (
     Integration,
     IntegrationRefused,
@@ -80,6 +80,11 @@ class Features:
         changes nothing if there is nothing owed."""
         await self._integration.retry_integration(project_id, behaviour_id, reason, request_id)
         await self.reconcile(project_id)
+
+    async def usage_of(self, project_id: str, feature_id: str) -> Any:
+        """What the feature's calls have used, as known now: the summary of a completed
+        feature keeps what was known when it completed."""
+        return await usage_of(self._pool, project_id, feature_id)
 
     async def summary_of(self, project_id: str, feature_id: str) -> dict[str, Any] | None:
         """The summary of a completed feature; none until it is completed."""

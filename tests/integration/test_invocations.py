@@ -550,6 +550,24 @@ async def test_a_result_that_arrives_late_and_first_is_used_and_the_retry_is_not
     assert await calling.states() == ["applied"]
 
 
+async def test_a_call_found_late_never_to_have_been_launched_is_not_one_that_ended(
+    calling: Calling,
+) -> None:
+    """3B-S4-1.11: known now, and on record as what it was, whatever was admitted in
+    its place. A feature's account of its calls does not count it."""
+    first = await calling.worker()
+    invocation = await calling.admitted(first)
+    await first.stop()
+    await calling.invocations.recover(PROJECT)
+    await calling.invocations.decide(calling.person(invocation, "retry"))
+    second = await calling.worker()
+    await calling.admitted(second)
+
+    assert await calling.invocations.record(invocation, NOT_STARTED) == "not_started"
+
+    assert await calling.states() == ["not_started", "intended"]
+
+
 async def test_a_result_that_arrives_after_its_retry_was_admitted_is_kept_and_not_used(
     calling: Calling,
 ) -> None:

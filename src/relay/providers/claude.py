@@ -137,6 +137,10 @@ class ClaudeAdapter:
             self._capabilities = Capabilities(version.strip(), flags)
         return self._capabilities
 
+    async def version(self) -> str:
+        """The installed CLI's version, asked now: it can be replaced while Relay runs."""
+        return (await self._ask("--version")).strip()
+
     async def _ask(self, flag: str) -> str:
         try:
             process = await asyncio.create_subprocess_exec(

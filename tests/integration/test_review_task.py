@@ -530,3 +530,65 @@ async def test_what_a_reviewer_assumed_is_on_record_with_the_review_it_delivered
         "amounts are whole numbers"
     ]
     assert await reviewing.world.column("SELECT count(*) FROM review_submissions") == [1]
+
+
+async def a_second_candidate_with_an_earlier_finding(reviewing: Reviewing) -> Any:
+    """QA raised a blocking finding on the first candidate, and a second is published."""
+    world = reviewing.world
+    blocker = {**NO_USAGE_MESSAGE, "severity": "high", "claim": "the amount is passed to eval"}
+    await (
+        await reviewing.worker("qa", Reviewer({"findings": [blocker], "carried": []}))
+    ).carry_out(await reviewing.owed("qa"))
+    await (await reviewing.worker("sentinel", Reviewer(NOTHING_FOUND))).carry_out(
+        await reviewing.owed("sentinel")
+    )
+    [raised] = await world.column("SELECT finding_id FROM findings")
+    world.publish_attempt("B1", {"vat.py": VAT_APPLIES_STANDARD_RATE + "# parsed\n"}, on=world.base)
+    assert (await run_green(world.behaviours, PROJECT, "B1", world.attempts["B1"])).is_valid
+    assert await world.reviews.publish_candidates() == 1
+    return raised
+
+
+@pytest.mark.parametrize("last", ["verified_fixed", "still_present"])
+async def test_two_verdicts_on_one_finding_decide_nothing_whichever_comes_last(
+    reviewing: Reviewing, last: str
+) -> None:
+    """3B-S4-1.4: which was meant is not for the order of a list to say."""
+    raised = await a_second_candidate_with_an_earlier_finding(reviewing)
+    first = "still_present" if last == "verified_fixed" else "verified_fixed"
+    both = [{"finding_id": raised, "verdict": first}, {"finding_id": raised, "verdict": last}]
+    provider = Reviewer(
+        {"findings": [], "carried": both},
+        {"findings": [], "carried": [{"finding_id": raised, "verdict": "still_present"}]},
+    )
+
+    await (await reviewing.worker("qa", provider)).carry_out(await reviewing.owed("qa"))
+
+    assert "are given more than one verdict: one each" in provider.asked[1].briefing
+    assert await reviewing.world.column("SELECT count(*) FROM finding_verifications") == [0]
+
+
+async def test_a_review_that_says_nothing_of_a_finding_its_reviewer_was_asked_about_is_no_review(
+    reviewing: Reviewing,
+) -> None:
+    """3B-S4-1.7: leaving the list out is saying nothing, and it had been asked."""
+    raised = await a_second_candidate_with_an_earlier_finding(reviewing)
+    provider = Reviewer(
+        {"findings": []},
+        {"findings": [], "carried": [{"finding_id": raised, "verdict": "still_present"}]},
+    )
+    submitted = await reviewing.world.column("SELECT count(*) FROM review_submissions")
+
+    await (await reviewing.worker("qa", provider)).carry_out(await reviewing.owed("qa"))
+
+    assert f"the review says nothing of ['{raised}'], which you raised before" in (
+        provider.asked[1].briefing
+    )
+    assert await reviewing.world.column("SELECT state FROM invocations ORDER BY started_at") == [
+        "applied",
+        "applied",
+        "rejected",
+        "applied",
+    ]
+    [now] = await reviewing.world.column("SELECT count(*) FROM review_submissions")
+    assert now == submitted[0] + 1  # the one that answered, and not the one that did not

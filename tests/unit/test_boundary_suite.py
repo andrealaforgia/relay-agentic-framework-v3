@@ -494,3 +494,23 @@ async def test_a_run_made_while_the_hosts_policy_changed_is_a_pass_of_nothing(
     assert stable.passed is not changed_meanwhile
     if changed_meanwhile:
         assert not result.passed
+
+
+def test_the_runtime_is_of_the_cli_that_is_installed_now_and_not_of_one_that_was(
+    tmp_path: Path,
+) -> None:
+    """3B-S4-1.9: a pass for the version there was allows nothing once another is there."""
+    from relay.providers.boundary_suite import runtime_now
+
+    cli = tmp_path / "claude"
+    cli.write_text("#!/bin/sh\necho '2.1.330 (Claude Code)'\n")
+    cli.chmod(0o755)
+    before = runtime_now("stated", str(cli))
+
+    cli.write_text("#!/bin/sh\necho '2.2.0 (Claude Code)'\n")
+    after = runtime_now("stated", str(cli))
+    gone = runtime_now("stated", str(tmp_path / "nothing-here"))
+
+    assert (before["cli"], after["cli"]) == ("2.1.330 (Claude Code)", "2.2.0 (Claude Code)")
+    assert before != after
+    assert gone["cli"] == "unavailable"
