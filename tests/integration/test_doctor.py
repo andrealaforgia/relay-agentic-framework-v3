@@ -284,3 +284,37 @@ async def test_a_retry_is_a_run_of_the_bounds_as_they_are_on_the_runtime_it_will
     asked = await runs.open_request("r-2", installation, uncertain.attempt_id, dict)
     assert asked == {uncertain.role: doctor.boundaries_of(settings, now)[uncertain.role]}
     assert asked[uncertain.role] != doctor.boundaries_of(settings, then)[uncertain.role]
+
+
+async def test_a_handle_of_another_installations_request_buys_nothing_from_this_one(
+    enrolled: AsyncConnectionPool, shell: dict[str, str], tmp_path: Path
+) -> None:
+    """3C-S1B-1.1: the journal says which installation a request was made of. Sent to
+    another, it is answered there, and nothing is run or changed here."""
+    from relay.cli import journal
+
+    await authority.state_policy(enrolled, PASSPHRASE, "none applies here", "andrea")
+    file = Path(shell["RELAY_STATE_DIR"]) / "requests.jsonl"
+    elsewhere = "01a20000-0000-7000-8000-00000000000b"
+    probe = journal.note(file, ["doctor", "--boundary"], elsewhere, None)
+    stating = journal.note(file, ["policy", "state", "whatever suits"], elsewhere, None)
+
+    ran = with_no_terminal(
+        ["doctor", "--boundary", "--request-id", probe.request_id], shell, tmp_path / "vat"
+    )
+    stated = with_no_terminal(
+        ["policy", "state", "whatever suits", "--request-id", stating.request_id],
+        shell,
+        tmp_path / "vat",
+    )
+
+    assert ran.code == 1 and f"was made of installation {elsewhere}" in ran.printed
+    assert "paid run" not in ran.printed
+    assert stated.code == 1 and f"was made of installation {elsewhere}" in stated.printed
+    async with enrolled.connection() as connection:
+        asked = await (
+            await connection.execute("SELECT count(*) AS n FROM boundary_requests")
+        ).fetchone()
+    assert asked is not None and asked["n"] == 0
+    policy = await authority.policy_of(enrolled)
+    assert policy is not None and policy.statement == "none applies here"
