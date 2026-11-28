@@ -263,6 +263,8 @@ async def test_what_a_call_returned_is_stored_whole_with_what_it_used(calling: C
             "cache_write_tokens": 4325,
             "cache_write_5m_tokens": 0,
             "cache_write_1h_tokens": 4325,
+            # What the provider attributed to this model, kept beside its tokens.
+            "provider_cost_usd": "0.0008912",
         }
     ]
     assert row["provider_cost_usd"] == Decimal("0.0008912")
