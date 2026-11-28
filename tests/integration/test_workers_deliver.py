@@ -4,6 +4,7 @@ The providers are scripted; what is real is everything around them."""
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from relay.application.authoring import (
 from relay.application.features import Features
 from relay.application.invocations import Invocations
 from relay.application.tasks import BuildTask, Profile, ReviewTask, Tasks, Workspaces
+from relay.application.usage import live_usage
 from relay.application.worker import Worker
 from relay.application.workers import WorkerSession
 from relay.providers.claude import Outcome, ProviderResult, Request
@@ -337,7 +339,18 @@ async def test_a_features_summary_says_what_its_calls_used_by_role_as_known_when
     # 3B-S4-1.12: the call that was in flight reports afterwards. The summary keeps what
     # was known when the feature completed; what is known now is read live.
     [late] = await world.column("SELECT invocation_id FROM invocations WHERE state = 'uncertain'")
+    # 3C-1.9: the live account is read from the calls themselves, and has the late report
+    # too, beside a summary that does not change.
+    before = await live_usage(world.database, PROJECT, "F1")
+    assert before["calls_whose_end_is_not_known"] == 1
     await at.invocations.record(late, metered(NOTHING_FOUND, cost=0.02))  # type: ignore[arg-type]
+    live = await live_usage(world.database, PROJECT, "F1")
+    assert live["calls_whose_end_is_not_known"] == 0 and live["calls"] == before["calls"] + 1
+    assert Decimal(live["charged_by_the_provider"]["usd"]) == Decimal(
+        before["charged_by_the_provider"]["usd"]
+    ) + Decimal("0.02")
+    assert live["by_role"]["qa"] == 2 and live["calls_with_no_use_reported"] == 1  # sentinel's
+    assert (await live_usage(world.database, PROJECT))["calls"] == live["calls"]  # one feature
     now = await world.features.usage_of(PROJECT, "F1")
     assert (await world.summary()) == summary
     assert now["calls_not_known"] == 0

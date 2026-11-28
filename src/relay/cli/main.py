@@ -26,7 +26,8 @@ from relay.application.boundary_runs import Attempt, BoundaryRuns, RunRefused
 from relay.application.inbox import Inbox
 from relay.application.integration import IntegrationRefused
 from relay.application.leadership import AlreadyLed, installation_of
-from relay.cli import deciding, doctor, journal, reading, terminal
+from relay.application.usage import account_text, live_usage
+from relay.cli import deciding, doctor, journal, reading, terminal, watching
 from relay.cli.enrolment import DEFAULT_IMAGE, Asked, CannotEnrol, enrol
 from relay.cli.selection import NoProject, select_project
 from relay.domain.story import ActionRefused, Receipt
@@ -711,6 +712,62 @@ async def _confirm(asked: argparse.Namespace, command: Sequence[str]) -> int:
     return 0 if receipt.disposition == "effective" else 1
 
 
+async def _costs(asked: argparse.Namespace) -> int:
+    """What calls have used, as known now (PO-9). With `--summary`, beside it what a
+    completed feature's summary recorded when it completed, which a late report does not
+    change."""
+    async with _opened() as (pool, broker):
+        try:
+            project = await select_project(pool, asked.project, os.environ, Path.cwd())
+            account = await live_usage(pool, project, asked.feature)
+            frozen = None
+            if asked.summary:
+                if not asked.feature:
+                    raise LookupError(
+                        "a summary is a feature's: say which, `relay costs F1 --summary`"
+                    )
+                relay = await assemble(pool, broker)
+                frozen = await relay.features.summary_of(project, asked.feature)
+        except (NoProject, LookupError, NotConfigured) as refused:
+            print(f"relay: {refused}", file=sys.stderr)
+            return 1
+    if asked.json:
+        print(
+            json.dumps(
+                {"now": account, "summary": frozen} if asked.summary else account,
+                indent=2,
+                default=str,
+            )
+        )
+        return 0
+    print(account_text(account))
+    if asked.summary:
+        print()
+        print(
+            "as recorded when the feature completed (never changed afterwards):\n"
+            + json.dumps(
+                (frozen or {}).get("usage", "the feature has not completed"), indent=2, default=str
+            )
+        )
+    return 0
+
+
+async def _watch(asked: argparse.Namespace) -> int:
+    """The board, the events or the tokens, until interrupted. It reads, and never writes."""
+    async with _opened() as (pool, _):
+        try:
+            project = await select_project(pool, asked.project, os.environ, Path.cwd())
+        except NoProject as refused:
+            print(f"relay: {refused}", file=sys.stderr)
+            return 1
+        view = "events" if asked.events else "tokens" if asked.tokens else "board"
+        stop = _until_told_to_stop()
+        await watching.watch(
+            pool, project, view, once=asked.once, every=asked.every, as_json=asked.json, stop=stop
+        )
+    return 0
+
+
 async def _read(asked: argparse.Namespace) -> int:
     """What may be read by anyone: no terminal, no passphrase, and nothing changed."""
     async with _opened() as (pool, _):
@@ -844,6 +901,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             acting.add_argument("text", metavar="TEXT")
         if "--reason" in takes or "--reason?" in takes:
             acting.add_argument("--reason", required="--reason" in takes)
+    costing = commands.add_parser("costs", help="what calls have used, as known now")
+    costing.add_argument("feature", nargs="?", help="one feature's (default: the project's)")
+    costing.add_argument(
+        "--summary", action="store_true", help="beside it, a completed feature's summary"
+    )
+    costing.add_argument("--project", help=which)
+    costing.add_argument("--json", action="store_true", help="the same facts, as JSON")
+    watcher = commands.add_parser("watch", help="watch the agents at work (reads; never writes)")
+    views = watcher.add_mutually_exclusive_group()
+    views.add_argument("--events", action="store_true", help="the ledger as it grows")
+    views.add_argument("--tokens", action="store_true", help="what calls have used")
+    watcher.add_argument("--once", action="store_true", help="show it once and leave")
+    watcher.add_argument(
+        "--every", type=float, default=watching.EVERY, help="seconds between readings"
+    )
+    watcher.add_argument("--project", help=which)
+    watcher.add_argument("--json", action="store_true", help="the same facts, as JSON")
     preparing = commands.add_parser(
         "prepare", help="propose an action for the Product Owner to confirm (decides nothing)"
     )
@@ -880,6 +954,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(_doctor(asked, given))
         if asked.command in ("status", "inbox", "show", "roadmap", "ledger"):
             return asyncio.run(_read(asked))
+        if asked.command == "costs":
+            return asyncio.run(_costs(asked))
+        if asked.command == "watch":
+            return asyncio.run(_watch(asked))
         if asked.command == "prepare":
             return asyncio.run(_prepare(asked))
         if asked.command == "confirm":
