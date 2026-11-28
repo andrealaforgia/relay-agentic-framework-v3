@@ -463,6 +463,39 @@ Reservations:
 
 `make check` on the commit that closes the step, run with compiled files cleared first: 1406 tests, 3 skipped (the ones that make paid calls).
 
+## Slice 3c, step 3 as built: watching
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 70 | CHALLENGE, 10 | The live account losing spend by role (PO-8) and a model's charge; a charge nobody reported read as zero, and a launch that never happened missing from the text; an open question shown as waiting no time, and two reviews sharing one age; no holder on the board, and what waits for the Product Owner given as a count; one frame of the board made of two moments; a frozen estimate with no price table; one look at the events ending at event 500; a model's name able to drive the terminal, and a screen clear before JSON; an account given for a feature that does not exist; an interval of nothing accepted |
+| 71 | CHALLENGE, 8 | A worker reported missing during a healthy red run, and after a reviewer asked; "nobody is making this call" said of a call that may be running; a model charge that is no amount breaking the whole cost view; a frozen estimate meaning one thing in text and another in JSON; the frozen half of a comparison knowing more than the half labelled now; two workers with one displayed name; a role with only an uncertain call missing from the account; an interrupt ignored while the events are drained |
+| 72 | CHALLENGE, 6 | Recovery and liveness inferred from the wrong process's lock; "held for" absent through a red run and counting time nobody held the work; Relay's estimate not shown by model; idle workers missing from the text board; a frozen summary's text dropping coverage that is known; an absurdly large model charge making the account unreadable |
+
+Twenty-four findings, every one reachable through `relay watch` or `relay costs`, every one fixed with a test. **The step was not accepted.** Round 72's six were fixed without a further round (D-8) and those fixes are not reviewed. Astra said in round 72 that it found no redraw defect.
+
+What the step does. `relay costs [feature]` and `relay watch --tokens [--feature F]` are one live account, read from the record of each call: every call counted once however many models it was billed to; each role's own calls, tokens, charges and estimates, with its calls in flight and its calls whose end is not known beside them; each model's tokens, what the provider attributed to it and what Relay estimates for it; what the provider charged for whole calls, said to be unknown when no call reported one and a part when only some did; and Relay's estimates grouped by the price table that made them and labelled estimates. `relay costs F1 --summary` shows beside it what a completed feature's summary froze, read first, in one projection for text and JSON, with estimates by table. `relay watch` is the board: whether a control plane is running; every worker there is a record of, by a name no other shares, with whether its lock is held; each feature with its stories and behaviours; each call in flight; each piece of work owed with its own age, whose grant it is under, whether that process's lock is held, and how long the present hold has lasted; and each item waiting for the Product Owner with its handle. Everything of the workflow in a frame is read from one snapshot. `relay watch --events` follows the ledger, each event once, whole however long, and stops when told. All of it reads and never writes; whatever a model or a provider wrote is made safe to show in text and is whole in JSON.
+
+A hold is timed by the table itself (migration `0020`): whichever route grants the work, a hold that is broken off and resumed starts again, and nothing that updates the row can give it another start.
+
+Deliberate breakage across the step and its three rounds: 69 breakages, 60 caught at first. Of the nine that were not: six showed a test missing or too weak, and each has a test that now catches it; one was aimed at text the formatter had rewrapped and was caught when aimed again; one broke a check that could not matter, which was removed; and one was reported caught when it was not, because the test that failed under it was failing already: a field had been added to a call's record without updating a test that compares the record whole, and the full run showed it. That test now has the field and catches the breakage. None survives.
+
+Departures from the contract: the board is plain text and not the earlier Relay's `rich` tables (the design's own instruction, against the architecture's "port the rendering"); the earlier Relay's lines of each agent's activity are not ported, since Relay 3 keeps the call and its result and not an agent's working output.
+
+Reservations:
+
+- **Round 72's fixes are not reviewed.**
+- **The board says whose grant work is under and whether that process's lock is held; it does not say who is carrying out an effect at this moment.** Astra asked for the effect's owner or term to be shown. They are not: a Builder that returned its candidate and left shows as a grant whose worker is gone while the control plane verifies it, and the board draws no conclusion.
+- **The histories Astra asked to be played are staged.** A red granted to the control plane, a reviewer's work left as asked, a hold resumed, and a summary with two price tables are put in place by SQL on real claims and a really completed feature. A real green held open after its Builder exits, a provider held open while only the ownership connection is cut, a late result after a measurable park, and a feature delivered across a change of price table are not tested.
+- **Liveness is not of a frame's snapshot.** A lock is held at this instant or it is not.
+- **Redrawing over time is tested as one frame** to a terminal-like output.
+- **Work already held when `0020` was applied has no held time.**
+- **A model's estimate is kept from this build on.** For calls recorded before, the model shows how many of its parts have no estimate on record; it is not worked out again by today's prices.
+- **The board lists every worker there has ever been a record of.** On an installation that has run for long that is a long list.
+- **The board polls every two seconds.** What comes and goes between two readings is in `--events`.
+- **A conversation's turns are not in the account**: they are step 4's.
+
+`make check` on the commit that closes the step, run with compiled files cleared first: 1434 tests, 3 skipped (the ones that make paid calls).
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.
