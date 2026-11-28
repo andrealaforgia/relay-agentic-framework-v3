@@ -413,3 +413,32 @@ def test_relay_session_is_a_conversation_with_a_person_at_a_terminal(talk: Talk)
     assert as_a_model.code == 1 and "needs a person at a terminal" in as_a_model.printed
     assert len(talk.launched()) == 1  # and nothing was launched for it
     assert uuid.UUID(launched["session"])
+
+
+@pytest.mark.skipif(
+    os.environ.get("RELAY_REAL_CLAUDE") != "1", reason="makes paid calls to the real CLI"
+)
+async def test_the_real_cli_holds_a_conversation_through_relays_server(talk: Talk) -> None:
+    """Opt-in, paid, on the cheapest model. What step 4 rests on, against the real CLI:
+    print mode starts with exactly Relay's server and its tools, calls them, and continues
+    the session on the next call."""
+    world = talk.world
+    await world.roadmap(STANDARD_RATE)
+    talk.launch = host.Launch(
+        **{**talk.launch.__dict__, "binary": "claude", "environment": dict(os.environ)}
+    )
+
+    await talk.say(
+        "Call the context tool. Then call record_analysis with the text 'HERON-4471'. "
+        "Then tell me in one sentence how many items wait for the Product Owner.",
+        "Without calling any tool: what text did I ask you to record? Reply with it alone.",
+    )
+
+    one, two = await talk.turns()
+    assert (one["state"], two["state"]) == ("applied", "applied"), (one["reason"], two["reason"])
+    assert (one["continued"], two["continued"]) == (False, True)
+    assert one["provider_session"] == two["provider_session"]
+    assert await world.column("SELECT text FROM analyses") == ["HERON-4471"]  # through the server
+    assert "HERON-4471" in two["reply"]  # and the second call remembered the first
+    assert one["provider_cost_usd"] is not None and one["usage"]
+    print("\n".join(talk.heard))
