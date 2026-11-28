@@ -21,7 +21,7 @@ from pathlib import Path
 import redis.asyncio as redis
 
 from relay import processes
-from relay.application import authority, confirmation, prepared
+from relay.application import authority, confirmation, conversations, prepared
 from relay.application.boundaries import Boundaries
 from relay.application.boundary_runs import Attempt, BoundaryRuns, RunRefused
 from relay.application.inbox import Inbox
@@ -473,6 +473,25 @@ async def _decide(asked: argparse.Namespace, command: Sequence[str]) -> int:
     async with _opened() as (pool, broker):
         try:
             project = await _project(pool, asked)
+            if verb == "start":
+                # A feature is started from a problem the person states, or from a
+                # version of the Interpreter's analysis that they name (3C-2.9). Either
+                # way the words are shown on the terminal before the passphrase is asked
+                # for, and starting it is theirs.
+                named = getattr(asked, "analysis", None)
+                if (named is None) == (asked.text is None):
+                    raise deciding.CannotDecide(
+                        "a feature is started from a problem you state, or from an analysis "
+                        "you name with --analysis: one of them, and not both"
+                    )
+                if named is not None:
+                    analysis = await conversations.analysis_of(pool, project, named)
+                    if analysis is None:
+                        raise deciding.CannotDecide(
+                            f"there is no analysis {named} of {project}: the latest is in "
+                            "the session's `context`"
+                        )
+                    asked.text = analysis["text"]
             if asked.request_id:
                 if asked.request_id.startswith("confirm:"):
                     # The name a confirmation gives its own request. Nobody else's.
@@ -1029,7 +1048,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     of_feature = feature.add_subparsers(dest="doing", required=True)
     starting = of_feature.add_parser("start", help="start a feature from a stated problem")
     starting.set_defaults(verb="start")
-    starting.add_argument("text", metavar="PROBLEM")
+    starting.add_argument("text", metavar="PROBLEM", nargs="?")
+    starting.add_argument(
+        "--analysis",
+        type=int,
+        metavar="VERSION",
+        help="start from this version of the Interpreter's analysis, instead of a stated problem",
+    )
     starting.add_argument("--project", help=which)
     starting.add_argument("--request-id", help=repeat)
     given = list(sys.argv[1:] if argv is None else argv)

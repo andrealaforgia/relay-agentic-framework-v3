@@ -415,6 +415,38 @@ def test_relay_session_is_a_conversation_with_a_person_at_a_terminal(talk: Talk)
     assert uuid.UUID(launched["session"])
 
 
+async def test_a_feature_is_started_from_an_analysis_only_by_the_person_naming_it(
+    talk: Talk,
+) -> None:
+    """3C-2.9: an analysis becomes a feature only when the Product Owner starts one, and
+    they may name the version it starts from. The words are shown before the passphrase."""
+    world, desk = talk.world, talk.desk
+    desk.shell["RELAY_PROJECT"] = PROJECT
+    talk.script(
+        {
+            "when": "VAT",
+            "calls": [
+                {"tool": "record_analysis", "arguments": {"text": "VAT is added twice on export."}}
+            ],
+            "say": "Recorded.",
+        }
+    )
+    await talk.say("VAT is wrong")
+    assert await world.column("SELECT count(*) FROM features") == [0]  # it started nothing
+
+    neither = desk.po("feature", "start")
+    both = desk.po("feature", "start", "Another problem", "--analysis", "1")
+    missing = desk.po("feature", "start", "--analysis", "7")
+    started = desk.po("feature", "start", "--analysis", "1")
+
+    for refused in (neither, both):
+        assert refused.code == 1 and "one of them, and not both" in refused.printed
+    assert missing.code == 1 and "there is no analysis 7" in missing.printed
+    assert started.code == 0, started.printed
+    assert "VAT is added twice on export." in started.shown  # what they are starting
+    assert await world.column("SELECT problem FROM features") == ["VAT is added twice on export."]
+
+
 @pytest.mark.skipif(
     os.environ.get("RELAY_REAL_CLAUDE") != "1", reason="makes paid calls to the real CLI"
 )
