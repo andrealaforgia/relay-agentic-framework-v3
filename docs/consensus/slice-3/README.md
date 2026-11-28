@@ -432,6 +432,37 @@ Reservations:
 
 `make check` on the commit that closes the step, run with compiled files cleared first: 1345 tests, 3 skipped (the ones that make paid calls).
 
+## Slice 3c, step 2 as built: the Product Owner's commands
+
+| Round | Astra's disposition | What it found |
+|---|---|---|
+| 67 | CHALLENGE, 14 | A code confirmed after it had expired; a code choosing its own project; another command's receipt printed as success; model-authored text driving the terminal at the confirmation prompt; a cancellation surviving a pause and a resume; a rejection prepared before a story is at work; a second retry of one refused push raising; a parked call's cost as one unlabelled figure, and its basis missing a late bill; a failed final check not showing what was observed; ambiguous item handles; no record of how a decision was confirmed, and a passphrase rotated under it; a generated feature name already taken; `status` listing work as waiting on someone who had acted; the text ledger dropping payloads and the default roadmap choosing the wrong feature |
+| 68 | CHALLENGE, 11 | A database used by the previous build unable to upgrade (a pushed migration edited, again); one code reported expired and still deciding; a confirmation returning another action's receipt; exact replays from the previous build losing their receipts; a replay answered by the wrong installation; a cancellation surviving a final check retried and failed again; words accepted and then dropped or refused; a call shown as launched that may not have been; a final check's timeout unexplained; the default roadmap choosing a feature waiting its turn; control characters in the reading commands |
+| 69 | CHALLENGE, 10 | An installation opened by the build pushed between the two forms of `0018` unable to upgrade; a receipt returned for another project, and feature names abbreviated; exact replays of `replace-decision FEATURE/Dn` and of text typed with space round it refused; "expired" said by a terminal whose update settled nothing; a direct replay missing a receipt committed while it resolved; a cancellation surviving a second completion request; extra words accepted for feature actions and replacements; installation commands able to take a confirmation's request name; an unchanged prepared action stale after upgrade; `status` sending the operator to a worker for control-plane work |
+
+Thirty-five findings, every one reachable through a shipped command, every one fixed with a test. **The step was not accepted.** Round 69's ten were fixed without a further round (D-8) and those fixes are not reviewed. Astra said along the way that it found no stale-answer defect in `answer` and `replace-decision`, whose services check their own target, and no failure that depends on three kinds of item waiting together.
+
+What the step does. Everything waiting for the Product Owner is one list of five kinds of item (a gate, a failed final check, a question, a parked call, a refused push), each with what there is to see, what can be done, an unambiguous handle, and a digest of what was shown. `approve`, `request-changes`, `reject`, `retry`, `set-aside`, `answer`, `replace-decision`, `pause`, `resume`, `cancel` and `feature start` each resolve what they are about from the record, refuse a word the decision has no place for, show it on the controlling terminal with whatever a model or a repository wrote made safe to show, ask for the passphrase with a prompt that says in Relay's own words what it is for, and carry the decision out under a handle taken first. The service holds each decision, in its own transaction, to what was shown: a gate by its identity, a parked call by all that was shown of it, a refused push by its intent and by the behaviour still being blocked on it, a story by its revision, basis and state, a feature by its state and how far it has come. The receipt records that the passphrase was read at the terminal and which passphrase, and a passphrase changed since it was checked refuses the decision. A request sent again is answered from its own receipt, which says what it was for, with no passphrase asked. `prepare` needs no authority and decides nothing; `confirm` is the person's, shows what was prepared and why, is stale if what it was prepared against has moved, and takes the code once, by the database's clock, after which the code is settled by that confirmation alone. `status`, `inbox`, `show`, `roadmap` and `ledger` read and change nothing, as text or `--json`.
+
+Deliberate breakage across the step and its three rounds: 86 breakages, 77 caught at first. Of the nine that were not: six showed a test missing or too weak, and each has a test that now catches it; two were aimed at text the formatter had rewrapped and were caught when aimed again; and one broke a guard that could not matter, which was removed. None survives.
+
+**A mistake made twice in this slice, and what was done about it.** A migration that had been pushed was edited in place, in step 1b and again in step 2, so an installation made by the pushed build could not upgrade. The second time left three forms of one migration in history, one of them in a build pushed in between. Every migration is now pinned by content in a test that also fails if a migration is missing from the list, and the migrator recognises the one in-between form by its exact checksum and brings it forward.
+
+Reservations:
+
+- **Round 69's fixes are not reviewed.**
+- **The passphrase is still the whole of S3-1.8.** The receipt says which passphrase confirmed a decision, not who typed it.
+- **A code is taken in a transaction of its own, immediately before the decision, not in the decision's.** The decisions are made by five services. A code taken and never carried on stays taken, unexpired and undecided, and is listed nowhere as waiting.
+- **Two terminals with one code, and two identical decisions sent at once**, are each tested in one process, by making the second one's first look for a receipt come back empty; not as two processes held at a lock.
+- **Three kinds of item waiting together after a restart** is tested as two together (a refused push and a parked call) and one apart (a failed final check), with new service objects standing for the restart.
+- **An action prepared by an earlier build is held to the feature as that build described it**, which is a weaker description than this build's: such an action can survive a change that this build would have caught.
+- **The list of pinned migrations is kept by hand**, in the commit that first pushes each.
+- **A feature's name is `F` and the next free number.**
+- **`relay ledger` shows at most two hundred events from where it is asked to start.**
+- **Making a line break visible** puts a long statement of a problem on one line of the terminal.
+
+`make check` on the commit that closes the step, run with compiled files cleared first: 1406 tests, 3 skipped (the ones that make paid calls).
+
 Conditions carried to 3b: a principal on every worker-callable operation; durable task and invocation identity before any provider is called; a worker receives the story and list revisions with what it reviews and hands them back unchanged.
 
 All replies are from `gpt-6.2-astra`. Agreement between two models is not evidence of correctness.
