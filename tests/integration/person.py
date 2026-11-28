@@ -79,7 +79,16 @@ def at_a_terminal(
                 quiet_since = time.monotonic()
             else:
                 time.sleep(0.02)
-            if to_type and shown.count(b": ") > answered and shown.rstrip(b" ").endswith(b":"):
+            # Only once the terminal has gone quiet: a long piece of what is shown can
+            # arrive in parts, and one of them can end in a colon that is no prompt. What
+            # is typed before the real prompt is thrown away when the terminal is set to
+            # read a passphrase, and the prompt then waits for ever.
+            if (
+                to_type
+                and time.monotonic() - quiet_since > 0.15
+                and shown.count(b": ") > answered
+                and shown.rstrip(b" ").endswith(b":")
+            ):
                 answered = shown.count(b": ")
                 if before_typing is not None:
                     # What happens while the person is looking at what they were shown.
