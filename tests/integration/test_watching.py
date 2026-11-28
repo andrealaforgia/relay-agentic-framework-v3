@@ -73,6 +73,11 @@ async def test_the_board_shows_who_is_alive_what_is_being_delivered_and_what_wai
         assert facts["features"][0]["stories"][0]["title"] == hostile.title  # whole, in JSON
         await world.answer(question)
         assert "waiting for the Product Owner: nothing" in desk.anyone("watch", "--once").out
+        # A call that has ended is no longer in flight.
+        async with world.database.connection() as connection:
+            await connection.execute("UPDATE invocations SET state = 'errored'")
+        assert desk.read("watch", "--once")["calls_in_flight"] == []
+        assert "in flight: no call" in desk.anyone("watch", "--once").out
     finally:
         await calling.close()
 
