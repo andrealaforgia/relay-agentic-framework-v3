@@ -84,13 +84,28 @@ async def board(pool: Pool, project_id: str) -> dict[str, Any]:
             "control_plane": "running" if led and led["led"] else "not running",
             "workers": {role: alive.count(role) for role in ROLES},
         },
+        # Every worker there is a record of, with whether its lock is held now.
+        "workers": [
+            {
+                "worker": str(each["worker_id"]),
+                "role": str(each["role"]),
+                "alive": str(each["worker_id"]) in living,
+            }
+            for each in workers
+        ],
         "features": standing["features"],
         "owed": [
             {
                 **each,
                 # Whoever holds it, and whether they are still there: a holder that has
                 # gone has not been recovered from yet, and the work is not moving.
-                "holder_alive": (each["held_by"] in living) if each["held_by"] else None,
+                "holder_alive": (
+                    (each["held_by"] in living)
+                    if each["holder"] == "worker"
+                    else bool(led and led["led"])
+                    if each["holder"] == "control plane"
+                    else None
+                ),
             }
             for each in standing["owed"]
         ],
@@ -134,19 +149,31 @@ def board_text(facts: dict[str, Any]) -> str:
                     f"    {each['behaviour']}  {each['state']:<16} {visible(each['summary'])}"
                 )
     lines.append("")
+    name = _names([each["worker"] for each in facts["workers"]])
     lines.append("in flight:" if facts["calls_in_flight"] else "in flight: no call")
     for each in facts["calls_in_flight"]:
         lines.append(
             f"  {each['role']:<9} {each['work']} of {each['of']}  on {visible(each['model'])}  "
-            f"for {_for(each['for_seconds'])}  by worker {each['worker'][:8]}"
-            + ("" if each["worker_alive"] else " (GONE: nobody is making this call)")
+            f"for {_for(each['for_seconds'])}  by worker {name(each['worker'])}"
+            # What the board knows, and no more: the worker's lock is not held. The
+            # provider may be running still, and its result may yet arrive.
+            + (
+                ""
+                if each["worker_alive"]
+                else " (its worker's lock is GONE: whether the call is still running is not known)"
+            )
         )
     lines.append("owed:" if facts["owed"] else "owed: nothing")
     for each in facts["owed"]:
         held = ""
-        if each["held_by"]:
+        if each["holder"]:
+            who = (
+                f"worker {name(each['held_by'])}"
+                if each["holder"] == "worker"
+                else "the control plane"
+            )
             held = (
-                f"; held by worker {each['held_by'][:8]} "
+                f"; held by {who} "
                 f"({'alive' if each['holder_alive'] else 'GONE: not yet recovered'})"
                 + (
                     f" for {_for(each['held_for_seconds'])}"
@@ -169,6 +196,20 @@ def board_text(facts: dict[str, Any]) -> str:
                 f"(`relay show {each['handle']}`)"
             )
     return "\n".join(lines)
+
+
+def _names(workers: list[str]) -> Callable[[str], str]:
+    """A short name for each worker that no other worker in the frame shares. Identities
+    made in the same minute begin alike, so eight characters do not tell two workers
+    started together apart."""
+
+    def name(worker: str) -> str:
+        for length in range(8, len(worker) + 1):
+            if sum(1 for other in set(workers) if other.startswith(worker[:length])) <= 1:
+                return worker[:length]
+        return worker
+
+    return name
 
 
 async def watch(
@@ -211,6 +252,10 @@ async def watch(
                     if as_json
                     else reading.ledger_text(new)
                 )
+                if stop is not None and stop.is_set():
+                    # Told to stop while there was more to read: a ledger that grows
+                    # faster than it is read would otherwise never let go.
+                    return
         else:
             facts = (
                 await live_usage(pool, project_id, feature_id)

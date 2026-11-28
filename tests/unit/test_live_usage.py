@@ -7,7 +7,14 @@ from decimal import Decimal
 from typing import Any
 
 from relay.application.final_checks import totals_of
-from relay.application.usage import UNKNOWN, account_of, account_text, summary_text
+from relay.application.usage import (
+    NOT_ON_RECORD,
+    UNKNOWN,
+    account_of,
+    account_text,
+    frozen_account,
+    summary_text,
+)
 
 
 def call(
@@ -30,14 +37,18 @@ def call(
     }
 
 
-def billed(model: str, cost: str | None = None, **counters: int | None) -> dict[str, Any]:
+def billed(
+    model: str, cost: str | None = None, *, kept: bool = True, **counters: int | None
+) -> dict[str, Any]:
+    """A line of a call's record of use. `kept=False`: a record made before a model's
+    charge was kept in it."""
     whole = {
         "input_tokens": 10,
         "output_tokens": 5,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
     }
-    return {"model": model, **whole, **counters, "provider_cost_usd": cost}
+    return {"model": model, **whole, **counters, **({"provider_cost_usd": cost} if kept else {})}
 
 
 def shown(account: dict[str, Any]) -> str:
@@ -115,11 +126,11 @@ def test_a_models_charge_is_read_from_the_providers_own_breakdown_where_the_call
     account = account_of(
         [
             call(
-                usage=[billed("opus")],
+                usage=[billed("opus", kept=False)],
                 charged="0.10",
                 billed_by_model={"opus": {"costUSD": 0.1}},
             ),
-            call(usage=[billed("haiku")], charged="0.01"),  # no breakdown at all
+            call(usage=[billed("haiku", kept=False)], charged="0.01"),  # no breakdown at all
         ]
     )
 
@@ -262,3 +273,123 @@ def test_a_frozen_summary_keeps_its_estimates_by_the_table_that_made_them() -> N
     }}}}  # fmt: skip
     assert "which table, or tables, made it is not on record" in summary_text(older)
     assert "has not completed" in summary_text(None)
+
+
+def test_a_model_charge_that_is_no_amount_is_unknown_and_breaks_nothing_else() -> None:
+    """3C-S3-2.3: the provider sent `costUSD: true`. The record's reader refused it and
+    kept null; the account does not go back to the raw report for it. And for a record
+    made before the charge was kept, the raw report is read by the same rule."""
+    account = account_of(
+        [
+            call(
+                usage=[billed("opus")],  # kept, as null
+                charged="0.10",
+                billed_by_model={"opus": {"costUSD": True}},
+            ),
+            call(
+                usage=[billed("haiku", kept=False)],
+                charged="0.02",
+                billed_by_model={"haiku": {"costUSD": True}},
+            ),
+            call(
+                usage=[billed("sonnet", kept=False)],
+                charged="0.03",
+                billed_by_model={"sonnet": {"costUSD": "a lot"}},
+            ),
+            call(usage=[billed("sonnet", cost="not a number")], charged="0.01"),
+            call(usage=[billed("fable", cost="NaN")], charged="0.00"),
+            call(usage=[billed("fable", cost="Infinity")], charged="0.00"),
+            call(usage=[billed("opus", cost="0.5")], role="qa", charged="0.5"),
+        ]
+    )
+
+    assert account["by_model"]["opus"]["charged_usd"] == UNKNOWN  # one of two not said
+    assert account["by_model"]["haiku"]["charged_usd"] == UNKNOWN
+    assert account["by_model"]["sonnet"]["charged_usd"] == UNKNOWN
+    assert account["by_model"]["fable"]["charged_usd"] == UNKNOWN  # not an amount either
+    assert account["charged_by_the_provider"]["usd"] == "0.66"  # every whole call, readable
+    assert account["by_role"]["qa"]["charged_by_the_provider"]["usd"] == "0.5"
+    # A kept null is not overridden by a good amount in the raw report either.
+    kept_null = account_of(
+        [call(usage=[billed("opus")], charged="0.1", billed_by_model={"opus": {"costUSD": 0.1}})]
+    )
+    assert kept_null["by_model"]["opus"]["charged_usd"] == UNKNOWN
+
+
+def test_a_role_whose_only_call_nobody_knows_the_end_of_has_an_account_of_that() -> None:
+    """3C-S3-2.7."""
+    account = account_of(
+        [
+            call(role="builder", usage=[billed("opus")], charged="0.10"),
+            call(role="qa", state="uncertain"),
+            call(role="sentinel", state="intended"),
+            call(role="verifier", state="not_started"),
+        ]
+    )
+
+    assert set(account["by_role"]) == {"builder", "qa", "sentinel"}  # not what never started
+    qa, sentinel = account["by_role"]["qa"], account["by_role"]["sentinel"]
+    assert (qa["calls"], qa["calls_whose_end_is_not_known"], qa["calls_in_flight"]) == (0, 1, 0)
+    assert (sentinel["calls"], sentinel["calls_in_flight"]) == (0, 1)
+    assert account["by_role"]["builder"]["calls_whose_end_is_not_known"] == 0
+    assert account["charged_by_the_provider"]["usd"] == "0.1"  # ended calls' spend only
+    text = shown(account)
+    assert "the qa: 0 call(s), and 1 whose end is not known" in text
+    assert "the sentinel: 0 call(s), and 1 in flight" in text
+
+
+def test_a_frozen_account_says_the_same_in_text_and_in_json() -> None:
+    """3C-S3-2.4: two tables and a call Relay could not price. Neither rendering has one
+    sum of two tables, and both have the counters, the cache included."""
+    summary = {
+        "usage": totals_of(
+            [
+                call(
+                    role="builder",
+                    usage=[billed("opus", cache_read_tokens=9)],
+                    charged="0.04",
+                    estimated="0.04",
+                    table="A",
+                ),
+                call(
+                    role="builder",
+                    usage=[billed("opus")],
+                    charged="0.08",
+                    estimated="0.08",
+                    table="B",
+                ),
+                call(role="builder", usage=[billed("mystery")], charged="0.01"),
+                call(role="qa", state="uncertain"),
+            ]
+        )
+    }
+
+    account = frozen_account(summary)
+    text = summary_text(summary)
+
+    builder = account["by_role"]["builder"]
+    assert "estimated_cost_usd" not in builder  # no sum with no table to its name
+    assert builder["estimated_by_relay"] == [
+        {"price_table": "A", "usd": "0.04", "calls": 1},
+        {"price_table": "B", "usd": "0.08", "calls": 1},
+    ]
+    assert (builder["calls"], builder["calls_with_no_estimate"]) == (3, 1)
+    assert (builder["cache_read_tokens"], builder["cache_write_tokens"]) == (9, 0)
+    assert builder["charged_by_the_provider_usd"] == "0.13"
+    assert account["calls_not_known_then"] == 1
+    assert "price table A): 0.04 USD over 1 call(s)" in text
+    assert "price table B): 0.08 USD over 1 call(s)" in text
+    assert "0.12" not in text and "calls Relay could not estimate: 1" in text
+    assert "cache read 9, cache written 0" in text and "charged by the provider: 0.13" in text
+    assert "calls whose use was not known then: 1" in text
+    # What is stored is not changed by being shown.
+    assert summary["usage"]["by_role"]["builder"]["estimated_cost_usd"] == "unknown"
+    # A summary from before: its one sum, with its provenance said to be not on record.
+    older = {"usage": {"calls_not_known": 0, "by_role": {"builder": {
+        "calls": 2, "input_tokens": 20, "output_tokens": 10, "cache_read_tokens": 0,
+        "cache_write_tokens": 0, "provider_cost_usd": "0.3", "estimated_cost_usd": "0.3",
+    }}}}  # fmt: skip
+    [estimate] = frozen_account(older)["by_role"]["builder"]["estimated_by_relay"]
+    assert estimate == {"price_table": NOT_ON_RECORD, "usd": "0.3", "calls": NOT_ON_RECORD}
+    assert frozen_account(older)["by_role"]["builder"]["calls_with_no_estimate"] == NOT_ON_RECORD
+    assert frozen_account({"usage": "unknown"}) == "unknown"

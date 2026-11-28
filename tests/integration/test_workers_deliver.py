@@ -18,7 +18,12 @@ from relay.application.authoring import (
 from relay.application.features import Features
 from relay.application.invocations import Invocations
 from relay.application.tasks import BuildTask, Profile, ReviewTask, Tasks, Workspaces
-from relay.application.usage import live_usage
+from relay.application.usage import (
+    beside_its_summary,
+    frozen_account,
+    live_usage,
+    summary_text,
+)
 from relay.application.worker import Worker
 from relay.application.workers import WorkerSession
 from relay.providers.claude import Outcome, ProviderResult, Request
@@ -361,6 +366,21 @@ async def test_a_features_summary_says_what_its_calls_used_by_role_as_known_when
     assert live["by_role"]["sentinel"]["charged_by_the_provider"]["usd"] == "unknown"
     assert live["by_role"]["verifier"]["input_tokens"] == 300
     assert (await live_usage(world.database, PROJECT))["calls"] == live["calls"]  # one feature
+    # 3C-S3-2.4: what `relay costs F1 --summary` shows of it, the same in text and JSON:
+    # estimates by table, no sum without one, and the frozen counters.
+    live, stored = await beside_its_summary(world.database, PROJECT, "F1")
+    assert stored is not None and stored["usage"] == usage
+    frozen = frozen_account(stored)
+    assert "estimated_cost_usd" not in frozen["by_role"]["verifier"]
+    assert frozen["by_role"]["verifier"]["estimated_by_relay"] == [by_table]
+    assert frozen["by_role"]["verifier"]["calls_with_no_estimate"] == 0
+    assert frozen["by_role"]["verifier"]["cache_read_tokens"] == 15  # the frozen counter
+    assert frozen["by_role"]["sentinel"]["estimated_by_relay"] == []
+    assert frozen["by_role"]["sentinel"]["calls_with_no_estimate"] == 1
+    assert frozen["calls_not_known_then"] == 1
+    assert f"price table {by_table['price_table']}): {by_table['usd']} USD over 3" in summary_text(
+        stored
+    )
     now = await world.features.usage_of(PROJECT, "F1")
     assert (await world.summary()) == summary
     assert now["calls_not_known"] == 0

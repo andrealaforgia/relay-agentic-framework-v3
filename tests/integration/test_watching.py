@@ -5,18 +5,22 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
+import uuid
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
+from relay.application.final_checks import totals_of
 from relay.application.leadership import Leadership
 from relay.application.stories import StoryDraft
 from relay.application.workers import WorkerSession
 from relay.cli import reading, watching
 from relay.git.checkout import name_attempts_under
 from relay.runtime import configure
+from tests.integration.completion_world import CompletionWorld, last_story_at_its_gate
 from tests.integration.conftest import DATABASE_URL, open_pool
 from tests.integration.decision_world import DecisionWorld
 from tests.integration.fixtures import run_green
@@ -79,6 +83,7 @@ async def test_the_board_shows_who_is_alive_what_is_being_delivered_and_what_wai
         [build] = [each for each in facts["owed"] if each["work"] == "build"]
         # 3C-S3-1.4: who holds it, whether they are there, and held is not owed.
         assert build["held_by"] == call["worker"] and build["holder_alive"] is True
+        assert build["holder"] == "worker"
         assert build["held_for_seconds"] is not None
         assert build["owed_for_seconds"] >= build["held_for_seconds"] >= 0
         assert f"held by worker {call['worker'][:8]} (alive)" in board
@@ -239,12 +244,30 @@ async def test_each_piece_of_work_has_its_own_age_and_work_that_asked_has_one_to
     assert reviews["sentinel"]["owed_for_seconds"] >= 3600 > reviews["qa"]["owed_for_seconds"]
     assert reviews["qa"]["assignment"] != reviews["sentinel"]["assignment"]
     # And work that asked: listed while its question is open, with its own age.
+    # As a reviewer that asked leaves it (3C-S3-2.1): it claimed the review, asked, and
+    # exited. The work is finished as asked, with the grant it was done under kept as
+    # history, and that grant is on the ledger.
+    reviewer = await WorkerSession.start(world.database, "qa")
+    grant = await world.claims.claim(
+        reviewer.principal, uuid.UUID(reviews["qa"]["assignment"]), reviewer.worker_id
+    )
+    [claimed] = [
+        each
+        for each in (await watching.board(world.database, PROJECT))["owed"]
+        if each["work"] == "review" and each["to"] == "qa"
+    ]
+    assert claimed["holder"] == "worker" and claimed["held_for_seconds"] is not None
+    await reviewer.stop()
     question = await world.ask()
     async with world.database.connection() as connection:
         asking = await (
             await connection.execute(
-                "UPDATE assignments SET state = 'asked', created_at = created_at - interval "
-                "'3 hours' WHERE kind = 'review' AND role = 'qa' RETURNING assignment_id"
+                # Asking stopped the story's work and released it; what a reviewer's own
+                # question leaves is the work as asked, under the grant it was done by.
+                "UPDATE assignments SET state = 'asked', grant_id = %s, granted_to = %s, "
+                "granted_worker = %s, created_at = created_at - interval '3 hours' "
+                "WHERE kind = 'review' AND role = 'qa' RETURNING assignment_id",
+                (grant, reviewer.principal.identity, reviewer.worker_id),
             )
         ).fetchone()
         assert asking is not None
@@ -259,6 +282,15 @@ async def test_each_piece_of_work_has_its_own_age_and_work_that_asked_has_one_to
             if each["state"].startswith("waiting on a question")
         ]
         assert asked["owed_for_seconds"] >= 3 * 3600
+        # Nobody holds it: the person owes an answer, and no worker needs recovering.
+        assert (asked["holder"], asked["held_by"], asked["holder_alive"]) == (None, None, None)
+        assert asked["held_for_seconds"] is None
+    [line] = [
+        each
+        for each in watching.board_text(await watching.board(world.database, PROJECT)).splitlines()
+        if "waiting on a question" in each
+    ]
+    assert "held by" not in line and "GONE" not in line
     assert "owed for 3h" in watching.board_text(await watching.board(world.database, PROJECT))
 
 
@@ -282,7 +314,19 @@ async def test_a_holder_that_has_gone_is_said_to_have_gone(desk: Desk) -> None:
         assert facts["processes"]["workers"]["builder"] == 1  # the other one
         assert build["held_by"] == str(holder.worker_id) and build["holder_alive"] is False
         assert str(other.worker_id) != build["held_by"]
-        assert "GONE: not yet recovered" in text and "GONE: nobody is making this call" in text
+        assert "GONE: not yet recovered" in text
+        # 3C-S3-2.2: the lock is gone; that the provider stopped is not known, nor said.
+        assert "its worker's lock is GONE: whether the call is still running is not known" in text
+        assert "nobody is making this call" not in text
+        # 3C-S3-2.6: two workers started together are told apart by what is shown.
+        [line] = [each for each in text.splitlines() if "held by worker" in each]
+        named = line.split("held by worker ")[1].split(" ")[0]
+        assert str(holder.worker_id).startswith(named)
+        assert not str(other.worker_id).startswith(named)
+        assert {each["worker"]: each["alive"] for each in facts["workers"]} == {
+            str(holder.worker_id): False,
+            str(other.worker_id): True,
+        }
     finally:
         await calling.close()
 
@@ -387,3 +431,163 @@ def test_an_interval_of_nothing_is_refused_before_anything_is_read(desk: Desk) -
         ran = desk.anyone("watch", "--once", f"--every={interval}")
         assert ran.code == 1 and "a number of seconds above nothing" in ran.printed
     assert desk.anyone("watch", "--feature", "F1", "--once").code == 1  # only with --tokens
+
+
+async def test_work_the_control_plane_holds_is_said_to_be_held_by_it(desk: Desk) -> None:
+    """3C-S3-2.1: a red is taken up by the control plane itself, under no worker's name.
+    While it runs the board says so, and does not report a worker missing."""
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    await world.awaiting_builder("B1")
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "UPDATE assignments SET state = 'granted', grant_id = gen_random_uuid(), "
+            "granted_to = 'relay/control-plane' WHERE kind = 'build'"
+        )
+
+    async def led() -> Leadership:
+        return await Leadership.take(world.database)
+
+    mine = await asyncio.create_task(led(), context=contextvars.copy_context())
+    try:
+        facts = await watching.board(world.database, PROJECT)
+        [held] = [each for each in facts["owed"] if each["work"] == "build"]
+        assert (held["holder"], held["held_by"], held["holder_alive"]) == (
+            "control plane",
+            None,
+            True,
+        )
+        text = watching.board_text(facts)
+        assert "held by the control plane (alive)" in text
+        assert "worker None" not in text and "GONE" not in text
+    finally:
+        await mine.release()
+    after = watching.board_text(await watching.board(world.database, PROJECT))
+    assert "held by the control plane (GONE: not yet recovered)" in after
+
+
+async def test_told_to_stop_the_events_view_reads_no_further_page(
+    desk: Desk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S3-2.8: an interrupt while there is more to read is obeyed at the next page."""
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    monkeypatch.setattr(watching, "_PAGE", 2)
+    read, fetched = reading.ledger, [0]
+
+    async def counted(*arguments: Any, **more: Any) -> Any:
+        fetched[0] += 1
+        return await read(*arguments, **more)
+
+    monkeypatch.setattr(reading, "ledger", counted)
+    stop = asyncio.Event()
+    shown: list[str] = []
+
+    def and_then_interrupted(text: str) -> None:
+        shown.append(text)
+        stop.set()
+
+    async with asyncio.timeout(20):
+        await watching.watch(
+            world.database, PROJECT, "events", every=0.1, out=and_then_interrupted, stop=stop
+        )
+
+    assert fetched[0] == 1 and len(shown) == 1 and len(shown[0].splitlines()) == 2
+
+
+async def test_beside_a_summary_the_present_never_knows_less_than_what_was_frozen(
+    desk: Desk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S3-2.5: a call ends while `costs F1 --summary` is being read. What is shown as
+    now has it: the frozen half is read first."""
+    from relay.application import usage
+
+    world = desk.world
+    await world.decide(await world.roadmap(STANDARD_RATE))
+    await world.awaiting_builder("B1")
+    calling = Calling(world)
+    try:
+        await calling.admitted(await calling.worker())
+        read = usage.summary_of
+
+        async def and_then_the_call_ends(*arguments: Any) -> Any:
+            frozen = await read(*arguments)
+            async with world.database.connection() as connection:
+                await connection.execute(
+                    "UPDATE invocations SET state = 'applied', provider_cost_usd = 0.30"
+                )
+            return frozen
+
+        monkeypatch.setattr(usage, "summary_of", and_then_the_call_ends)
+
+        now, frozen = await usage.beside_its_summary(world.database, PROJECT, "F1")
+
+        assert frozen is None
+        assert (now["calls"], now["calls_in_flight"]) == (1, 0)
+        assert now["charged_by_the_provider"]["usd"] == "0.3"
+        with pytest.raises(usage.NoSuchFeature):
+            await usage.beside_its_summary(world.database, PROJECT, "F9")
+        monkeypatch.undo()
+        assert desk.read("costs", "F1", "--summary") == {
+            "now": json.loads(json.dumps(now, default=str)),
+            "summary": None,
+        }
+    finally:
+        await calling.close()
+
+
+async def test_costs_with_a_summary_shows_the_frozen_account_the_same_in_text_and_json(
+    database: AsyncConnectionPool, shell: dict[str, str], tmp_path: Path, runner_image: str
+) -> None:
+    """3C-S3-2.4, through the command: a completed feature whose summary has estimates of
+    two price tables and a call Relay could not price. The summary's account of use is
+    put there as `totals_of` writes one; the feature is completed by Relay."""
+    world = CompletionWorld(database, tmp_path, runner_image)
+    world.base = await world.open()
+    await configure(
+        database,
+        workspaces=str(tmp_path.resolve() / "workspaces"),
+        mirrors=str(world.mirrors),
+        image=runner_image,
+    )
+    desk = Desk(world, shell)
+    try:
+        await world.decide(await last_story_at_its_gate(world))
+        assert await world.feature() == "completed"
+        desk.shell["RELAY_PROJECT"] = PROJECT  # delivering leaves the checkout on no branch
+
+        def made(estimated: str | None, table: str | None) -> dict[str, Any]:
+            return {
+                "role": "builder",
+                "state": "applied",
+                "usage": [{"model": "opus", "input_tokens": 10, "output_tokens": 5,
+                           "cache_read_tokens": 9, "cache_write_tokens": 0}],
+                "provider_cost_usd": Decimal("0.05"),
+                "estimated_cost_usd": Decimal(estimated) if estimated else None,
+                "price_table": table,
+            }  # fmt: skip
+
+        usage = totals_of([made("0.04", "A"), made("0.08", "B"), made(None, None)])
+        async with database.connection() as connection:
+            await connection.execute(
+                "UPDATE feature_summaries SET summary = jsonb_set(summary, '{usage}', %s::jsonb)",
+                (json.dumps(usage),),
+            )
+
+        both = desk.read("costs", "F1", "--summary")
+        text = desk.anyone("costs", "F1", "--summary").out
+
+        builder = both["summary"]["by_role"]["builder"]
+        assert "estimated_cost_usd" not in builder
+        assert builder["estimated_by_relay"] == [
+            {"price_table": "A", "usd": "0.04", "calls": 1},
+            {"price_table": "B", "usd": "0.08", "calls": 1},
+        ]
+        assert (builder["calls_with_no_estimate"], builder["cache_read_tokens"]) == (1, 27)
+        assert "price table A): 0.04 USD over 1 call(s)" in text
+        assert "price table B): 0.08 USD over 1 call(s)" in text
+        assert "calls Relay could not estimate: 1" in text and "cache read 27" in text
+        assert "0.12" not in text and "0.12" not in json.dumps(both)
+        assert both["now"]["calls"] == 0  # none of these was a recorded call
+    finally:
+        name_attempts_under("")

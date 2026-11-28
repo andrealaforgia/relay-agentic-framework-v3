@@ -22,6 +22,7 @@ from decimal import Decimal
 from typing import Any
 
 from relay.persistence.database import Pool
+from relay.providers.stream import money_as_reported
 
 COUNTED = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
 UNKNOWN = "unknown"
@@ -92,6 +93,17 @@ def _totals(ended: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _money(value: Any) -> Decimal | None:
+    """An amount Relay recorded, or None if what is there is not one."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        amount = Decimal(str(value))
+    except ArithmeticError, ValueError:
+        return None
+    return amount if amount.is_finite() else None
+
+
 def account_of(calls: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """The account of some calls. Each has its role, its state, what it reported using by
     model billed, its two costs, the price table its estimate was made by, and what the
@@ -113,9 +125,19 @@ def account_of(calls: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             into = parts.setdefault(model, {name: [] for name in (*COUNTED, "charged")})
             for counted in COUNTED:
                 into[counted].append(each.get(counted))
-            said = each.get("provider_cost_usd")
-            if said is None and isinstance(breakdown.get(model), Mapping):
-                said = breakdown[model].get("costUSD")
+            if "provider_cost_usd" in each:
+                # The record's own reading of it, null included: a charge the reader
+                # refused is unknown, and the raw report is not asked again.
+                said = _money(each["provider_cost_usd"])
+            else:
+                # A record made before a model's charge was kept: read from what the
+                # provider sent, by the provider reader's own rule for money.
+                reported = breakdown.get(model)
+                said = (
+                    money_as_reported(reported.get("costUSD"))
+                    if isinstance(reported, Mapping)
+                    else None
+                )
             into["charged"].append(said)
     for model, counters in parts.items():
         for counted in COUNTED:
@@ -125,11 +147,11 @@ def account_of(calls: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         # sum only if it did for every line billed to the model.
         charges = counters["charged"]
         by_model[model]["charged_usd"] = (
-            UNKNOWN
-            if None in charges
-            else _usd(sum((Decimal(str(each)) for each in charges), Decimal(0)))
+            UNKNOWN if None in charges else _usd(sum(charges, Decimal(0)))
         )
-    roles = sorted({str(each["role"]) for each in ended})
+    # Every role that made a call, ended or not: a role whose only call is one nobody
+    # knows the end of has an account, of that.
+    roles = sorted({str(each["role"]) for each in made})
     return {
         # Counted once each, whatever they were billed to; the provider's charge for a
         # whole call is in this total once, and is not the sum of what is under models.
@@ -139,7 +161,16 @@ def account_of(calls: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "calls_that_never_started": len(calls) - len(made),
         # Who spent it (PO-8): each role's own calls, tokens, charges and estimates.
         "by_role": {
-            role: _totals([each for each in ended if each["role"] == role]) for role in roles
+            role: {
+                **_totals([each for each in ended if each["role"] == role]),
+                "calls_in_flight": sum(
+                    1 for each in made if each["role"] == role and each["state"] == "intended"
+                ),
+                "calls_whose_end_is_not_known": sum(
+                    1 for each in made if each["role"] == role and each["state"] == "uncertain"
+                ),
+            }
+            for role in roles
         },
         "by_model": dict(sorted(by_model.items())),
     }
@@ -244,8 +275,17 @@ def account_text(account: Mapping[str, Any]) -> str:
     if account["calls"]:
         lines += _totals_text(account, "  ")
     for role, totals in account["by_role"].items():
-        lines.append(f"  the {_shown(role)}: {totals['calls']} call(s)")
-        lines += _totals_text(totals, "    ")
+        lines.append(
+            f"  the {_shown(role)}: {totals['calls']} call(s)"
+            + (f", and {totals['calls_in_flight']} in flight" if totals["calls_in_flight"] else "")
+            + (
+                f", and {totals['calls_whose_end_is_not_known']} whose end is not known"
+                if totals["calls_whose_end_is_not_known"]
+                else ""
+            )
+        )
+        if totals["calls"]:
+            lines += _totals_text(totals, "    ")
     for model, used in account["by_model"].items():
         lines.append(
             f"  on {_shown(model)}: {used['calls']} call(s), in {used['input_tokens']}, out "
@@ -254,6 +294,43 @@ def account_text(account: Mapping[str, Any]) -> str:
             + ("not said" if used["charged_usd"] == UNKNOWN else f"{used['charged_usd']} USD")
         )
     return "\n".join(lines)
+
+
+NOT_ON_RECORD = "not on record"
+
+
+def frozen_account(summary: Mapping[str, Any]) -> Any:
+    """A stored summary's account of use, as it is shown: in text and in JSON alike. What
+    is stored is not changed. An estimate is shown by the table that made it, with how
+    many of the role's calls have none; a summary written before that was kept shows its
+    one sum with its table said to be not on record, and never as a plain total."""
+    usage = summary.get("usage")
+    if not isinstance(usage, Mapping):
+        return usage
+    by_role: dict[str, Any] = {}
+    for role, totals in dict(usage.get("by_role", {})).items():
+        tables = totals.get("estimated_by_table")
+        if tables is None:
+            estimates: Any = [
+                {
+                    "price_table": NOT_ON_RECORD,
+                    "usd": totals.get("estimated_cost_usd", UNKNOWN),
+                    "calls": NOT_ON_RECORD,
+                }
+            ]
+            unestimated: Any = NOT_ON_RECORD
+        else:
+            estimates = [dict(each) for each in tables]
+            unestimated = totals["calls"] - sum(int(each["calls"]) for each in tables)
+        by_role[role] = {
+            "calls": totals["calls"],
+            "calls_with_no_use_reported": totals.get("calls_with_no_use_reported", 0),
+            **{counted: totals.get(counted, UNKNOWN) for counted in COUNTED},
+            "charged_by_the_provider_usd": totals.get("provider_cost_usd", UNKNOWN),
+            "estimated_by_relay": estimates,
+            "calls_with_no_estimate": unestimated,
+        }
+    return {"calls_not_known_then": usage.get("calls_not_known", 0), "by_role": by_role}
 
 
 async def summary_of(pool: Pool, project_id: str, feature_id: str) -> dict[str, Any] | None:
@@ -268,34 +345,48 @@ async def summary_of(pool: Pool, project_id: str, feature_id: str) -> dict[str, 
     return dict(row["summary"]) if row else None
 
 
+async def beside_its_summary(
+    pool: Pool, project_id: str, feature_id: str
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """A feature's account now, and what its summary froze. The summary is read first:
+    what is frozen then never knows more than what is shown beside it as the present. A
+    name that is no feature is refused before either."""
+    await live_usage(pool, project_id, feature_id)
+    frozen = await summary_of(pool, project_id, feature_id)
+    return await live_usage(pool, project_id, feature_id), frozen
+
+
 def summary_text(frozen: Mapping[str, Any] | None) -> str:
-    """A frozen summary's account of use, for a person. Its estimates are shown by the
-    table that made them where the summary kept that; one written before that was kept
-    says so, and its estimate is not passed off as being of one table."""
+    """A frozen summary's account of use, for a person: the same facts as `frozen_account`."""
     if frozen is None:
         return "the feature has not completed: it has no summary yet"
-    usage = frozen.get("usage")
-    if not isinstance(usage, Mapping):
-        return f"as recorded when the feature completed: {usage}"
+    account = frozen_account(frozen)
+    if not isinstance(account, Mapping):
+        return f"as recorded when the feature completed: {account}"
     lines = [
         "as recorded when the feature completed (never changed afterwards):",
-        f"  calls whose use was not known then: {usage.get('calls_not_known', 0)}",
+        f"  calls whose use was not known then: {account['calls_not_known_then']}",
     ]
-    for role, totals in dict(usage.get("by_role", {})).items():
+    for role, totals in account["by_role"].items():
+        lines.append(f"  the {_shown(role)}: {totals['calls']} call(s)")
         lines.append(
-            f"  the {_shown(role)}: {totals['calls']} call(s), in {totals['input_tokens']}, out "
-            f"{totals['output_tokens']}; charged {totals['provider_cost_usd']}"
+            f"    tokens: in {totals['input_tokens']}, out {totals['output_tokens']}, cache "
+            f"read {totals['cache_read_tokens']}, cache written {totals['cache_write_tokens']}"
         )
-        tables = totals.get("estimated_by_table")
-        if tables is None:
-            lines.append(
-                f"    estimated by Relay (an estimate): {totals['estimated_cost_usd']}. This "
-                "summary was written before estimates were kept by price table: which table, "
-                "or tables, made it is not on record"
-            )
-        for each in tables or ():
-            lines.append(
-                f"    estimated by Relay (an estimate, price table "
-                f"{_shown(each['price_table'])}): {each['usd']} USD over {each['calls']} call(s)"
-            )
+        lines.append(f"    charged by the provider: {totals['charged_by_the_provider_usd']}")
+        for each in totals["estimated_by_relay"]:
+            if each["price_table"] == NOT_ON_RECORD:
+                lines.append(
+                    f"    estimated by Relay (an estimate): {each['usd']}. This summary was "
+                    "written before estimates were kept by price table: which table, or "
+                    "tables, made it is not on record"
+                )
+            else:
+                lines.append(
+                    f"    estimated by Relay (an estimate, price table "
+                    f"{_shown(each['price_table'])}): {each['usd']} USD over "
+                    f"{each['calls']} call(s)"
+                )
+        if totals["calls_with_no_estimate"] not in (0, NOT_ON_RECORD):
+            lines.append(f"    calls Relay could not estimate: {totals['calls_with_no_estimate']}")
     return "\n".join(lines)

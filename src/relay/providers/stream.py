@@ -208,6 +208,11 @@ def _count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def money_as_reported(value: Any) -> Decimal | None:
+    """An amount of money as a provider's report gives it, or None if it is not one."""
+    return _money(value)
+
+
 def _money(value: Any) -> Decimal | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None

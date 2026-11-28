@@ -125,10 +125,27 @@ async def status_in(
                         "owed_for_seconds": int(each["owed_for"]),
                         # Since its grant, where it has one: how long it has been held
                         # is not how long it has been owed.
+                        # Held now only if granted now: work that asked keeps the grant
+                        # it was done under as history, and nobody holds it.
                         "held_for_seconds": (
-                            int(each["held_for"]) if each["held_for"] is not None else None
+                            int(each["held_for"])
+                            if each["state"] == "granted" and each["held_for"] is not None
+                            else None
                         ),
-                        "held_by": str(each["granted_worker"]) if each["taken"] else None,
+                        # By a worker, or by the control plane itself, which takes up a
+                        # red, an integration and a final check under no worker's name.
+                        "holder": (
+                            None
+                            if each["state"] != "granted"
+                            else "worker"
+                            if each["granted_worker"] is not None
+                            else "control plane"
+                        ),
+                        "held_by": (
+                            str(each["granted_worker"])
+                            if each["state"] == "granted" and each["granted_worker"] is not None
+                            else None
+                        ),
                     }
                     if for_the_board
                     else {}

@@ -27,7 +27,13 @@ from relay.application.boundary_runs import Attempt, BoundaryRuns, RunRefused
 from relay.application.inbox import Inbox
 from relay.application.integration import IntegrationRefused
 from relay.application.leadership import AlreadyLed, installation_of
-from relay.application.usage import account_text, live_usage, summary_of, summary_text
+from relay.application.usage import (
+    account_text,
+    beside_its_summary,
+    frozen_account,
+    live_usage,
+    summary_text,
+)
 from relay.cli import deciding, doctor, journal, reading, terminal, watching
 from relay.cli.enrolment import DEFAULT_IMAGE, Asked, CannotEnrol, enrol
 from relay.cli.selection import NoProject, select_project
@@ -724,15 +730,25 @@ async def _costs(asked: argparse.Namespace) -> int:
                 raise LookupError("a summary is a feature's: say which, `relay costs F1 --summary`")
             # A name that is no feature of the project has no account: it is refused,
             # and not answered with an account of nothing.
-            account = await live_usage(pool, project, asked.feature)
-            frozen = await summary_of(pool, project, asked.feature) if asked.summary else None
+            # The summary first, and then now: what is frozen can then never know more
+            # than what is beside it as the present. And a name that is no feature is
+            # refused before either.
+            if asked.summary:
+                account, frozen = await beside_its_summary(pool, project, asked.feature)
+            else:
+                account, frozen = await live_usage(pool, project, asked.feature), None
         except (NoProject, LookupError) as refused:
             print(f"relay: {refused}", file=sys.stderr)
             return 1
     if asked.json:
         print(
             json.dumps(
-                {"now": account, "summary": frozen} if asked.summary else account,
+                {
+                    "now": account,
+                    "summary": frozen_account(frozen) if frozen is not None else None,
+                }
+                if asked.summary
+                else account,
                 indent=2,
                 default=str,
             )
