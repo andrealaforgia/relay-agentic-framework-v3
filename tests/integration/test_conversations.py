@@ -247,3 +247,9 @@ async def test_context_is_what_a_new_session_needs_from_the_record(world: Decisi
         "the Product Owner",
         "zero-rated",
     )
+    # A decision that was replaced is not in force: the one that replaced it is.
+    [first] = await world.column("SELECT decision_id FROM decisions")
+    assert isinstance(first, uuid.UUID)
+    await world.replace(first, "standard-rated after all")
+    [now] = (await conversations.context(pool, PROJECT))["decisions_in_force"]
+    assert (now["decision"], now["text"]) == ("D2", "standard-rated after all")

@@ -7,7 +7,8 @@ Everything it keeps is in the directory `SESSION_STANDIN` names:
   `calls` (tools of the server to call, in order, with their arguments), `say` (its reply,
   where `{results}` is what the calls returned and `{turns}` how many turns this provider
   session has had), and optionally `extra_tool` (a tool it was not given, reported at the
-  start), `no_server` (it starts without the server), `lose_result` (it ends without a
+  start), `missing_tool` (one of the server's it starts without), `say_first` (something
+  it says before it has said what it started with), `no_server` (it starts without the server), `lose_result` (it ends without a
   result) or `fail` (its result is an error).
 - `sessions/<id>.json`: what each provider session was told, turn by turn. A session that
   is not there cannot be resumed, as with the real CLI.
@@ -80,6 +81,10 @@ server = subprocess.Popen(
 sent = 0
 
 
+def emit(event: dict) -> None:
+    print(json.dumps(event), flush=True)
+
+
 def ask(method: str, **params: object) -> dict:
     global sent
     sent += 1
@@ -91,12 +96,16 @@ def ask(method: str, **params: object) -> dict:
     return json.loads(server.stdout.readline())
 
 
-def emit(event: dict) -> None:
-    print(json.dumps(event), flush=True)
-
-
 ask("initialize", protocolVersion="2025-06-18", capabilities={}, clientInfo={"name": "stand-in"})
-offered = [each["name"] for each in ask("tools/list")["result"]["tools"]]
+offered = [
+    each["name"]
+    for each in ask("tools/list")["result"]["tools"]
+    if each["name"] != rule.get("missing_tool")
+]
+if "say_first" in rule:
+    emit(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": rule["say_first"]}]}}
+    )
 emit(
     {
         "type": "system",

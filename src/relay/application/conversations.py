@@ -108,8 +108,9 @@ async def settle_turn(
     envelope: dict[str, Any] | None = None,
 ) -> bool:
     """Settle a turn, once: a turn that is settled already is left as it was settled.
-    A turn that ended with its provider session known leaves that with the conversation,
-    for the next turn to continue."""
+    A turn whose result named its provider session leaves that with the conversation for
+    the next turn to continue, however the turn went: a session that turns out not to be
+    there is found out when it is next asked for, and a new one made."""
     async with pool.connection() as connection, connection.transaction():
         settled = await (
             await connection.execute(
@@ -135,7 +136,7 @@ async def settle_turn(
         ).fetchone()
         if settled is None:
             return False
-        if state == "applied" and provider_session is not None:
+        if provider_session is not None:
             await connection.execute(
                 "UPDATE conversations SET provider_session = %s WHERE conversation_id = %s",
                 (provider_session, settled["conversation_id"]),

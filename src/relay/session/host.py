@@ -246,7 +246,7 @@ async def turn(
     ran: Ran | None = None
     if theirs is not None:
         ran = await call(launch, config, said, resume=theirs, new=new, heard=heard)
-        if ran.never_began and ran.state != "not_started":
+        if ran.never_began:
             # The provider's session could not be continued: it is gone, or was never
             # kept. The turn is made all the same, with a new one (3C-3.8).
             continued, ran = False, None

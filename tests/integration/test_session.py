@@ -210,12 +210,24 @@ async def test_a_run_that_starts_with_more_or_less_than_it_was_given_is_ended(ta
     talk.script(
         {"when": "a shell", "extra_tool": "Bash", "say": "I have a shell."},
         {"when": "no server", "no_server": True, "say": "I have no server."},
+        {"when": "one short", "missing_tool": "prepare", "say": "I cannot prepare."},
+        {
+            "when": "eager",
+            "say_first": "I speak before I say what I have.",
+            "extra_tool": "Bash",
+            "say": "Too late.",
+        },
         {"when": "as given", "say": "As given."},
     )
 
-    await talk.say("with a shell", "with no server", "as given")
+    await talk.say("with a shell", "with no server", "one short", "eager", "as given")
 
-    shell, bare, good = await talk.turns()
+    shell, bare, short, eager, good = await talk.turns()
+    assert short["state"] == "uncertain"
+    assert "without Relay's tools: mcp__relay__prepare" in short["reason"]
+    # Nothing a run says is passed on before what it started with has been seen to be
+    # what it was given.
+    assert eager["state"] == "uncertain" and "I speak before I say what I have." not in talk.heard
     assert shell["state"] == "uncertain" and "tools it was not given: Bash" in shell["reason"]
     assert bare["state"] == "uncertain" and "not relay alone" in bare["reason"]
     assert (shell["reply"], bare["reply"]) == (None, None)
@@ -242,12 +254,34 @@ async def test_a_turn_whose_result_is_lost_is_uncertain_and_the_cost_view_says_s
     assert two["reason"] == "the run ended without a result" and two["provider_cost_usd"] is None
     # A call that ended in an error was a call all the same, and what it cost is kept.
     assert three["provider_cost_usd"] == Decimal("0.002") and three["usage"]
+    # And its provider session, which its result named, is the conversation's still.
+    assert await talk.world.column("SELECT provider_session FROM conversations") == [
+        three["provider_session"]
+    ]
+    assert three["provider_session"] == one["provider_session"]
     account = await live_usage(talk.world.database, PROJECT)
     interpreter = account["by_role"]["interpreter"]
     assert (interpreter["calls"], interpreter["calls_whose_end_is_not_known"]) == (2, 1)
     assert interpreter["charged_by_the_provider"]["usd"] == "0.004"  # what is known
     costs = talk.desk.anyone("costs", "--project", PROJECT).out
     assert "the interpreter: 2 call(s), and 1 whose end is not known" in costs
+
+
+async def test_a_turn_that_went_wrong_is_continued_from_all_the_same(talk: Talk) -> None:
+    """The provider's session a failed turn named is there to be continued: what the
+    person said in that turn is in it, and the next turn does not start again from nothing."""
+    talk.script(
+        {"when": "first", "fail": True, "say": "It went wrong."},
+        {"when": "second", "say": "Turn {turns}."},
+    )
+
+    await talk.say("first", "second")
+
+    failed, continued = talk.launched()
+    assert continued["resumed"] and continued["session"] == failed["session"]
+    assert "Turn 2." in talk.heard
+    one, two = await talk.turns()
+    assert (one["state"], two["state"], two["continued"]) == ("errored", "applied", True)
 
 
 async def test_a_provider_session_that_cannot_be_resumed_is_not_the_end_of_the_conversation(
@@ -413,6 +447,14 @@ def test_relay_session_is_a_conversation_with_a_person_at_a_terminal(talk: Talk)
     assert as_a_model.code == 1 and "needs a person at a terminal" in as_a_model.printed
     assert len(talk.launched()) == 1  # and nothing was launched for it
     assert uuid.UUID(launched["session"])
+    # The person ends the input (Ctrl-D): the conversation ends, and is not asked again.
+    ended = at_a_terminal(
+        ["session", "--project", PROJECT],
+        ["where are we?", "\x04"],
+        talk.desk.shell,
+        talk.desk.here,
+    )
+    assert ended.code == 0 and "ended after 1 turn(s)" in ended.printed
 
 
 async def test_a_feature_is_started_from_an_analysis_only_by_the_person_naming_it(
