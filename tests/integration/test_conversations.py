@@ -210,6 +210,7 @@ async def test_the_persons_own_words_are_kept_against_the_note_they_answered(
     talk = await conversations.open_conversation(pool, PROJECT)
     with pytest.raises(conversations.NotThisConversation):
         await conversations.note_answered(pool, talk, "0")  # nothing has been said yet
+    earlier = await conversations.begin_turn(pool, talk, "Before any question.", MODEL)
     note = await conversations.note_question(pool, talk, " Does it apply to exports? ")
     other = await conversations.note_question(pool, talk, "And to books?")
     first = await conversations.begin_turn(pool, talk, "No, exports are zero-rated.", MODEL)
@@ -235,6 +236,9 @@ async def test_the_persons_own_words_are_kept_against_the_note_they_answered(
     await conversations.begin_turn(pool, again, "hello again", MODEL)
     with pytest.raises(conversations.NotThisConversation, match="no one turn after that note"):
         await conversations.note_answered(pool, again, str(note), "ffffffff")
+    with pytest.raises(conversations.NotThisConversation, match="no one turn after that note"):
+        # Said before the question was thought of: it answers nothing.
+        await conversations.note_answered(pool, again, str(note), str(earlier.turn_id))
     words = await conversations.note_answered(pool, again, str(note)[:23], str(first.turn_id))
 
     assert words == "No, exports are zero-rated."

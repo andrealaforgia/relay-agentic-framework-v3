@@ -9,6 +9,7 @@ Everything it keeps is in the directory `SESSION_STANDIN` names:
   session has had), and optionally `extra_tool` (a tool it was not given, reported at the
   start), `missing_tool` (one of the server's it starts without), `say_first` (something
   it says before it has said what it started with), `vanish` (it ends without a word),
+  `refuse` (it ends in an error before it starts, `saying` something, at a `cost`),
   `no_start` (it never says what it started with), `start_as` and `end_as` (it starts, or
   ends, as another session than the one it was asked to be), `no_server` (it starts without the server), `lose_result` (it ends without a
   result) or `fail` (its result is an error).
@@ -86,6 +87,25 @@ with open(HOME / "launched.jsonl", "a") as launched:
 
 if rule.get("vanish"):
     sys.exit(0)  # launched, and gone without a word
+if "refuse" in rule:
+    # An error before anything is started, as the CLI gives one: with what it says is
+    # wrong, and what it says it cost.
+    print(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "num_turns": 0,
+                "session_id": session,
+                "total_cost_usd": rule["refuse"].get("cost", 0),
+                "modelUsage": {},
+                "errors": [rule["refuse"]["saying"]],
+            }
+        ),
+        flush=True,
+    )
+    sys.exit(1)
 configured = json.loads(Path(following("--mcp-config")).read_text())["mcpServers"]
 [(name, how)] = configured.items()
 server = subprocess.Popen(

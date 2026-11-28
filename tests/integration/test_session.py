@@ -424,12 +424,22 @@ async def test_a_resume_that_ends_without_saying_how_is_one_call_and_not_two(tal
         {"when": "first", "say": "One."},
         {"when": "second", "vanish": True, "say": "(nothing)"},
         {"when": "third", "no_start": True, "say": "A result with no start."},
+        # An error before the start that is not the provider saying it has no such session.
+        {"when": "fourth", "refuse": {"saying": "Not logged in"}},
+        # And one that says so, and says it cost something: then it was a call.
+        {
+            "when": "fifth",
+            "refuse": {"saying": "No conversation found with session ID: x", "cost": 0.01},
+        },
     )
 
-    await talk.say("first", "second", "third")
+    await talk.say("first", "second", "third", "fourth", "fifth")
 
-    assert [each["resumed"] for each in talk.launched()] == [False, True, True]  # three, not five
-    one, two, three = await talk.turns()
+    assert [each["resumed"] for each in talk.launched()] == [False, True, True, True, True]
+    *_, fourth, fifth = await talk.turns()
+    assert (fourth["state"], fourth["reason"]) == ("errored", "error_during_execution")
+    assert fifth["state"] == "errored" and fifth["provider_cost_usd"] == Decimal("0.01")
+    one, two, three, *_ = await talk.turns()
     assert one["state"] == "applied"
     assert (two["state"], two["reason"]) == ("uncertain", "the run ended without a result")
     # A result that came with no start: what it says it used is kept, what it said is
@@ -438,8 +448,8 @@ async def test_a_resume_that_ends_without_saying_how_is_one_call_and_not_two(tal
     assert three["reply"] is None and "A result with no start." not in talk.heard
     assert three["usage"] and three["continued"] is True
     costs = talk.desk.anyone("costs", "--project", PROJECT).out
-    assert "the interpreter: 2 call(s), and 1 whose end is not known" in costs
-    assert "charged by the provider: 0.004 USD over 2 call(s)" in costs
+    assert "the interpreter: 4 call(s), and 1 whose end is not known" in costs
+    assert "charged by the provider: 0.014 USD over 4 call(s)" in costs
 
 
 async def test_a_run_is_held_to_the_session_it_was_asked_to_be(talk: Talk) -> None:
