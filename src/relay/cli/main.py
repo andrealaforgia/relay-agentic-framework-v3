@@ -514,6 +514,7 @@ async def _decide(asked: argparse.Namespace, command: Sequence[str]) -> int:
                     getattr(asked, "target", "") or "",
                     getattr(asked, "text", None),
                     getattr(asked, "reason", None),
+                    getattr(asked, "analysis", None),
                 ):
                     # It decided what it decided, and decides nothing now. No passphrase
                     # is asked for, and what it was about need no longer be there.
@@ -529,6 +530,7 @@ async def _decide(asked: argparse.Namespace, command: Sequence[str]) -> int:
                     getattr(asked, "target", "") or "",
                     getattr(asked, "text", None),
                     getattr(asked, "reason", None),
+                    getattr(asked, "analysis", None),
                 )
             except deciding.CannotDecide:
                 # Sent twice at once: the other one decided while this one was looking,
@@ -543,6 +545,7 @@ async def _decide(asked: argparse.Namespace, command: Sequence[str]) -> int:
                         getattr(asked, "target", "") or "",
                         getattr(asked, "text", None),
                         getattr(asked, "reason", None),
+                        getattr(asked, "analysis", None),
                     )
                 ):
                     print(f"request {asked.request_id}")
@@ -833,11 +836,7 @@ async def _session(asked: argparse.Namespace) -> int:
                 budget_usd=profile.budget_usd or DEFAULT_BUDGET_USD,
                 timeout=profile.timeout,
                 server=host.server_command(project),
-                # What the server needs to find this installation, and nothing it has
-                # no use for.
-                server_environment={
-                    name: value for name, value in os.environ.items() if name.startswith("RELAY_")
-                },
+                server_environment=host.for_the_server(os.environ, Path.cwd()),
                 workdir=journal.journal_file().parent / "session",
             )
             terminal.say(

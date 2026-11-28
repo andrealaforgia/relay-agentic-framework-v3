@@ -247,7 +247,7 @@ It can also help you shape a problem before any feature exists. It keeps its ana
 relay feature start --analysis 2
 ```
 
-Nothing of the conversation is lost when you close it. Its analysis, the questions it meant to ask you and your own words in answer are in Relay's record, and the next session starts from them.
+What matters of a conversation outlasts it. Its analysis, the questions it meant to ask you, your own words in answer and what it prepared are in Relay's record, and the next session starts from them. The rest of what was said is kept too, but a new session is not told an earlier conversation's every word.
 
 ### Your passphrase
 
@@ -272,9 +272,9 @@ Between them they say what is not running, what work is owed and to whom, and wh
 | `waiting for the control plane (relay up)` | Work only the control plane does: running a test, integrating, a final check | Start `relay up` |
 | `waiting for a worker` | No worker of that role is running, or its role has no pass on record | Start the worker; run `relay doctor` |
 | A worker starts and launches nothing | No policy stated, or no boundary pass for the installed CLI | `relay doctor` says which |
-| A **parked call** in the inbox | A call ended and Relay cannot tell how, or several calls gave nothing usable. Relay will not pay for another without you | `relay retry <handle> --reason "..."` to allow one more, or `relay set-aside <handle>` to leave the work stopped |
+| A **parked call** in the inbox | A call ended and Relay cannot tell how, or several calls gave nothing usable. Relay will not pay for another without you | `relay retry <handle>` to allow one more, or `relay set-aside <handle>` to leave the work stopped |
 | A **refused push** in the inbox | Your Git remote refused Relay's push to the trunk | Put the remote right, then `relay retry <handle> --reason "..."` |
-| A **failed final check** in the inbox | The feature's tests did not all pass on the trunk at the end | `relay show <handle>` has what was observed; `relay retry <handle> --reason "..."` runs the check again |
+| A **failed final check** in the inbox | The feature's tests did not all pass on the trunk at the end | `relay show <handle>` has what was observed; `relay retry <handle>` runs the check again |
 | The board says a worker's lock is not held | That worker process has gone. Work it held is picked up again by the control plane | Start a worker of that role |
 | You want a feature to wait | | `relay pause F1 --reason "..."`, later `relay resume F1` |
 | You want a feature gone | It cannot be undone | `relay cancel F1 --reason "..."` |

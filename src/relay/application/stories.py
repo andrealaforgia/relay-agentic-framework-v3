@@ -53,6 +53,7 @@ from relay.domain.identifiers import require_identifier
 from relay.domain.story import (
     HOLDING_THE_SLOT,
     IN_A_PROJECT,
+    IN_A_PROJECT_FROM_AN_ANALYSIS,
     ON_A_FEATURE,
     ON_A_FEATURE_AS_SEEN,
     ON_A_STORY,
@@ -186,7 +187,9 @@ class Stories:
         the receipt says the name. The receipt is committed with the feature: the same
         request sent again is given it again, and starts nothing more."""
         require_human(action.principal)
-        require_well_formed(action, IN_A_PROJECT)
+        require_well_formed(
+            action, IN_A_PROJECT_FROM_AN_ANALYSIS if "analysis" in action.payload else IN_A_PROJECT
+        )
         action = replace(action, target=project_id)
         async with self._pool.connection() as connection, connection.transaction():
             await lock_gate(connection, project_id, exclusive=True)

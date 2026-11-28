@@ -98,9 +98,11 @@ async def resolve(
     target: str,
     text: str | None = None,
     reason: str | None = None,
+    analysis: int | None = None,
 ) -> Decision:
     """What this verb on this target is, as the record has it now. Refuses what cannot be
-    done to it, naming what can."""
+    done to it, naming what can. `analysis`: for a start, the version of the Interpreter's
+    analysis whose words `text` is."""
     # What each verb has a place for, asked before anything else: a word that is taken
     # is shown, decided on and recorded, and a word with no place is refused here,
     # before a code is given for it or a passphrase asked.
@@ -113,15 +115,27 @@ async def resolve(
         if not problem:
             raise CannotDecide("a feature starts from a stated problem")
 
+        started_from = {"problem": problem}
+        if analysis is not None:
+            # Which version was adopted is part of what is confirmed and of what is
+            # recorded: two versions that say the same thing are still two.
+            started_from["analysis"] = str(analysis)
+
         async def start(request_id: str) -> Receipt:
             return await relay.stories.start_feature(
-                project_id,
-                HumanAction(PRODUCT_OWNER, request_id, "", "start", {"problem": problem}),
+                project_id, HumanAction(PRODUCT_OWNER, request_id, "", "start", started_from)
             )
 
+        source = (
+            "this problem"
+            if analysis is None
+            else f"version {analysis} of the Interpreter's analysis, which a model wrote "
+            "and you are adopting as the problem"
+        )
+        named = "" if analysis is None else f":analysis:{analysis}"
         return Decision(
-            verb, f"Start a feature in {project_id} from this problem:\n\n  {visible(problem)}\n",
-            f"{project_id}:start:{problem}", f"start:{problem}", start,
+            verb, f"Start a feature in {project_id} from {source}:\n\n  {visible(problem)}\n",
+            f"{project_id}:start:{problem}{named}", f"start:{problem}{named}", start,
             "", f"start a feature in {project_id}",
         )  # fmt: skip
     if verb in ("pause", "resume", "cancel"):
@@ -393,6 +407,7 @@ async def receipt_on_record(
     target: str,
     text: str | None,
     reason: str | None,
+    analysis: int | None = None,
 ) -> Receipt | None:
     """The receipt the Product Owner's request was given, if it has one and it is this
     request's: asked before a passphrase is asked for, since a request sent again decides
@@ -448,8 +463,15 @@ async def receipt_on_record(
                 named = numbered is not None
             same_target = named and of is not None and of["project_id"] == project_id
     # The same words, trimmed on both sides: an earlier build recorded them as typed.
-    words = ("problem",) if verb == "start" else ("text", "reason")
-    given = {"problem": text, "text": text, "reason": reason}
+    words = ("problem", "analysis") if verb == "start" else ("text", "reason")
+    given = {
+        "problem": text,
+        "text": text,
+        "reason": reason,
+        # The version it was started from, if it was from one: a request for another
+        # version, or for the same words stated by the person, is another request.
+        "analysis": None if analysis is None else str(analysis),
+    }
     same_words = all(
         str(said.get(each, "")).strip() == (given[each] or "").strip() for each in words
     )

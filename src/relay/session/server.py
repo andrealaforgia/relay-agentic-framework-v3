@@ -127,9 +127,18 @@ TOOLS = (
     ),
     Tool(
         "note_answered",
-        "Say which note the Product Owner's last message answered. Relay records their "
-        "own words against it, as they typed them.",
-        _schema(("note",), note={"type": "string", "description": "The note's identity."}),
+        "Say which note the Product Owner answered: with their last message, or in an "
+        "earlier turn that `context` lists beside the note. Relay records their own words "
+        "of that turn against it, as they typed them.",
+        _schema(
+            ("note",),
+            note={"type": "string", "description": "The note's identity."},
+            said_in={
+                "type": "string",
+                "description": "The turn they answered it in, as `context` lists it beside "
+                "the note, if it was an earlier one than their last message.",
+            },
+        ),
     ),
 )
 
@@ -251,9 +260,9 @@ class Server:
             raise Refused(str(no)) from no
         return {"note": str(note), "decided": "nothing"}
 
-    async def _note_answered(self, note: str) -> Any:
+    async def _note_answered(self, note: str, said_in: str | None = None) -> Any:
         try:
-            words = await conversations.note_answered(self._pool, self._conversation, note)
+            words = await conversations.note_answered(self._pool, self._conversation, note, said_in)
         except conversations.NotThisConversation as no:
             raise Refused(str(no)) from no
         return {"note": note, "recorded_as_the_persons_answer": words}

@@ -306,6 +306,9 @@ ON_A_FEATURE_AS_SEEN = {
 }
 # Starting a feature: the problem it starts from, said by the Product Owner.
 IN_A_PROJECT = {"start": frozenset({"problem"})}
+# Or the problem as a version of the Interpreter's analysis states it, which the Product
+# Owner named: the version is part of what they started, and of the record of it.
+IN_A_PROJECT_FROM_AN_ANALYSIS = {"start": frozenset({"problem", "analysis"})}
 
 
 def require_well_formed(

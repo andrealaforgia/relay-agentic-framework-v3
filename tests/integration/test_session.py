@@ -80,6 +80,24 @@ class Talk:
             ]
 
 
+def read(heard: list[str], having: str) -> dict[str, Any]:
+    """The last thing a tool returned, among what the session was heard to say, that has
+    this in it: a reply here is the results of the tools it called, one after another."""
+    decoder, found = json.JSONDecoder(), None
+    for said in heard:
+        at = said.find("{")
+        while 0 <= at < len(said):
+            try:
+                value, end = decoder.raw_decode(said, at)
+            except ValueError:
+                break
+            if isinstance(value, dict) and having in value:
+                found = value
+            at = said.find("{", end)
+    assert found is not None, heard
+    return found
+
+
 def flag(argv: list[str], name: str) -> str:
     return argv[argv.index(name) + 1]
 
@@ -162,6 +180,9 @@ async def test_a_conversation_is_turns_of_one_provider_session_each_a_call_on_re
     assert one["reply"] == "Turn 1: nothing yet." and one["provider_cost_usd"] == Decimal("0.002")
     assert one["usage"][0]["model"] == MODEL and one["estimated_cost_usd"] is not None
     assert any("0.002 USD charged by the provider" in each for each in talk.heard)
+    # As an amount, and not with the noise of the binary fraction it arrived as.
+    noisy = host.Ran("applied", terminal=host.Terminal({"total_cost_usd": 0.0011075000000000002}))
+    assert "0.0011075 USD charged by the provider" in host.cost_line(noisy, talk.launch.prices)
     assert any("an estimate, price table" in each for each in talk.heard)
     account = await live_usage(talk.world.database, PROJECT)
     assert account["by_role"]["interpreter"]["calls"] == 2
@@ -352,8 +373,10 @@ async def test_a_provider_session_that_cannot_be_resumed_is_not_the_end_of_the_c
 async def test_what_the_person_typed_is_kept_when_the_session_ends_before_the_model_replies(
     talk: Talk,
 ) -> None:
-    """3C-3.7: the session is closed after the answer is recorded and before the model
-    replies. A new session is told the note and the person's own words since."""
+    """3C-3.7 and 3C-S4-1.5: the session is closed after the answer is recorded and before
+    the model replies. The person comes back and says something else. A new session is
+    told the note and each thing the person has said since, with the turn it was said
+    in; it names that turn, and the note has the words of it and no others."""
     talk.script(
         {
             "when": "VAT",
@@ -361,7 +384,7 @@ async def test_what_the_person_typed_is_kept_when_the_session_ends_before_the_mo
             "say": "Net or gross today?",
         },
         {"when": "Gross, since March", "lose_result": True, "say": "(never heard)"},
-        {"when": "hello again", "say": "Welcome back."},
+        {"when": "hello again", "calls": [{"tool": "context"}], "say": "{results}"},
     )
     await talk.say("VAT is wrong", "Gross, since March.")
 
@@ -369,12 +392,228 @@ async def test_what_the_person_typed_is_kept_when_the_session_ends_before_the_mo
 
     *_, afresh = talk.launched()
     assert not afresh["resumed"]
-    told = json.loads(afresh["told"].split("\n\n")[1])
-    [note] = told["notes"]
+    [note] = read(talk.heard, "notes")["notes"]
     assert note["outstanding"] is True and note["question"] == "Net or gross today?"
-    # Theirs, as typed, though no model ever read the first of them; and this turn's.
-    assert note["said_by_the_person_since"] == ["Gross, since March.", "hello again"]
-    assert await talk.world.column("SELECT count(*) FROM conversations") == [2]
+    first, second = note["said_by_the_person_since"]
+    assert (first["said"], second["said"]) == ("Gross, since March.", "hello again")
+    talk.script(
+        {
+            "when": "which one",
+            "calls": [
+                {
+                    "tool": "note_answered",
+                    "arguments": {"note": note["note"], "said_in": first["turn"]},
+                },
+                {"tool": "context"},
+            ],
+            "say": "{results}",
+        }
+    )
+    await talk.say("which one did I answer?")
+    [linked] = read(talk.heard, "notes")["notes"]
+    assert linked["outstanding"] is False
+    assert linked["answer_in_the_persons_words"] == "Gross, since March."  # not "hello again"
+    assert await talk.world.column("SELECT answer FROM notes") == ["Gross, since March."]
+
+
+async def test_a_resume_that_ends_without_saying_how_is_one_call_and_not_two(talk: Talk) -> None:
+    """3C-S4-1.1: only the provider's own refusal of a session that is not there is a
+    reason to make the turn again. A resumed run that vanishes may have been a call: it
+    is left as one, uncertain, and nothing more is launched for the turn."""
+    talk.script(
+        {"when": "first", "say": "One."},
+        {"when": "second", "vanish": True, "say": "(nothing)"},
+        {"when": "third", "no_start": True, "say": "A result with no start."},
+    )
+
+    await talk.say("first", "second", "third")
+
+    assert [each["resumed"] for each in talk.launched()] == [False, True, True]  # three, not five
+    one, two, three = await talk.turns()
+    assert one["state"] == "applied"
+    assert (two["state"], two["reason"]) == ("uncertain", "the run ended without a result")
+    # A result that came with no start: what it says it used is kept, what it said is
+    # not passed on, and the turn is not made again.
+    assert three["state"] == "errored" and three["provider_cost_usd"] == Decimal("0.002")
+    assert three["reply"] is None and "A result with no start." not in talk.heard
+    assert three["usage"] and three["continued"] is True
+    costs = talk.desk.anyone("costs", "--project", PROJECT).out
+    assert "the interpreter: 2 call(s), and 1 whose end is not known" in costs
+    assert "charged by the provider: 0.004 USD over 2 call(s)" in costs
+
+
+async def test_a_run_is_held_to_the_session_it_was_asked_to_be(talk: Talk) -> None:
+    """3C-S4-1.2: a run that starts as another session is ended; a result of another
+    session is not the turn's reply, and its session is not the one continued next."""
+    other = "11111111-2222-4333-8444-555555555555"
+    talk.script(
+        {"when": "first", "say": "One."},
+        {"when": "starts as another", "start_as": other, "say": "As another."},
+        {"when": "ends as another", "end_as": other, "say": "Ended as another."},
+        {"when": "last", "say": "Turn {turns}."},
+    )
+
+    await talk.say("first", "starts as another", "ends as another", "last")
+
+    one, started, ended, last = await talk.turns()
+    assert started["state"] == "uncertain" and f"started as session '{other}'" in started["reason"]
+    assert "As another." not in talk.heard
+    assert ended["state"] == "errored" and f"the result is of session '{other}'" in ended["reason"]
+    assert ended["reply"] is None and ended["provider_session"] is None
+    assert ended["provider_cost_usd"] == Decimal("0.002")  # what it used is kept
+    # The conversation still continues the session it had: never the other one.
+    launched = talk.launched()
+    assert {each["session"] for each in launched} == {str(one["provider_session"])}
+    assert last["state"] == "applied" and str(last["provider_session"]) != other
+
+
+async def test_a_result_relay_has_read_is_recorded_though_the_host_is_interrupted(
+    talk: Talk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """3C-S4-1.3: the host is interrupted after the result was read and before it is
+    written down. It is written down, once, with its reply and its charge."""
+    import asyncio
+
+    talk.script({"when": "first", "say": "One."})
+    settle, reached, release = conversations.settle_turn, asyncio.Event(), asyncio.Event()
+
+    async def held(*arguments: Any, **named: Any) -> bool:
+        reached.set()
+        await release.wait()
+        return await settle(*arguments, **named)
+
+    monkeypatch.setattr(conversations, "settle_turn", held)
+    session = asyncio.create_task(talk.say("first"))
+    await asyncio.wait_for(reached.wait(), 30)
+
+    session.cancel()  # Ctrl-C, here
+    await asyncio.sleep(0.2)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await session
+
+    [turn] = await talk.turns()
+    assert (turn["state"], turn["reply"]) == ("applied", "One.")
+    assert turn["provider_cost_usd"] == Decimal("0.002")
+    account = await live_usage(talk.world.database, PROJECT)
+    assert account["by_role"]["interpreter"]["charged_by_the_provider"] == {
+        "usd": "0.002",
+        "calls_it_said_the_cost_of": 1,
+        "calls_it_did_not": 0,
+    }
+    assert await talk.world.column("SELECT closed_at IS NOT NULL FROM conversations") == [True]
+
+
+async def test_a_host_interrupted_while_its_call_runs_leaves_one_uncertain_call(
+    talk: Talk,
+) -> None:
+    """3C-S4-1.3: and interrupted before any result: the call is ended and the turn is
+    left as one nobody knows the end of, not as one still in flight."""
+    import asyncio
+
+    talk.script({"when": "first", "calls": [{"tool": "status"}] * 40, "say": "One."})
+    session = asyncio.create_task(talk.say("first"))
+    async with asyncio.timeout(30):
+        while not talk.launched():
+            await asyncio.sleep(0.05)
+
+    session.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await session
+
+    [turn] = await talk.turns()
+    assert turn["state"] == "uncertain" and turn["ended_at"] is not None
+    assert "interrupted" in turn["reason"] or "without a result" in turn["reason"]
+
+
+async def test_a_new_provider_session_is_told_what_was_said_before(talk: Talk) -> None:
+    """3C-S4-1.6: the first turn discusses two options and records nothing. The
+    provider's transcript is lost. The follow-up is told both sides of the first turn."""
+    talk.script(
+        {"when": "options", "say": "Either a flat rate, or a rate for each country."},
+        {"when": "the second option", "say": "A rate for each country costs more."},
+    )
+
+    def and_the_transcript_is_lost() -> str:
+        for each in (talk.home / "sessions").iterdir():
+            each.unlink()
+        return "What would the second option cost?"
+
+    await talk.say("What are my options for VAT?", and_the_transcript_is_lost)
+
+    *_, afresh = talk.launched()
+    assert not afresh["resumed"]
+    told = afresh["told"]
+    assert '"the_product_owner_said": "What are my options for VAT?"' in told
+    assert '"the_interpreter_replied": "Either a flat rate, or a rate for each country."' in told
+    assert told.endswith("What would the second option cost?")
+    assert "A rate for each country costs more." in talk.heard
+
+
+def test_the_server_is_told_where_the_installation_is_as_a_place_it_can_find(
+    talk: Talk, tmp_path: Path
+) -> None:
+    """3C-S4-1.8: `RELAY_CONFIG=./relay.toml relay session`. The file is named relative to
+    where the person is; the server is started somewhere else, and is given the file."""
+    assert host.for_the_server(
+        {"RELAY_CONFIG": "./relay.toml", "RELAY_PROJECT": "p", "HOME": "/h", "PATH": "/bin"},
+        Path("/somewhere/else"),
+    ) == {"RELAY_CONFIG": "/somewhere/else/relay.toml", "RELAY_PROJECT": "p"}
+    absolute = str(tmp_path.resolve() / "relay.toml")
+    assert host.for_the_server({"RELAY_CONFIG": absolute}, Path("/x")) == {"RELAY_CONFIG": absolute}
+    assert host.for_the_server({"RELAY_PROJECT": "p"}, Path("/x")) == {"RELAY_PROJECT": "p"}
+    # And through the command: everything the installation is found by is in the file.
+    shell = dict(talk.desk.shell)
+    (talk.desk.here / "relay.toml").write_text(
+        "[relay]\n"
+        f'database = "{shell.pop("RELAY_DATABASE_URL")}"\n'
+        f'redis = "{shell.pop("RELAY_REDIS_URL")}"\n'
+        f'schema = "{shell.pop("RELAY_DATABASE_SCHEMA")}"\n'
+    )
+    shell["RELAY_CONFIG"] = "./relay.toml"
+    talk.script({"when": "where are we", "calls": [{"tool": "context"}], "say": "{results}"})
+
+    ran = at_a_terminal(
+        ["session", "--project", PROJECT], ["where are we?", "/quit"], shell, talk.desk.here
+    )
+
+    assert ran.code == 0, ran.printed
+    assert f'"project": "{PROJECT}"' in ran.printed  # the server found the installation
+
+
+async def test_starting_from_an_analysis_is_starting_from_that_version(talk: Talk) -> None:
+    """3C-S4-1.9: two versions that say the same thing are still two. Which one the person
+    adopted is shown to them, said to be a model's, and is part of the request."""
+    world, desk = talk.world, talk.desk
+    desk.shell["RELAY_PROJECT"] = PROJECT
+    same = {"tool": "record_analysis", "arguments": {"text": "VAT is added twice on export."}}
+    talk.script({"when": "VAT", "calls": [same, same], "say": "Recorded twice."})
+    await talk.say("VAT is wrong")
+    assert await world.column("SELECT version FROM analyses ORDER BY version") == [1, 2]
+
+    started = desk.po("feature", "start", "--analysis", "1", "--request-id", "start-from-one")
+
+    assert started.code == 0, started.printed
+    assert "version 1 of the Interpreter's analysis, which a model wrote" in started.shown
+    async with world.database.connection() as connection:
+        row = await (
+            await connection.execute(
+                "SELECT payload FROM human_actions WHERE request_id = 'start-from-one'"
+            )
+        ).fetchone()
+    assert row is not None and row["payload"] == {
+        "problem": "VAT is added twice on export.",
+        "analysis": "1",
+    }
+    again = desk.po("feature", "start", "--analysis", "1", "--request-id", "start-from-one")
+    other = desk.po("feature", "start", "--analysis", "2", "--request-id", "start-from-one")
+    stated = desk.po(
+        "feature", "start", "VAT is added twice on export.", "--request-id", "start-from-one"
+    )
+    assert again.code == 0 and "started F1 (as on record)" in again.printed
+    for different in (other, stated):
+        assert different.code == 1 and "a request for something else" in different.printed
+    assert await world.column("SELECT count(*) FROM features") == [1]
 
 
 async def test_with_no_statement_of_policy_no_session_is_launched(talk: Talk) -> None:
@@ -397,6 +636,7 @@ async def test_a_cli_that_cannot_be_launched_leaves_a_turn_that_never_started(ta
 
     [turn] = await talk.turns()
     assert turn["state"] == "not_started" and "could not be launched" in turn["reason"]
+    assert turn["gives_up_at"] is not None
     assert turn["said"] == "hello"
     account = await live_usage(talk.world.database, PROJECT)
     assert (account["calls"], account["calls_that_never_started"]) == (0, 1)
@@ -410,7 +650,7 @@ async def test_a_turn_left_open_by_a_host_that_died_is_found_by_the_next_session
     await conversations.begin_turn(pool, old, "and then the terminal was closed", MODEL)
     async with pool.connection() as connection:
         await connection.execute(
-            "UPDATE conversation_turns SET started_at = started_at - interval '1 hour'"
+            "UPDATE conversation_turns SET gives_up_at = gives_up_at - interval '1 hour'"
         )
     talk.script({"when": "hello", "say": "hello"})
 
@@ -497,7 +737,7 @@ async def test_the_real_cli_holds_a_conversation_through_relays_server(talk: Tal
     print mode starts with exactly Relay's server and its tools, calls them, and continues
     the session on the next call."""
     world = talk.world
-    await world.roadmap(STANDARD_RATE)
+    gate = await world.roadmap(STANDARD_RATE)
     talk.launch = host.Launch(
         **{**talk.launch.__dict__, "binary": "claude", "environment": dict(os.environ)}
     )
@@ -515,4 +755,18 @@ async def test_the_real_cli_holds_a_conversation_through_relays_server(talk: Tal
     assert await world.column("SELECT text FROM analyses") == ["HERON-4471"]  # through the server
     assert "HERON-4471" in two["reply"]  # and the second call remembered the first
     assert one["provider_cost_usd"] is not None and one["usage"]
+    # And the promised history, through the real session: an item read from the record,
+    # its approval prepared by the model, and the decision made by the person alone.
+    await talk.say(
+        "Call the inbox tool. There is one item, a roadmap. Call the prepare tool to "
+        "propose approving it: action 'approve', of the item's handle, why 'it is what was "
+        "asked for'. Then tell me the code."
+    )
+    [code] = await world.column("SELECT code FROM prepared_actions")
+    assert await world.column("SELECT state FROM gates") == ["open"]  # the model decided nothing
+    assert await world.column("SELECT target, prepared_by FROM prepared_actions") == [str(gate)]
+    assert str(code) in "\n".join(talk.heard)
+    confirmed = talk.desk.po("confirm", str(code))
+    assert confirmed.code == 0, confirmed.printed
+    assert await world.column("SELECT outcome FROM gates") == ["approved"]
     print("\n".join(talk.heard))

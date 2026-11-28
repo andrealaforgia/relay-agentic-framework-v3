@@ -21,6 +21,7 @@ from collections.abc import Mapping, Sequence
 from decimal import Decimal, localcontext
 from typing import Any
 
+from relay.application.conversations import STATE_NOW
 from relay.persistence.database import Pool
 from relay.providers.stream import money_as_reported
 
@@ -236,8 +237,10 @@ async def live_usage(pool: Pool, project_id: str, feature_id: str | None = None)
             # is counted as that, like any call.
             calls += await (
                 await connection.execute(
-                    "SELECT role, state, usage, provider_cost_usd, estimated_cost_usd, "
-                    "price_table, envelope->'modelUsage' AS billed_by_model "
+                    # As it stands now: a turn left open past its own deadline is one
+                    # nobody knows the end of, whoever is or is not there to say so.
+                    f"SELECT role, {STATE_NOW} AS state, usage, provider_cost_usd, "
+                    "estimated_cost_usd, price_table, envelope->'modelUsage' AS billed_by_model "
                     "FROM conversation_turns WHERE project_id = %s ORDER BY started_at",
                     (project_id,),
                 )

@@ -110,19 +110,66 @@ async def test_turns_are_accounted_like_any_call_and_a_lost_one_is_uncertain(
     assert (await live_usage(pool, PROJECT, "F1"))["by_role"] == {}
 
 
-async def test_a_turn_whose_host_died_is_said_to_be_uncertain_once_it_is_old(
+async def test_a_turn_left_open_past_its_own_deadline_is_uncertain_to_whoever_reads_it(
     world: DecisionWorld,
 ) -> None:
+    """3C-S4-1.4: recovery does not wait for somebody to open another session. A turn's
+    deadline is its own, set by the host that made it; past it the cost view says the
+    call's end is not known, with nothing having been written. And a definite result
+    that arrives late replaces "nobody knows", once."""
     pool = world.database
     talk = await conversations.open_conversation(pool, PROJECT)
-    await conversations.begin_turn(pool, talk, "hello", MODEL)
+    quick = await conversations.begin_turn(pool, talk, "hello", MODEL, gives_up_after=0.0)
+    slow = await conversations.begin_turn(pool, talk, "and then", MODEL, gives_up_after=3600.0)
 
-    assert await conversations.give_up_on_turns_left_open(pool, PROJECT, older_than=600) == 0
-    assert await conversations.give_up_on_turns_left_open(pool, PROJECT, older_than=0) == 1
+    account = await live_usage(pool, PROJECT)  # nobody has swept anything
 
-    [row] = await rows(world, "SELECT state, reason, ended_at FROM conversation_turns")
-    assert row["state"] == "uncertain" and "before this turn was settled" in row["reason"]
-    assert row["ended_at"] is not None
+    interpreter = account["by_role"]["interpreter"]
+    assert (interpreter["calls_whose_end_is_not_known"], interpreter["calls_in_flight"]) == (1, 1)
+    assert await world.column("SELECT DISTINCT state FROM conversation_turns") == ["intended"]
+    # Written down by the next session to open: by each turn's own deadline, not by the
+    # limit the new session happens to give its own calls.
+    assert await conversations.give_up_on_turns_left_open(pool, PROJECT) == 1
+    left, open_still = await rows(
+        world, "SELECT state, reason, ended_at FROM conversation_turns ORDER BY number"
+    )
+    assert (left["state"], left["reason"]) == ("uncertain", conversations.LEFT_OPEN)
+    assert left["ended_at"] is not None and open_still["state"] == "intended"
+    assert await conversations.settle_turn(
+        pool, quick.turn_id, "applied", reply="late, and definite", usage=USED,
+        provider_cost_usd=Decimal("0.001"),
+    )  # fmt: skip
+    assert not await conversations.settle_turn(pool, quick.turn_id, "errored", reason="again")
+    [now] = await rows(world, f"SELECT * FROM conversation_turns WHERE turn_id = '{quick.turn_id}'")
+    assert (now["state"], now["reply"]) == ("applied", "late, and definite")
+    after = (await live_usage(pool, PROJECT))["by_role"]["interpreter"]
+    assert (after["calls"], after["calls_whose_end_is_not_known"]) == (1, 0)
+    assert after["charged_by_the_provider"]["usd"] == "0.001"
+    # A turn nobody knows the end of for another reason is not replaced by a guess.
+    await conversations.settle_turn(pool, slow.turn_id, "uncertain", reason="no result")
+    assert not await conversations.settle_turn(pool, slow.turn_id, "applied", reply="?")
+
+
+async def test_two_sessions_recording_at_once_are_each_given_a_version(
+    world: DecisionWorld,
+) -> None:
+    """3C-S4-1.10."""
+    import asyncio
+
+    pool = world.database
+    talks = [await conversations.open_conversation(pool, PROJECT) for _ in range(6)]
+
+    versions = await asyncio.gather(
+        *(
+            conversations.record_analysis(pool, talk, f"analysis by session {number}")
+            for number, talk in enumerate(talks)
+        )
+    )
+
+    assert sorted(versions) == [1, 2, 3, 4, 5, 6]
+    for number, version in enumerate(versions):
+        kept = await conversations.analysis_of(pool, PROJECT, version)
+        assert kept is not None and kept["text"] == f"analysis by session {number}"
 
 
 async def test_an_analysis_is_kept_in_versions_and_decides_nothing(world: DecisionWorld) -> None:
@@ -165,7 +212,7 @@ async def test_the_persons_own_words_are_kept_against_the_note_they_answered(
         await conversations.note_answered(pool, talk, "0")  # nothing has been said yet
     note = await conversations.note_question(pool, talk, " Does it apply to exports? ")
     other = await conversations.note_question(pool, talk, "And to books?")
-    await conversations.begin_turn(pool, talk, "No, exports are zero-rated.", MODEL)
+    first = await conversations.begin_turn(pool, talk, "No, exports are zero-rated.", MODEL)
 
     # The session is closed here, before any model replied (the acceptance history): a
     # new session's context has the note and what the person typed after it.
@@ -177,12 +224,30 @@ async def test_the_persons_own_words_are_kept_against_the_note_they_answered(
         "question": "Does it apply to exports?",
         "written": conversations.WRITTEN_BY,
         "outstanding": True,
-        "said_by_the_person_since": ["No, exports are zero-rated."],
+        "said_by_the_person_since": [
+            {"turn": str(first.turn_id), "said": "No, exports are zero-rated."}
+        ],
     }
 
-    words = await conversations.note_answered(pool, talk, str(note)[:23])
+    # 3C-S4-1.5: the person comes back and says something else first. The answer is
+    # still the words of the turn it was given in, which the Interpreter names.
+    again = await conversations.open_conversation(pool, PROJECT)
+    await conversations.begin_turn(pool, again, "hello again", MODEL)
+    with pytest.raises(conversations.NotThisConversation, match="no one turn after that note"):
+        await conversations.note_answered(pool, again, str(note), "ffffffff")
+    words = await conversations.note_answered(pool, again, str(note)[:23], str(first.turn_id))
 
     assert words == "No, exports are zero-rated."
+    # And with no turn named, it is the turn being made.
+    assert await conversations.note_answered(pool, again, str(other)) == "hello again"
+    [_, latest] = (await conversations.context(pool, PROJECT))["notes"]
+    assert latest["answer_in_the_persons_words"] == "hello again"
+    async with pool.connection() as connection:
+        await connection.execute(
+            "UPDATE notes SET answered_in = NULL, answer = NULL, answered_at = NULL "
+            "WHERE note_id = %s",
+            (other,),
+        )
     [answered, still_open] = (await conversations.context(pool, PROJECT))["notes"]
     assert answered["outstanding"] is False
     assert answered["answer_in_the_persons_words"] == "No, exports are zero-rated."

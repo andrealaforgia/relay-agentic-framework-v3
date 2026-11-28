@@ -23,7 +23,7 @@ import tempfile
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any
 
@@ -93,10 +93,49 @@ class Ran:
     reason: str | None = None
     started: Started | None = None
     terminal: Terminal | None = None
+    # Whether what the run said and the session it named are Relay's to use: it started
+    # with what it was given, as the session it was asked to be, and ended as that one.
+    accepted: bool = False
 
     @property
-    def never_began(self) -> bool:
-        return self.started is None
+    def could_not_resume(self) -> bool:
+        """The provider said, before anything was started or charged, that it has no such
+        session. Only this is a reason to make the turn again with a new one: a run that
+        merely ended without saying how may have been a call, and is left as one."""
+        if self.started is not None or self.terminal is None or self.terminal.succeeded:
+            return False
+        # Nothing charged and nothing used: the real refusal reports a cost of nought and
+        # counters that are all nought, with no turn made.
+        if self.terminal.provider_cost_usd not in (None, Decimal(0)):
+            return False
+        if self.terminal.envelope.get("num_turns") not in (None, 0):
+            return False
+        if any(
+            count
+            for each in self.terminal.usage
+            for count in (
+                each.input_tokens,
+                each.output_tokens,
+                each.cache_read_tokens,
+                each.cache_write_tokens,
+            )
+        ):
+            return False
+        said = json.dumps(self.terminal.envelope.get("errors", ""))
+        return "No conversation found" in said
+
+
+class Abandon:
+    """A way to end a call from outside it: the host was interrupted."""
+
+    def __init__(self) -> None:
+        self.asked, self.group = False, 0
+
+    def now(self) -> None:
+        self.asked = True
+        if self.group:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.group, signal.SIGKILL)
 
 
 def servers(launch: Launch) -> dict[str, Any]:
@@ -157,8 +196,11 @@ async def call(
     resume: uuid.UUID | None,
     new: uuid.UUID,
     heard: Callable[[str], None],
+    abandon: Abandon | None = None,
 ) -> Ran:
-    """One call of the CLI: what it said is passed on as it streams."""
+    """One call of the CLI: what it said is passed on as it streams, once it has started
+    as the session it was asked to be, with what it was given and nothing else."""
+    wanted = str(resume if resume is not None else new)
     try:
         process = await asyncio.create_subprocess_exec(
             *command(launch, config, resume=resume, new=new),
@@ -172,6 +214,10 @@ async def call(
         )
     except OSError as failure:
         return Ran("not_started", f"could not be launched: {failure}")
+    if abandon is not None:
+        abandon.group = process.pid
+        if abandon.asked:
+            abandon.now()
     started: Started | None = None
     terminal: Terminal | None = None
     ended_for: str | None = None
@@ -185,10 +231,15 @@ async def call(
                 process.stdin.close()
                 async for raw in process.stdout:
                     for event in read_line(raw.decode(errors="replace")):
-                        if isinstance(event, Started):
+                        if isinstance(event, Started) and started is None:
                             started = event
-                            ended_for = beyond(event)
-                        elif isinstance(event, Said) and started is not None:
+                            ended_for = beyond(event) or (
+                                None
+                                if event.session_id == wanted
+                                else f"the run started as session {event.session_id!r}, "
+                                f"and was asked to be {wanted}"
+                            )
+                        elif isinstance(event, Said) and started is not None and not ended_for:
                             heard(event.text)
                         elif isinstance(event, Terminal):
                             terminal = event
@@ -202,29 +253,63 @@ async def call(
         with contextlib.suppress(Exception):
             await process.wait()
     if ended_for is not None:
-        # Ended by Relay after it had started: what it did before that nobody can say,
+        # Ended by Relay after it was launched: what it did before that nobody can say,
         # and whatever it was charged is not known.
-        return Ran("uncertain" if started is not None else "errored", ended_for, started)
+        return Ran("uncertain", ended_for, started)
     if terminal is None:
+        # Launched, and gone without saying how it ended: it may have been a call.
         return Ran(
-            "uncertain" if started is not None else "errored",
-            "the run ended without a result",
+            "uncertain",
+            "the host was interrupted and the call ended"
+            if abandon is not None and abandon.asked
+            else "the run ended without a result",
             started,
         )
+    if started is None:
+        # A result from a run that never said what it started with. What it reports
+        # having used is kept; what it says, and the session it names, are not Relay's
+        # to pass on or to continue.
+        return Ran(
+            "errored",
+            terminal.terminal_reason
+            or terminal.subtype
+            or "a result came from a run that never said what it started with",
+            None,
+            terminal,
+        )
+    if terminal.session_id != wanted:
+        return Ran(
+            "errored",
+            f"the result is of session {terminal.session_id!r}, and the call was {wanted}",
+            started,
+            terminal,
+        )
     if terminal.succeeded:
-        return Ran("applied", None, started, terminal)
-    return Ran("errored", terminal.terminal_reason or terminal.subtype, started, terminal)
+        return Ran("applied", None, started, terminal, accepted=True)
+    return Ran(
+        "errored", terminal.terminal_reason or terminal.subtype, started, terminal, accepted=True
+    )
 
 
-def from_the_record(context: Mapping[str, Any], said: str) -> str:
+def from_the_record(
+    context: Mapping[str, Any], earlier: Sequence[Mapping[str, Any]], said: str
+) -> str:
     """What a new provider session is told with the person's words: the conversation as
-    Relay has it, since nothing of an earlier session's transcript comes with it."""
+    Relay has it, since nothing of an earlier session's transcript comes with it. What
+    was said so far in this conversation, both sides, and where things stand."""
+    so_far = (
+        "What has been said in this conversation so far, as Relay recorded it:\n\n"
+        f"{json.dumps(list(earlier), indent=2, default=str)}\n\n"
+        if earlier
+        else ""
+    )
     return (
         "This is a new session of a conversation Relay has on record. What follows is "
         "Relay's record of where things stand, as `context` gives it: the latest analysis, "
         "the notes and the Product Owner's answers to them, what is waiting, and what was "
         "prepared and not yet confirmed.\n\n"
         f"{json.dumps(context, indent=2, default=str)}\n\n"
+        f"{so_far}"
         "The Product Owner now says:\n\n"
         f"{said}"
     )
@@ -239,32 +324,72 @@ async def turn(
     said: str,
     heard: Callable[[str], None],
 ) -> Ran:
-    """One turn: recorded before its call, made, and settled once."""
-    made = await conversations.begin_turn(pool, conversation, said, launch.model)
+    """One turn: recorded before its call, made, and settled once. Once the call has
+    been made its outcome is recorded whatever becomes of this host: an interrupt ends
+    the call, and what is known of it by then is written down before the interrupt is
+    obeyed."""
+    abandon = Abandon()
+    whole = asyncio.ensure_future(
+        _turn(pool, launch, config, conversation, project_id, said, heard, abandon)
+    )
+    try:
+        return await asyncio.shield(whole)
+    except asyncio.CancelledError:
+        abandon.now()
+        with contextlib.suppress(Exception):
+            await asyncio.shield(whole)
+        raise
+
+
+async def _turn(
+    pool: Pool,
+    launch: Launch,
+    config: Path,
+    conversation: uuid.UUID,
+    project_id: str,
+    said: str,
+    heard: Callable[[str], None],
+    abandon: Abandon,
+) -> Ran:
+    made = await conversations.begin_turn(
+        pool, conversation, said, launch.model, gives_up_after=launch.timeout + 60
+    )
     theirs = await conversations.provider_session_of(pool, conversation)
     continued, new = theirs is not None, uuid.uuid4()
     ran: Ran | None = None
     if theirs is not None:
-        ran = await call(launch, config, said, resume=theirs, new=new, heard=heard)
-        if ran.never_began:
-            # The provider's session could not be continued: it is gone, or was never
-            # kept. The turn is made all the same, with a new one (3C-3.8).
+        ran = await call(launch, config, said, resume=theirs, new=new, heard=heard, abandon=abandon)
+        if ran.could_not_resume and not abandon.asked:
+            # The provider's session is not there to continue, and it said so before
+            # anything was started. The turn is made all the same, with a new one
+            # (3C-3.8). Nothing else is a reason to make a second call for one turn.
             continued, ran = False, None
     if ran is None:
-        briefing = from_the_record(await conversations.context(pool, project_id), said)
-        ran = await call(launch, config, briefing, resume=None, new=new, heard=heard)
+        briefing = from_the_record(
+            await conversations.context(pool, project_id),
+            await conversations.turns_before(pool, conversation, made.number),
+            said,
+        )
+        ran = await call(
+            launch, config, briefing, resume=None, new=new, heard=heard, abandon=abandon
+        )
+    # Whatever a result says was used is kept, whether or not the rest of it is.
     used, charged, estimated = (
         use_of(launch.prices, ran.terminal) if ran.terminal is not None else (None, None, None)
     )
-    session = ran.terminal.session_id if ran.terminal is not None else None
     await conversations.settle_turn(
         pool,
         made.turn_id,
         ran.state,
-        reply=ran.terminal.text if ran.terminal is not None else None,
+        reply=ran.terminal.text if ran.terminal is not None and ran.accepted else None,
         reason=ran.reason,
         continued=continued,
-        provider_session=_identity(session),
+        # Continued next time only if it is the session this call was, start to end.
+        provider_session=(
+            _identity(ran.terminal.session_id)
+            if ran.terminal is not None and ran.accepted
+            else None
+        ),
         usage=used,
         provider_cost_usd=charged,
         estimated_cost_usd=estimated,
@@ -281,11 +406,20 @@ def _identity(text: str | None) -> uuid.UUID | None:
         return None
 
 
+def _amount(amount: Decimal) -> Decimal:
+    with localcontext() as context:
+        context.prec = 100
+        return amount.quantize(Decimal("0.00000001")).normalize()
+
+
 def cost_line(ran: Ran, prices: PriceTable) -> str:
     """What a turn cost, as far as it is known (PO-9)."""
     if ran.terminal is None:
         return "this turn's cost is not known"
     _, charged, estimated = use_of(prices, ran.terminal)
+    # To a hundred-millionth of a dollar: not with the noise of a binary fraction.
+    charged = None if charged is None else _amount(charged)
+    estimated = None if estimated is None else _amount(estimated)
     return (
         "this turn: "
         + (f"{charged} USD charged by the provider" if charged is not None else "charge unknown")
@@ -314,7 +448,7 @@ async def converse(
                 "no statement of this host's remote policy has been made, and without one "
                 "no call is launched: state it with `relay policy state`"
             )
-    await conversations.give_up_on_turns_left_open(pool, project_id, launch.timeout + 60)
+    await conversations.give_up_on_turns_left_open(pool, project_id)
     conversation = await conversations.open_conversation(pool, project_id)
     turns = 0
     launch.workdir.mkdir(parents=True, exist_ok=True)
@@ -347,6 +481,16 @@ async def converse(
         finally:
             await conversations.close_conversation(pool, conversation)
     return turns
+
+
+def for_the_server(environ: Mapping[str, str], directory: Path) -> dict[str, str]:
+    """What the server needs to find this installation, and nothing it has no use for. A
+    configuration file named relative to where the person ran the command is given as
+    the file it is: the server is started somewhere else."""
+    told = {name: value for name, value in environ.items() if name.startswith("RELAY_")}
+    if told.get("RELAY_CONFIG"):
+        told["RELAY_CONFIG"] = str((directory / told["RELAY_CONFIG"]).resolve())
+    return told
 
 
 def server_command(project_id: str) -> list[str]:

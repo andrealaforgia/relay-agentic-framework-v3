@@ -67,9 +67,13 @@ async def provider_session_of(pool: Pool, conversation: uuid.UUID) -> uuid.UUID 
     return row["provider_session"]  # type: ignore[no-any-return]
 
 
-async def begin_turn(pool: Pool, conversation: uuid.UUID, said: str, model: str) -> Turn:
+async def begin_turn(
+    pool: Pool, conversation: uuid.UUID, said: str, model: str, gives_up_after: float = 1860.0
+) -> Turn:
     """Record a turn before its call is made: the person's words, as typed, and the call's
-    own fresh identity. Whatever happens to the call, what the person said is on record."""
+    own fresh identity. Whatever happens to the call, what the person said is on record.
+    `gives_up_after` is how long, in seconds, its host allows the call and its settling:
+    past that, a turn still open is one nobody knows the end of."""
     turn = uuid.uuid7()
     async with pool.connection() as connection, connection.transaction():
         of = await (
@@ -83,9 +87,10 @@ async def begin_turn(pool: Pool, conversation: uuid.UUID, said: str, model: str)
         row = await (
             await connection.execute(
                 "INSERT INTO conversation_turns (turn_id, conversation_id, project_id, number, "
-                "said, model) SELECT %s, %s, %s, coalesce(max(number), 0) + 1, %s, %s "
+                "said, model, gives_up_at) SELECT %s, %s, %s, coalesce(max(number), 0) + 1, "
+                "%s, %s, clock_timestamp() + make_interval(secs => %s) "
                 "FROM conversation_turns WHERE conversation_id = %s RETURNING number",
-                (turn, conversation, of["project_id"], said, model, conversation),
+                (turn, conversation, of["project_id"], said, model, gives_up_after, conversation),
             )
         ).fetchone()
     assert row is not None
@@ -117,7 +122,10 @@ async def settle_turn(
                 "UPDATE conversation_turns SET state = %s, reply = %s, reason = %s, "
                 "continued = %s, provider_session = %s, usage = %s, provider_cost_usd = %s, "
                 "estimated_cost_usd = %s, price_table = %s, envelope = %s, "
-                "ended_at = clock_timestamp() WHERE turn_id = %s AND state = 'intended' "
+                "ended_at = clock_timestamp() WHERE turn_id = %s AND (state = 'intended' "
+                # Given up on, and now known after all: a definite result that arrives
+                # late replaces "nobody knows". Nothing replaces a definite result.
+                "OR (state = 'uncertain' AND reason = %s AND %s IN ('applied', 'errored'))) "
                 "RETURNING conversation_id",
                 (
                     state,
@@ -131,6 +139,8 @@ async def settle_turn(
                     price_table,
                     Jsonb(envelope) if envelope is not None else None,
                     turn,
+                    LEFT_OPEN,
+                    state,
                 ),
             )
         ).fetchone()
@@ -144,16 +154,25 @@ async def settle_turn(
     return True
 
 
-async def give_up_on_turns_left_open(pool: Pool, project_id: str, older_than: float) -> int:
-    """A turn whose host died before settling it: nobody knows how its call ended. Said
-    to be so once it is older than any call is allowed to run."""
+LEFT_OPEN = "the session ended before this turn was settled"
+
+# A turn as it stands now, for whoever reads it: one still open past its own deadline is
+# one nobody knows the end of, whether or not anything has written that down yet.
+STATE_NOW = (
+    "CASE WHEN state = 'intended' AND gives_up_at IS NOT NULL "
+    "AND gives_up_at < clock_timestamp() THEN 'uncertain' ELSE state END"
+)
+
+
+async def give_up_on_turns_left_open(pool: Pool, project_id: str) -> int:
+    """Write down what a reader already sees: a turn still open past its own deadline was
+    left by a host that died, and nobody knows how its call ended."""
     async with pool.connection() as connection:
         swept = await connection.execute(
             "UPDATE conversation_turns SET state = 'uncertain', ended_at = clock_timestamp(), "
-            "reason = 'the session ended before this turn was settled' "
-            "WHERE project_id = %s AND state = 'intended' "
-            "AND started_at < clock_timestamp() - make_interval(secs => %s)",
-            (project_id, older_than),
+            "reason = %s WHERE project_id = %s AND state = 'intended' "
+            "AND gives_up_at < clock_timestamp()",
+            (LEFT_OPEN, project_id),
         )
     return swept.rowcount
 
@@ -179,6 +198,9 @@ async def record_analysis(
         raise ValueError("an analysis says something")
     async with pool.connection() as connection, connection.transaction():
         of = await _project_of(connection, conversation)
+        # One at a time for a project: two sessions recording at once are each given a
+        # version of their own, and neither is refused the other's.
+        await connection.execute("SELECT 1 FROM projects WHERE project_id = %s FOR UPDATE", (of,))
         await _feature_of(connection, of, feature_id)
         row = await (
             await connection.execute(
@@ -222,24 +244,18 @@ async def note_question(
     return note
 
 
-async def note_answered(pool: Pool, conversation: uuid.UUID, note: str) -> str:
-    """The Interpreter says which note the person's last words answered. What is recorded
-    against the note is what the person typed in the turn being made, as typed: the model
-    names the note, and has no say in the words. Returns those words."""
+async def note_answered(
+    pool: Pool, conversation: uuid.UUID, note: str, said_in: str | None = None
+) -> str:
+    """The Interpreter says which note the person answered, and in which turn: the turn
+    being made, unless it names an earlier one that `context` listed beside the note.
+    What is recorded against the note is what the person typed in that turn, as typed:
+    the model names the note and the turn, and has no say in the words. Returns them."""
     async with pool.connection() as connection, connection.transaction():
         of = await _project_of(connection, conversation)
-        turn = await (
-            await connection.execute(
-                "SELECT turn_id, said FROM conversation_turns WHERE conversation_id = %s "
-                "ORDER BY number DESC LIMIT 1",
-                (conversation,),
-            )
-        ).fetchone()
-        if turn is None:
-            raise NotThisConversation("nothing has been said in this conversation yet")
         found = await (
             await connection.execute(
-                "SELECT note_id, answered_in FROM notes WHERE project_id = %s "
+                "SELECT note_id, answered_in, noted_at FROM notes WHERE project_id = %s "
                 "AND note_id::text LIKE %s || '%%' FOR UPDATE",
                 (of, note.strip().lower()),
             )
@@ -250,12 +266,65 @@ async def note_answered(pool: Pool, conversation: uuid.UUID, note: str) -> str:
             )
         if found[0]["answered_in"] is not None:
             raise NotThisConversation(f"the note {note!r} has its answer already")
+        if said_in is None:
+            turns = await (
+                await connection.execute(
+                    "SELECT turn_id, said FROM conversation_turns WHERE conversation_id = %s "
+                    "ORDER BY number DESC LIMIT 1",
+                    (conversation,),
+                )
+            ).fetchall()
+            if not turns:
+                raise NotThisConversation("nothing has been said in this conversation yet")
+        else:
+            # A turn of this project, typed after the note was made: one of those
+            # `context` lists beside it, in this conversation or an earlier one.
+            turns = await (
+                await connection.execute(
+                    "SELECT turn_id, said FROM conversation_turns WHERE project_id = %s "
+                    "AND turn_id::text LIKE %s || '%%' AND started_at > %s",
+                    (of, said_in.strip().lower(), found[0]["noted_at"]),
+                )
+            ).fetchall()
+            if len(turns) != 1:
+                raise NotThisConversation(
+                    f"no one turn after that note is {said_in!r}: `context` lists what the "
+                    "person has said since each open note, with the turn it was said in"
+                )
+        [turn] = turns
         await connection.execute(
             "UPDATE notes SET answered_in = %s, answer = %s, answered_at = clock_timestamp() "
             "WHERE note_id = %s",
             (turn["turn_id"], turn["said"], found[0]["note_id"]),
         )
     return str(turn["said"])
+
+
+async def turns_before(
+    pool: Pool, conversation: uuid.UUID, number: int, at_most: int = 30
+) -> list[dict[str, Any]]:
+    """What was said in a conversation before one of its turns, both sides, as Relay has
+    it: the last `at_most` of them, oldest first."""
+    async with pool.connection() as connection:
+        rows = await (
+            await connection.execute(
+                f"SELECT number, said, reply, {STATE_NOW} AS state FROM conversation_turns "
+                "WHERE conversation_id = %s AND number < %s ORDER BY number DESC LIMIT %s",
+                (conversation, number, at_most),
+            )
+        ).fetchall()
+    return [
+        {
+            "turn": each["number"],
+            "the_product_owner_said": each["said"],
+            **(
+                {"the_interpreter_replied": each["reply"]}
+                if each["reply"] is not None
+                else {"no_reply_is_on_record": f"the turn is {each['state']}"}
+            ),
+        }
+        for each in reversed(rows)
+    ]
 
 
 async def _project_of(connection: Any, conversation: uuid.UUID) -> str:
@@ -278,8 +347,8 @@ async def context(pool: Pool, project_id: str) -> dict[str, Any]:
         await connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         features = await (
             await connection.execute(
-                "SELECT feature_id, problem, state FROM features WHERE project_id = %s "
-                "ORDER BY feature_id",
+                "SELECT feature_id, problem, state, closed_by FROM features "
+                "WHERE project_id = %s ORDER BY feature_id",
                 (project_id,),
             )
         ).fetchall()
@@ -303,8 +372,15 @@ async def context(pool: Pool, project_id: str) -> dict[str, Any]:
         prepared = await (
             await connection.execute(
                 "SELECT code, verb, target, said, reason, why, prepared_by, prepared_at, "
-                "expires_at FROM prepared_actions WHERE project_id = %s AND ended IS NULL "
-                "AND consumed_by IS NULL AND expires_at > now() ORDER BY prepared_at",
+                "expires_at, consumed_by FROM prepared_actions p WHERE project_id = %s "
+                "AND ended IS NULL AND ("
+                # Waiting to be confirmed, and still good.
+                "(consumed_by IS NULL AND expires_at > now()) OR "
+                # Or taken by a confirmation that then decided nothing: the command died
+                # between the two. Its code is still the way to finish it, as `relay
+                # confirm` holds, however long ago it was prepared.
+                "(consumed_by IS NOT NULL AND NOT EXISTS (SELECT 1 FROM human_actions h "
+                "WHERE h.request_id = p.consumed_by))) ORDER BY prepared_at",
                 (project_id,),
             )
         ).fetchall()
@@ -320,7 +396,8 @@ async def context(pool: Pool, project_id: str) -> dict[str, Any]:
                 "SELECT n.note_id, n.feature_id, n.text, n.noted_at, n.answer, n.answered_at, "
                 # What the person has typed since an open note was made: theirs, on
                 # record before any call, whether or not a model got to read it.
-                "(SELECT coalesce(jsonb_agg(t.said ORDER BY t.started_at), '[]'::jsonb) "
+                "(SELECT coalesce(jsonb_agg(jsonb_build_object('turn', t.turn_id, "
+                "'said', t.said) ORDER BY t.started_at), '[]'::jsonb) "
                 "FROM conversation_turns t WHERE t.project_id = n.project_id "
                 "AND t.started_at > n.noted_at) AS said_since "
                 "FROM notes n WHERE n.project_id = %s ORDER BY n.noted_at",
@@ -330,7 +407,13 @@ async def context(pool: Pool, project_id: str) -> dict[str, Any]:
     return {
         "project": project_id,
         "features": [
-            {"feature": each["feature_id"], "state": each["state"], "problem": each["problem"]}
+            {
+                "feature": each["feature_id"],
+                # As `relay status` gives it: a paused feature is paused, whatever it
+                # was doing when it was paused.
+                "state": each["closed_by"] or each["state"],
+                "problem": each["problem"],
+            }
             for each in features
         ],
         "decisions_in_force": [
@@ -364,6 +447,12 @@ async def context(pool: Pool, project_id: str) -> dict[str, Any]:
                 "reason": each["reason"],
                 "why": each["why"],
                 "prepared_by": each["prepared_by"],
+                "state": (
+                    "waiting to be confirmed"
+                    if each["consumed_by"] is None
+                    else "a confirmation of it was begun and decided nothing: "
+                    f"`relay confirm {each['code']}` again finishes it"
+                ),
                 "prepared_at": each["prepared_at"].isoformat(),
                 "expires_at": each["expires_at"].isoformat(),
             }

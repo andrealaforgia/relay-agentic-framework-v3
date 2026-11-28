@@ -8,7 +8,9 @@ Everything it keeps is in the directory `SESSION_STANDIN` names:
   where `{results}` is what the calls returned and `{turns}` how many turns this provider
   session has had), and optionally `extra_tool` (a tool it was not given, reported at the
   start), `missing_tool` (one of the server's it starts without), `say_first` (something
-  it says before it has said what it started with), `no_server` (it starts without the server), `lose_result` (it ends without a
+  it says before it has said what it started with), `vanish` (it ends without a word),
+  `no_start` (it never says what it started with), `start_as` and `end_as` (it starts, or
+  ends, as another session than the one it was asked to be), `no_server` (it starts without the server), `lose_result` (it ends without a
   result) or `fail` (its result is an error).
 - `sessions/<id>.json`: what each provider session was told, turn by turn. A session that
   is not there cannot be resumed, as with the real CLI.
@@ -47,10 +49,20 @@ if resumed and not kept.exists():
     print(
         json.dumps(
             {
+                # As CLI 2.1.332 says it, with its counters of nought.
                 "type": "result",
                 "subtype": "error_during_execution",
                 "is_error": True,
+                "num_turns": 0,
                 "session_id": session,
+                "total_cost_usd": 0,
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+                "modelUsage": {},
                 "errors": [f"No conversation found with session ID: {session}"],
             }
         ),
@@ -60,7 +72,10 @@ if resumed and not kept.exists():
 
 told = sys.stdin.read()
 script = json.loads((HOME / "script.json").read_text())
-rule = next((each for each in script if each["when"] in told), {"say": "I have nothing to add."})
+# A rule is chosen by what the person said: the last part of what it was told, when it
+# was told Relay's record first.
+asked = told.rsplit("The Product Owner now says:\n\n", 1)[-1]
+rule = next((each for each in script if each["when"] in asked), {"say": "I have nothing to add."})
 history = json.loads(kept.read_text()) if kept.exists() else []
 history.append(told)
 with open(HOME / "launched.jsonl", "a") as launched:
@@ -69,6 +84,8 @@ with open(HOME / "launched.jsonl", "a") as launched:
         + "\n"
     )
 
+if rule.get("vanish"):
+    sys.exit(0)  # launched, and gone without a word
 configured = json.loads(Path(following("--mcp-config")).read_text())["mcpServers"]
 [(name, how)] = configured.items()
 server = subprocess.Popen(
@@ -106,18 +123,19 @@ if "say_first" in rule:
     emit(
         {"type": "assistant", "message": {"content": [{"type": "text", "text": rule["say_first"]}]}}
     )
-emit(
-    {
-        "type": "system",
-        "subtype": "init",
-        "session_id": session,
-        "model": model,
-        "tools": [f"mcp__{name}__{each}" for each in offered]
-        + ([rule["extra_tool"]] if "extra_tool" in rule else []),
-        "mcp_servers": [] if rule.get("no_server") else [{"name": name, "status": "connected"}],
-        "claude_code_version": VERSION,
-    }
-)
+if not rule.get("no_start"):
+    emit(
+        {
+            "type": "system",
+            "subtype": "init",
+            "session_id": rule.get("start_as", session),
+            "model": model,
+            "tools": [f"mcp__{name}__{each}" for each in offered]
+            + ([rule["extra_tool"]] if "extra_tool" in rule else []),
+            "mcp_servers": [] if rule.get("no_server") else [{"name": name, "status": "connected"}],
+            "claude_code_version": VERSION,
+        }
+    )
 results = []
 for number, each in enumerate(rule.get("calls", [])):
     emit(
@@ -167,7 +185,7 @@ emit(
         "type": "result",
         "subtype": "error_during_execution" if rule.get("fail") else "success",
         "is_error": bool(rule.get("fail")),
-        "session_id": session,
+        "session_id": rule.get("end_as", session),
         "result": said,
         "total_cost_usd": 0.002,
         "modelUsage": {

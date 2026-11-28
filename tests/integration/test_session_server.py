@@ -11,7 +11,7 @@ import pytest
 import redis.asyncio as redis
 from psycopg_pool import AsyncConnectionPool
 
-from relay.application import authority, conversations
+from relay.application import authority, conversations, prepared
 from relay.git.checkout import name_attempts_under
 from relay.runtime import assemble, configure
 from relay.session.server import PROTOCOLS, THE_INTERPRETER, TOOLS, Server, serve
@@ -255,6 +255,36 @@ async def test_an_analysis_and_a_question_outlive_the_session_that_made_them(
     assert after["outstanding"] is False
     assert after["answer_in_the_persons_words"] == "Gross, since March."
     assert "has its answer already" in await new.refused("note_answered", note=note["note"])
+
+
+async def test_context_gives_a_returning_person_the_state_the_commands_give(
+    session: Session,
+) -> None:
+    """3C-S4-1.7: a paused feature is paused; and a confirmation that was begun and then
+    decided nothing is still there to be finished, however long ago it was prepared."""
+    world, desk = session.world, session.desk
+    desk.shell["RELAY_PROJECT"] = PROJECT
+    gate = await world.roadmap(STANDARD_RATE)
+    made = await session.call("prepare", action="approve", of=str(gate), why="as asked")
+    code = made["prepared"]
+    # The confirming command took the code and died before it decided anything.
+    assert await prepared.consume(world.database, code, f"confirm:{code}")
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "UPDATE prepared_actions SET expires_at = now() - interval '2 hours'"
+        )
+
+    told = await session.call("context")
+
+    [begun] = told["prepared_and_not_confirmed"]
+    assert begun["code"] == code and f"`relay confirm {code}` again finishes it" in begun["state"]
+    finished = desk.po("confirm", code)
+    assert finished.code == 0, finished.printed + finished.shown
+    assert (await session.call("context"))["prepared_and_not_confirmed"] == []
+    # And a feature that was paused is given as paused, as `relay status` gives it.
+    assert desk.po("pause", "F1", "--reason", "waiting for the budget").code == 0
+    [feature] = (await session.call("context"))["features"]
+    assert feature["state"] == desk.read("status")["features"][0]["state"] == "paused"
 
 
 async def test_what_is_written_to_the_client_is_the_protocol_and_nothing_else(
