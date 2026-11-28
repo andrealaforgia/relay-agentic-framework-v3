@@ -24,6 +24,19 @@ class NoTerminal(Exception):
 
 def read_secret(prompt: str, terminal: str = TERMINAL) -> str:
     """Show `prompt` on the controlling terminal and read one line from it, unechoed."""
+    typed = _read(prompt, terminal, shown=False)
+    return "" if typed is None else typed
+
+
+def read_line(prompt: str, terminal: str = TERMINAL) -> str | None:
+    """Show `prompt` on the controlling terminal and read one line the person types there,
+    shown as they type it. None when the person ends the input (Ctrl-D): there is no more.
+    A conversation is with a person at a terminal, as a passphrase is: what a model that
+    runs the command puts on standard input is not read."""
+    return _read(prompt, terminal, shown=True)
+
+
+def _read(prompt: str, terminal: str, *, shown: bool) -> str | None:
     try:
         descriptor = os.open(terminal, os.O_RDWR | os.O_NOCTTY)
     except OSError as none:
@@ -37,7 +50,10 @@ def read_secret(prompt: str, terminal: str = TERMINAL) -> str:
         except termios.error as not_one:
             raise NoTerminal(f"{terminal} is not a terminal") from not_one
         quiet = list(before)
-        quiet[3] &= ~termios.ECHO  # what is typed is not shown
+        if shown:
+            quiet[3] |= termios.ECHO
+        else:
+            quiet[3] &= ~termios.ECHO  # what is typed is not shown
         quiet[3] |= termios.ICANON  # and is read a line at a time
         try:
             termios.tcsetattr(descriptor, termios.TCSAFLUSH, quiet)
@@ -51,9 +67,12 @@ def read_secret(prompt: str, terminal: str = TERMINAL) -> str:
         finally:
             with suppress(termios.error):
                 termios.tcsetattr(descriptor, termios.TCSAFLUSH, before)
-            with suppress(OSError):
-                os.write(descriptor, b"\n")
-        return typed.decode().rstrip("\r\n")
+            if not shown:
+                with suppress(OSError):
+                    os.write(descriptor, b"\n")
+        if shown and not typed:
+            return None
+        return typed.decode(errors="replace").rstrip("\r\n")
     finally:
         os.close(descriptor)
 

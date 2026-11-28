@@ -43,14 +43,18 @@ from relay.persistence.database import Pool, migrate, open_pool, schema_state
 from relay.providers.boundary_suite import SuiteResult, run_suite, runtime_now
 from relay.providers.claude import ClaudeAdapter
 from relay.runtime import (
+    DEFAULT_BUDGET_USD,
     ROLES,
     NotConfigured,
     assemble,
     bootstrap,
+    profile_of,
     settings_of,
     stated_policy,
     wake,
 )
+from relay.session import host
+from relay.session.server import Server, serve
 
 
 @asynccontextmanager
@@ -795,6 +799,60 @@ async def _watch(asked: argparse.Namespace) -> int:
     return 0
 
 
+async def _session(asked: argparse.Namespace) -> int:
+    """The Product Owner's conversation with Relay (PO-3), hosted by Relay: a line from the
+    person at their terminal, one call with Relay's own server and no other tool, and so
+    on until they end it. The session reads and prepares. It decides nothing."""
+    async with _opened() as (pool, broker):
+        try:
+            project = await select_project(pool, asked.project, os.environ, Path.cwd())
+            relay = await assemble(pool, broker)
+            profile = profile_of(relay.settings, "interpreter")
+            launch = host.Launch(
+                binary=str(relay.settings.get("cli", "claude")),
+                model=asked.model or profile.model,
+                budget_usd=profile.budget_usd or DEFAULT_BUDGET_USD,
+                timeout=profile.timeout,
+                server=host.server_command(project),
+                # What the server needs to find this installation, and nothing it has
+                # no use for.
+                server_environment={
+                    name: value for name, value in os.environ.items() if name.startswith("RELAY_")
+                },
+                workdir=journal.journal_file().parent / "session",
+            )
+            terminal.say(
+                f"relay session: {project}. The Interpreter reads Relay's record and can "
+                "prepare an action for you to confirm; it decides nothing. End with Ctrl-D "
+                "or /quit.\n"
+            )
+            turns = await host.converse(
+                pool,
+                project,
+                launch,
+                listen=lambda: terminal.read_line("you: "),
+                # What a model wrote, shown a line at a time with nothing in it that
+                # could move the cursor or rewrite what is above.
+                say=lambda text: print(
+                    "\n".join(terminal.visible(line) for line in text.splitlines()), flush=True
+                ),
+            )
+        except (NoProject, NotConfigured, host.NotLaunched, terminal.NoTerminal) as no:
+            print(f"relay: {no}", file=sys.stderr)
+            return 1
+    print(f"relay session: ended after {turns} turn(s). `relay costs` has what they used.")
+    return 0
+
+
+async def _session_server(asked: argparse.Namespace) -> int:
+    """The server a session's calls are given: started by the CLI, for one project and
+    one conversation, speaking the protocol on standard input and output."""
+    async with _opened() as (pool, broker):
+        relay = await assemble(pool, broker)
+        await serve(Server(relay, asked.project, uuid.UUID(asked.conversation)))
+    return 0
+
+
 async def _read(asked: argparse.Namespace) -> int:
     """What may be read by anyone: no terminal, no passphrase, and nothing changed."""
     async with _opened() as (pool, _):
@@ -958,6 +1016,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     confirming = commands.add_parser("confirm", help="take a prepared action, with the passphrase")
     confirming.add_argument("code")
     confirming.add_argument("--project", help=which)
+    talking = commands.add_parser(
+        "session", help="talk to Relay: a conversation that reads and prepares, and decides nothing"
+    )
+    talking.add_argument("--project")
+    talking.add_argument("--model", help="the model for this session, instead of the profile's")
+    # Started by a session's own calls, not by a person: it speaks a protocol.
+    serving = commands.add_parser("session-server")
+    serving.add_argument("--project", required=True)
+    serving.add_argument("--conversation", required=True)
     feature = commands.add_parser("feature", help="a feature")
     of_feature = feature.add_subparsers(dest="doing", required=True)
     starting = of_feature.add_parser("start", help="start a feature from a stated problem")
@@ -988,6 +1055,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(_watch(asked))
         if asked.command == "prepare":
             return asyncio.run(_prepare(asked))
+        if asked.command == "session":
+            return asyncio.run(_session(asked))
+        if asked.command == "session-server":
+            return asyncio.run(_session_server(asked))
         if asked.command == "confirm":
             return asyncio.run(_confirm(asked, given))
         if getattr(asked, "verb", None):
