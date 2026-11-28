@@ -59,6 +59,8 @@ def test_a_zero_that_was_reported_is_a_zero_and_everything_reported_is_summed() 
         "cache_write_tokens": 0,
         "provider_cost_usd": "0.02",
         "estimated_cost_usd": "0.02",
+        # By the table that made each estimate: here none was said, which is said.
+        "estimated_by_table": [{"price_table": "unknown", "usd": "0.02", "calls": 2}],
     }
 
 

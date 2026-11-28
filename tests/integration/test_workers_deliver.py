@@ -333,7 +333,12 @@ async def test_a_features_summary_says_what_its_calls_used_by_role_as_known_when
         "provider_cost_usd": "0.03",
         "estimated_cost_usd": usage["by_role"]["verifier"]["estimated_cost_usd"],
         "calls_with_no_use_reported": 0,
+        "estimated_by_table": usage["by_role"]["verifier"]["estimated_by_table"],
     }
+    # 3C-S3-1.6: frozen by the table that made them, one table here, and they are the sum.
+    [by_table] = usage["by_role"]["verifier"]["estimated_by_table"]
+    assert by_table["calls"] == 3 and by_table["price_table"] != "unknown"
+    assert by_table["usd"] == usage["by_role"]["verifier"]["estimated_cost_usd"]
     assert usage["by_role"]["verifier"]["estimated_cost_usd"] != "unknown"
     assert usage["by_role"]["analyst"]["calls"] == 2
     # 3B-S4-1.12: the call that was in flight reports afterwards. The summary keeps what
@@ -349,7 +354,12 @@ async def test_a_features_summary_says_what_its_calls_used_by_role_as_known_when
     assert Decimal(live["charged_by_the_provider"]["usd"]) == Decimal(
         before["charged_by_the_provider"]["usd"]
     ) + Decimal("0.02")
-    assert live["by_role"]["qa"] == 2 and live["calls_with_no_use_reported"] == 1  # sentinel's
+    assert live["by_role"]["qa"]["calls"] == 2
+    assert live["calls_with_no_use_reported"] == 1  # the Sentinel's, which said nothing
+    # PO-8: each role's own spend, the late report in the role that made it.
+    assert Decimal(live["by_role"]["qa"]["charged_by_the_provider"]["usd"]) == Decimal("0.03")
+    assert live["by_role"]["sentinel"]["charged_by_the_provider"]["usd"] == "unknown"
+    assert live["by_role"]["verifier"]["input_tokens"] == 300
     assert (await live_usage(world.database, PROJECT))["calls"] == live["calls"]  # one feature
     now = await world.features.usage_of(PROJECT, "F1")
     assert (await world.summary()) == summary
@@ -365,4 +375,5 @@ async def test_a_features_summary_says_what_its_calls_used_by_role_as_known_when
         "provider_cost_usd": "unknown",
         "estimated_cost_usd": "unknown",
         "calls_with_no_use_reported": 1,
+        "estimated_by_table": [],
     }

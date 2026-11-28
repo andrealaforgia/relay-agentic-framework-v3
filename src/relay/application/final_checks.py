@@ -671,8 +671,8 @@ async def _usage(connection: Connection, project_id: str, feature_id: str) -> An
     A feature none of whose work was a recorded call says only that: unknown."""
     calls = await (
         await connection.execute(
-            "SELECT v.role, v.state, v.usage, v.provider_cost_usd, v.estimated_cost_usd "
-            "FROM invocations v JOIN assignments a USING (assignment_id) "
+            "SELECT v.role, v.state, v.usage, v.provider_cost_usd, v.estimated_cost_usd, "
+            "v.price_table FROM invocations v JOIN assignments a USING (assignment_id) "
             "WHERE a.project_id = %s AND a.feature_id = %s AND v.state <> 'not_started' "
             "ORDER BY v.role, v.started_at",
             (project_id, feature_id),
@@ -691,6 +691,7 @@ def totals_of(calls: Sequence[Mapping[str, Any]]) -> Any:
     # call, and None for whatever was not reported. A total is a total only if nothing
     # that goes into it is missing; a reported zero is a zero.
     parts: dict[str, dict[str, list[Any]]] = {}
+    tables: dict[str, dict[str, list[Decimal]]] = {}
     not_known = 0
     for call in calls:
         if call["state"] in ("intended", "uncertain"):
@@ -713,7 +714,21 @@ def totals_of(calls: Sequence[Mapping[str, Any]]) -> Any:
             into[counted] += [billed.get(counted) for billed in call["usage"] or ()] or [None]
         for cost in ("provider_cost_usd", "estimated_cost_usd"):
             into[cost].append(call[cost])
+        if call["estimated_cost_usd"] is not None:
+            # By the table that made it: a feature whose calls span a change of prices
+            # has estimates of two tables, and they are not one sum of one provenance.
+            tables.setdefault(call["role"], {}).setdefault(
+                str(call.get("price_table") or "unknown"), []
+            ).append(Decimal(call["estimated_cost_usd"]))
     for name, role in by_role.items():
+        role["estimated_by_table"] = [
+            {
+                "price_table": table,
+                "usd": f"{sum(amounts, Decimal(0)).quantize(Decimal('0.00000001')).normalize():f}",
+                "calls": len(amounts),
+            }
+            for table, amounts in sorted(tables.get(name, {}).items())
+        ]
         for counted in _COUNTED:
             each = parts[name][counted]
             role[counted] = "unknown" if None in each else sum(each)

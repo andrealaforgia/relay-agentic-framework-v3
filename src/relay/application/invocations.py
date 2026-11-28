@@ -451,6 +451,12 @@ class Invocations:
                 "cache_write_tokens": each.cache_write_tokens,
                 "cache_write_5m_tokens": each.cache_write_5m_tokens,
                 "cache_write_1h_tokens": each.cache_write_1h_tokens,
+                # What the provider said this model's part of the call cost, where it
+                # said: the call's whole cost is kept beside this, and is not their sum
+                # unless the provider made it so.
+                "provider_cost_usd": (
+                    str(each.provider_cost_usd) if each.provider_cost_usd is not None else None
+                ),
             }
             for each in used
         ]

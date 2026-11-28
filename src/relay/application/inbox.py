@@ -156,165 +156,170 @@ class Inbox:
 
     async def items(self, project_id: str) -> list[Item]:
         """What is waiting for the Product Owner in a project, longest-waiting first."""
-        found: list[Item] = []
         async with self._pool.connection() as connection:
-            gates = await (
+            return await items_in(connection, project_id)
+
+
+async def items_in(connection: Connection, project_id: str) -> list[Item]:
+    """The same, read on the caller's connection: in the caller's snapshot, if it has one."""
+    found: list[Item] = []
+    gates = await (
+        await connection.execute(
+            "SELECT g.gate_id, g.kind, g.feature_id, g.story_id, g.manifest, "
+            "g.manifest_digest, i.opened_at FROM inbox_items i JOIN gates g USING (gate_id) "
+            "WHERE i.project_id = %s AND i.state = 'open' AND g.state = 'open'",
+            (project_id,),
+        )
+    ).fetchall()
+    for gate in gates:
+        observed: dict[str, Any] = {}
+        if gate["kind"] == "completion":
+            kind, about = FINAL_CHECK, f"the final check of {gate['feature_id']} failed"
+            actions = ACTIONS[FINAL_CHECK]
+            # What each check was to produce and what the oracle saw it produce:
+            # the two things a person weighs between checking again and changing
+            # the roadmap.
+            runs = await (
                 await connection.execute(
-                    "SELECT g.gate_id, g.kind, g.feature_id, g.story_id, g.manifest, "
-                    "g.manifest_digest, i.opened_at FROM inbox_items i JOIN gates g USING (gate_id) "
-                    "WHERE i.project_id = %s AND i.state = 'open' AND g.state = 'open'",
-                    (project_id,),
+                    "SELECT o.name, o.contract, r.satisfied, e.exit_code, e.stdout, "
+                    "e.stderr, e.ineligibility FROM completion_receipts r JOIN obligations o "
+                    "USING (obligation_id) JOIN executions e USING (execution_id) "
+                    "WHERE r.batch_id = %s ORDER BY o.name",
+                    (gate["manifest"].get("batch_id"),),
                 )
             ).fetchall()
-            for gate in gates:
-                observed: dict[str, Any] = {}
-                if gate["kind"] == "completion":
-                    kind, about = FINAL_CHECK, f"the final check of {gate['feature_id']} failed"
-                    actions = ACTIONS[FINAL_CHECK]
-                    # What each check was to produce and what the oracle saw it produce:
-                    # the two things a person weighs between checking again and changing
-                    # the roadmap.
-                    runs = await (
-                        await connection.execute(
-                            "SELECT o.name, o.contract, r.satisfied, e.exit_code, e.stdout, "
-                            "e.stderr, e.ineligibility FROM completion_receipts r JOIN obligations o "
-                            "USING (obligation_id) JOIN executions e USING (execution_id) "
-                            "WHERE r.batch_id = %s ORDER BY o.name",
-                            (gate["manifest"].get("batch_id"),),
-                        )
-                    ).fetchall()
-                    observed = {
-                        "observed": [
-                            {
-                                "check": run["name"],
-                                "satisfied": run["satisfied"],
-                                "expected": run["contract"].get("expect"),
-                                "ran": run["contract"].get("launch"),
-                                # Why the run does not count, where the oracle said so:
-                                # a run that timed out has no exit status and may have
-                                # printed nothing, and that is the whole explanation.
-                                "why_the_run_does_not_count": run["ineligibility"],
-                                "exit_code": run["exit_code"],
-                                "stdout": _text(run["stdout"]),
-                                "stderr": _text(run["stderr"]),
-                            }
-                            for run in runs
-                        ]
+            observed = {
+                "observed": [
+                    {
+                        "check": run["name"],
+                        "satisfied": run["satisfied"],
+                        "expected": run["contract"].get("expect"),
+                        "ran": run["contract"].get("launch"),
+                        # Why the run does not count, where the oracle said so:
+                        # a run that timed out has no exit status and may have
+                        # printed nothing, and that is the whole explanation.
+                        "why_the_run_does_not_count": run["ineligibility"],
+                        "exit_code": run["exit_code"],
+                        "stdout": _text(run["stdout"]),
+                        "stderr": _text(run["stderr"]),
                     }
-                else:
-                    kind = GATE
-                    about = {
-                        "roadmap": f"the roadmap of {gate['feature_id']}",
-                        "story": f"story {gate['story_id']} of {gate['feature_id']}",
-                        "supersession": f"a replacement in {gate['feature_id']}",
-                    }[gate["kind"]]
-                    actions = ACTIONS[GATE] + (("reject",) if gate["kind"] == "story" else ())
-                found.append(
-                    Item(
-                        str(gate["gate_id"]),
-                        kind,
-                        about,
-                        gate["feature_id"],
-                        {
-                            "gate": gate["kind"],
-                            "story": gate["story_id"],
-                            **gate["manifest"],
-                            **observed,
-                        },
-                        actions,
-                        str(gate["manifest_digest"]),
-                        gate["opened_at"].isoformat(timespec="seconds"),
-                    )
-                )
-            questions = await (
-                await connection.execute(
-                    "SELECT q.question_id, q.feature_id, q.scope_story, q.asked_by, q.text, "
-                    "q.why, q.options, i.opened_at FROM inbox_items i JOIN questions q "
-                    "USING (question_id) WHERE i.project_id = %s AND i.state = 'open' "
-                    "AND q.state = 'open'",
-                    (project_id,),
-                )
-            ).fetchall()
-            for question in questions:
-                evidence = {
-                    "text": question["text"],
-                    "why": question["why"],
-                    "options": list(question["options"]),
-                    "asked_by": question["asked_by"],
-                    "story": question["scope_story"] or None,
-                }
-                found.append(
-                    Item(
-                        str(question["question_id"]),
-                        QUESTION,
-                        f"a question from the {question['asked_by']} in {question['feature_id']}",
-                        question["feature_id"],
-                        evidence,
-                        ACTIONS[QUESTION],
-                        _basis({"question": str(question["question_id"]), **evidence}),
-                        question["opened_at"].isoformat(timespec="seconds"),
-                    )
-                )
-            parked = await (
-                await connection.execute(
-                    "SELECT v.invocation_id, i.opened_at FROM inbox_items i JOIN invocations v "
-                    "USING (invocation_id) JOIN assignments a USING (assignment_id) "
-                    "WHERE i.project_id = %s AND i.state = 'open' AND i.kind = 'invocation' "
-                    "AND a.state IN ('wanted', 'granted')",
-                    (project_id,),
-                )
-            ).fetchall()
-            for call in parked:
-                about_call = await parked_evidence(connection, call["invocation_id"])
-                assert about_call is not None
-                found.append(
-                    Item(
-                        str(call["invocation_id"]),
-                        PARKED_CALL,
-                        f"the {about_call['role']}'s {about_call['work']} is stopped",
-                        about_call["feature"],
-                        about_call,
-                        ACTIONS[PARKED_CALL],
-                        parked_basis(call["invocation_id"], about_call),
-                        call["opened_at"].isoformat(timespec="seconds"),
-                    )
-                )
-            refused = await (
-                await connection.execute(
-                    # A behaviour's latest intent, refused, with the behaviour blocked on
-                    # it: once a person has allowed a retry the behaviour is no longer
-                    # blocked, and a later refusal is another intent and another item.
-                    "SELECT i.intent_id, i.behaviour_id, i.candidate_revision, i.expected_trunk, "
-                    "i.trunk, i.reason, i.created_at, i.sends_started FROM integration_intents i "
-                    "JOIN behaviours b USING (project_id, behaviour_id) "
-                    "WHERE i.project_id = %s AND i.state = 'rejected' AND b.state = 'blocked' "
-                    "AND i.created_at = (SELECT max(x.created_at) FROM integration_intents x "
-                    "WHERE x.project_id = i.project_id AND x.behaviour_id = i.behaviour_id)",
-                    (project_id,),
-                )
-            ).fetchall()
-            for push in refused:
-                evidence = {
-                    "behaviour": push["behaviour_id"],
-                    "candidate": push["candidate_revision"],
-                    "onto": push["expected_trunk"],
-                    "branch": push["trunk"],
-                    "what_the_repository_said": push["reason"],
-                    "sends_made": int(push["sends_started"]),
-                }
-                found.append(
-                    Item(
-                        str(push["intent_id"]),
-                        REFUSED_PUSH,
-                        f"the repository refused {push['behaviour_id']} onto {push['trunk']}",
-                        None,
-                        evidence,
-                        ACTIONS[REFUSED_PUSH],
-                        _basis({"intent": str(push["intent_id"]), **evidence}),
-                        push["created_at"].isoformat(timespec="seconds"),
-                    )
-                )
-        return [
-            dataclasses.replace(each, handle=_handle(each.item_id, found))
-            for each in sorted(found, key=lambda each: (each.waiting_since, each.item_id))
-        ]
+                    for run in runs
+                ]
+            }
+        else:
+            kind = GATE
+            about = {
+                "roadmap": f"the roadmap of {gate['feature_id']}",
+                "story": f"story {gate['story_id']} of {gate['feature_id']}",
+                "supersession": f"a replacement in {gate['feature_id']}",
+            }[gate["kind"]]
+            actions = ACTIONS[GATE] + (("reject",) if gate["kind"] == "story" else ())
+        found.append(
+            Item(
+                str(gate["gate_id"]),
+                kind,
+                about,
+                gate["feature_id"],
+                {
+                    "gate": gate["kind"],
+                    "story": gate["story_id"],
+                    **gate["manifest"],
+                    **observed,
+                },
+                actions,
+                str(gate["manifest_digest"]),
+                gate["opened_at"].isoformat(timespec="seconds"),
+            )
+        )
+    questions = await (
+        await connection.execute(
+            "SELECT q.question_id, q.feature_id, q.scope_story, q.asked_by, q.text, "
+            "q.why, q.options, i.opened_at FROM inbox_items i JOIN questions q "
+            "USING (question_id) WHERE i.project_id = %s AND i.state = 'open' "
+            "AND q.state = 'open'",
+            (project_id,),
+        )
+    ).fetchall()
+    for question in questions:
+        evidence = {
+            "text": question["text"],
+            "why": question["why"],
+            "options": list(question["options"]),
+            "asked_by": question["asked_by"],
+            "story": question["scope_story"] or None,
+        }
+        found.append(
+            Item(
+                str(question["question_id"]),
+                QUESTION,
+                f"a question from the {question['asked_by']} in {question['feature_id']}",
+                question["feature_id"],
+                evidence,
+                ACTIONS[QUESTION],
+                _basis({"question": str(question["question_id"]), **evidence}),
+                question["opened_at"].isoformat(timespec="seconds"),
+            )
+        )
+    parked = await (
+        await connection.execute(
+            "SELECT v.invocation_id, i.opened_at FROM inbox_items i JOIN invocations v "
+            "USING (invocation_id) JOIN assignments a USING (assignment_id) "
+            "WHERE i.project_id = %s AND i.state = 'open' AND i.kind = 'invocation' "
+            "AND a.state IN ('wanted', 'granted')",
+            (project_id,),
+        )
+    ).fetchall()
+    for call in parked:
+        about_call = await parked_evidence(connection, call["invocation_id"])
+        assert about_call is not None
+        found.append(
+            Item(
+                str(call["invocation_id"]),
+                PARKED_CALL,
+                f"the {about_call['role']}'s {about_call['work']} is stopped",
+                about_call["feature"],
+                about_call,
+                ACTIONS[PARKED_CALL],
+                parked_basis(call["invocation_id"], about_call),
+                call["opened_at"].isoformat(timespec="seconds"),
+            )
+        )
+    refused = await (
+        await connection.execute(
+            # A behaviour's latest intent, refused, with the behaviour blocked on
+            # it: once a person has allowed a retry the behaviour is no longer
+            # blocked, and a later refusal is another intent and another item.
+            "SELECT i.intent_id, i.behaviour_id, i.candidate_revision, i.expected_trunk, "
+            "i.trunk, i.reason, i.created_at, i.sends_started FROM integration_intents i "
+            "JOIN behaviours b USING (project_id, behaviour_id) "
+            "WHERE i.project_id = %s AND i.state = 'rejected' AND b.state = 'blocked' "
+            "AND i.created_at = (SELECT max(x.created_at) FROM integration_intents x "
+            "WHERE x.project_id = i.project_id AND x.behaviour_id = i.behaviour_id)",
+            (project_id,),
+        )
+    ).fetchall()
+    for push in refused:
+        evidence = {
+            "behaviour": push["behaviour_id"],
+            "candidate": push["candidate_revision"],
+            "onto": push["expected_trunk"],
+            "branch": push["trunk"],
+            "what_the_repository_said": push["reason"],
+            "sends_made": int(push["sends_started"]),
+        }
+        found.append(
+            Item(
+                str(push["intent_id"]),
+                REFUSED_PUSH,
+                f"the repository refused {push['behaviour_id']} onto {push['trunk']}",
+                None,
+                evidence,
+                ACTIONS[REFUSED_PUSH],
+                _basis({"intent": str(push["intent_id"]), **evidence}),
+                push["created_at"].isoformat(timespec="seconds"),
+            )
+        )
+    return [
+        dataclasses.replace(each, handle=_handle(each.item_id, found))
+        for each in sorted(found, key=lambda each: (each.waiting_since, each.item_id))
+    ]

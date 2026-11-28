@@ -7,7 +7,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
-from relay.application.inbox import Inbox, Item
+from relay.application.inbox import Item, items_in
 from relay.cli.terminal import visible
 from relay.persistence.database import Pool
 
@@ -16,45 +16,60 @@ async def status(pool: Pool, project_id: str) -> dict[str, Any]:
     """Each feature and where it stands, with its stories and their behaviours; what is
     owed and to whom; and how much is waiting for the Product Owner."""
     async with pool.connection() as connection:
-        features = await (
-            await connection.execute(
-                "SELECT feature_id, problem, state, closed_by FROM features "
-                "WHERE project_id = %s ORDER BY feature_id",
-                (project_id,),
-            )
-        ).fetchall()
-        stories = await (
-            await connection.execute(
-                "SELECT story_id, feature_id, title, state FROM stories "
-                "WHERE project_id = %s AND state <> 'withdrawn' ORDER BY position, story_id",
-                (project_id,),
-            )
-        ).fetchall()
-        behaviours = await (
-            await connection.execute(
-                "SELECT behaviour_id, story_id, summary, state FROM behaviours "
-                "WHERE project_id = %s ORDER BY behaviour_id",
-                (project_id,),
-            )
-        ).fetchall()
-        owed = await (
-            await connection.execute(
-                # Who can act on each, read from what is open now and not from the state
-                # the work was left in: work that asked is waiting only while its
-                # question is open, and work stopped on a call is waiting for a person
-                # only while a person is still being asked about it.
-                "SELECT a.kind, a.role, a.state, a.feature_id, a.story_id, a.behaviour_id, "
-                "a.parked, a.grant_id IS NOT NULL AS taken, "
-                "EXISTS (SELECT 1 FROM questions q WHERE q.asked_for = a.assignment_id "
-                "AND q.state = 'open') AS asking, "
-                "EXISTS (SELECT 1 FROM inbox_items i JOIN invocations v USING (invocation_id) "
-                "WHERE v.assignment_id = a.assignment_id AND i.state = 'open') AS asked_about "
-                "FROM assignments a WHERE a.project_id = %s "
-                "AND a.state IN ('wanted', 'granted', 'asked') ORDER BY a.created_at",
-                (project_id,),
-            )
-        ).fetchall()
-    waiting = await Inbox(pool).items(project_id)
+        return await status_in(connection, project_id)
+
+
+async def status_in(
+    connection: Any, project_id: str, *, for_the_board: bool = False
+) -> dict[str, Any]:
+    """The same, read on the caller's connection. For the board, each piece of work owed
+    also has its own identity, how long it has been owed and held, and who holds it."""
+    features = await (
+        await connection.execute(
+            "SELECT feature_id, problem, state, closed_by FROM features "
+            "WHERE project_id = %s ORDER BY feature_id",
+            (project_id,),
+        )
+    ).fetchall()
+    stories = await (
+        await connection.execute(
+            "SELECT story_id, feature_id, title, state FROM stories "
+            "WHERE project_id = %s AND state <> 'withdrawn' ORDER BY position, story_id",
+            (project_id,),
+        )
+    ).fetchall()
+    behaviours = await (
+        await connection.execute(
+            "SELECT behaviour_id, story_id, summary, state FROM behaviours "
+            "WHERE project_id = %s ORDER BY behaviour_id",
+            (project_id,),
+        )
+    ).fetchall()
+    owed = await (
+        await connection.execute(
+            # Who can act on each, read from what is open now and not from the state
+            # the work was left in: work that asked is waiting only while its
+            # question is open, and work stopped on a call is waiting for a person
+            # only while a person is still being asked about it.
+            "SELECT a.kind, a.role, a.state, a.feature_id, a.story_id, a.behaviour_id, "
+            "a.parked, a.grant_id IS NOT NULL AS taken, "
+            "EXISTS (SELECT 1 FROM questions q WHERE q.asked_for = a.assignment_id "
+            "AND q.state = 'open') AS asking, "
+            "EXISTS (SELECT 1 FROM inbox_items i JOIN invocations v USING (invocation_id) "
+            "WHERE v.assignment_id = a.assignment_id AND i.state = 'open') AS asked_about "
+            # Each with its own age, by its own identity: two reviews of one behaviour
+            # are two pieces of work, owed at two times.
+            ", a.assignment_id, a.granted_worker, "
+            "extract(epoch FROM clock_timestamp() - a.created_at) AS owed_for, "
+            "(SELECT extract(epoch FROM clock_timestamp() - max(e.recorded_at)) "
+            "FROM events e WHERE e.project_id = a.project_id AND e.event_type = "
+            "'assignment.granted' AND e.payload->>'grant_id' = a.grant_id::text) AS held_for "
+            "FROM assignments a WHERE a.project_id = %s "
+            "AND a.state IN ('wanted', 'granted', 'asked') ORDER BY a.created_at",
+            (project_id,),
+        )
+    ).fetchall()
+    waiting = await items_in(connection, project_id)
     return {
         "project": project_id,
         "features": [
@@ -104,6 +119,20 @@ async def status(pool: Pool, project_id: str) -> dict[str, Any]:
                     if each["kind"] in ("red", "integrate", "complete")
                     else "waiting for a worker"
                 ),
+                **(
+                    {
+                        "assignment": str(each["assignment_id"]),
+                        "owed_for_seconds": int(each["owed_for"]),
+                        # Since its grant, where it has one: how long it has been held
+                        # is not how long it has been owed.
+                        "held_for_seconds": (
+                            int(each["held_for"]) if each["held_for"] is not None else None
+                        ),
+                        "held_by": str(each["granted_worker"]) if each["taken"] else None,
+                    }
+                    if for_the_board
+                    else {}
+                ),
             }
             for each in owed
             # Work that asked, and whose question has been answered, is done with: what
@@ -111,6 +140,16 @@ async def status(pool: Pool, project_id: str) -> dict[str, Any]:
             if each["state"] != "asked" or each["asking"]
         ],
         "waiting_for_the_product_owner": len(waiting),
+        **(
+            {
+                "waiting": [
+                    {"handle": each.handle, "kind": each.kind, "about": each.about}
+                    for each in waiting
+                ]
+            }
+            if for_the_board
+            else {}
+        ),
     }
 
 
