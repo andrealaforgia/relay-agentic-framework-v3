@@ -65,6 +65,7 @@ SHIPPED = {
     "0017_enrolment.sql": "b69abf31a36f0792569da7ff3c0e6f2490b29076479e792c2a708221c6f75231",
     "0018_prepared.sql": "c45e8b0533564ba622bc13245be79bc42d0944b4af4194e495a2870679c8c79b",
     "0019_confirmation.sql": "0d7c50dfe5e722383092875f82b0464d2d022fa15cea7b92c1f78dce7feb5ff5",
+    "0020_held_since.sql": "b88fe7d42a6ec7dfac1d0dd063858be3aac271eae6f6805c9eb19a582ff30d4b",
 }
 
 
@@ -314,16 +315,19 @@ async def test_an_installation_opened_by_either_build_that_was_pushed_with_0018_
                     await connection.execute("SELECT confirmed FROM human_actions")
                 ).fetchall()
             assert {each["version"]: each["checksum"] for each in recorded} == {
-                name: SHIPPED[name] for name in ("0018_prepared.sql", "0019_confirmation.sql")
+                name: SHIPPED[name] for name in SHIPPED if name >= "0018"
             }
+            later = sorted(name for name in SHIPPED if name > "0019_confirmation.sql")
             assert code is not None and which is not None
             if as_pushed_in == "5f6da3d":
-                assert applied == []  # what 0019 adds was there: said to be applied, not run
+                # What 0019 adds was there: said to be applied, not run. Only what came
+                # after it is run.
+                assert sorted(applied) == later
                 assert code["consumed_by"] == "confirm:c0de0001"
                 assert which["passphrase_revision"] == 3
                 assert [each["confirmed"] for each in kept] == [{"passphrase_revision": 3}]
             else:
-                assert applied == ["0019_confirmation.sql"]
+                assert sorted(applied) == ["0019_confirmation.sql", *later]
                 assert code["consumed_by"] is None and which["passphrase_revision"] == 0
     finally:
         async with open_pool(DATABASE_URL) as admin, admin.connection() as connection:

@@ -17,7 +17,7 @@ import tempfile
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any
 
@@ -681,6 +681,14 @@ async def _usage(connection: Connection, project_id: str, feature_id: str) -> An
     return totals_of(calls)
 
 
+def _usd(amount: Decimal) -> str:
+    """To a hundred-millionth of a dollar, however large the amount: an absurd charge is
+    shown as the absurd charge it is, and does not stop the account being written."""
+    with localcontext() as context:
+        context.prec = 100
+        return f"{amount.quantize(Decimal('0.00000001')).normalize():f}"
+
+
 def totals_of(calls: Sequence[Mapping[str, Any]]) -> Any:
     """The account of a feature's calls: see `_usage`. Each call has its role, its
     state, what it reported using by model billed, and its two costs."""
@@ -724,7 +732,7 @@ def totals_of(calls: Sequence[Mapping[str, Any]]) -> Any:
         role["estimated_by_table"] = [
             {
                 "price_table": table,
-                "usd": f"{sum(amounts, Decimal(0)).quantize(Decimal('0.00000001')).normalize():f}",
+                "usd": _usd(sum(amounts, Decimal(0))),
                 "calls": len(amounts),
             }
             for table, amounts in sorted(tables.get(name, {}).items())
@@ -736,11 +744,7 @@ def totals_of(calls: Sequence[Mapping[str, Any]]) -> Any:
             each = parts[name][cost]
             # To a hundred-millionth of a dollar: what a provider reports as a binary
             # fraction is not shown with the noise of one.
-            role[cost] = (
-                "unknown"
-                if None in each
-                else f"{sum(each, Decimal(0)).quantize(Decimal('0.00000001')).normalize():f}"
-            )
+            role[cost] = "unknown" if None in each else _usd(sum(each, Decimal(0)))
     return {"by_role": by_role, "calls_not_known": not_known}
 
 

@@ -61,9 +61,9 @@ async def status_in(
             # are two pieces of work, owed at two times.
             ", a.assignment_id, a.granted_worker, "
             "extract(epoch FROM clock_timestamp() - a.created_at) AS owed_for, "
-            "(SELECT extract(epoch FROM clock_timestamp() - max(e.recorded_at)) "
-            "FROM events e WHERE e.project_id = a.project_id AND e.event_type = "
-            "'assignment.granted' AND e.payload->>'grant_id' = a.grant_id::text) AS held_for "
+            # Since the hold it is under now began, as the table itself timed it:
+            # whichever route granted it, and not counting a hold that was broken off.
+            "extract(epoch FROM clock_timestamp() - a.held_since) AS held_for "
             "FROM assignments a WHERE a.project_id = %s "
             "AND a.state IN ('wanted', 'granted', 'asked') ORDER BY a.created_at",
             (project_id,),

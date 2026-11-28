@@ -9,6 +9,7 @@ fields. A line that is not an event Relay knows is passed over: the format grows
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -215,6 +216,9 @@ def money_as_reported(value: Any) -> Decimal | None:
 
 def _money(value: Any) -> Decimal | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        # JSON as Python reads it can say Infinity and NaN. Neither is an amount.
         return None
     # The shortest decimal that reads back as the number reported: 0.0008912, not its
     # binary neighbour.

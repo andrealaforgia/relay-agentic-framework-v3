@@ -265,8 +265,12 @@ async def test_what_a_call_returned_is_stored_whole_with_what_it_used(calling: C
             "cache_write_1h_tokens": 4325,
             # What the provider attributed to this model, kept beside its tokens.
             "provider_cost_usd": "0.0008912",
+            # 3C-S3-3.3: and what Relay estimates its part cost, with the table used.
+            "estimated_cost_usd": "0.0008912",
+            "price_table": row["price_table"],
         }
     ]
+    assert row["price_table"]
     assert row["provider_cost_usd"] == Decimal("0.0008912")
     assert row["estimated_cost_usd"] == Decimal("0.0008912")
     assert row["price_table"] == "2026-11-03"

@@ -82,11 +82,13 @@ async def test_the_board_shows_who_is_alive_what_is_being_delivered_and_what_wai
         assert facts["waiting_for_the_product_owner"] == 1
         [build] = [each for each in facts["owed"] if each["work"] == "build"]
         # 3C-S3-1.4: who holds it, whether they are there, and held is not owed.
-        assert build["held_by"] == call["worker"] and build["holder_alive"] is True
+        assert build["held_by"] == call["worker"] and build["holder_lock_held"] is True
         assert build["holder"] == "worker"
         assert build["held_for_seconds"] is not None
         assert build["owed_for_seconds"] >= build["held_for_seconds"] >= 0
-        assert f"held by worker {call['worker'][:8]} (alive)" in board
+        assert f"granted to worker {call['worker'][:8]} (that worker's lock is held)" in board
+        # 3C-S3-3.4: and each worker there is a record of is listed, idle or not.
+        assert f"  builder   {call['worker'][:8]}  lock held" in board
         assert f"by worker {call['worker'][:8]}" in board
         assert facts["features"][0]["stories"][0]["title"] == hostile.title  # whole, in JSON
         await world.answer(question)
@@ -283,14 +285,18 @@ async def test_each_piece_of_work_has_its_own_age_and_work_that_asked_has_one_to
         ]
         assert asked["owed_for_seconds"] >= 3 * 3600
         # Nobody holds it: the person owes an answer, and no worker needs recovering.
-        assert (asked["holder"], asked["held_by"], asked["holder_alive"]) == (None, None, None)
+        assert (asked["holder"], asked["held_by"], asked["holder_lock_held"]) == (
+            None,
+            None,
+            None,
+        )
         assert asked["held_for_seconds"] is None
     [line] = [
         each
         for each in watching.board_text(await watching.board(world.database, PROJECT)).splitlines()
         if "waiting on a question" in each
     ]
-    assert "held by" not in line and "GONE" not in line
+    assert "granted to" not in line and "lock" not in line
     assert "owed for 3h" in watching.board_text(await watching.board(world.database, PROJECT))
 
 
@@ -312,15 +318,21 @@ async def test_a_holder_that_has_gone_is_said_to_have_gone(desk: Desk) -> None:
 
         [build] = [each for each in facts["owed"] if each["work"] == "build"]
         assert facts["processes"]["workers"]["builder"] == 1  # the other one
-        assert build["held_by"] == str(holder.worker_id) and build["holder_alive"] is False
+        assert build["held_by"] == str(holder.worker_id) and build["holder_lock_held"] is False
         assert str(other.worker_id) != build["held_by"]
-        assert "GONE: not yet recovered" in text
+        # 3C-S3-3.1: the two facts, and no conclusion about recovery drawn from them.
+        assert "(that worker's lock is NOT held: its process is gone)" in text
+        assert "not yet recovered" not in text
         # 3C-S3-2.2: the lock is gone; that the provider stopped is not known, nor said.
         assert "its worker's lock is GONE: whether the call is still running is not known" in text
         assert "nobody is making this call" not in text
         # 3C-S3-2.6: two workers started together are told apart by what is shown.
-        [line] = [each for each in text.splitlines() if "held by worker" in each]
-        named = line.split("held by worker ")[1].split(" ")[0]
+        [line] = [each for each in text.splitlines() if "granted to worker" in each]
+        named = line.split("granted to worker ")[1].split(" ")[0]
+        # 3C-S3-3.4: both are in the list of workers, each by its own name.
+        assert f"  builder   {named}  lock not held: gone" in text
+        [idle] = [each for each in text.splitlines() if each.endswith("  lock held")]
+        assert str(other.worker_id).startswith(idle.split()[1]) and idle.split()[1] != named
         assert str(holder.worker_id).startswith(named)
         assert not str(other.worker_id).startswith(named)
         assert {each["worker"]: each["alive"] for each in facts["workers"]} == {
@@ -452,18 +464,57 @@ async def test_work_the_control_plane_holds_is_said_to_be_held_by_it(desk: Desk)
     try:
         facts = await watching.board(world.database, PROJECT)
         [held] = [each for each in facts["owed"] if each["work"] == "build"]
-        assert (held["holder"], held["held_by"], held["holder_alive"]) == (
+        assert (held["holder"], held["held_by"], held["holder_lock_held"]) == (
             "control plane",
             None,
             True,
         )
         text = watching.board_text(facts)
-        assert "held by the control plane (alive)" in text
-        assert "worker None" not in text and "GONE" not in text
+        assert "granted to the control plane (a control plane is running)" in text
+        assert "worker None" not in text and "gone" not in text
+        # 3C-S3-3.2: a hold no worker's claim began is timed all the same.
+        assert held["held_for_seconds"] is not None and held["held_for_seconds"] < 60
     finally:
         await mine.release()
     after = watching.board_text(await watching.board(world.database, PROJECT))
-    assert "held by the control plane (GONE: not yet recovered)" in after
+    assert "granted to the control plane (no control plane is running)" in after
+    assert "recovered" not in after
+
+    # 3C-S3-3.2: and a hold that was broken off and resumed is timed from its resumption.
+    async def held_for() -> int:
+        frame = await watching.board(world.database, PROJECT)
+        [build] = [each for each in frame["owed"] if each["work"] == "build"]
+        assert isinstance(build["held_for_seconds"], int)
+        return build["held_for_seconds"]
+
+    await asyncio.sleep(2.1)
+    assert await held_for() >= 2
+    async with world.database.connection() as connection:
+        [grant] = await world.column("SELECT grant_id FROM assignments WHERE kind = 'build'")
+        await connection.execute(
+            "UPDATE assignments SET state = 'wanted', grant_id = NULL, granted_to = NULL "
+            "WHERE kind = 'build'"
+        )
+        await connection.execute(
+            "UPDATE assignments SET state = 'granted', grant_id = %s, granted_to = "
+            "'relay/control-plane', held_since = now() - interval '1 day' WHERE kind = 'build'",
+            (grant,),
+        )  # the same grant given back; and nobody can say it was held all along
+    assert await held_for() < 2
+    # Nor can a hold under way be given another start by whoever updates the row.
+    async with world.database.connection() as connection:
+        await connection.execute(
+            "UPDATE assignments SET held_since = now() - interval '1 day' WHERE kind = 'build'"
+        )
+    assert await held_for() < 2
+    # Work that asked keeps its grant and is not held; taken up again under that same
+    # grant, its hold is a new one.
+    async with world.database.connection() as connection:
+        await connection.execute("UPDATE assignments SET state = 'asked' WHERE kind = 'build'")
+    assert await world.column("SELECT held_since FROM assignments WHERE kind = 'build'") == [None]
+    async with world.database.connection() as connection:
+        await connection.execute("UPDATE assignments SET state = 'granted' WHERE kind = 'build'")
+    assert await held_for() < 2
 
 
 async def test_told_to_stop_the_events_view_reads_no_further_page(

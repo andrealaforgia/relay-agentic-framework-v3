@@ -444,6 +444,10 @@ class Invocations:
         )
         reported = [
             {
+                # What Relay estimates this model's part cost, and by which table of
+                # prices: beside the call's whole estimate, which is counted once.
+                "estimated_cost_usd": str(its) if its is not None else None,
+                "price_table": self._prices.version if its is not None else None,
                 "model": each.model,
                 "input_tokens": each.input_tokens,
                 "output_tokens": each.output_tokens,
@@ -458,7 +462,7 @@ class Invocations:
                     str(each.provider_cost_usd) if each.provider_cost_usd is not None else None
                 ),
             }
-            for each in used
+            for each, its in zip(used, estimates, strict=True)
         ]
         return reported, result.terminal.provider_cost_usd, estimated
 

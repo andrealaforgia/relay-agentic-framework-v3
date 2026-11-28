@@ -18,7 +18,7 @@ Four things are kept apart, because adding them together would say something unt
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Any
 
 from relay.persistence.database import Pool
@@ -31,7 +31,10 @@ UNKNOWN = "unknown"
 def _usd(amount: Decimal) -> str:
     # To a hundred-millionth of a dollar: what a provider reports as a binary fraction is
     # not shown with the noise of one.
-    return f"{amount.quantize(Decimal('0.00000001')).normalize():f}"
+    # However large: an absurd amount is shown as it is, and breaks nothing.
+    with localcontext() as context:
+        context.prec = 100
+        return f"{amount.quantize(Decimal('0.00000001')).normalize():f}"
 
 
 def _charged(ended: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -122,7 +125,15 @@ def account_of(calls: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             by_model.setdefault(model, {"calls": 0})["calls"] += 1
         for each in billed:
             model = str(each.get("model") or UNKNOWN)
-            into = parts.setdefault(model, {name: [] for name in (*COUNTED, "charged")})
+            into = parts.setdefault(
+                model, {name: [] for name in (*COUNTED, "charged", "estimated")}
+            )
+            # Relay's own estimate of this model's part, with the table that made it. A
+            # record made before that was kept has neither, and it is not worked out
+            # again here by prices that may not be those of the time.
+            into["estimated"].append(
+                (_money(each.get("estimated_cost_usd")), each.get("price_table"))
+            )
             for counted in COUNTED:
                 into[counted].append(each.get(counted))
             if "provider_cost_usd" in each:
@@ -148,6 +159,17 @@ def account_of(calls: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         charges = counters["charged"]
         by_model[model]["charged_usd"] = (
             UNKNOWN if None in charges else _usd(sum(charges, Decimal(0)))
+        )
+        by_table: dict[str, list[Decimal]] = {}
+        for amount, table in counters["estimated"]:
+            if amount is not None:
+                by_table.setdefault(str(table or UNKNOWN), []).append(amount)
+        by_model[model]["estimated_by_relay"] = [
+            {"price_table": table, "usd": _usd(sum(amounts, Decimal(0))), "lines": len(amounts)}
+            for table, amounts in sorted(by_table.items())
+        ]
+        by_model[model]["lines_with_no_estimate"] = sum(
+            1 for amount, _ in counters["estimated"] if amount is None
         )
     # Every role that made a call, ended or not: a role whose only call is one nobody
     # knows the end of has an account, of that.
@@ -180,20 +202,24 @@ class NoSuchFeature(LookupError):
     """The feature named is not one of the project's."""
 
 
+async def _require_feature(connection: Any, project_id: str, feature_id: str) -> None:
+    there = await (
+        await connection.execute(
+            "SELECT 1 FROM features WHERE project_id = %s AND feature_id = %s",
+            (project_id, feature_id),
+        )
+    ).fetchone()
+    if there is None:
+        raise NoSuchFeature(f"there is no feature {feature_id!r} in {project_id}")
+
+
 async def live_usage(pool: Pool, project_id: str, feature_id: str | None = None) -> dict[str, Any]:
     """The account of a project's calls, or of one feature's, as it is known now. A
     feature that has made no call yet has an account of nothing; a name that is no
     feature of the project has none at all."""
     async with pool.connection() as connection:
         if feature_id is not None:
-            there = await (
-                await connection.execute(
-                    "SELECT 1 FROM features WHERE project_id = %s AND feature_id = %s",
-                    (project_id, feature_id),
-                )
-            ).fetchone()
-            if there is None:
-                raise NoSuchFeature(f"there is no feature {feature_id!r} in {project_id}")
+            await _require_feature(connection, project_id, feature_id)
         calls = await (
             await connection.execute(
                 "SELECT v.role, v.state, v.usage, v.provider_cost_usd, v.estimated_cost_usd, "
@@ -293,6 +319,16 @@ def account_text(account: Mapping[str, Any]) -> str:
             f"{used['cache_write_tokens']}; the provider's charge for this model: "
             + ("not said" if used["charged_usd"] == UNKNOWN else f"{used['charged_usd']} USD")
         )
+        for estimate in used["estimated_by_relay"]:
+            lines.append(
+                f"    estimated by Relay for this model (an estimate, price table "
+                f"{_shown(estimate['price_table'])}): {estimate['usd']} USD"
+            )
+        if used["lines_with_no_estimate"]:
+            lines.append(
+                f"    with no estimate on record for this model: "
+                f"{used['lines_with_no_estimate']} of its part(s) in calls"
+            )
     return "\n".join(lines)
 
 
@@ -311,14 +347,19 @@ def frozen_account(summary: Mapping[str, Any]) -> Any:
     for role, totals in dict(usage.get("by_role", {})).items():
         tables = totals.get("estimated_by_table")
         if tables is None:
+            sum_then = totals.get("estimated_cost_usd", UNKNOWN)
+            # The writer of that time gave a sum only when every one of the role's
+            # calls had an estimate: a sum is of all of them, and only its table is
+            # not on record. With no sum, how many had one is not on record either.
+            whole = sum_then != UNKNOWN
             estimates: Any = [
                 {
                     "price_table": NOT_ON_RECORD,
-                    "usd": totals.get("estimated_cost_usd", UNKNOWN),
-                    "calls": NOT_ON_RECORD,
+                    "usd": sum_then,
+                    "calls": totals["calls"] if whole else NOT_ON_RECORD,
                 }
             ]
-            unestimated: Any = NOT_ON_RECORD
+            unestimated: Any = 0 if whole else NOT_ON_RECORD
         else:
             estimates = [dict(each) for each in tables]
             unestimated = totals["calls"] - sum(int(each["calls"]) for each in tables)
@@ -350,8 +391,7 @@ async def beside_its_summary(
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """A feature's account now, and what its summary froze. The summary is read first:
     what is frozen then never knows more than what is shown beside it as the present. A
-    name that is no feature is refused before either."""
-    await live_usage(pool, project_id, feature_id)
+    name that is no feature has no summary, and is refused by the reading of its account."""
     frozen = await summary_of(pool, project_id, feature_id)
     return await live_usage(pool, project_id, feature_id), frozen
 
@@ -372,12 +412,19 @@ def summary_text(frozen: Mapping[str, Any] | None) -> str:
         lines.append(
             f"    tokens: in {totals['input_tokens']}, out {totals['output_tokens']}, cache "
             f"read {totals['cache_read_tokens']}, cache written {totals['cache_write_tokens']}"
+            + (
+                f"  ({totals['calls_with_no_use_reported']} call(s) reported no use)"
+                if totals["calls_with_no_use_reported"]
+                else ""
+            )
         )
         lines.append(f"    charged by the provider: {totals['charged_by_the_provider_usd']}")
         for each in totals["estimated_by_relay"]:
             if each["price_table"] == NOT_ON_RECORD:
                 lines.append(
-                    f"    estimated by Relay (an estimate): {each['usd']}. This summary was "
+                    f"    estimated by Relay (an estimate): {each['usd']}"
+                    + (f" over {each['calls']} call(s)" if each["calls"] != NOT_ON_RECORD else "")
+                    + ". This summary was "
                     "written before estimates were kept by price table: which table, or "
                     "tables, made it is not on record"
                 )

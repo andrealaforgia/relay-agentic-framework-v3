@@ -114,6 +114,9 @@ def test_two_roles_on_one_model_each_have_their_own_spend_and_a_whole_calls_char
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
         "charged_usd": "0.05",
+        # No estimate was recorded for this model's part: said, and not made up now.
+        "estimated_by_relay": [],
+        "lines_with_no_estimate": 1,
     }
     text = shown(account)
     assert "the builder: 2 call(s)" in text and "the qa: 1 call(s)" in text
@@ -390,6 +393,85 @@ def test_a_frozen_account_says_the_same_in_text_and_in_json() -> None:
         "cache_write_tokens": 0, "provider_cost_usd": "0.3", "estimated_cost_usd": "0.3",
     }}}}  # fmt: skip
     [estimate] = frozen_account(older)["by_role"]["builder"]["estimated_by_relay"]
-    assert estimate == {"price_table": NOT_ON_RECORD, "usd": "0.3", "calls": NOT_ON_RECORD}
+    # 3C-S3-3.5: the writer of that time summed only when every call had an estimate, so
+    # the sum covers both calls: the table is what is not on record.
+    assert estimate == {"price_table": NOT_ON_RECORD, "usd": "0.3", "calls": 2}
+    assert frozen_account(older)["by_role"]["builder"]["calls_with_no_estimate"] == 0
+    assert "(an estimate): 0.3 over 2 call(s). This summary was" in summary_text(older)
+    older["usage"]["by_role"]["builder"]["estimated_cost_usd"] = "unknown"
+    [unsummed] = frozen_account(older)["by_role"]["builder"]["estimated_by_relay"]
+    assert unsummed["calls"] == NOT_ON_RECORD
     assert frozen_account(older)["by_role"]["builder"]["calls_with_no_estimate"] == NOT_ON_RECORD
+    # And a call that reported no use is said in the text as it is in the facts.
+    silent = {"usage": totals_of([call(role="qa", state="errored")])}
+    assert frozen_account(silent)["by_role"]["qa"]["calls_with_no_use_reported"] == 1
+    assert "(1 call(s) reported no use)" in summary_text(silent)
     assert frozen_account({"usage": "unknown"}) == "unknown"
+
+
+def test_each_models_estimate_is_shown_with_its_table_and_the_whole_call_is_counted_once() -> None:
+    """3C-S3-3.3: one call billed to two models Relay has prices for."""
+    account = account_of(
+        [
+            call(
+                usage=[
+                    {**billed("opus"), "estimated_cost_usd": "0.0004", "price_table": "2026-11"},
+                    {**billed("haiku"), "estimated_cost_usd": "0.00008", "price_table": "2026-11"},
+                ],
+                charged="0.0005",
+                estimated="0.00048",
+            ),
+            call(
+                usage=[{**billed("opus"), "estimated_cost_usd": "0.1", "price_table": "2026-10"}],
+                estimated="0.1",
+                table="2026-10",
+            ),
+            call(usage=[billed("opus")], estimated="0.2"),  # recorded before this was kept
+        ]
+    )
+
+    opus, haiku = account["by_model"]["opus"], account["by_model"]["haiku"]
+    assert opus["estimated_by_relay"] == [
+        {"price_table": "2026-10", "usd": "0.1", "lines": 1},
+        {"price_table": "2026-11", "usd": "0.0004", "lines": 1},
+    ]
+    assert opus["lines_with_no_estimate"] == 1  # unknown, and not worked out again
+    assert haiku["estimated_by_relay"] == [{"price_table": "2026-11", "usd": "0.00008", "lines": 1}]
+    # The whole calls' estimates, once each, by table: not rebuilt from the models.
+    assert account["estimated_by_relay"] == [
+        {"price_table": "2026-10", "usd": "0.1", "calls": 1},
+        {"price_table": "2026-11", "usd": "0.20048", "calls": 2},
+    ]
+    text = shown(account)
+    assert (
+        "estimated by Relay for this model (an estimate, price table 2026-11): 0.0004 USD" in text
+    )
+    assert "with no estimate on record for this model: 1" in text
+
+
+def test_an_absurd_amount_is_shown_as_it_is_and_breaks_nothing() -> None:
+    """3C-S3-3.6: the provider said a model's part cost ten to the twentieth dollars."""
+    from relay.providers.stream import money_as_reported
+
+    absurd = money_as_reported(1e20)
+    assert absurd is not None
+    assert money_as_reported(float("inf")) is None and money_as_reported(float("nan")) is None
+    calls = [
+        call(usage=[billed("opus", cost=str(absurd))], charged="0.10"),
+        call(
+            usage=[billed("haiku", cost="0.01")],
+            role="qa",
+            charged=str(absurd),
+            estimated=str(absurd),
+        ),
+    ]
+
+    account = account_of(calls)
+    frozen = totals_of(calls)
+
+    assert account["by_model"]["opus"]["charged_usd"] == "100000000000000000000"
+    assert account["by_model"]["haiku"]["charged_usd"] == "0.01"
+    assert account["charged_by_the_provider"]["usd"] == "100000000000000000000.1"
+    assert account["by_role"]["builder"]["charged_by_the_provider"]["usd"] == "0.1"
+    assert frozen["by_role"]["qa"]["provider_cost_usd"] == "100000000000000000000"
+    assert "100000000000000000000.1 USD" in shown(account)

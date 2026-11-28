@@ -97,9 +97,13 @@ async def board(pool: Pool, project_id: str) -> dict[str, Any]:
         "owed": [
             {
                 **each,
-                # Whoever holds it, and whether they are still there: a holder that has
-                # gone has not been recovered from yet, and the work is not moving.
-                "holder_alive": (
+                # Two facts, and no conclusion drawn from them: whose grant the work is
+                # under, and whether that process's lock is held now. Who is carrying
+                # out an effect of it at this moment is not something a lock says: a
+                # Builder that returned its candidate and left is gone while the control
+                # plane verifies it, and a control plane that has just taken over holds
+                # the lock before it has dealt with what its predecessor left.
+                "holder_lock_held": (
                     (each["held_by"] in living)
                     if each["holder"] == "worker"
                     else bool(led and led["led"])
@@ -136,8 +140,15 @@ def board_text(facts: dict[str, Any]) -> str:
         f"control plane: {processes['control_plane']}"
         + ("" if processes["control_plane"] == "running" else "   (start it: `relay up`)"),
         f"workers:       {workers}",
-        "",
     ]
+    name = _names([each["worker"] for each in facts["workers"]])
+    for each in facts["workers"]:
+        # Each one there is a record of, idle or not: which is there and which is not.
+        lines.append(
+            f"  {each['role']:<9} {name(each['worker'])}  "
+            + ("lock held" if each["alive"] else "lock not held: gone")
+        )
+    lines.append("")
     if not facts["features"]:
         lines.append('no feature yet: start one with `relay feature start "<the problem>"`')
     for feature in facts["features"]:
@@ -149,7 +160,6 @@ def board_text(facts: dict[str, Any]) -> str:
                     f"    {each['behaviour']}  {each['state']:<16} {visible(each['summary'])}"
                 )
     lines.append("")
-    name = _names([each["worker"] for each in facts["workers"]])
     lines.append("in flight:" if facts["calls_in_flight"] else "in flight: no call")
     for each in facts["calls_in_flight"]:
         lines.append(
@@ -173,8 +183,21 @@ def board_text(facts: dict[str, Any]) -> str:
                 else "the control plane"
             )
             held = (
-                f"; held by {who} "
-                f"({'alive' if each['holder_alive'] else 'GONE: not yet recovered'})"
+                f"; granted to {who} ("
+                + (
+                    (
+                        "that worker's lock is held"
+                        if each["holder_lock_held"]
+                        else "that worker's lock is NOT held: its process is gone"
+                    )
+                    if each["holder"] == "worker"
+                    else (
+                        "a control plane is running"
+                        if each["holder_lock_held"]
+                        else "no control plane is running"
+                    )
+                )
+                + ")"
                 + (
                     f" for {_for(each['held_for_seconds'])}"
                     if each["held_for_seconds"] is not None
