@@ -44,6 +44,7 @@ async def prepare(
     shown: str,
     basis: str,
     good_for: timedelta = GOOD_FOR,
+    by: str = "the command line",
 ) -> Prepared:
     if not why.strip():
         raise ValueError("an action is prepared with why it is proposed")
@@ -51,8 +52,9 @@ async def prepare(
     async with pool.connection() as connection:
         await connection.execute(
             "INSERT INTO prepared_actions (code, project_id, verb, target, said, reason, why, "
-            "shown, basis, expires_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now() + %s)",
-            (code, project_id, verb, target, said, reason, why.strip(), shown, basis, good_for),
+            "shown, basis, expires_at, prepared_by) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now() + %s, %s)",
+            (code, project_id, verb, target, said, reason, why.strip(), shown, basis, good_for, by),
         )
     found = await find(pool, code)
     assert found is not None

@@ -66,6 +66,7 @@ SHIPPED = {
     "0018_prepared.sql": "c45e8b0533564ba622bc13245be79bc42d0944b4af4194e495a2870679c8c79b",
     "0019_confirmation.sql": "0d7c50dfe5e722383092875f82b0464d2d022fa15cea7b92c1f78dce7feb5ff5",
     "0020_held_since.sql": "b88fe7d42a6ec7dfac1d0dd063858be3aac271eae6f6805c9eb19a582ff30d4b",
+    "0021_conversations.sql": "d89852099301e96df5af8a13b72f5a4a0e852e072c35cb4f390e701081723300",
 }
 
 

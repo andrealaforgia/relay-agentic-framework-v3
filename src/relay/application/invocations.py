@@ -60,6 +60,7 @@ from relay.persistence.ledger import append_event
 from relay.providers.claude import Outcome, ProviderResult
 from relay.providers.definitions import AgentDefinition
 from relay.providers.pricing import PRICES, PriceTable, estimate
+from relay.providers.stream import Terminal
 
 # Calls that gave nothing usable, per assignment, before a person is asked.
 ATTEMPTS_BEFORE_ASKING = 3
@@ -157,6 +158,44 @@ class Parked:
 
 
 EffectsFor = Callable[[dict[str, Any]], Sequence[Effect]]
+
+
+def use_of(
+    prices: PriceTable, terminal: Terminal
+) -> tuple[list[dict[str, Any]], Decimal | None, Decimal | None]:
+    """What a call's terminal result says it used, by model billed; what the provider
+    said the whole call cost; and Relay's estimate of the whole, by `prices`."""
+    used = terminal.usage
+    estimates = [estimate(prices, each) for each in used]
+    # An estimate of the whole only if every part of it could be estimated.
+    estimated = (
+        sum((each for each in estimates if each is not None), Decimal(0))
+        if used and None not in estimates
+        else None
+    )
+    reported = [
+        {
+            # What Relay estimates this model's part cost, and by which table of
+            # prices: beside the call's whole estimate, which is counted once.
+            "estimated_cost_usd": str(its) if its is not None else None,
+            "price_table": prices.version if its is not None else None,
+            "model": each.model,
+            "input_tokens": each.input_tokens,
+            "output_tokens": each.output_tokens,
+            "cache_read_tokens": each.cache_read_tokens,
+            "cache_write_tokens": each.cache_write_tokens,
+            "cache_write_5m_tokens": each.cache_write_5m_tokens,
+            "cache_write_1h_tokens": each.cache_write_1h_tokens,
+            # What the provider said this model's part of the call cost, where it
+            # said: the call's whole cost is kept beside this, and is not their sum
+            # unless the provider made it so.
+            "provider_cost_usd": (
+                str(each.provider_cost_usd) if each.provider_cost_usd is not None else None
+            ),
+        }
+        for each, its in zip(used, estimates, strict=True)
+    ]
+    return reported, terminal.provider_cost_usd, estimated
 
 
 class Invocations:
@@ -434,37 +473,7 @@ class Invocations:
     ) -> tuple[list[dict[str, Any]] | None, Decimal | None, Decimal | None]:
         if result.terminal is None:
             return None, None, None
-        used = result.terminal.usage
-        estimates = [estimate(self._prices, each) for each in used]
-        # An estimate of the whole only if every part of it could be estimated.
-        estimated = (
-            sum((each for each in estimates if each is not None), Decimal(0))
-            if used and None not in estimates
-            else None
-        )
-        reported = [
-            {
-                # What Relay estimates this model's part cost, and by which table of
-                # prices: beside the call's whole estimate, which is counted once.
-                "estimated_cost_usd": str(its) if its is not None else None,
-                "price_table": self._prices.version if its is not None else None,
-                "model": each.model,
-                "input_tokens": each.input_tokens,
-                "output_tokens": each.output_tokens,
-                "cache_read_tokens": each.cache_read_tokens,
-                "cache_write_tokens": each.cache_write_tokens,
-                "cache_write_5m_tokens": each.cache_write_5m_tokens,
-                "cache_write_1h_tokens": each.cache_write_1h_tokens,
-                # What the provider said this model's part of the call cost, where it
-                # said: the call's whole cost is kept beside this, and is not their sum
-                # unless the provider made it so.
-                "provider_cost_usd": (
-                    str(each.provider_cost_usd) if each.provider_cost_usd is not None else None
-                ),
-            }
-            for each, its in zip(used, estimates, strict=True)
-        ]
-        return reported, result.terminal.provider_cost_usd, estimated
+        return use_of(self._prices, result.terminal)
 
     async def as_it_stands(self, assignment_id: uuid.UUID) -> dict[str, Any]:
         """The revisions and decision basis of what a piece of work is about, now. A task

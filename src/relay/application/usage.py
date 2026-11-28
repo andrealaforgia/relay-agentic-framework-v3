@@ -230,6 +230,18 @@ async def live_usage(pool: Pool, project_id: str, feature_id: str | None = None)
                 (project_id, feature_id, feature_id),
             )
         ).fetchall()
+        if feature_id is None:
+            # A conversation's turns are paid calls too (3C-3.6): by a role of their
+            # own, for the project and for no feature. A turn nobody knows the end of
+            # is counted as that, like any call.
+            calls += await (
+                await connection.execute(
+                    "SELECT role, state, usage, provider_cost_usd, estimated_cost_usd, "
+                    "price_table, envelope->'modelUsage' AS billed_by_model "
+                    "FROM conversation_turns WHERE project_id = %s ORDER BY started_at",
+                    (project_id,),
+                )
+            ).fetchall()
     return {"project": project_id, "feature": feature_id, **account_of(calls)}
 
 
